@@ -59,24 +59,38 @@ function quoteObjectKey(key: string): string {
 }
 
 /** Flatten a structured object, returning the tree definition. */
-export function flatten(x: any): [any[], JsTreeDef] {
+export function flatten(tree: any): [any[], JsTreeDef] {
   const leaves: any[] = [];
-  const treedef = _flatten(x, leaves);
+  const treedef = _flatten(tree, leaves);
   return [leaves, treedef];
 }
 
-function _flatten(x: any, leaves: any[]): JsTreeDef {
-  if (Array.isArray(x)) {
-    const childTrees = x.map((c) => _flatten(c, leaves));
+function _flatten(tree: any, leaves: any[]): JsTreeDef {
+  if (Array.isArray(tree)) {
+    const childTrees = tree.map((c) => _flatten(c, leaves));
     return new JsTreeDef(NodeType.Array, null, childTrees);
-  } else if (typeof x === "object" && x !== null && x.constructor === Object) {
-    const [keys, values] = unzip2(Object.entries(x));
+  } else if (
+    typeof tree === "object" &&
+    tree !== null &&
+    tree.constructor === Object
+  ) {
+    const [keys, values] = unzip2(Object.entries(tree));
     const childTrees = values.map((c) => _flatten(c, leaves));
     return new JsTreeDef(NodeType.Object, keys, childTrees);
   } else {
-    leaves.push(x);
+    leaves.push(tree);
     return JsTreeDef.leaf;
   }
+}
+
+/** Get the leaves of a tree. */
+export function leaves(tree: any): any[] {
+  return flatten(tree)[0];
+}
+
+/** Get the treedef for a tree. */
+export function structure(tree: any): JsTreeDef {
+  return flatten(tree)[1];
 }
 
 /** Reconstruct a structured object from the flattened representation. */
