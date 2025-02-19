@@ -1339,13 +1339,13 @@ function linearizeFlat(
     ...primalsIn.map(PartialVal.known),
     ...primalsIn.map((t) => PartialVal.unknown(t.aval)),
   ];
-  const jvpF = (...x: Tracer[]) => {
+  const fJvp = (...x: Tracer[]) => {
     // Args contain both primals and tangents, concatenated.
     const k = x.length / 2;
     const [primalsOut, tangentsOut] = jvp(f, x.slice(0, k), x.slice(k, 2 * k));
     return [...primalsOut, ...tangentsOut];
   };
-  const { jaxpr, pvalsOut, consts } = partialEvalFlat(jvpF, pvalsIn);
+  const { jaxpr, pvalsOut, consts } = partialEvalFlat(fJvp, pvalsIn);
   const primalPvals = pvalsOut.slice(0, pvalsOut.length / 2);
   if (!primalPvals.every((pval) => pval.isKnown)) {
     throw new TypeError(
