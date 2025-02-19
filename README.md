@@ -11,6 +11,7 @@ npm test
 ## Milestones
 
 - [ ] It works!
+- [ ] Demos: Browser REPL / editor
 - [ ] Demos: Navier-Stokes, neural networks, statistics
 - [ ] We figure out the `dispose()` / linear types stuff
 - [ ] Device switching with `.to()` between webgl/webgpu/cpu/wasm
