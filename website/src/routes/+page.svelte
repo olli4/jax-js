@@ -4,7 +4,6 @@
   import { ArrowRightIcon, PaletteIcon, PlayIcon } from "lucide-svelte";
 
   import ReplEditor from "$lib/repl/ReplEditor.svelte";
-  import { jaxSrc } from "$lib/jax-js-source";
 
   const codeSamples: {
     title: string;
@@ -44,17 +43,19 @@ const y = np.dot(X, np.array([1, 2])).add(3);
   let replEditor: ReplEditor;
 
   async function handleFormat() {
-    const { format } = await import("prettier");
+    const { formatWithCursor } = await import("prettier");
     const prettierParserTypescript = await import("prettier/parser-typescript");
     const prettierPluginEstree = await import("prettier/plugins/estree");
 
     const code = replEditor.getText();
     try {
-      const formattedCode = await format(code, {
+      const { formatted, cursorOffset } = await formatWithCursor(code, {
         parser: "typescript",
         plugins: [prettierParserTypescript, prettierPluginEstree as any],
+        cursorOffset: replEditor.getCursorOffset(),
       });
-      replEditor.setText(formattedCode);
+      replEditor.setText(formatted);
+      replEditor.setCursorOffset(cursorOffset);
     } catch (e: any) {
       // TODO: Display the error in the console.
       alert(e.toString());
@@ -62,6 +63,7 @@ const y = np.dot(X, np.array([1, 2])).add(3);
   }
 
   async function handleRun() {
+    const jax = await import("@jax-js/core");
     const ts = await import("typescript");
     const { rollup } = await import("@rollup/browser");
 
@@ -71,22 +73,16 @@ const y = np.dot(X, np.array([1, 2])).add(3);
     const virtualPlugin: Plugin = {
       name: "virtual",
       resolveId(id) {
-        console.log("resolving", id);
         // We treat 'index.ts' as the user code entry point.
-        if (id === "index.ts" || id === "@jax-js/core") {
+        if (id === "index.ts") {
           return id;
         } else {
-          console.log("Module not found: " + id);
-          return "<empty>";
+          throw new Error("Module not found: " + id);
         }
       },
       load(id) {
         if (id === "index.ts") {
           return userCode;
-        } else if (id === "@jax-js/core") {
-          return jaxSrc;
-        } else if (id === "<empty>") {
-          return "export default {}";
         } else {
           return null;
         }
@@ -96,12 +92,11 @@ const y = np.dot(X, np.array([1, 2])).add(3);
     const typescriptPlugin: Plugin = {
       name: "typescript",
       transform(code, id) {
-        console.log(code.length, id);
         if (id.endsWith(".ts")) {
           return ts.transpileModule(code, {
             compilerOptions: {
               module: ts.ModuleKind.ESNext,
-              target: ts.ScriptTarget.ES2017,
+              target: ts.ScriptTarget.ES2022,
             },
           }).outputText;
         }
@@ -113,16 +108,19 @@ const y = np.dot(X, np.array([1, 2])).add(3);
     const bundle = await rollup({
       input: "index.ts",
       plugins: [typescriptPlugin, virtualPlugin],
+      external: ["@jax-js/core"],
     });
 
     const { output } = await bundle.generate({
       file: "bundle.js",
       format: "iife",
+      globals: {
+        "@jax-js/core": "JAX",
+      },
     });
 
     const bundledCode = output[0].code;
-
-    eval(bundledCode);
+    new Function("JAX", bundledCode)(jax);
   }
 </script>
 
@@ -177,7 +175,7 @@ const y = np.dot(X, np.array([1, 2])).add(3);
     {#snippet b()}
       <SplitPane
         type="vertical"
-        pos="-200px"
+        pos="-240px"
         min="33%"
         max="-64px"
         --color="var(--color-gray-200)"
@@ -207,12 +205,29 @@ const y = np.dot(X, np.array([1, 2])).add(3);
               <ReplEditor
                 initialText={codeSamples[selected].code}
                 bind:this={replEditor}
+                onformat={handleFormat}
+                onrun={handleRun}
               />
             </div>
           </div>
         {/snippet}
         {#snippet b()}
-          <div>hello</div>
+          <section class="p-4 !overflow-y-auto">
+            <div class="text-sm font-mono">hello</div>
+            <div class="text-sm font-mono">hello</div>
+            <div class="text-sm font-mono">hello</div>
+            <div class="text-sm font-mono">hello</div>
+            <div class="text-sm font-mono">hello</div>
+            <div class="text-sm font-mono">hello</div>
+            <div class="text-sm font-mono">hello</div>
+            <div class="text-sm font-mono">hello</div>
+            <div class="text-sm font-mono">hello</div>
+            <div class="text-sm font-mono">hello</div>
+            <div class="text-sm font-mono">hello</div>
+            <div class="text-sm font-mono">hello</div>
+            <div class="text-sm font-mono">hello</div>
+            <div class="text-sm font-mono">hello</div>
+          </section>
         {/snippet}
       </SplitPane>
     {/snippet}

@@ -5,7 +5,7 @@ import htmlWorker from "monaco-editor/esm/vs/language/html/html.worker?worker";
 import jsonWorker from "monaco-editor/esm/vs/language/json/json.worker?worker";
 import tsWorker from "monaco-editor/esm/vs/language/typescript/ts.worker?worker";
 
-import { jaxTypesSrc } from "./jax-js-source";
+import jaxTypesSrc from "@jax-js/core/dist/index.d.ts?raw";
 
 self.MonacoEnvironment = {
   getWorker: function (_: string, label: string) {

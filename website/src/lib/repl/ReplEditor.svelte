@@ -2,7 +2,15 @@
   import { onDestroy, onMount } from "svelte";
   import type * as Monaco from "monaco-editor/esm/vs/editor/editor.api";
 
-  export let initialText: string;
+  let {
+    initialText,
+    onformat,
+    onrun,
+  }: {
+    initialText: string;
+    onformat?: () => void;
+    onrun?: () => void;
+  } = $props();
 
   let containerEl: HTMLDivElement;
   let editor: Monaco.editor.IStandaloneCodeEditor;
@@ -16,12 +24,57 @@
     editor?.setValue(text);
   }
 
+  export function getCursorOffset() {
+    const model = editor?.getModel();
+    if (editor && model) {
+      return model.getOffsetAt(
+        editor.getPosition() ?? {
+          lineNumber: 1,
+          column: 1,
+        },
+      );
+    } else {
+      return 0;
+    }
+  }
+
+  export function setCursorOffset(offset: number) {
+    const model = editor?.getModel();
+    if (editor && model) {
+      const position = model.getPositionAt(offset);
+      editor.setPosition(position);
+    }
+  }
+
   onMount(async () => {
     monaco = (await import("$lib/monaco")).default;
 
     editor = monaco.editor.create(containerEl, {
       fontSize: 14,
       automaticLayout: true,
+    });
+    editor.addAction({
+      id: "format",
+      label: "Format with Prettier",
+      keybindings: [monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyS],
+      contextMenuGroupId: "navigation",
+      contextMenuOrder: 1,
+      run: () => {
+        onformat?.();
+      },
+    });
+    editor.addAction({
+      id: "run",
+      label: "Run Code",
+      keybindings: [
+        monaco.KeyMod.CtrlCmd | monaco.KeyCode.Enter,
+        monaco.KeyMod.Shift | monaco.KeyCode.Enter,
+      ],
+      contextMenuGroupId: "navigation",
+      contextMenuOrder: 0.9,
+      run: () => {
+        onrun?.();
+      },
     });
     const model = monaco.editor.createModel(
       initialText,
