@@ -9,9 +9,11 @@
   </div>
 
   <p class="mb-5">
-    In 2025, most software lives in the browser, with JavaScript. Imagine if you
-    could just run
+    In 2025, most software is written in JavaScript and runs in browsers. But ML
+    libraries don't.
   </p>
+
+  <p class="mb-5">What if they did?</p>
 
   <pre class="mb-5 text-center"><code>npm install @jax-js/core</code></pre>
 
@@ -61,10 +63,8 @@
   </p>
 
   <p class="mb-5">
-    Want to distribute software? Make a website. And if you want to let people
-    run neural networks or anything numerical on that website, use <code
-      >jax-js</code
-    >.
+    Want to distribute software? Make a website. And if you want to run neural
+    networks or numerical code on that website, use <code>jax-js</code>.
   </p>
 
   <p>
