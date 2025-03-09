@@ -17,7 +17,11 @@
  * something, it'll just be copied from tinygrad (with comments :D).
  */
 
-import { deepEqual, rep, zip } from "./utils";
+import { deepEqual, isPermutation, rep, zip } from "./utils";
+
+type Pair = [number, number];
+
+const jstr = JSON.stringify;
 
 /** Remove "1" dimensions from the strides list. */
 function canonicalizeStrides(shape: number[], strides: number[]): number[] {
@@ -60,14 +64,14 @@ class View {
     readonly offset: number,
 
     /** Masked out subarray where data is read. All other data is zeroed. */
-    readonly mask: [number, number][] | null,
+    readonly mask: Pair[] | null,
   ) {}
 
   static create(
     shape: number[],
     strides?: number[],
     offset: number = 0,
-    mask: [number, number][] | null = null,
+    mask: Pair[] | null = null,
   ): View {
     if (shape.some((s) => s < 0))
       throw new Error("View shape must be non-negative");
@@ -99,7 +103,7 @@ class View {
         if (hasNoData) {
           strides = rep(shape.length, 0);
           offset = 0;
-          mask = rep(shape.length, () => [0, 0] as [number, number]);
+          mask = rep(shape.length, () => [0, 0] as Pair);
         }
         for (const i of elimDims) {
           offset += strides[i] * mask[i][0];
@@ -108,6 +112,10 @@ class View {
       }
     }
     return new View(shape, strides, 0, null);
+  }
+
+  get ndim(): number {
+    return this.shape.length;
   }
 
   get size(): number {
@@ -162,8 +170,8 @@ class View {
     //  - strides: the new strides for v1, reduced from terms
 
     let origin = unravel(v2.shape, v1.offset); // v1 applies after v2
-    let terms: [number, number][][] = rep(v2.shape.length, () => []);
-    const strides = rep(v1.shape.length, 0);
+    let terms: Pair[][] = rep(v2.ndim, () => []);
+    const strides = rep(v1.ndim, 0);
     for (let d1 = 0; d1 < v1.strides.length; d1++) {
       const st = v1.strides[d1];
       if (st === 0) {
@@ -171,7 +179,7 @@ class View {
       }
       const unravelOffset = unravel(v2.shape, v1.offset + st);
       // compare new unravel with origin
-      for (let d2 = 0; d2 < v2.shape.length; d2++) {
+      for (let d2 = 0; d2 < v2.ndim; d2++) {
         const o = origin[d2];
         const diff = unravelOffset[d2] - o;
         if (diff === 0) {
@@ -188,7 +196,7 @@ class View {
     // joined together. Sometimes this may not be possible.
     let [mergedSize, mergedTermMin, mergedTermMax] = [1, 0, 0];
     const extents: [number, number, number][] = []; // size, vmin, vmax
-    for (let i = v2.shape.length - 1; i >= 0; i--) {
+    for (let i = v2.ndim - 1; i >= 0; i--) {
       const term = terms[i]; // list of [dim in v1, stride in v2.shape[i]]
       const s = v2.shape[i];
       // Figure out the min and max value of this dimension in v2.
@@ -220,11 +228,11 @@ class View {
 
     // If v2 has a mask, let's try to project it onto v1
     if (v2.mask !== null) {
-      const newB = rep(v1.shape.length, 0);
+      const newB = rep(v1.ndim, 0);
       const newE = v1.shape.slice();
       let bad = false;
 
-      for (let d2 = 0; d2 < v2.shape.length; d2++) {
+      for (let d2 = 0; d2 < v2.ndim; d2++) {
         const [b, e] = v2.mask[d2];
         const o = origin[d2];
         const term = terms[d2];
@@ -248,7 +256,7 @@ class View {
       }
 
       // If any of v1 was masked off, try again with that mask in place.
-      for (let d1 = 0; d1 < v1.shape.length; d1++) {
+      for (let d1 = 0; d1 < v1.ndim; d1++) {
         if (newB[d1] !== 0 || newE[d1] !== v1.shape[d1]) {
           return v2.compose(
             View.create(v1.shape, v1.strides, v1.offset, zip(newB, newE)),
@@ -263,12 +271,98 @@ class View {
 
     // Final offset is v2.offset plus sum of origin*d2 strides.
     let finalOffset = v2.offset;
-    for (let d2 = 0; d2 < v2.shape.length; d2++) {
+    for (let d2 = 0; d2 < v2.ndim; d2++) {
       finalOffset += origin[d2] * v2.strides[d2];
     }
 
     // Return the composed view (no mask, see normalization at the beginning).
     return View.create(v1.shape, strides, finalOffset, null);
+  }
+
+  /** Pad the view with zeros on each dimension. */
+  pad(arg: Pair[]): View {
+    if (arg.length !== this.ndim || !arg.every(([b, e]) => b >= 0 && e >= 0)) {
+      throw new Error(`invalid pad ${jstr(arg)} for ${jstr(this.shape)}`);
+    }
+    if (arg.every(([b, e]) => b === 0 && e === 0)) return this;
+    const zvarg = arg.map<Pair>(([b, e], i) => [-b, this.shape[i] + e]);
+    const mask = arg.map<Pair>(([b, e], i) => [b, this.shape[i] + b]);
+    return this.#unsafeResize(zvarg, mask);
+  }
+
+  /** Shrink the view by taking a subarray. */
+  shrink(arg: Pair[]): View {
+    if (
+      arg.length !== this.ndim ||
+      !arg.every(([b, e], i) => 0 <= b && b <= e && e <= this.shape[i])
+    ) {
+      throw new Error(`invalid shrink ${jstr(arg)} for ${jstr(this.shape)}`);
+    }
+    return this.#unsafeResize(arg);
+  }
+
+  #unsafeResize(arg: Pair[], mask?: Pair[]): View {
+    const offset = this.strides
+      .map((s, i) => s * arg[i][0])
+      .reduce((a, b) => a + b, 0);
+    if (this.mask) {
+      // Move the old mask
+      const nmask = this.mask.map<Pair>(([mx, my], i) => [
+        Math.max(0, Math.min(mx - arg[i][0], arg[i][1] - arg[i][0])),
+        Math.max(0, Math.min(my - arg[i][0], arg[i][1] - arg[i][0])),
+      ]);
+      // Merge the masks if we have two
+      mask = mask
+        ? mask.map(([mx, my], i) => [
+            Math.max(mx, nmask[i][0]),
+            Math.min(my, nmask[i][1]),
+          ])
+        : nmask;
+    }
+    return View.create(
+      arg.map(([b, e]) => e - b),
+      this.strides,
+      this.offset + offset,
+      mask,
+    );
+  }
+
+  /** Expand one or more axes with length "1" by repeating the data. */
+  expand(newShape: number[]): View {
+    if (newShape.length !== this.ndim) {
+      throw new Error(
+        `Can't expand ${jstr(this.shape)} into ${jstr(newShape)}`,
+      );
+    }
+    for (let i = 0; i < this.ndim; i++) {
+      if (newShape[i] !== this.shape[i] && this.shape[i] !== 1) {
+        throw new Error(
+          `Can't expand ${jstr(this.shape)} into ${jstr(newShape)}`,
+        );
+      }
+    }
+    // If it's a zero size array, just return a zero size array.
+    if (this.size === 0) return View.create(newShape);
+    const mask = this.mask
+      ? this.mask.map<Pair>((m, i) =>
+          this.shape[i] === newShape[i]
+            ? m
+            : m[0] === 0 && m[1] === 1
+              ? [0, newShape[i]]
+              : [0, 0],
+        )
+      : null;
+    return View.create(newShape, this.strides, this.offset, mask);
+  }
+
+  /** Permute the axes of an array. */
+  permute(axis: number[]): View {
+    if (!isPermutation(axis, this.ndim))
+      throw new Error(`Invalid permutation ${jstr(axis)} of len ${this.ndim}`);
+    const newShape = axis.map((a) => this.shape[a]);
+    const newStrides = axis.map((a) => this.strides[a]);
+    const newMask = this.mask ? axis.map((a) => this.mask![a]) : null;
+    return View.create(newShape, newStrides, this.offset, newMask);
   }
 
   /** Reshape the view into a new shape. */

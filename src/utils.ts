@@ -56,6 +56,16 @@ export function range(start: number, stop: number, step: number = 1): number[] {
   return result;
 }
 
+export function isPermutation(axis: number[], n: number): boolean {
+  if (axis.length !== n) return false;
+  const seen = new Set<number>();
+  for (const x of axis) {
+    if (x < 0 || x >= n) return false;
+    seen.add(x);
+  }
+  return seen.size === n;
+}
+
 /** Topologically sort a DAG, given terminal nodes and an ancestor function. */
 export function toposort<T>(terminals: T[], parents: (node: T) => T[]) {
   const childCounts: Map<T, number> = new Map();
