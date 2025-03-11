@@ -1,4 +1,5 @@
 import { Backend, BackendOp, Slot, SlotError } from "../backend";
+import { ShapeTracker } from "../shape";
 import { DEBUG } from "../utils";
 
 /** Implementation of `Backend` that uses WebGPU in browsers. */
@@ -84,6 +85,7 @@ export class WebGPUBackend implements Backend {
   async executeOp(
     op: BackendOp,
     inputs: Slot[],
+    shapes: ShapeTracker[],
     outputs: Slot[],
   ): Promise<void> {
     const inputBuffers = inputs.map((slot) => this.#getBuffer(slot));
@@ -92,7 +94,12 @@ export class WebGPUBackend implements Backend {
     pipelineSubmit(op, this.device, pipeline, inputBuffers, outputBuffers);
   }
 
-  executeOpSync(op: BackendOp, inputs: Slot[], outputs: Slot[]): void {
+  executeOpSync(
+    op: BackendOp,
+    inputs: Slot[],
+    shapes: ShapeTracker[],
+    outputs: Slot[],
+  ): void {
     const inputBuffers = inputs.map((slot) => this.#getBuffer(slot));
     const outputBuffers = outputs.map((slot) => this.#getBuffer(slot));
     const pipeline = this.pipelines.getSync(pipelineSource(op));

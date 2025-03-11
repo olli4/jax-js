@@ -1,4 +1,5 @@
 import { Backend, BackendOp, Slot, SlotError } from "../backend";
+import { ShapeTracker } from "../shape";
 
 /** Most basic implementation of `Backend` for testing. */
 export class CPUBackend implements Backend {
@@ -53,12 +54,18 @@ export class CPUBackend implements Backend {
   async executeOp(
     op: BackendOp,
     inputs: Slot[],
+    shapes: ShapeTracker[],
     outputs: Slot[],
   ): Promise<void> {
-    return this.executeOpSync(op, inputs, outputs);
+    return this.executeOpSync(op, inputs, shapes, outputs);
   }
 
-  executeOpSync(op: BackendOp, inputs: Slot[], outputs: Slot[]): void {
+  executeOpSync(
+    op: BackendOp,
+    inputs: Slot[],
+    shapes: ShapeTracker[],
+    outputs: Slot[],
+  ): void {
     const inputBuffers = inputs.map((slot) => this.#getBuffer(slot));
     const outputBuffers = outputs.map((slot) => this.#getBuffer(slot));
     cpuOps[op](inputBuffers, outputBuffers);

@@ -9,6 +9,8 @@
  * and dispatch happens on the level of each shader. Buffers are untyped.
  */
 
+import { ShapeTracker } from "./shape";
+
 export async function getBackend(backendName: string): Promise<Backend | null> {
   if (backendName === "cpu") {
     const { CPUBackend } = await import("./backend/cpu");
@@ -48,10 +50,20 @@ export interface Backend {
   readSync(slot: Slot, start?: number, count?: number): ArrayBuffer;
 
   /** Run a backend operation. */
-  executeOp(op: BackendOp, inputs: Slot[], outputs: Slot[]): Promise<void>;
+  executeOp(
+    op: BackendOp,
+    inputs: Slot[],
+    shapes: ShapeTracker[],
+    outputs: Slot[],
+  ): Promise<void>;
 
   /** Run a backend operation, blocking variant. */
-  executeOpSync(op: BackendOp, inputs: Slot[], outputs: Slot[]): void;
+  executeOpSync(
+    op: BackendOp,
+    inputs: Slot[],
+    shapes: ShapeTracker[],
+    outputs: Slot[],
+  ): void;
 }
 
 export enum BackendOp { // TODO: This is temporary
