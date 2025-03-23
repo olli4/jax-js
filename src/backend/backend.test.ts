@@ -51,17 +51,32 @@ describe.each(["cpu", "webgpu"])("Backend '%s'", (backendName) => {
   });
 
   test("synchronously reads a buffer", async ({ skip }) => {
-    if (backendName === "webgpu")
-      return skip("WebGPU does not support sync reads");
-
     const backend = await getBackend(backendName);
     if (!backend) return skip();
 
     const array = new Float32Array([1, 1, 2, 3, 5, 7]);
     const a = backend.malloc(6 * 4, array.buffer);
     try {
-      const buf = backend.readSync(a);
+      let buf = backend.readSync(a);
       expect(new Float32Array(buf)).toEqual(array);
+      buf = backend.readSync(a, 3 * 4, 2 * 4);
+      expect(new Float32Array(buf)).toEqual(array.slice(3, 5));
+    } finally {
+      backend.decRef(a);
+    }
+  });
+
+  test("synchronously reads a buffer", async ({ skip }) => {
+    const backend = await getBackend(backendName);
+    if (!backend) return skip();
+
+    const array = new Float32Array([1, 1, 2, 3, 5, 7]);
+    const a = backend.malloc(6 * 4, array.buffer);
+    try {
+      let buf = await backend.read(a);
+      expect(new Float32Array(buf)).toEqual(array);
+      buf = await backend.read(a, 3 * 4, 2 * 4);
+      expect(new Float32Array(buf)).toEqual(array.slice(3, 5));
     } finally {
       backend.decRef(a);
     }

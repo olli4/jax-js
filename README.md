@@ -10,8 +10,9 @@ npm test
 
 ## Next on Eric's mind
 
-- Sync reading of array data
 - "Array" interface to replace tfjs (`await` to get data)
+- How to do optimizations?? map out the plan
+- Think about two-stage `cumsum()`
 
 ## Milestones
 
