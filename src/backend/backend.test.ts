@@ -66,7 +66,7 @@ describe.each(["cpu", "webgpu"])("Backend '%s'", (backendName) => {
     }
   });
 
-  test("synchronously reads a buffer", async ({ skip }) => {
+  test("asynchronously reads a buffer", async ({ skip }) => {
     const backend = await getBackend(backendName);
     if (!backend) return skip();
 
