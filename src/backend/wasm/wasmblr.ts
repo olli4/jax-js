@@ -82,7 +82,8 @@ class Memory {
 
   constructor(readonly cg: CodeGenerator) {}
 
-  declare(min: number, max: number = 0): this {
+  /** Declare the size of the memory. Each page is 64 KiB. */
+  pages(min: number, max: number = 0): this {
     assert(this.min === 0 && this.max === 0);
     this.min = min;
     this.max = max;
@@ -143,7 +144,7 @@ export class CodeGenerator {
   i32x4: I32x4;
   f32x4: F32x4;
   memory: Memory;
-  void_ = { typeId: 0x40 };
+  void = { typeId: 0x40 };
 
   functions: Function_[] = [];
   exportedFunctions = new Map<number, string>();
@@ -461,18 +462,18 @@ function BINARY_OP(
 }
 
 function LOAD_OP(op: string, opcode: number, outType: string) {
-  return function (this: any, alignment: number = 1, offset: number = 0) {
+  return function (this: any, align: number = 0, offset: number = 0) {
     const idxType = this.cg.pop();
     assert(idxType.typeId === this.cg.i32.typeId, `invalid type for ${op}`);
     this.cg.emit(opcode);
-    this.cg.emit(encodeUnsigned(alignment));
+    this.cg.emit(encodeUnsigned(align));
     this.cg.emit(encodeUnsigned(offset));
     this.cg.push(this.cg[outType]);
   };
 }
 
 function STORE_OP(op: string, opcode: number, inType: string) {
-  return function (this: any, alignment: number = 1, offset: number = 0) {
+  return function (this: any, align: number = 0, offset: number = 0) {
     const valType = this.cg.pop();
     const idxType = this.cg.pop();
     assert(
@@ -481,7 +482,7 @@ function STORE_OP(op: string, opcode: number, inType: string) {
     );
     assert(idxType.typeId === this.cg.i32.typeId, `invalid type for ${op}`);
     this.cg.emit(opcode);
-    this.cg.emit(encodeUnsigned(alignment));
+    this.cg.emit(encodeUnsigned(align));
     this.cg.emit(encodeUnsigned(offset));
   };
 }
@@ -632,12 +633,12 @@ function VECTOR_OPL(
 }
 
 function VECTOR_LOAD_OP(op: string, vopcode: number) {
-  return function (this: any, alignment: number = 1, offset: number = 0) {
+  return function (this: any, align: number = 0, offset: number = 0) {
     const idxType = this.cg.pop();
     assert(idxType.typeId === this.cg.i32.typeId, `invalid type for ${op}`);
     this.cg.emit(0xfd);
     this.cg.emit(encodeUnsigned(vopcode));
-    this.cg.emit(encodeUnsigned(alignment));
+    this.cg.emit(encodeUnsigned(align));
     this.cg.emit(encodeUnsigned(offset));
     this.cg.push(this.cg.v128);
   };
@@ -655,14 +656,14 @@ class V128 {
   load32_splat = VECTOR_LOAD_OP("load32_splat", 0x09);
   load32_zero = VECTOR_LOAD_OP("load32_zero", 0x5c);
 
-  store(alignment: number = 1, offset: number = 0) {
+  store(align: number = 0, offset: number = 0) {
     const valType = this.cg.pop();
     assert(valType.typeId === this.cg.v128.typeId, `invalid type for store`);
     const idxType = this.cg.pop();
     assert(idxType.typeId === this.cg.i32.typeId, `invalid type for store`);
     this.cg.emit(0xfd);
     this.cg.emit(encodeUnsigned(0x0b));
-    this.cg.emit(encodeUnsigned(alignment));
+    this.cg.emit(encodeUnsigned(align));
     this.cg.emit(encodeUnsigned(offset));
   }
 

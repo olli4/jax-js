@@ -1,5 +1,6 @@
 import { suite, test, expect } from "vitest";
 import { CodeGenerator } from "./wasmblr";
+import { C } from "vitest/dist/chunks/reporters.6vxQttCV";
 
 suite("CodeGenerator", () => {
   test("assembles the add() function", async () => {
@@ -54,5 +55,64 @@ suite("CodeGenerator", () => {
     expect(factorial(2)).toBe(2);
     expect(factorial(3)).toBe(6);
     expect(factorial(7)).toBe(5040);
+  });
+
+  test("can run SIMD on i32x4", async () => {
+    const cg = new CodeGenerator();
+
+    cg.memory.pages(1).export("memory");
+    const vectorSumFunc = cg.function([cg.i32], [cg.f32], () => {
+      const vec = cg.local.declare(cg.f32x4);
+      const i = cg.local.declare(cg.i32);
+
+      // All locals are initialized to zero in Wasm.
+      // cg.i32.const(0); cg.local.set(i);
+      // cg.f32.const(0); cg.f32x4.splat(); cg.local.set(vec);
+
+      cg.loop(cg.void);
+      {
+        cg.local.get(i);
+        cg.i32.const(4); // number of bytes per f32 element
+        cg.i32.mul();
+        cg.f32x4.load(4);
+        cg.local.get(vec);
+        cg.f32x4.add();
+
+        cg.local.set(vec);
+        cg.local.get(i);
+        cg.i32.const(4);
+        cg.i32.add();
+        cg.local.set(i);
+
+        cg.local.get(i);
+        cg.local.get(0);
+        cg.i32.lt_u();
+        cg.br_if(0);
+      }
+      cg.end();
+
+      cg.f32.const(0);
+      for (let i = 0; i < 4; i++) {
+        cg.local.get(vec);
+        cg.f32x4.extract_lane(i);
+        cg.f32.add();
+      }
+    });
+    cg.export(vectorSumFunc, "vectorSum");
+
+    const wasmBytes = cg.finish();
+    const { instance } = await WebAssembly.instantiate(wasmBytes, {
+      env: {
+        memory: new WebAssembly.Memory({ initial: 1 }),
+      },
+    });
+
+    const { memory, vectorSum } = instance.exports as {
+      memory: WebAssembly.Memory;
+      vectorSum: (length: number) => number;
+    };
+    new Float32Array(memory.buffer).set([1, 2, 3, 4, 5, 6, 7, 8]);
+    const result = vectorSum(8);
+    expect(result).toBe(36);
   });
 });
