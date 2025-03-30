@@ -1,17 +1,18 @@
-import { describe, expect, test } from "vitest";
+import { describe, expect, test as globalTest } from "vitest";
 import { getBackend, accessorAlu, BackendType, init } from "../backend";
 import { ShapeTracker } from "../shape";
 import { AluExp, DType } from "../alu";
 import { range } from "../utils";
 
 const backends: BackendType[] = ["cpu", "webgpu"];
+const backendsAvailable = await init(...backends);
 
-describe.each(backends)("Backend '%s'", async (backendType) => {
-  await init(backendType);
+describe.each(backends)("Backend '%s'", (backendType) => {
+  const skipped = !backendsAvailable.includes(backendType);
+  const test = globalTest.skipIf(skipped);
 
-  test("can run simple operations", async ({ skip }) => {
+  test("can run simple operations", async () => {
     const backend = getBackend(backendType);
-    if (!backend) return skip();
 
     const shape = ShapeTracker.fromShape([3]);
     const a = backend.malloc(3 * 4, new Float32Array([1, 2, 3]).buffer);
@@ -40,10 +41,8 @@ describe.each(backends)("Backend '%s'", async (backendType) => {
     }
   });
 
-  test("can create array from index", async ({ skip }) => {
+  test("can create array from index", async () => {
     const backend = getBackend(backendType);
-    if (!backend) return skip();
-
     const a = backend.malloc(200 * 4);
     try {
       const gidx = AluExp.special(DType.Int32, "gidx", 200);
@@ -56,10 +55,8 @@ describe.each(backends)("Backend '%s'", async (backendType) => {
     }
   });
 
-  test("can run synchronous operations", ({ skip }) => {
+  test("can run synchronous operations", () => {
     const backend = getBackend(backendType);
-    if (!backend) return skip();
-
     const a = backend.malloc(4 * 4);
     try {
       const gidx = AluExp.special(DType.Int32, "gidx", 4);
@@ -72,10 +69,8 @@ describe.each(backends)("Backend '%s'", async (backendType) => {
     }
   });
 
-  test("synchronously reads a buffer", ({ skip }) => {
+  test("synchronously reads a buffer", () => {
     const backend = getBackend(backendType);
-    if (!backend) return skip();
-
     const array = new Float32Array([1, 1, 2, 3, 5, 7]);
     const a = backend.malloc(6 * 4, array.buffer);
     try {
@@ -88,10 +83,8 @@ describe.each(backends)("Backend '%s'", async (backendType) => {
     }
   });
 
-  test("asynchronously reads a buffer", async ({ skip }) => {
+  test("asynchronously reads a buffer", async () => {
     const backend = getBackend(backendType);
-    if (!backend) return skip();
-
     const array = new Float32Array([1, 1, 2, 3, 5, 7]);
     const a = backend.malloc(6 * 4, array.buffer);
     try {
