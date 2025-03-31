@@ -149,6 +149,9 @@ export class Array {
     }
     return this.#reshape(this.#st.permute(axes));
   }
+  get T(): Array {
+    return this.transpose();
+  }
 
   #binary(op: AluOp, other: Array) {
     if (!deepEqual(this.shape, other.shape)) {
@@ -207,20 +210,21 @@ export class Array {
       const output = this.#backend.malloc(this.#st.size * 4);
       const gidx = AluExp.special(DType.Int32, "gidx", this.#st.size);
       const exp = accessorAluExp(this.#source, this.#st, gidx);
-      const pending = new Set([new PendingExecute(exp, [], [output])]);
+      const pendingItem = new PendingExecute(exp, [], [output]);
       this.#source = output;
       this.#st = ShapeTracker.fromShape(this.shape);
-      this.#pending = pending;
+      this.#pending = new Set([pendingItem]);
     } else {
       // Only realize if the ShapeTracker is non-contiguous.
       if (this.#st.contiguous) return;
       const output = this.#backend.malloc(this.#st.size * 4);
       const gidx = AluExp.special(DType.Int32, "gidx", this.#st.size);
       const exp = accessorGlobal(0, this.#st, gidx);
+      const pendingItem = new PendingExecute(exp, [this.#source], [output]);
       this.#source = output;
       this.#st = ShapeTracker.fromShape(this.shape);
       this.#pending ??= new Set();
-      this.#pending.add(new PendingExecute(exp, [], [output]));
+      this.#pending.add(pendingItem);
     }
   }
 

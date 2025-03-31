@@ -15,6 +15,12 @@ describe.each(backendTypes)("Backend '%s'", (backend) => {
     expect(await ar.data()).toEqual(
       new Float32Array([0, 0, 0, 0, 0, 0, 0, 0, 0]),
     );
+    expect(await ar.T.data()).toEqual(
+      new Float32Array([0, 0, 0, 0, 0, 0, 0, 0, 0]),
+    );
+    expect(ar.T.dataSync()).toEqual(
+      new Float32Array([0, 0, 0, 0, 0, 0, 0, 0, 0]),
+    );
   });
 
   test("can construct Array.ones()", async () => {
@@ -40,5 +46,8 @@ describe.each(backendTypes)("Backend '%s'", (backend) => {
     expect(c.shape).toEqual([4]);
     expect(c.dtype).toEqual("float32");
     expect(c.dataSync()).toEqual(new Float32Array([10, 10, 6, -34]));
+    expect(c.reshape([2, 2]).T.dataSync()).toEqual(
+      new Float32Array([10, 6, 10, -34]),
+    );
   });
 });
