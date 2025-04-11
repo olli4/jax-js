@@ -2,97 +2,133 @@
   const n = 2048;
 
   const benchmarks = [
-    "shmem-tiling-vec4",
+    "naive",
+    "shmem-tiling-basic",
     "unroll-4x4-vec4",
     "tinygrad",
   ] as const;
 
   let result: Record<string, number> = $state({});
 
-  const shmemTilingKernel = `
-const TILE_SIZE = 8;
-const VEC_SIZE = 4;
+  const randomBuffer = new Float32Array(
+    [...new Array(n * n)].map(() => Math.random()),
+  );
 
+  const naiveKernel = `
 @group(0) @binding(0) var<storage, read> A : array<f32>;
 @group(0) @binding(1) var<storage, read> B : array<f32>;
 @group(0) @binding(2) var<storage, read_write> C : array<f32>;
 
-var<workgroup> Asub : array<array<vec4<f32>, TILE_SIZE>, TILE_SIZE>;
-var<workgroup> Bsub : array<array<vec4<f32>, TILE_SIZE>, TILE_SIZE>;
+// Define the dimensions for the square matrices.
+const DIM : u32 = 2048u;
 
-@compute @workgroup_size(TILE_SIZE, TILE_SIZE)
-fn main(@builtin(global_invocation_id) global_id : vec3<u32>,
-        @builtin(local_invocation_id) local_id : vec3<u32>,
-        @builtin(workgroup_id) workgroup_id : vec3<u32>) {
+// Helper function for reading from matrix A.
+fn mm_readA(row: u32, col: u32) -> f32 {
+  // Matrix A is stored in row-major order.
+  return A[row * DIM + col];
+}
 
-  let M = 2048u;
-  let N = 2048u;
-  let K = 2048u;
+// Helper function for reading from matrix B.
+fn mm_readB(row: u32, col: u32) -> f32 {
+  // Matrix B is stored in row-major order.
+  return B[row * DIM + col];
+}
 
-  let globalRow = global_id.y;
-  let globalCol = global_id.x;
+// Helper function for writing the computed result to matrix C.
+fn mm_write(row: u32, col: u32, value: f32) {
+  C[row * DIM + col] = value;
+}
 
-  let localRow = local_id.y;
-  let localCol = local_id.x;
+@compute @workgroup_size(16, 16, 1)
+fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
+  // Compute the output coordinates.
+  let row: u32 = global_id.y;
+  let col: u32 = global_id.x;
 
-  var acc: array<vec4<f32>, VEC_SIZE>;
-  // Initialize accumulators
-  for (var i = 0u; i < VEC_SIZE; i = i + 1u) {
-    acc[i] = vec4<f32>(0.0);
+  // If the workgroup size oversubscribes the matrix dimensions, ensure we don't access out of bounds.
+  if (row >= DIM || col >= DIM) {
+    return;
   }
 
-  let numTiles = K / TILE_SIZE;
+  var sum: f32 = 0.0;
+  // Compute the dot product for the (row, col) position.
+  for (var k: u32 = 0u; k < DIM; k = k + 1u) {
+    sum = sum + mm_readA(row, k) * mm_readB(k, col);
+  }
 
-  for (var t = 0u; t < numTiles; t = t + 1u) {
-    // Load A tile into shared memory (as vec4<f32>)
-    // Each thread loads one vec4 component from A.
-    for (var i = 0u; i < VEC_SIZE; i = i + 1u) {
-      let inputRow = localRow;
-      let inputCol = localCol * VEC_SIZE + i;
-      let indexA = inputRow * K + t * TILE_SIZE * VEC_SIZE + inputCol;
-      // Build a vec4 from consecutive elements if needed.
-      // For simplicity we assume A is stored contiguously.
-      Asub[localRow][localCol][i] = A[indexA];
-    }
+  // Write the computed sum to the output matrix.
+  mm_write(row, col, sum);
+}
+`;
 
-    // Load B tile into shared memory (as vec4<f32>)
-    for (var i = 0u; i < VEC_SIZE; i = i + 1u) {
-      let inputRow = localRow * VEC_SIZE + i;
-      let inputCol = localCol;
-      let indexB = (t * TILE_SIZE * VEC_SIZE + inputRow) * N + inputCol * VEC_SIZE;
-      Bsub[localRow * VEC_SIZE + i][localCol] = vec4<f32>(
-        B[indexB + 0],
-        B[indexB + 1],
-        B[indexB + 2],
-        B[indexB + 3]
-      );
-    }
+  const shmemTilingKernel = `
+@group(0) @binding(0) var<storage, read> A : array<f32>;
+@group(0) @binding(1) var<storage, read> B : array<f32>;
+@group(0) @binding(2) var<storage, read_write> C : array<f32>;
 
+// Declare workgroup (shared) memory tiles for A and B.
+var<workgroup> Asub: array<array<f32, TILE_SIZE>, TILE_SIZE>;
+var<workgroup> Bsub: array<array<f32, TILE_SIZE>, TILE_SIZE>;
+
+// Define matrix dimensions.
+const M : u32 = 2048u;  // Number of rows of A and C.
+const N : u32 = 2048u;  // Number of columns of B and C.
+const K : u32 = 2048u;  // Number of columns of A and rows of B.
+const TILE_SIZE : u32 = 16u; // Workgroup tile size.
+
+// Helper functions similar to tfjs codegen.
+fn mm_readA(row: u32, col: u32) -> f32 {
+  // Reads the element at A[row, col].
+  return A[row * K + col];
+}
+
+fn mm_readB(row: u32, col: u32) -> f32 {
+  // Reads the element at B[row, col].
+  return B[row * N + col];
+}
+
+fn mm_write(row: u32, col: u32, value: f32) {
+  // Writes the computed value to C[row, col].
+  C[row * N + col] = value;
+}
+
+@compute @workgroup_size(TILE_SIZE, TILE_SIZE, 1)
+fn main(@builtin(local_invocation_id) local_id: vec3<u32>,
+        @builtin(global_invocation_id) global_id: vec3<u32>) {
+  // Compute the output coordinate [row, col] for this thread.
+  let row: u32 = global_id.y;
+  let col: u32 = global_id.x;
+
+  var sum: f32 = 0.0;
+
+  // Loop over the tiles along the shared dimension.
+  // Since K=2048 and TILE_SIZE=16, there are exactly 2048/16 = 128 tiles.
+  for (var t: u32 = 0u; t < (K / TILE_SIZE); t = t + 1u) {
+    // Each thread loads one element of A and one element of B into shared memory.
+    // For A, load element at (row, t*TILE_SIZE + local_x).
+    let aRow: u32 = row;
+    let aCol: u32 = t * TILE_SIZE + local_id.x;
+    Asub[local_id.y][local_id.x] = mm_readA(aRow, aCol);
+
+    // For B, load element at (t*TILE_SIZE + local_y, col).
+    let bRow: u32 = t * TILE_SIZE + local_id.y;
+    let bCol: u32 = col;
+    Bsub[local_id.y][local_id.x] = mm_readB(bRow, bCol);
+
+    // Ensure the full tile has been loaded before computation.
     workgroupBarrier();
 
-    // Compute partial sum for the tile.
-    for (var k = 0u; k < TILE_SIZE; k = k + 1u) {
-      let BCached = Bsub[k][localCol];
-      for (var i = 0u; i < VEC_SIZE; i = i + 1u) {
-        // ACached is a scalar, so convert it to a vec4.
-        let ACached = Asub[localRow][k][i];
-        acc[i] = fma(vec4<f32>(ACached), BCached, acc[i]);
-      }
+    // Compute the partial dot product for the tile.
+    for (var k_inner: u32 = 0u; k_inner < TILE_SIZE; k_inner = k_inner + 1u) {
+      sum = sum + Asub[local_id.y][k_inner] * Bsub[k_inner][local_id.x];
     }
 
+    // Synchronize before loading the next tile.
     workgroupBarrier();
   }
 
-  // Write the result back to C.
-  for (var i = 0u; i < VEC_SIZE; i = i + 1u) {
-    let outputRow = globalRow;
-    let outputCol = globalCol * VEC_SIZE + i;
-    let indexC = outputRow * N + outputCol * VEC_SIZE;
-    C[indexC + 0] = acc[i].x;
-    C[indexC + 1] = acc[i].y;
-    C[indexC + 2] = acc[i].z;
-    C[indexC + 3] = acc[i].w;
-  }
+  // Write the computed value to the output matrix C.
+  mm_write(row, col, sum);
 }`;
 
   const unroll4x4Kernel = `
@@ -412,16 +448,37 @@ fn main(
       usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
     });
 
-    const randomData = new Float32Array(n * n);
-    for (let i = 0; i < n * n; i++) {
-      randomData[i] = Math.random();
-    }
-    device.queue.writeBuffer(a, 0, randomData);
-    device.queue.writeBuffer(b, 0, randomData);
-    await device.queue.onSubmittedWorkDone();
+    device.queue.writeBuffer(a, 0, randomBuffer);
+    device.queue.writeBuffer(b, 0, randomBuffer);
+    // await device.queue.onSubmittedWorkDone();
 
     try {
-      if (variant === "shmem-tiling-vec4") {
+      if (variant === "naive") {
+        const pipeline = await device.createComputePipelineAsync({
+          compute: {
+            module: device.createShaderModule({ code: naiveKernel }),
+            entryPoint: "main",
+          },
+          layout: "auto",
+        });
+
+        const bindGroup = device.createBindGroup({
+          layout: pipeline.getBindGroupLayout(0),
+          entries: [
+            { binding: 0, resource: { buffer: a } },
+            { binding: 1, resource: { buffer: b } },
+            { binding: 2, resource: { buffer: c } },
+          ],
+        });
+
+        const commandEncoder = device.createCommandEncoder();
+        const passEncoder = commandEncoder.beginComputePass();
+        passEncoder.setPipeline(pipeline);
+        passEncoder.setBindGroup(0, bindGroup);
+        passEncoder.dispatchWorkgroups(n / 16, n / 16);
+        passEncoder.end();
+        device.queue.submit([commandEncoder.finish()]);
+      } else if (variant === "shmem-tiling-basic") {
         const pipeline = await device.createComputePipelineAsync({
           compute: {
             module: device.createShaderModule({ code: shmemTilingKernel }),
@@ -443,7 +500,7 @@ fn main(
         const passEncoder = commandEncoder.beginComputePass();
         passEncoder.setPipeline(pipeline);
         passEncoder.setBindGroup(0, bindGroup);
-        passEncoder.dispatchWorkgroups(n / 8 / 4, n / 8);
+        passEncoder.dispatchWorkgroups(n / 16, n / 16);
         passEncoder.end();
         device.queue.submit([commandEncoder.finish()]);
       } else if (variant === "unroll-4x4-vec4") {
@@ -507,7 +564,7 @@ fn main(
 
       await staging.mapAsync(GPUMapMode.READ, 0, n * n * 4);
       const buf = new Float32Array(staging.getMappedRange());
-      console.log(buf[0], buf[1], buf[2], buf[3]);
+      console.log(buf[0], buf[1], buf[2], buf[3], buf[n * n - 1]);
       staging.unmap(); // Do not need to actually read it.
 
       const time = performance.now() - start;
@@ -522,16 +579,15 @@ fn main(
 
   async function tfjsbench() {
     const tf = await import("@tensorflow/tfjs");
-    console.log(tf);
     await import("@tensorflow/tfjs-backend-webgpu");
     await tf.setBackend("webgpu");
 
-    const a = tf.randomUniform([n, n], 0, 1);
-    const b = tf.randomUniform([n, n], 0, 1);
+    const a = tf.tensor(randomBuffer, [n, n]);
+    const b = tf.tensor(randomBuffer, [n, n]);
     const start = performance.now();
     const c = tf.matMul(a, b);
     const ar = await c.data();
-    console.log(ar[0], ar[1], ar[2], ar[3]);
+    console.log(ar[0], ar[1], ar[2], ar[3], ar[n * n - 1]);
     const time = performance.now() - start;
     result["tfjs"] = time / 1000; // seconds
 
