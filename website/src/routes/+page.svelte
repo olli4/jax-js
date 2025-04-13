@@ -19,17 +19,17 @@
   </p>
 
   <p class="mb-6">
-    Really, machine learning belongs in the browser—instantly accessible, and
-    running on local GPUs. But the best libraries are in Python; they weren't
+    Really, machine learning belongs in the browser—instantly accessible and
+    running locally. But the best libraries are in Python; they weren't
     <em>built for</em> the web. We're trying to change that.
   </p>
 
   <pre class="mb-6 text-center"><code>npm install @jax-js/core</code></pre>
 
   <p class="mb-6">
-    <code>jax-js</code> brings high-performance GPUs to JavaScript, with a simple
-    API. So you can do neural networks, statistics, image processing, and all sorts
-    of numerical computing.
+    <code>jax-js</code> brings high-performance WebAssembly and GPU kernels to JavaScript,
+    with a simple API. So you can do neural networks, statistics, image processing,
+    and all sorts of numerical computing.
   </p>
 
   <div class="mb-6 grid grid-cols-2 sm:grid-cols-4 gap-2 sm:gap-4">
@@ -50,10 +50,10 @@
 
   <p class="mb-6">
     Like the <a href="https://jax.dev" target="_blank" class="link"
-      >Python library</a
+      >JAX Python library</a
     >
-    it's inspired by, <code>jax-js</code> is carefully optimized, including a
-    JIT compiler and GPU kernel scheduler. It's also
+    it's based on, <code>jax-js</code> is carefully optimized, including a JIT
+    compiler and GPU kernel scheduler. It's also
     <strong>extremely fast and portable</strong>, running on Chrome, Firefox,
     Safari, iOS, and Android, while having best-in-class performance.
   </p>
@@ -66,7 +66,7 @@
   </div>
 
   <p class="mb-6">
-    How is this possible? <code>jax-js</code> has a compiler that generates
+    How is this possible? <code>jax-js</code> compiles math into optimized
     WebAssembly, WebGL, and WebGPU code on modern browsers. Its generated code
     is even faster than specialized neural network libraries like
     <a href="https://www.tensorflow.org/js/" target="_blank" class="link"
@@ -83,10 +83,9 @@
   </p>
 
   <p class="mb-6">
-    If you've used JAX in Python before, <code>jax-js</code> mimics the API
-    closely. If not — don't worry, it's basically just NumPy arrays with a few
-    simple transformations (<code>grad</code>, <code>jit</code>,
-    <code>vmap</code>).
+    NumPy (2005), PyTorch (2016), and JAX (2018) revolutionized numerical
+    computing and sparked a flourishing ecosystem in Python. <code>jax-js</code>
+    aspires to bring that same foundation to JavaScript.
   </p>
 
   <p>
