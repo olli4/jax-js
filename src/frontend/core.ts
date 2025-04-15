@@ -148,12 +148,6 @@ export abstract class Trace {
 export interface AbstractValue {
   shape: number[];
   dtype: DType;
-
-  _neg: (x: Tracer) => Tracer;
-  _add: (x: Tracer, y: Tracer) => Tracer;
-  _mul: (x: Tracer, y: Tracer) => Tracer;
-  _gt: (x: Tracer, y: Tracer) => Tracer;
-  _lt: (x: Tracer, y: Tracer) => Tracer;
 }
 
 export abstract class Tracer {
@@ -178,19 +172,19 @@ export abstract class Tracer {
   // fact that tracers can be lifted to different levels. But they simplify the
   // API visible to users.
   neg() {
-    return this.aval._neg(this) as this;
+    return neg(this) as this;
   }
   add(other: this | TracerValue) {
-    return this.aval._add(this, pureArray(other)) as this;
+    return add(this, other) as this;
   }
   mul(other: this | TracerValue) {
-    return this.aval._mul(this, pureArray(other)) as this;
+    return mul(this, other) as this;
   }
   gt(other: this | TracerValue) {
-    return this.aval._gt(this, pureArray(other)) as this;
+    return greater(this, other) as this;
   }
   lt(other: this | TracerValue) {
-    return this.aval._lt(this, pureArray(other)) as this;
+    return less(this, other) as this;
   }
 }
 
@@ -202,9 +196,10 @@ export function ndim(x: TracerValue) {
   }
 }
 
+// Note: Autodidax has a `ConcreteArray` type with "arrayAbstractionLevel" set
+// to a higher value. I didn't see how this would be useful yet, so currently
+// the only `AbstractValue` is a `ShapedArray` instance.
 export class ShapedArray implements AbstractValue {
-  readonly arrayAbstractionLevel: number = 1;
-
   constructor(
     readonly shape: number[],
     readonly dtype: DType,
@@ -218,13 +213,6 @@ export class ShapedArray implements AbstractValue {
     return this.shape.length;
   }
 
-  // See note about primitive wrappers with fudged types.
-  _neg = neg as any;
-  _add = add as any;
-  _mul = mul as any;
-  _gt = greater as any;
-  _lt = less as any;
-
   strShort() {
     return `${this.dtype}[${this.shape.join(",")}]`;
   }
@@ -236,14 +224,6 @@ export class ShapedArray implements AbstractValue {
         this.ndim === other.ndim &&
         this.shape.every((d, i) => d === other.shape[i]))
     );
-  }
-}
-
-class ConcreteArray extends ShapedArray {
-  readonly arrayAbstractionLevel: number = 2;
-
-  constructor(readonly val: tf.Tensor) {
-    super(val.shape, val.dtype as any);
   }
 }
 
@@ -267,7 +247,7 @@ export class Array extends Tracer {
   }
 
   get aval(): AbstractValue {
-    return new ConcreteArray(this.data);
+    return new ShapedArray(this.data.shape, this.dtype);
   }
 
   /** Return a simple string representation of the array's dimensions. */
@@ -299,7 +279,10 @@ export function getAval(x: TracerValue): AbstractValue {
   if (x instanceof Tracer) {
     return x.aval;
   } else if (typeof x === "boolean" || typeof x === "number") {
-    return new ConcreteArray(tf.scalar(x));
+    return new ShapedArray(
+      [],
+      typeof x === "boolean" ? DType.Bool : DType.Float32,
+    );
   } else {
     throw new TypeError(`Unknown value: ${x}`);
   }
