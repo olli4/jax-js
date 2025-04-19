@@ -137,6 +137,7 @@ suite("View.expand()", () => {
     const v = View.create([10, 1, 3]);
     const expanded = v.expand([10, 4, 3]);
     expect(expanded.shape).toEqual([10, 4, 3]);
+    expect(expanded.strides).toEqual([3, 0, 1]);
   });
 
   test("expand throws an error if non-singleton dimensions are changed", () => {

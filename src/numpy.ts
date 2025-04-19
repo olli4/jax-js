@@ -1,10 +1,10 @@
 import { DType } from "./alu";
-import { Array, array, scalar } from "./frontend/array";
+import { Array, array, eye, scalar } from "./frontend/array";
 import * as core from "./frontend/core";
 import * as vmapModule from "./frontend/vmap";
-import { deepEqual } from "./utils";
+import { deepEqual, RecursiveArray } from "./utils";
 
-export { Array, array, DType, scalar };
+export { Array, array, DType, eye, scalar };
 
 export const float32 = DType.Float32;
 export const int32 = DType.Int32;
@@ -17,7 +17,12 @@ export const complex64 = DType.Complex64;
 // current stack of interpreters. But we hide that away from users to mimic
 // JAX's composable tracing transformations.
 
-export type ArrayLike = Array | number | boolean;
+export type ArrayLike =
+  | Array
+  | RecursiveArray<number>
+  | RecursiveArray<boolean>
+  | number
+  | boolean;
 
 export const add = core.add as (x: ArrayLike, y: ArrayLike) => Array;
 export const mul = core.mul as (x: ArrayLike, y: ArrayLike) => Array;

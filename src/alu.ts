@@ -298,7 +298,9 @@ export class Kernel {
     readonly exp: AluExp,
     /** Optional reduction to be performed. */
     readonly reduction?: Reduction,
-  ) {}
+  ) {
+    this.exp = exp.simplify();
+  }
 
   /** Unique string representation of this object, usable as a map key. */
   toString() {

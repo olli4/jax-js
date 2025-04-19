@@ -43,7 +43,7 @@ function defaultStrides(shape: number[]): number[] {
   for (let i = shape.length - 1; i > 0; i--) {
     strides[i - 1] = shape[i] * strides[i];
   }
-  return strides;
+  return canonicalizeStrides(shape, strides);
 }
 
 /** Merge contiguous subparts or zero-strided dimensions in a view. */
@@ -69,21 +69,22 @@ function mergeDims(
   ];
 
   // Merge this dim to next dim if mask size is 1.
-  // In the original code, this is called "merging" and confusing since it also
-  // checks if shape[i] == 1, but that condition is a control flow no-op.
-  let mergeMask = mask && mask[0][1] - mask[0][0] === 1;
+  // As a special case, merging can also be set at the beginning if shape[0] is
+  // 1. This is so that initial dimensions of size 1 can be merged in. Any
+  // subsequent ones would be skipped by `if (s === 1) continue;`.
+  let merging = mask ? mask[0][1] - mask[0][0] === 1 : shape[0] === 1;
   for (let i = 1; i < shape.length; i++) {
     const [s, st] = [shape[i], strides[i]];
     if (s === 1) continue; // Always merge 1
     const [lastS, lastSt, lastPreExpandS] = ret[ret.length - 1];
-    if (mergeMask || lastSt === s * st) {
+    if (merging || lastSt === 0 || lastSt === s * st) {
       // Merge last dim with this dim if merging or strides matched.
       // If merging due to mask of size 1, reset real size.
-      ret[ret.length - 1] = [lastS * s, st, mergeMask ? s : lastPreExpandS * s];
+      ret[ret.length - 1] = [lastS * s, st, merging ? s : lastPreExpandS * s];
     } else {
       ret.push([s, st, s]);
     }
-    mergeMask = mask && mask[i][1] - mask[i][0] === 1;
+    merging = mask ? mask[i][1] - mask[i][0] === 1 : false;
   }
 
   return ret;

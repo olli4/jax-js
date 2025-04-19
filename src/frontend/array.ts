@@ -300,7 +300,7 @@ export class Array extends Tracer {
     }
 
     const exp = custom(src);
-    const kernel = new Kernel(src.length, lhs.#st.size, exp);
+    const kernel = new Kernel(inputs.length, lhs.#st.size, exp);
     const output = lhs.#backend.malloc(kernel.size * 4);
     const pending = [
       ...lhs.#pending,

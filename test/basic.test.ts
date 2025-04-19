@@ -1,5 +1,5 @@
 import { expect, suite, test } from "vitest";
-import { init, numpy as np, jvp, jacfwd, vmap } from "@jax-js/core";
+import { init, jvp, jacfwd, numpy as np, vmap } from "@jax-js/core";
 
 await init("cpu");
 
@@ -148,5 +148,33 @@ suite("jax.jacfwd()", () => {
         [0, 0, 6],
       ]),
     );
+  });
+});
+
+suite("jax.numpy.eye()", () => {
+  test("computes a square matrix", () => {
+    const x = np.eye(3);
+    expect(x.js()).toBeAllclose([
+      [1, 0, 0],
+      [0, 1, 0],
+      [0, 0, 1],
+    ]);
+  });
+
+  test("computes a rectangular matrix", () => {
+    const x = np.eye(2, 3);
+    expect(x.js()).toBeAllclose([
+      [1, 0, 0],
+      [0, 1, 0],
+    ]);
+  });
+
+  test("can be multiplied", () => {
+    const x = np.eye(3, 5).mul(-42);
+    expect(x.js()).toBeAllclose([
+      [-42, 0, 0, 0, 0],
+      [0, -42, 0, 0, 0],
+      [0, 0, -42, 0, 0],
+    ]);
   });
 });

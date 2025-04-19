@@ -3,8 +3,9 @@ import { Backend, BackendType, Executable, Slot, SlotError } from "../backend";
 import { DEBUG, findPow2 } from "../utils";
 
 type ShaderDispatch = {
-  pipeline: GPUComputePipeline;
+  shader: string; // informational
   grid: [number, number];
+  pipeline: GPUComputePipeline;
 };
 
 /** Implementation of `Backend` that uses WebGPU in browsers. */
@@ -97,13 +98,13 @@ export class WebGPUBackend implements Backend {
   async prepare(kernel: Kernel): Promise<Executable<ShaderDispatch>> {
     const { shader, grid } = pipelineSource(this.device, kernel);
     const pipeline = await this.pipelines.prepare(shader);
-    return new Executable(kernel, { pipeline, grid });
+    return new Executable(kernel, { shader, grid, pipeline });
   }
 
   prepareSync(kernel: Kernel): Executable<ShaderDispatch> {
     const { shader, grid } = pipelineSource(this.device, kernel);
     const pipeline = this.pipelines.prepareSync(shader);
-    return new Executable(kernel, { pipeline, grid });
+    return new Executable(kernel, { shader, grid, pipeline });
   }
 
   dispatch(
@@ -186,9 +187,7 @@ function pipelineSource(
   device: GPUDevice,
   kernel: Kernel,
 ): { shader: string; grid: [number, number] } {
-  let { exp, nargs } = kernel;
-
-  exp = exp.simplify();
+  const { exp, nargs } = kernel;
   const args = Array.from({ length: nargs }, (_, i) => `in${i}`);
 
   // binding(0..n-1): input buffers
