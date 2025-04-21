@@ -58,4 +58,14 @@ describe.each(backendTypes)("Backend '%s'", (backend) => {
     const b = a.add(a).add(a);
     expect(b.dataSync()).toEqual(new Float32Array([3, 6, 9]));
   });
+
+  test("can coerce array to primitive", () => {
+    const a = array(42, { backend });
+    expect(a).toBeCloseTo(42);
+
+    // https://github.com/microsoft/TypeScript/issues/42218
+    expect(+(a as any)).toEqual(42);
+    expect((a as any) + 1).toEqual(43);
+    expect((a as any) ** 2).toEqual(42 ** 2);
+  });
 });

@@ -159,6 +159,25 @@ export class Array extends Tracer {
     );
   }
 
+  /**
+   * Convert this array into a primitive value.
+   *
+   * This only works for scalars (0-dimensional arrays). It lets you get values
+   * "out" of the JAX system. For instance, if `x = np.array(5)`, then you can
+   * evaluate `x + 1` and `x ** 2` to get `6` and `25`, respectively.
+   *
+   * This method is also called for `==` equality.
+   */
+  [Symbol.toPrimitive](): any {
+    if (this.ndim === 0) {
+      return this.dataSync()[0];
+    } else {
+      throw new Error(
+        `Cannot convert non-scalar array to primitive: ${this.toString()}`,
+      );
+    }
+  }
+
   // Movement operations
   // TODO: move to Tracer / Primitive
 
