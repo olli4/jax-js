@@ -1,12 +1,12 @@
 /** @file Core library internals and interpreter stack, based on Autodidax. */
 
 import { DType } from "../alu";
-import { DEBUG, range } from "../utils";
 import {
   JsTreeDef,
   flatten as treeFlatten,
   unflatten as treeUnflatten,
 } from "../tree";
+import { DEBUG, range } from "../utils";
 
 export enum Primitive {
   Add = "add",

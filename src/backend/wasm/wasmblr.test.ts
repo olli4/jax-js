@@ -1,4 +1,5 @@
-import { suite, test, expect } from "vitest";
+import { expect, suite, test } from "vitest";
+
 import { CodeGenerator } from "./wasmblr";
 
 suite("CodeGenerator", () => {

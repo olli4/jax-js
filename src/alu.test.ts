@@ -1,4 +1,5 @@
 import { expect, test } from "vitest";
+
 import { AluExp, DType } from "./alu";
 
 test("AluExp can be evaluated", () => {

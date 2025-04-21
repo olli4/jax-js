@@ -1,4 +1,3 @@
-import { expect, suite, test } from "vitest";
 import {
   grad,
   init,
@@ -8,6 +7,7 @@ import {
   numpy as np,
   vjp,
 } from "@jax-js/core";
+import { expect, suite, test } from "vitest";
 
 await init("cpu");
 

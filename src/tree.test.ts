@@ -1,5 +1,6 @@
-import { suite, test, expect } from "vitest";
-import { JsTreeDef, NodeType, flatten, unflatten } from "./tree";
+import { expect, suite, test } from "vitest";
+
+import { flatten, JsTreeDef, NodeType, unflatten } from "./tree";
 
 suite("JsTreeDef.toString()", () => {
   test("should return '*' for a leaf", () => {

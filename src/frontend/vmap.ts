@@ -18,8 +18,8 @@ import {
   Trace,
   Tracer,
   TracerValue,
-  TreeMismatchError,
   transpose,
+  TreeMismatchError,
 } from "./core";
 import { flatten as treeFlatten, unflatten as treeUnflatten } from "../tree";
 import { jvp } from "./jvp";

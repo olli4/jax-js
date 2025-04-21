@@ -1,6 +1,7 @@
-import { suite, test, expect } from "vitest";
-import { ShapeTracker, unravelAlu, View } from "./shape";
+import { expect, suite, test } from "vitest";
+
 import { AluExp, DType } from "./alu";
+import { ShapeTracker, unravelAlu, View } from "./shape";
 
 suite("View.create()", () => {
   test("creates a contiguous view with default strides", () => {

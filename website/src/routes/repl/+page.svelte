@@ -1,4 +1,6 @@
 <script lang="ts">
+  import { base } from "$app/paths";
+
   import { SplitPane } from "@rich_harris/svelte-split-pane";
   import type { Plugin } from "@rollup/browser";
   import {
@@ -13,7 +15,6 @@
   } from "lucide-svelte";
 
   import ReplEditor from "$lib/repl/ReplEditor.svelte";
-  import { base } from "$app/paths";
 
   const codeSamples: {
     title: string;

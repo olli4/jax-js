@@ -1,6 +1,6 @@
 import { DType } from "../alu";
 import { PPrint } from "../pprint";
-import { flatten as treeFlatten, JsTreeDef } from "../tree";
+import { JsTreeDef, flatten as treeFlatten } from "../tree";
 import { range, unzip2, zip } from "../utils";
 import { Array, generalBroadcast, pureArray } from "./array";
 import {

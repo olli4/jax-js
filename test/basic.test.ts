@@ -1,5 +1,5 @@
+import { init, jacfwd, jvp, numpy as np, vmap } from "@jax-js/core";
 import { expect, suite, test } from "vitest";
-import { init, jvp, jacfwd, numpy as np, vmap } from "@jax-js/core";
 
 await init("cpu");
 

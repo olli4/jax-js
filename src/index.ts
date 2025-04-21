@@ -1,4 +1,4 @@
-import { init, BackendType, setBackend } from "./backend";
+import { BackendType, init, setBackend } from "./backend";
 import * as jaxprModule from "./frontend/jaxpr";
 import * as jvpModule from "./frontend/jvp";
 import * as linearizeModule from "./frontend/linearize";

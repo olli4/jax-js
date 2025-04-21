@@ -1,7 +1,8 @@
 import { describe, expect, test as globalTest } from "vitest";
+
+import { AluExp, AluOp, DType, Kernel, Reduction } from "../alu";
 import { accessorGlobal, backendTypes, getBackend, init } from "../backend";
 import { ShapeTracker } from "../shape";
-import { AluExp, AluOp, DType, Kernel, Reduction } from "../alu";
 import { range } from "../utils";
 
 const backendsAvailable = await init(...backendTypes);
