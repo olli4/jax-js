@@ -501,6 +501,12 @@ export class Array extends Tracer {
               return AluExp.cmpne(x, y).not();
             case CompareOp.NotEqual:
               return AluExp.cmpne(x, y);
+            case CompareOp.GreaterEqual:
+              // `x >= y` is equivalent to `!(x < y)`
+              // TODO: handle NaN
+              return AluExp.cmplt(x, y).not();
+            case CompareOp.LessEqual:
+              return AluExp.add(AluExp.cmplt(x, y), AluExp.cmpne(x, y).not());
           }
         };
         return [Array.#naryCustom("compare", custom, [x, y], [], DType.Bool)];

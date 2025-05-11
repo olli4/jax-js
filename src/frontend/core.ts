@@ -26,6 +26,8 @@ export enum CompareOp {
   Less = "less",
   Equal = "equal",
   NotEqual = "not_equal",
+  GreaterEqual = "greater_equal",
+  LessEqual = "less_equal",
 }
 
 export function add(x: TracerValue, y: TracerValue) {
@@ -62,6 +64,12 @@ export function equal(x: TracerValue, y: TracerValue) {
 }
 export function notEqual(x: TracerValue, y: TracerValue) {
   return compare(x, y, CompareOp.NotEqual);
+}
+export function greaterEqual(x: TracerValue, y: TracerValue) {
+  return compare(x, y, CompareOp.GreaterEqual);
+}
+export function lessEqual(x: TracerValue, y: TracerValue) {
+  return compare(x, y, CompareOp.LessEqual);
 }
 
 export function where(cond: TracerValue, x: TracerValue, y: TracerValue) {
@@ -205,6 +213,12 @@ export abstract class Tracer {
   }
   notEqual(other: this | TracerValue) {
     return notEqual(this, other) as this;
+  }
+  greaterEqual(other: this | TracerValue) {
+    return greaterEqual(this, other) as this;
+  }
+  lessEqual(other: this | TracerValue) {
+    return lessEqual(this, other) as this;
   }
   sum(axis?: number | number[]) {
     return reduceSum(this, axis) as this;

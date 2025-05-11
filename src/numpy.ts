@@ -28,6 +28,14 @@ export const greater = core.greater as (x: ArrayLike, y: ArrayLike) => Array;
 export const less = core.less as (x: ArrayLike, y: ArrayLike) => Array;
 export const equal = core.equal as (x: ArrayLike, y: ArrayLike) => Array;
 export const notEqual = core.notEqual as (x: ArrayLike, y: ArrayLike) => Array;
+export const greaterEqual = core.greaterEqual as (
+  x: ArrayLike,
+  y: ArrayLike,
+) => Array;
+export const lessEqual = core.lessEqual as (
+  x: ArrayLike,
+  y: ArrayLike,
+) => Array;
 export const where = core.where as (
   cond: ArrayLike,
   x: ArrayLike,
