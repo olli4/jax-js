@@ -291,3 +291,41 @@ export const vecdot = jit(function vecdot(x: Array, y: Array) {
 export function vdot(x: ArrayLike, y: ArrayLike): Array {
   return vecdot(ravel(x), ravel(y));
 }
+
+/**
+ * Return a tuple of coordinate matrices from coordinate vectors.
+ *
+ * Make N-D coordinate arrays for vectorized evaluations of N-D scalar/vector
+ * fields over N-D grids, given one-dimensional coordinate arrays x1, x2,…, xn.
+ */
+export function meshgrid(
+  xs: Array[],
+  { indexing }: { indexing?: "xy" | "ij" } = {},
+): Array[] {
+  indexing ??= "xy"; // Default for numpy is "xy"
+
+  for (const x of xs) {
+    if (x.ndim !== 1) {
+      throw new TypeError(
+        `meshgrid: all inputs must be 1D arrays, got ${x.ndim}D array`,
+      );
+    }
+  }
+  if (xs.length <= 1) return xs;
+  if (indexing === "xy") {
+    // For "xy" indexing, we just have to reverse the first two values.
+    const [a, b, ...rest] = xs;
+    const [rb, ra, ...rrest] = meshgrid([b, a, ...rest], { indexing: "ij" });
+    return [ra, rb, ...rrest];
+  }
+
+  // Now do the actual meshgrid construction, using movement operators.
+  const shape = xs.map((x) => x.shape[0]);
+  return xs.map(
+    (x, i) =>
+      core.broadcast(x, shape, [
+        ...range(i),
+        ...range(i + 1, xs.length),
+      ]) as Array,
+  );
+}

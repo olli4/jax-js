@@ -341,4 +341,47 @@ suite.each(backendTypes)("backend:%s", (backend) => {
       expect(z.shape).toEqual([2, 3, 4, 1, 4, 6]);
     });
   });
+
+  suite("jax.numpy.meshgrid()", () => {
+    test("creates xy meshgrid", () => {
+      const x = np.array([1, 2, 3]);
+      const y = np.array([4, 5]);
+      const [X, Y] = np.meshgrid([x, y]);
+      expect(X.js()).toEqual([
+        [1, 2, 3],
+        [1, 2, 3],
+      ]);
+      expect(Y.js()).toEqual([
+        [4, 4, 4],
+        [5, 5, 5],
+      ]);
+    });
+
+    test("works with ij indexing", () => {
+      const x = np.array([1, 2, 3]);
+      const y = np.array([4, 5]);
+      const [X, Y] = np.meshgrid([x, y], { indexing: "ij" });
+      expect(X.js()).toEqual([
+        [1, 1],
+        [2, 2],
+        [3, 3],
+      ]);
+      expect(Y.js()).toEqual([
+        [4, 5],
+        [4, 5],
+        [4, 5],
+      ]);
+    });
+
+    test("works with 3D arrays", () => {
+      // Note: XYZ -> [Y, X, Z]
+      const x = np.array([1, 2]);
+      const y = np.array([3, 4, 5]);
+      const z = np.array([6, 7, 8, 9]);
+      const [X, Y, Z] = np.meshgrid([x, y, z]); // "xy" indexing
+      expect(X.shape).toEqual([3, 2, 4]);
+      expect(Y.shape).toEqual([3, 2, 4]);
+      expect(Z.shape).toEqual([3, 2, 4]);
+    });
+  });
 });
