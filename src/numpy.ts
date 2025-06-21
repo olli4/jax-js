@@ -343,3 +343,25 @@ export function meshgrid(
       ]) as Array,
   );
 }
+
+/**
+ * Clip (limit) the values in an array.
+ *
+ * Given an interval, values outside the interval are clipped to the interval
+ * edges. For example, if an interval of [0, 1] is specified, values smaller
+ * than 0 become 0, and values larger than 1 become 1.
+ *
+ * If either bound is undefined, it is ignored.
+ */
+export function clip(a: Array, min?: ArrayLike, max?: ArrayLike): Array {
+  if (max !== undefined) {
+    const maxArray = array(max);
+    a = clip(a, min);
+    return where(greater(a.ref, maxArray.ref), maxArray, a);
+  }
+  if (min !== undefined) {
+    const minArray = array(min);
+    return where(less(a.ref, minArray.ref), minArray, a);
+  }
+  return a; // No clipping, just return the original array.
+}

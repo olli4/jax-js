@@ -473,7 +473,7 @@ export class Array extends Tracer {
     const pending = this.#pending;
     if (pending) {
       // Compile all pending executables concurrently.
-      await Promise.all(pending.map((exe) => exe.prepare()));
+      await Promise.all(pending.map((p) => p.prepare()));
       for (const p of pending) p.submit();
     }
     const buf = await this.#backend.read(this.#source as Slot);
@@ -490,7 +490,7 @@ export class Array extends Tracer {
     const pending = this.#pending;
     if (pending) {
       // Compile all pending executables concurrently.
-      await Promise.all(pending.map((exe) => exe.prepare()));
+      await Promise.all(pending.map((p) => p.prepare()));
       for (const p of pending) p.submit();
     }
     await this.#backend.read(this.#source, 0, 0);

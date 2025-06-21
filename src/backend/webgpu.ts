@@ -291,8 +291,10 @@ function pipelineSource(device: GPUDevice, kernel: Kernel): ShaderInfo {
     if (AluGroup.Binary.has(op) || AluGroup.Compare.has(op)) {
       const a = gen(src[0]);
       const b = gen(src[1]);
-      if (op === AluOp.Add) source = `(${a} + ${b})`;
-      else if (op === AluOp.Sub) source = `(${a} - ${b})`;
+      if (op === AluOp.Add) {
+        if (dtype === DType.Bool) source = `(${a} || ${b})`;
+        else source = `(${a} + ${b})`;
+      } else if (op === AluOp.Sub) source = `(${a} - ${b})`;
       else if (op === AluOp.Mul) {
         if (dtype === DType.Bool) source = `(${a} && ${b})`;
         else source = `(${a} * ${b})`;

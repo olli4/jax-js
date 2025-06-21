@@ -315,6 +315,11 @@ export abstract class Tracer {
 
   // Below this line are composite operations built from primitives.
 
+  /** Subtract an array from this one. */
+  sub(other: this | TracerValue): this {
+    return this.add(neg(other)) as this;
+  }
+
   /** Return specified diagonals. See `numpy.diagonal` for full docs. */
   diagonal(offset = 0, axis1 = 0, axis2 = 1): this {
     if (!Number.isInteger(offset))

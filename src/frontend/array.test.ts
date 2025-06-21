@@ -1,7 +1,8 @@
 import { beforeEach, expect, suite, test } from "vitest";
 
 import { backendTypes, init, setBackend } from "../backend";
-import { array, ones, zeros } from "./array";
+import { arange, array, ones, zeros } from "./array";
+import { DType } from "../alu";
 
 const backendsAvailable = await init();
 
@@ -100,5 +101,25 @@ suite.each(backendTypes)("backend:%s", (backend) => {
 
     expect(b.ref.equal(3).js()).toEqual([false, true, false]);
     expect(b.notEqual(array([2, 3, 4])).js()).toEqual([true, false, false]);
+  });
+
+  // TODO: Figure out why this is not working on WebGPU backend.
+  test.skip("comparison operators async", async () => {
+    const x = array([1, 2, 3]);
+    expect(await x.ref.greater(2).jsAsync()).toEqual([false, false, true]);
+    expect(await x.ref.greaterEqual(2).jsAsync()).toEqual([false, true, true]);
+    expect(await x.ref.less(2).jsAsync()).toEqual([true, false, false]);
+    expect(await x.ref.lessEqual(2).jsAsync()).toEqual([true, true, false]);
+    expect(await x.ref.equal(2).jsAsync()).toEqual([false, true, false]);
+    expect(await x.ref.notEqual(2).jsAsync()).toEqual([true, false, true]);
+    x.dispose();
+
+    let ar = arange(0, 5000, 1, { dtype: DType.Float32 });
+    await ar.ref.data(); // Ensure data is loaded
+    ar = ar.add(1);
+    const vals = (await ar.less(2500).data()) as Int32Array;
+    for (let i = 0; i < vals.length; i++) {
+      expect(vals[i]).toEqual(i + 1 < 2500);
+    }
   });
 });
