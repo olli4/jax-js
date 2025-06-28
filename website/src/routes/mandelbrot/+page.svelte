@@ -93,7 +93,7 @@
     const data = imageData.data;
 
     for (let i = 0; i < result.length; i++) {
-      const value = 255 * (result[i] / 100);
+      const value = 255 * (1 - result[i] / 100);
       data[i * 4] = value; // Red
       data[i * 4 + 1] = value; // Green
       data[i * 4 + 2] = value; // Blue
