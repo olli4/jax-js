@@ -34,11 +34,8 @@ export const vmap = vmapModule.vmap as <
 ) => (...args: MapJsTree<Parameters<F>, ArrayLike, ArrayLike>) => ReturnType<F>;
 
 /** Compute the Jacobian evaluated column-by-column by forward-mode AD. */
-export const jacfwd = vmapModule.jacfwd as unknown as <
-  F extends (x: Array) => Array,
->(
+export const jacfwd = vmapModule.jacfwd as <F extends (x: Array) => Array>(
   f: F,
-  x: Array,
 ) => (...args: MapJsTree<Parameters<F>, ArrayLike, ArrayLike>) => ReturnType<F>;
 
 /** Construct a Jaxpr by dynamically tracing a function with example inputs. */
@@ -98,3 +95,9 @@ export const grad = linearizeModule.grad as <
 ) => (
   ...primals: MapJsTree<Parameters<F>, ArrayLike, ArrayLike>
 ) => MapJsTree<Parameters<F>[0], ArrayLike, Array>;
+
+/** Compute the Jacobian evaluated row-by-row by reverse-mode AD. */
+export const jacrev = linearizeModule.jacrev as typeof jacfwd;
+
+/** Compute the Jacobian with reverse-mode AD. Alias for `jacrev()`. */
+export const jacobian = jacrev;

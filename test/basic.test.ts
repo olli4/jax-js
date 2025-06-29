@@ -1,4 +1,4 @@
-import { jacfwd, jvp, numpy as np, vmap } from "@jax-js/jax";
+import { jacfwd, jacrev, jvp, numpy as np, vmap } from "@jax-js/jax";
 import { expect, suite, test } from "vitest";
 
 test("can create array", () => {
@@ -152,7 +152,7 @@ suite("jax.jacfwd()", () => {
   test("computes jacobian of 3d square", () => {
     const f = (x: np.Array) => x.ref.mul(x);
     const x = np.array([1, 2, 3]);
-    const j = jacfwd(f, x);
+    const j = jacfwd(f)(x);
     expect(j).toBeAllclose(
       np.array([
         [2, 0, 0],
@@ -160,5 +160,13 @@ suite("jax.jacfwd()", () => {
         [0, 0, 6],
       ]),
     );
+  });
+
+  test("equals jacrev() output", () => {
+    const f = (x: np.Array) => np.sin(x.ref).add(np.cos(x));
+    const x = np.array([1, 2, 3]);
+    const jFwd = jacfwd(f)(x.ref);
+    const jRev = jacrev(f)(x);
+    expect(jFwd).toBeAllclose(jRev);
   });
 });

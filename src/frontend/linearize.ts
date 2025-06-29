@@ -3,7 +3,7 @@
 import { DType } from "../alu";
 import { flatten as treeFlatten, unflatten as treeUnflatten } from "../tree";
 import { invertPermutation, partitionList, toposort, unzip2 } from "../utils";
-import { pureArray, scalar, zeros } from "./array";
+import { eye, pureArray, scalar, zeros } from "./array";
 import {
   AbstractValue,
   add,
@@ -39,6 +39,7 @@ import {
   Var,
 } from "./jaxpr";
 import { jvp } from "./jvp";
+import { vmap } from "./vmap";
 
 /** Array value that can either be known or unknown. */
 class PartialVal {
@@ -778,5 +779,18 @@ export function grad(f: (...primals: any) => Tracer) {
     }
     // JAX convention, differentiate with respect to the first argument.
     return fVjp(pureArray(1))[0];
+  };
+}
+
+// See also: jacfwd()
+export function jacrev(f: any) {
+  return function jacobianReverse(x: Tracer) {
+    if (x.shape.length !== 1) {
+      throw new TypeError("jacrev only supports 1D inputs");
+    }
+    const [size] = x.shape;
+    const pullback = (ct: Tracer) => vjp(f, x)[1](ct)[0];
+    // TODO: Use correct device
+    return vmap(pullback, [1])(eye(size, undefined, { dtype: x.dtype }));
   };
 }

@@ -339,11 +339,15 @@ export function vmap(
   };
 }
 
-export function jacfwd(f: any, x: Tracer) {
-  if (x.shape.length !== 1) {
-    throw new TypeError("jacfwd only supports 1D inputs");
-  }
-  const [size] = x.shape;
-  const pushfwd = (v: Tracer) => jvp(f, [x], [v])[1];
-  return vmap(pushfwd, [0])(eye(size));
+// See also: jacrev()
+export function jacfwd(f: any) {
+  return function jacobianForward(x: Tracer) {
+    if (x.shape.length !== 1) {
+      throw new TypeError("jacfwd only supports 1D inputs");
+    }
+    const [size] = x.shape;
+    const pushfwd = (v: Tracer) => jvp(f, [x], [v])[1];
+    // TODO: Use correct device
+    return vmap(pushfwd, [0])(eye(size, undefined, { dtype: x.dtype }));
+  };
 }
