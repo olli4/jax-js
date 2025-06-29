@@ -64,7 +64,9 @@ async function createBackend(device: Device): Promise<Backend | null> {
     return new CPUBackend();
   } else if (device === "webgpu") {
     if (!navigator.gpu) return null; // WebGPU is not available.
-    const adapter = await navigator.gpu.requestAdapter();
+    const adapter = await navigator.gpu.requestAdapter({
+      powerPreference: "high-performance",
+    });
     if (!adapter) return null;
 
     const { WebGPUBackend } = await import("./backend/webgpu");
