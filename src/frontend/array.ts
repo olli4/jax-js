@@ -61,9 +61,10 @@ export class PendingExecute {
     readonly inputs: Slot[],
     readonly outputs: Slot[],
   ) {
-    // Take a reference to all input buffers, while this execution is pending.
+    // Take a reference to all I/O buffers, while this execution is pending.
     // The reference is dropped after submit() or cancellation.
     for (const slot of inputs) this.backend.incRef(slot);
+    for (const slot of outputs) this.backend.incRef(slot);
   }
 
   // Change the reference count of the PendingExecute object.
@@ -74,6 +75,7 @@ export class PendingExecute {
     if (this.#rc <= 0 && !this.submitted) {
       // Cancel operation, release the references held to all input buffers.
       for (const slot of this.inputs) this.backend.decRef(slot);
+      for (const slot of this.outputs) this.backend.decRef(slot);
     }
   }
 
@@ -101,6 +103,7 @@ export class PendingExecute {
     this.submitted = true;
     this.backend.dispatch(this.prepared, this.inputs, this.outputs);
     for (const slot of this.inputs) this.backend.decRef(slot);
+    for (const slot of this.outputs) this.backend.decRef(slot);
   }
 }
 
@@ -559,6 +562,7 @@ export class Array extends Tracer {
         [this.#source],
         [output],
       );
+      this.#backend.decRef(this.#source);
       this.#source = output;
       this.#st = ShapeTracker.fromShape(this.shape);
       this.#pendingSet ??= new Set();

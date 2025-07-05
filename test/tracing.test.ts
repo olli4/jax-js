@@ -217,7 +217,7 @@ suite("jax.jit()", () => {
   });
 
   test("grad-of-jit", () => {
-    const f = jit((x: np.Array) => x.ref.mul(x.ref));
+    const f = jit((x: np.Array) => x.ref.mul(x));
 
     expect(grad(f)(3)).toBeAllclose(6);
     expect(grad(f)(10)).toBeAllclose(20);
