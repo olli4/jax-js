@@ -91,7 +91,7 @@
     let params = await initializeParams();
     const { X_train, y_train, X_test, y_test } = await loadData();
 
-    const lr = 1e-4;
+    const lr = 5e-4;
 
     try {
       const batchSize = 2000;
@@ -119,6 +119,19 @@
             `batch ${i} completed in ${duration.toFixed(1)} ms, loss: ${((await lossVal.jsAsync()) as number).toFixed(4)}`,
           );
         }
+
+        log(`=> Evaluating on test set...`);
+        const testSize = X_test.shape[0];
+        const testLoss: number[] = [];
+        for (let i = 0; i + batchSize <= testSize; i += batchSize) {
+          const X = X_test.ref.slice([i, i + batchSize]).reshape([-1, 784]);
+          const y = y_test.ref.slice([i, i + batchSize]);
+          testLoss.push(
+            (await loss(tree.ref(params), X, y).jsAsync()) as number,
+          );
+        }
+        const testLossAvg = testLoss.reduce((a, b) => a + b) / testLoss.length;
+        log(`=> Test loss: ${testLossAvg.toFixed(4)}`);
       }
     } finally {
       X_train.dispose();
