@@ -231,4 +231,13 @@ suite.each(devices)("device:%s", (device) => {
     await x.ref.wait();
     expect(await x.sum().jsAsync()).toEqual(100_000_000);
   });
+
+  test("iterate over an array", () => {
+    const [a, b] = array([
+      [1, 2, 3],
+      [4, 5, 6],
+    ]);
+    expect(a.js()).toEqual([1, 2, 3]);
+    expect(b.js()).toEqual([4, 5, 6]);
+  });
 });

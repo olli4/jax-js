@@ -9,6 +9,7 @@ import {
   cos,
   exp,
   flattenFun,
+  flip,
   fullRaise,
   idiv,
   log,
@@ -18,11 +19,14 @@ import {
   ndim,
   neg,
   newMain,
+  pad,
   Primitive,
   PrimitiveParams,
   reciprocal,
   reduce,
+  reshape,
   ShapedArray,
+  shrink,
   sin,
   stopGradient,
   Trace,
@@ -42,7 +46,7 @@ import { jvp } from "./jvp";
 
 function mappedAval(batchDim: number, aval: AbstractValue) {
   const shape = [...aval.shape];
-  shape.splice(batchDim, 1);
+  shape.splice(batchDim, 1); // Remove the batch dimension.
   return new ShapedArray(shape, aval.dtype);
 }
 
@@ -186,6 +190,9 @@ function broadcastBatcher(op: (...x: Tracer[]) => Tracer): VmapRule<Primitive> {
       return [[op(...args)], [dims[idx]]];
     }
 
+    // TODO: I wrote this like 5 months ago. I do not know what the code below
+    // does, but it seems to be wrong. Revisit this later.
+
     args = args.map((x, i) =>
       ndim(x) > 0 ? moveBatchAxis(axisSize, dims[i], 0, x) : x,
     );
@@ -235,7 +242,36 @@ const vmapRules: Partial<{ [P in Primitive]: VmapRule<P> }> = {
       {},
     );
   },
-  // TODO: where, transpose, broadcast, reshape, flip, shrink, pad, gather
+  // TODO: where, transpose, broadcast, gather
+  [Primitive.Reshape](axisSize, [x], [xBdim], { shape }) {
+    if (xBdim === null) {
+      return [[reshape(x, shape)], [null]];
+    }
+    // Move xBdim to the front, so reshape can have contiguous axes.
+    x = moveBatchAxis(axisSize, xBdim, 0, x);
+    return [[reshape(x, [axisSize, ...shape])], [0]];
+  },
+  [Primitive.Flip](axisSize, [x], [xBdim], { axis }) {
+    if (xBdim === null) {
+      return [[flip(x, axis)], [null]];
+    }
+    const newAxis = axis.map((ax) => ax + (xBdim <= ax ? 1 : 0));
+    return [[flip(x, newAxis)], [xBdim]];
+  },
+  [Primitive.Shrink](axisSize, [x], [xBdim], { slice }) {
+    if (xBdim === null) {
+      return [[shrink(x, slice)], [null]];
+    }
+    const newSlice = slice.toSpliced(xBdim, 0, [0, axisSize]);
+    return [[shrink(x, newSlice)], [xBdim]];
+  },
+  [Primitive.Pad](axisSize, [x], [xBdim], { width }) {
+    if (xBdim === null) {
+      return [[pad(x, width)], [null]];
+    }
+    const newWidth = width.toSpliced(xBdim, 0, [0, 0]);
+    return [[pad(x, newWidth)], [xBdim]];
+  },
   [Primitive.JitCall](axisSize, args, dims, { jaxpr }) {
     const { newJaxpr, newConsts } = vmapJaxpr(jaxpr, axisSize, dims);
     const outs = bind(

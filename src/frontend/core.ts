@@ -536,6 +536,28 @@ export abstract class Tracer {
   }
 
   /**
+   * Iterate over the first dimension of this array, returning slices.
+   *
+   * This can be used to destructure arrays. For example:
+   *
+   * ```js
+   * let x = np.array([[1, 2], [3, 4]]);
+   * let [a, b] = x;
+   * console.log(a.js()); // [1, 2]
+   * console.log(b.js()); // [3, 4]
+   * ```
+   */
+  *[Symbol.iterator](): IterableIterator<this> {
+    if (this.ndim === 0) {
+      throw new Error("Cannot iterate over a scalar array");
+    }
+    for (let i = 0; i < this.shape[0]; i++) {
+      yield this.ref.slice(i);
+    }
+    this.dispose();
+  }
+
+  /**
    * Slice an array along one or more axes.
    *
    * This is the equivalent of slicing in Python, e.g. `x[1:3, 2, :, None]`. To

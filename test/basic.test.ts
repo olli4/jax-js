@@ -170,6 +170,19 @@ suite("jax.vmap()", () => {
     expect(vmap(np.dot, 0)(a.ref, b.ref).js()).toEqual([17, 53]);
     expect(vmap(np.dot, 1)(a, b).js()).toEqual([26, 44]);
   });
+
+  test("can vectorize over iteration and slice", () => {
+    const f = (x: np.Array) => [...x];
+    const batchedF = vmap(f, 0);
+    const x = np.array([
+      [1, 2, 3],
+      [4, 5, 6],
+    ]);
+    const [a, b, c] = batchedF(x);
+    expect(a.js()).toEqual([1, 4]);
+    expect(b.js()).toEqual([2, 5]);
+    expect(c.js()).toEqual([3, 6]);
+  });
 });
 
 suite("jax.jacfwd()", () => {
