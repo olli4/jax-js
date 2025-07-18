@@ -280,7 +280,7 @@
     drawing = true;
     ctx.fillStyle = "black";
     ctx.beginPath();
-    ctx.ellipse(x, y, 10, 10, 0, 0, Math.PI * 2);
+    ctx.ellipse(x, y, 15, 15, 0, 0, Math.PI * 2);
     ctx.fill();
     lastPos = [x, y];
     hasDrawn = true;
@@ -294,7 +294,7 @@
     ctx.beginPath();
     ctx.moveTo(lastPos[0], lastPos[1]);
     ctx.lineTo(x, y);
-    ctx.lineWidth = 20;
+    ctx.lineWidth = 30;
     ctx.lineCap = "round";
     ctx.stroke();
     lastPos = [x, y];
@@ -367,8 +367,12 @@
             ></canvas>
 
             {#if hasDrawn}
-              <button class="absolute bottom-1 right-1" onclick={clearCanvas}
-                >Clear</button
+              <button
+                class="absolute bottom-1 right-1"
+                onclick={(event) => {
+                  event.stopPropagation();
+                  clearCanvas();
+                }}>Clear</button
               >
             {:else}
               <p
