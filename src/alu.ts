@@ -753,8 +753,9 @@ export class AluExp implements FpHashable {
         case AluOp.GlobalView: {
           const [gid, st] = node.arg as [number, ShapeTracker];
           const shape = st.shape.join(",");
+          const lastStrides = st.lastStrides.join(",");
           const cont = st.contiguous ? "c" : "nc";
-          return `GV_${gid}<${node.dtype}>{${shape}${cont ? "" : "*"}}[${parts.map(strip1).join(", ")}]`;
+          return `GV_${gid}<${node.dtype}>{${shape}:${lastStrides}:${cont}}[${parts.map(strip1).join(", ")}]`;
         }
       }
 
