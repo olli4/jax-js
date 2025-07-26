@@ -19,6 +19,7 @@ export default defineConfig([
   {
     plugins: { import: eslintImport },
     rules: {
+      "@typescript-eslint/consistent-type-exports": "error",
       "@typescript-eslint/no-array-constructor": "off",
       "@typescript-eslint/no-empty-object-type": "off",
       "@typescript-eslint/no-explicit-any": "off",

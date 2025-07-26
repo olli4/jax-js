@@ -159,3 +159,12 @@ export function map<T, U, Tree extends JsTree<T>>(
 export function ref<Tree extends JsTree<Array>>(tree: Tree): Tree {
   return map((x: Array) => x.ref, tree) as unknown as Tree;
 }
+
+/** Dispose every array in a tree. */
+export function dispose<Tree extends JsTree<Array>>(
+  tree: Tree | null | undefined,
+): void {
+  if (tree) {
+    map((x: Array) => x.dispose(), tree);
+  }
+}

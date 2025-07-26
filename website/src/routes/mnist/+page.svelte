@@ -119,8 +119,7 @@
 
     let params = await initializeParams();
 
-    if (latestParams !== null)
-      tree.map((x: np.Array) => x.dispose(), latestParams);
+    tree.dispose(latestParams);
     latestParams = tree.ref(params);
 
     const startTime = performance.now();
@@ -180,8 +179,7 @@
           });
         }
 
-        if (latestParams !== null)
-          tree.map((x: np.Array) => x.dispose(), latestParams);
+        tree.dispose(latestParams);
         latestParams = tree.ref(params);
 
         // Retrigger the inference demo if the user has drawn something.
@@ -222,7 +220,7 @@
       y_train.dispose();
       X_test.dispose();
       y_test.dispose();
-      tree.map((x: np.Array) => x.dispose(), params);
+      tree.dispose(params);
     }
   }
 

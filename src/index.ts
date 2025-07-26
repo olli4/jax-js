@@ -5,14 +5,26 @@ import * as linearizeModule from "./frontend/linearize";
 import * as vmapModule from "./frontend/vmap";
 import * as nn from "./nn";
 import * as numpy from "./numpy";
-import { Array, ArrayLike } from "./numpy";
+import { Array, ArrayLike, DType } from "./numpy";
 import * as random from "./random";
 import * as tree from "./tree";
 import type { JsTree, JsTreeDef, MapJsTree } from "./tree";
 
 import "./polyfills";
 
-export { init, type Device, devices, nn, numpy, random, setDevice, tree };
+export {
+  init,
+  type Device,
+  devices,
+  DType,
+  type JsTree,
+  type JsTreeDef,
+  nn,
+  numpy,
+  random,
+  setDevice,
+  tree,
+};
 
 // Assert that a function's arguments are a subtype of the given type.
 /** @inline */
