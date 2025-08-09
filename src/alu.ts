@@ -588,6 +588,14 @@ export class AluExp implements FpHashable {
       }
     }
 
+    // Where(cond, 1, 0) => Cast(ty, cond)
+    if (
+      op === AluOp.Where &&
+      src.slice(1).every((s, i) => s.op === AluOp.Const && s.arg === 1 - i)
+    ) {
+      return AluExp.cast(this.dtype, src[0]);
+    }
+
     // No-op comparisons.
     if (op === AluOp.Cmplt) {
       if (src[0].min >= src[1].max) return AluExp.const(DType.Bool, false);
