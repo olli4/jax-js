@@ -31,6 +31,10 @@
     predict(params: Params, x: np.Array): np.Array;
   };
 
+  function maxPool2x2(x: np.Array): np.Array {
+    return lax.reduceWindow(x, np.max, [2, 2], [2, 2]);
+  }
+
   const MLP: ModelType = {
     init(key: np.Array): Params {
       const [d0, d1, d2, d3] = [784, 256, 128, 10]; // Hidden layer dimensions
@@ -107,13 +111,17 @@
     predict: jit((params: Params, x: np.Array): np.Array => {
       // Forward pass through the network
       x = x.reshape([-1, 1, 28, 28]);
+      // TODO: This causes kernel panic on my machine (M1 MBP).
+      // const z1 = maxPool2x2(
+      //   lax.convGeneralDilated(x, params.w1, [1, 1], "VALID").add(params.b1),
+      // );
       const z1 = lax
         .convGeneralDilated(x, params.w1, [2, 2], "VALID")
         .add(params.b1);
       const a1 = nn.relu(z1); // [batch, 32, 12, 12]
-      const z2 = lax
-        .convGeneralDilated(a1, params.w2, [2, 2], "VALID")
-        .add(params.b2);
+      const z2 = maxPool2x2(
+        lax.convGeneralDilated(a1, params.w2, [1, 1], "VALID").add(params.b2),
+      );
       const a2 = nn.relu(z2); // [batch, 64, 5, 5]
       const a2flat = a2.reshape([-1, 1600]); // Flatten to [batch, 1600]
       const z3 = np.dot(a2flat, params.w3).add(params.b3);

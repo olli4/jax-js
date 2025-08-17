@@ -1,4 +1,4 @@
-import { AluOp, DType, isFloatDtype } from "../alu";
+import { AluOp, isFloatDtype } from "../alu";
 import {
   JsTree,
   flatten as treeFlatten,

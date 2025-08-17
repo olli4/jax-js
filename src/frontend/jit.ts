@@ -520,7 +520,11 @@ const jitRules: { [P in Primitive]: JitRule<P> } = {
     const size = prod(inShape);
     stX = stX.reshape([...inShape, prod(stX.shape.slice(inShape.length))]); // Combine all reduce axes.
     a = reshapeViews(a, (st) => st.compose(stX), true);
-    const reduction = new Reduction(a.dtype, AluOp.Add, prod(window));
+    const reduction = new Reduction(
+      a.dtype,
+      AluOp.Add,
+      stX.shape[stX.shape.length - 1],
+    );
     return new Kernel(nargs, size, a, reduction);
   },
   [Primitive.Dot](nargs, [a, b], [as, bs]) {
