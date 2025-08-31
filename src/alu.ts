@@ -360,6 +360,8 @@ export class AluExp implements FpHashable {
       case AluOp.Cast: {
         // Casts change the dtype.
         const wasFloat = isFloatDtype(src[0].dtype);
+        const bounded =
+          Number.isFinite(src[0].min) && Number.isFinite(src[0].max);
         if (this.dtype === DType.Bool) {
           const canBeZero = src[0].min <= 0 && src[0].max >= 0;
           const mustBeZero = src[0].min === 0 && src[0].max === 0;
@@ -371,7 +373,7 @@ export class AluExp implements FpHashable {
           const b = wasFloat
             ? clamp(src[0].max, -2147483648, 2147483647) | 0
             : src[0].max | 0;
-          ret = a <= b ? [a, b] : [-Infinity, Infinity];
+          ret = bounded && a <= b ? [a, b] : [-Infinity, Infinity];
         } else if (this.dtype === DType.Uint32) {
           const a = wasFloat
             ? clamp(src[0].min, 0, 4294967295) >>> 0
@@ -379,7 +381,7 @@ export class AluExp implements FpHashable {
           const b = wasFloat
             ? clamp(src[0].max, 0, 4294967295) >>> 0
             : src[0].max >>> 0;
-          ret = a <= b ? [a, b] : [-Infinity, Infinity];
+          ret = bounded && a <= b ? [a, b] : [0, Infinity];
         } else {
           ret = [src[0].min, src[0].max];
         }

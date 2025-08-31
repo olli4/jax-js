@@ -226,7 +226,7 @@ const vmapRules: Partial<{ [P in Primitive]: VmapRule<P> }> = {
   [Primitive.StopGradient]: unopBatcher(stopGradient),
   [Primitive.Cast]: unopBatcher((x, { dtype }) => cast(x, dtype)),
   [Primitive.Bitcast]: unopBatcher((x, { dtype }) => bitcast(x, dtype)),
-  // TODO: threefry2x32
+  // TODO: random_bits
   [Primitive.Sin]: unopBatcher(sin),
   [Primitive.Cos]: unopBatcher(cos),
   [Primitive.Exp]: unopBatcher(exp),

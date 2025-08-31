@@ -128,6 +128,11 @@ test("AluOp.Cast", () => {
   const e5 = AluExp.cast(DType.Bool, AluExp.i32(0));
   expect(e5.evaluate({})).toBe(0);
   expect(e5.dtype).toBe(DType.Bool);
+
+  // Range of cast should be correct when casting arbitrary int32 to uint32.
+  const e6 = AluExp.cast(DType.Uint32, AluExp.variable(DType.Int32, "x"));
+  expect(e6.min).toBe(0);
+  expect(e6.max).toBeGreaterThanOrEqual(4294967295);
 });
 
 test("AluOp.Bitcast", () => {
