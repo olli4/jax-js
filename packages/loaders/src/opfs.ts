@@ -157,15 +157,25 @@ export class OPFS {
 /** Primary OPFS instance for blob caching. */
 export const opfs = new OPFS();
 
+export interface FetchProgress {
+  loadedBytes: number;
+  totalBytes?: number;
+}
+
 /** Cached fetch that stores responses in OPFS and returns the data as `Uint8Array`. */
 export async function cachedFetch(
   input: string | URL,
   init?: RequestInit,
+  onProgress?: (progress: FetchProgress) => void,
 ): Promise<Uint8Array> {
   const url = typeof input === "string" ? input : String(input);
 
   const cachedData = await opfs.read(url);
   if (cachedData !== null) {
+    onProgress?.({
+      loadedBytes: cachedData.byteLength,
+      totalBytes: cachedData.byteLength,
+    });
     return cachedData;
   }
 
@@ -175,7 +185,36 @@ export async function cachedFetch(
       `Failed to fetch ${url}: ${resp.status} ${resp.statusText}`,
     );
   }
-  const data = await resp.bytes();
+  const contentLength = resp.headers.get("Content-Length");
+  let totalBytes = contentLength ? parseInt(contentLength, 10) : undefined;
+  if (totalBytes && (!Number.isInteger(totalBytes) || totalBytes < 0))
+    totalBytes = undefined;
+  let loadedBytes = 0;
+
+  let data: Uint8Array;
+  if (!resp.body) {
+    data = new Uint8Array(); // Empty body
+    onProgress?.({ loadedBytes, totalBytes: 0 });
+  } else {
+    // Wrap the body in a TransformStream to track download progress.
+    const trackedBody = resp.body.pipeThrough(
+      new TransformStream({
+        start() {
+          onProgress?.({ loadedBytes, totalBytes });
+        },
+        transform(chunk, controller) {
+          loadedBytes += chunk.byteLength;
+          onProgress?.({ loadedBytes, totalBytes });
+          controller.enqueue(chunk);
+        },
+      }),
+    );
+    data = await new Response(trackedBody).bytes();
+    onProgress?.({
+      loadedBytes: data.byteLength,
+      totalBytes: data.byteLength,
+    });
+  }
   try {
     await opfs.write(url, data);
   } catch (cacheError) {

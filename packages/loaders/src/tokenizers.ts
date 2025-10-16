@@ -30,7 +30,7 @@ export async function get(name: TokenizerType): Promise<Tokenizer> {
 }
 
 /** Configuration for BPE tokenizer. */
-export type BpeTokenizerConfig = {
+export interface BpeTokenizerConfig {
   /** BPE vocabulary mappings */
   vocab: Map<string, number>;
   /** BPE merge rules */
@@ -42,7 +42,7 @@ export type BpeTokenizerConfig = {
   unkTokenId?: number;
   /** Context length / max sequence length */
   contextLength: number;
-};
+}
 
 /** Byte-pair encoding (BPE) tokenizer implementation. */
 export class BpeTokenizer implements Tokenizer {
