@@ -33,6 +33,11 @@ jobs:
           BASE_PATH: "/${{ github.event.repository.name }}"
         working-directory: website
 
+      - name: Generate TypeDoc and add to website
+        run: |
+          pnpm run docs
+          cp -r docs/ website/build/docs
+
       - name: Upload artifacts
         uses: actions/upload-pages-artifact@v3
         with:

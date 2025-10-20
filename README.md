@@ -1,6 +1,6 @@
 # jax-js: JAX in pure JavaScript
 
-[Website](https://www.ekzhang.com/jax-js/)
+[Website](https://www.ekzhang.com/jax-js/) | [API Reference](https://www.ekzhang.com/jax-js/docs/)
 
 This is a machine learning framework for the browser. It aims to bring JAX-style, high-performance
 CPU and GPU kernels to JavaScript, so you can run numerical applications on the web.
