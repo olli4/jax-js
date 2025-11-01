@@ -19,12 +19,12 @@
   <pre class="mb-6 text-center"><code>npm install @jax-js/jax</code></pre>
 
   <p class="mb-6">
-    This is a machine learning framework that brings
+    <code>jax-js</code> is a new machine learning framework that brings
     <a href="https://docs.jax.dev/en/latest/" target="_blank" class="link"
       >JAX</a
     >-style, high-performance CPU and GPU kernels to JavaScript. Run neural
-    networks, image algorithms, simulations, and all sorts of other numerical
-    applications without leaving the frontend web.
+    networks, image algorithms, simulations, and many kinds of numerical
+    applications without leaving the frontend.
   </p>
 
   <div class="mb-6 grid grid-cols-2 sm:grid-cols-4 gap-2 sm:gap-4">
@@ -46,8 +46,8 @@
   <p class="mb-6">
     <code>jax-js</code> is likely the most portable ML framework, since it runs
     anywhere a browser can run (Chrome, Firefox, Safari, iOS, and Android). It's
-    also simple but optimized, including a JIT compiler and GPU kernel scheduler
-    based on the intermediate representation of
+    also simple but optimized, including a lightweight ML compiler and GPU
+    kernel scheduler inspired by
     <a href="https://github.com/tinygrad/tinygrad" target="_blank" class="link"
       >tinygrad</a
     >.
@@ -61,25 +61,26 @@
   </div>
 
   <p class="mb-6">
-    This built-in compiler achieves best-in-class performance on the web.
-    <code>jax-js</code> compiles math into optimized WebAssembly, WebGL, and
-    WebGPU code on modern browsers. It is up to 5x faster than other browser ML
-    frameworks like
+    The ML compiler achieves best-in-class performance on the web, as it takes a
+    different approach from most runtimes: JIT translating array programs into
+    WebAssembly, WebGL, and WebGPU kernels. It is up to 5x faster than other
+    browser ML frameworks like
     <a href="https://www.tensorflow.org/js/" target="_blank" class="link"
       >TensorFlow.js</a
-    > (Google).
+    > (Google) due to flexible operator fusion.
   </p>
 
   <p class="mb-6">
     <span class="italic"
-      >XXX Performance benchmarks coming soon—though see
+      >XXX Performance benchmarks coming soon, though see
       <a href="{base}/bench/matmul" class="link">here</a> for some initial results.</span
     >
   </p>
 
   <p class="mb-6">
-    NumPy, PyTorch, and JAX revolutionized numerical computing in Python.
-    <code>jax-js</code> aspires to provide that same general foundation for JavaScript—the
+    Libraries like NumPy, PyTorch, and JAX revolutionized numerical computing in
+    Python.
+    <code>jax-js</code> aspires to provide a similar foundation for JavaScript, the
     world's largest software platform.
   </p>
 
