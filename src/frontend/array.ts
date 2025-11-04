@@ -952,8 +952,10 @@ export function scalar(
 export function array(
   values:
     | Array
+    | Float16Array
     | Float32Array
     | Int32Array
+    | Uint32Array
     | RecursiveArray<number>
     | RecursiveArray<boolean>,
   { shape, dtype, device }: { shape?: number[] } & DTypeAndDevice = {},
@@ -967,7 +969,7 @@ export function array(
       // values = values.astype(dtype);
     }
     return values;
-  } else if (values instanceof Float32Array || values instanceof Int32Array) {
+  } else if (ArrayBuffer.isView(values)) {
     return arrayFromData(values, shape ?? [values.length], {
       dtype,
       device,
@@ -1154,6 +1156,9 @@ export function full(
   if (typeof fillValue === "number") {
     dtype = dtype ?? DType.Float32;
     source = AluExp.const(dtype, fillValue);
+  } else if (typeof fillValue === "bigint") {
+    dtype = dtype ?? DType.Int32;
+    source = AluExp.const(dtype, Number(fillValue));
   } else if (typeof fillValue === "boolean") {
     dtype = dtype ?? DType.Bool;
     source = AluExp.const(dtype, fillValue ? 1 : 0);

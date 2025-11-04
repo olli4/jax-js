@@ -626,9 +626,25 @@ suite.each(devices)("device:%s", (device) => {
 
   suite("jax.numpy.exp()", () => {
     test("computes element-wise exponential", () => {
-      const x = np.array([1, 2, 3]);
+      const x = np.array([-Infinity, 0, 1, 2, 3]);
       const y = np.exp(x);
-      expect(y.js()).toBeAllclose([Math.E, Math.E ** 2, Math.E ** 3]);
+      expect(y.js()).toBeAllclose([0, 1, Math.E, Math.E ** 2, Math.E ** 3]);
+    });
+
+    test("works with small and large numbers", () => {
+      const x = np.array([-1000, -100, -50, -10, 0, 10, 50, 100, 1000]);
+      const y = np.exp(x);
+      expect(y.js()).toBeAllclose([
+        0,
+        3.720075976020836e-44,
+        1.9287498479639178e-22,
+        4.5399929762484854e-5,
+        1,
+        22026.465794806718,
+        5.184705528587072e21,
+        2.6881171418161356e43,
+        Infinity,
+      ]);
     });
 
     test("works with jvp", () => {
@@ -896,24 +912,25 @@ suite.each(devices)("device:%s", (device) => {
   });
 
   suite("jax.numpy.tanh()", () => {
-    const vals = [-1, -0.7, 0, 0.5, 1.7, 10];
+    const vals = [-1, -0.7, 0, 0.5, 1.7, 10, 50, 100, 1000];
 
     test("sinh values", () => {
       for (const x of vals) {
-        expect(np.sinh(x).js()).toBeCloseTo(Math.sinh(x));
+        expect(np.sinh(x)).toBeAllclose(Math.sinh(x));
       }
     });
 
     test("cosh values", () => {
       for (const x of vals) {
-        expect(np.cosh(x).js()).toBeCloseTo(Math.cosh(x));
+        expect(np.cosh(x)).toBeAllclose(Math.cosh(x));
       }
     });
 
     test("tanh values", () => {
       for (const x of vals) {
-        expect(np.tanh(x).js()).toBeCloseTo(Math.tanh(x));
+        expect(np.tanh(x)).toBeAllclose(Math.tanh(x));
       }
+      expect(np.tanh(Infinity).js()).toEqual(1);
     });
   });
 });

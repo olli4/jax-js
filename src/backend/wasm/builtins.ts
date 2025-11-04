@@ -25,6 +25,28 @@ export function wasm_exp(cg: CodeGenerator): number {
     cg.i32.trunc_sat_f32_s();
     cg.local.set(k);
 
+    // Handle overflow: if k > 127, return Infinity
+    cg.local.get(k);
+    cg.i32.const(127);
+    cg.i32.gt_s();
+    cg.if(cg.void);
+    {
+      cg.f32.const(Infinity);
+      cg.return();
+    }
+    cg.end();
+
+    // Handle underflow: if k < -126, return 0
+    cg.local.get(k);
+    cg.i32.const(-126);
+    cg.i32.lt_s();
+    cg.if(cg.void);
+    {
+      cg.f32.const(0.0);
+      cg.return();
+    }
+    cg.end();
+
     // r = x - k*ln2
     cg.local.get(0);
     cg.local.get(k_f);

@@ -766,7 +766,10 @@ export function cosh(x: ArrayLike): Array {
  * `tanh(x) = sinh(x)/cosh(x) = (exp(x) - exp(-x)) / (exp(x) + exp(-x))`
  */
 export function tanh(x: ArrayLike): Array {
+  // Avoid overflow for large x by taking advantage of alternate representations:
+  // tanh(x) = -tanh(-x) = (1 - e^{-2x}) / (1 + e^{-2x})
   x = fudgeArray(x);
-  const e2x = exp(x.ref.add(x));
-  return e2x.ref.sub(1).div(e2x.add(1));
+  const negsgn = where(less(x.ref, 0), 1, -1);
+  const en2x = exp(x.mul(negsgn.ref).mul(2));
+  return en2x.ref.sub(1).div(en2x.add(1)).mul(negsgn);
 }
