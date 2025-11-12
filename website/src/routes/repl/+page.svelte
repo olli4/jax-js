@@ -85,11 +85,10 @@
 
     mockConsole.clear();
 
-    await jax.init();
-    try {
+    const devices = await jax.init();
+    if (devices.includes("webgpu")) {
       jax.setDevice("webgpu");
-    } catch (err: any) {
-      mockConsole.error(err);
+    } else {
       mockConsole.warn(`WebGPU not supported, falling back to Wasm`);
       jax.setDevice("wasm");
     }
