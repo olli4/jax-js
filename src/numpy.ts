@@ -489,7 +489,7 @@ export function ravel(a: ArrayLike): Array {
  */
 export function repeat(a: ArrayLike, repeats: number, axis?: number): Array {
   if (!Number.isInteger(repeats) || repeats < 0) {
-    throw new TypeError(
+    throw new Error(
       `repeat: repeats must be a non-negative integer, got ${repeats}`,
     );
   }
@@ -499,6 +499,9 @@ export function repeat(a: ArrayLike, repeats: number, axis?: number): Array {
     axis = 0;
   }
   axis = checkAxis(axis, a.ndim);
+  if (repeats === 1) {
+    return a;
+  }
   const broadcastedShape = a.shape.toSpliced(axis + 1, 0, repeats);
   const finalShape = a.shape.toSpliced(axis, 1, a.shape[axis] * repeats);
   return core
