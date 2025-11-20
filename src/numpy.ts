@@ -510,6 +510,41 @@ export function repeat(a: ArrayLike, repeats: number, axis?: number): Array {
 }
 
 /**
+ * Construct an array by repeating A the number of times given by reps.
+ *
+ * If `A` is an array of shape `(d1, d2, ..., dn)` and `reps` is a sequence of
+ * integers, the resulting array will have a shape of `(reps[0] * d1,
+ * reps[1] * d2, ..., reps[n] * dn)`, with `A` tiled along each dimension.
+ */
+export function tile(a: ArrayLike, reps: number | number[]): Array {
+  a = fudgeArray(a);
+  if (typeof reps === "number") reps = [reps];
+  if (!reps.every((r) => Number.isInteger(r) && r >= 0)) {
+    throw new Error(
+      `tile: reps must be non-negative integers, got ${JSON.stringify(reps)}`,
+    );
+  }
+  // Prepend 1s to match dimensions
+  const ndiff = reps.length - a.ndim;
+  if (ndiff > 0) a = a.reshape([...rep(ndiff, 1), ...a.shape]);
+  if (ndiff < 0) reps = [...rep(-ndiff, 1), ...reps];
+  // Build broadcasted shape by interleaving reps where > 1: [r1, d1, r2, d2, ...]
+  const broadcastedShape: number[] = [];
+  const broadcastAxes: number[] = [];
+  for (let i = 0; i < a.ndim; i++) {
+    if (reps[i] > 1) {
+      broadcastedShape.push(reps[i]);
+      broadcastAxes.push(broadcastedShape.length - 1);
+    }
+    broadcastedShape.push(a.shape[i]);
+  }
+  const finalShape = a.shape.map((d, i) => reps[i] * d);
+  return core
+    .broadcast(a, broadcastedShape, broadcastAxes)
+    .reshape(finalShape) as Array;
+}
+
+/**
  * Return specified diagonals.
  *
  * If a is 2D, return the diagonal of the array with the given offset. If a is

@@ -970,4 +970,41 @@ suite.each(devices)("device:%s", (device) => {
       expect(y.js()).toEqual([1, 1, 2, 2, 3, 3, 4, 4]);
     });
   });
+
+  suite("jax.numpy.tile()", () => {
+    test("tiles 1D array", () => {
+      const x = np.array([1, 2, 3]);
+      const y = np.tile(x, 2);
+      expect(y.js()).toEqual([1, 2, 3, 1, 2, 3]);
+    });
+
+    test("tiles 2D array along multiple axes", () => {
+      const x = np.array([
+        [1, 2],
+        [3, 4],
+      ]);
+      const y = np.tile(x.ref, [2, 1]);
+      expect(y.js()).toEqual([
+        [1, 2],
+        [3, 4],
+        [1, 2],
+        [3, 4],
+      ]);
+
+      const z = np.tile(x, 3);
+      expect(z.js()).toEqual([
+        [1, 2, 1, 2, 1, 2],
+        [3, 4, 3, 4, 3, 4],
+      ]);
+    });
+
+    test("tiles with reps having more dimensions than array", () => {
+      const x = np.array([1, 2]);
+      const y = np.tile(x, [2, 2]);
+      expect(y.js()).toEqual([
+        [1, 2, 1, 2],
+        [1, 2, 1, 2],
+      ]);
+    });
+  });
 });
