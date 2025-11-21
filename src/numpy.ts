@@ -844,6 +844,34 @@ export function log10(x: ArrayLike): Array {
   return log(x).mul(Math.LOG10E);
 }
 
+/** Calculate `exp(x) - 1` element-wise. */
+export function expm1(x: ArrayLike): Array {
+  // TODO: This isn't actually higher precision than just exp(x)-1 right now.
+  return exp(x).sub(1);
+}
+
+/** Calculate the natural logarithm of `1 + x` element-wise. */
+export function log1p(x: ArrayLike): Array {
+  // TODO: This isn't actually higher precision than just log(1+x) right now.
+  return log(add(1, x));
+}
+
+/** Convert angles from degrees to radians. */
+export function deg2rad(x: ArrayLike): Array {
+  return multiply(x, pi / 180);
+}
+
+/** Alias of `jax.numpy.deg2rad()`. */
+export const radians = deg2rad;
+
+/** Convert angles from radians to degrees. */
+export function rad2deg(x: ArrayLike): Array {
+  return multiply(x, 180 / pi);
+}
+
+/** Alias of `jax.numpy.rad2deg()`. */
+export const degrees = rad2deg;
+
 /** Computes first array raised to power of second array, element-wise. */
 export function power(x1: ArrayLike, x2: ArrayLike): Array {
   return exp(log(x1).mul(x2));
