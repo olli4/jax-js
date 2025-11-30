@@ -68,6 +68,7 @@ export function softSign(x: ArrayLike): Array {
 }
 
 /**
+ * @function
  * Sigmoid-weighted Linear Unit (SiLU) activation function, also known as
  * Swish, computed element-wise:
  * `silu(x) = x * sigmoid(x) = x / (1 + exp(-x))`.
@@ -79,6 +80,7 @@ export function softSign(x: ArrayLike): Array {
 export const silu = jit((x: Array) => x.ref.mul(sigmoid(x)));
 
 /**
+ * @function
  * Sigmoid-weighted Linear Unit (SiLU) activation function, also known as
  * Swish, computed element-wise:
  * `silu(x) = x * sigmoid(x) = x / (1 + exp(-x))`.
@@ -97,7 +99,10 @@ export function logSigmoid(x: ArrayLike): Array {
   return negative(softplus(negative(x)));
 }
 
-/** Identity activation function. Returns the argument unmodified. */
+/**
+ * @function
+ * Identity activation function. Returns the argument unmodified.
+ */
 export const identity = fudgeArray;
 
 /** Leaky rectified linear (ReLU) activation function */
@@ -129,6 +134,7 @@ export function celu(x: ArrayLike, alpha: number = 1.0): Array {
 }
 
 /**
+ * @function
  * Gaussion error linear unit (GELU) activation function.
  *
  * This is computed element-wise. Currently jax-js does not support the erf() or

@@ -65,71 +65,79 @@ export const pi = Math.PI;
 // current stack of interpreters. But we hide that away from users to mimic
 // JAX's composable tracing transformations.
 
-/** Element-wise addition, with broadcasting. */
+/** @function Element-wise addition, with broadcasting. */
 export const add = core.add as (x: ArrayLike, y: ArrayLike) => Array;
-/** Element-wise multiplication, with broadcasting. */
+/** @function Element-wise multiplication, with broadcasting. */
 export const multiply = core.mul as (x: ArrayLike, y: ArrayLike) => Array;
-/** Numerical negative of every element of an array. */
+/** @function Numerical negative of every element of an array. */
 export const negative = core.neg as (x: ArrayLike) => Array;
-/** Calculate element-wise reciprocal of the input. This is `1/x`. */
+/** @function Calculate element-wise reciprocal of the input. This is `1/x`. */
 export const reciprocal = core.reciprocal as (x: ArrayLike) => Array;
-/** Element-wise sine function (takes radians). */
+/** @function Element-wise sine function (takes radians). */
 export const sin = core.sin as (x: ArrayLike) => Array;
-/** Element-wise cosine function (takes radians). */
+/** @function Element-wise cosine function (takes radians). */
 export const cos = core.cos as (x: ArrayLike) => Array;
-/** Calculate the exponential of all elements in the input array. */
+/** @function Calculate the exponential of all elements in the input array. */
 export const exp = core.exp as (x: ArrayLike) => Array;
-/** Calculate the natural logarithm of all elements in the input array. */
+/** @function Calculate the natural logarithm of all elements in the input array. */
 export const log = core.log as (x: ArrayLike) => Array;
-/** Calculate the square root of all elements in the input array. */
+/** @function Calculate the square root of all elements in the input array. */
 export const sqrt = core.sqrt as (x: ArrayLike) => Array;
-/** Return element-wise minimum of the input arrays. */
+/** @function Return element-wise minimum of the input arrays. */
 export const minimum = core.min as (x: ArrayLike, y: ArrayLike) => Array;
-/** Return element-wise maximum of the input arrays. */
+/** @function Return element-wise maximum of the input arrays. */
 export const maximum = core.max as (x: ArrayLike, y: ArrayLike) => Array;
-/** Compare two arrays element-wise. */
+/** @function Compare two arrays element-wise. */
 export const greater = core.greater as (x: ArrayLike, y: ArrayLike) => Array;
-/** Compare two arrays element-wise. */
+/** @function Compare two arrays element-wise. */
 export const less = core.less as (x: ArrayLike, y: ArrayLike) => Array;
-/** Compare two arrays element-wise. */
+/** @function Compare two arrays element-wise. */
 export const equal = core.equal as (x: ArrayLike, y: ArrayLike) => Array;
-/** Compare two arrays element-wise. */
+/** @function Compare two arrays element-wise. */
 export const notEqual = core.notEqual as (x: ArrayLike, y: ArrayLike) => Array;
-/** Compare two arrays element-wise. */
+/** @function Compare two arrays element-wise. */
 export const greaterEqual = core.greaterEqual as (
   x: ArrayLike,
   y: ArrayLike,
 ) => Array;
-/** Compare two arrays element-wise. */
+/** @function Compare two arrays element-wise. */
 export const lessEqual = core.lessEqual as (
   x: ArrayLike,
   y: ArrayLike,
 ) => Array;
-/** Element-wise ternary operator, evaluates to `x` if cond else `y`. */
+/** @function Element-wise ternary operator, evaluates to `x` if cond else `y`. */
 export const where = core.where as (
   cond: ArrayLike,
   x: ArrayLike,
   y: ArrayLike,
 ) => Array;
-/** Permute the dimensions of an array. Defaults to reversing the axis order. */
+/**
+ * @function
+ * Permute the dimensions of an array. Defaults to reversing the axis order.
+ */
 export const transpose = core.transpose as (
   x: ArrayLike,
   perm?: number[],
 ) => Array;
 /**
+ * @function
  * Give a new shape to an array without changing its data.
  *
  * One shape dimension can be -1. In this case, the value is inferred from the
  * length of the array and remaining dimensions.
  */
 export const reshape = core.reshape as (x: ArrayLike, shape: number[]) => Array;
-/** Move axes of an array to new positions. Other axes retain original order. */
+/**
+ * @function
+ * Move axes of an array to new positions. Other axes retain original order.
+ */
 export const moveaxis = vmapModule.moveaxis as (
   x: ArrayLike,
   src: number,
   dst: number,
 ) => Array;
 /**
+ * @function
  * Add padding (zeros) to an array.
  *
  * The `width` argument is either an integer or pair of integers, in which case
@@ -141,25 +149,37 @@ export const pad = core.pad as (
   width: number | [number, number] | [number, number][],
 ) => Array;
 
-/** Return the number of dimensions of an array. Does not consume array reference. */
+/**
+ * @function
+ * Return the number of dimensions of an array. Does not consume array reference.
+ */
 export const ndim = core.ndim as (x: ArrayLike) => number;
 
-/** Return the shape of an array. Does not consume array reference. */
+/** @function Return the shape of an array. Does not consume array reference. */
 export const shape = core.getShape as (x: ArrayLike) => number[];
 
-/** Return an array of zeros with the same shape and type as a given array. */
+/**
+ * @function
+ * Return an array of zeros with the same shape and type as a given array.
+ */
 export const zerosLike = zerosLikeUnfudged as (
   a: ArrayLike,
   dtype?: DType,
 ) => Array;
 
-/** Return an array of ones with the same shape and type as a given array. */
+/**
+ * @function
+ * Return an array of ones with the same shape and type as a given array.
+ */
 export const onesLike = onesLikeUnfudged as (
   a: ArrayLike,
   dtype?: DType,
 ) => Array;
 
-/** Return a full array with the same shape and type as a given array. */
+/**
+ * @function
+ * Return a full array with the same shape and type as a given array.
+ */
 export const fullLike = fullLikeUnfudged as (
   a: ArrayLike,
   fillValue: number | boolean | Array,
@@ -474,7 +494,7 @@ export function fliplr(x: ArrayLike): Array {
   return flip(x, 1);
 }
 
-/** Alternative name for `numpy.transpose()`. */
+/** @function Alternative name for `numpy.transpose()`. */
 export const permuteDims = transpose;
 
 /** Return a 1-D flattened array containing the elements of the input. */
@@ -780,7 +800,7 @@ export function absolute(x: ArrayLike): Array {
   return where(less(x.ref, 0), x.ref.mul(-1), x);
 }
 
-/** Alias of `jax.numpy.absolute()`. */
+/** @function Alias of `jax.numpy.absolute()`. */
 export const abs = absolute;
 
 /** Return an element-wise indication of sign of the input. */
@@ -821,7 +841,7 @@ export function trueDivide(x: ArrayLike, y: ArrayLike): Array {
   return x.div(y);
 }
 
-/** Alias of `jax.numpy.trueDivide()`. */
+/** @function Alias of `jax.numpy.trueDivide()`. */
 export const divide = trueDivide;
 
 /** Round input to the nearest integer towards zero. */
@@ -861,7 +881,7 @@ export function deg2rad(x: ArrayLike): Array {
   return multiply(x, pi / 180);
 }
 
-/** Alias of `jax.numpy.deg2rad()`. */
+/** @function Alias of `jax.numpy.deg2rad()`. */
 export const radians = deg2rad;
 
 /** Convert angles from radians to degrees. */
@@ -869,7 +889,7 @@ export function rad2deg(x: ArrayLike): Array {
   return multiply(x, 180 / pi);
 }
 
-/** Alias of `jax.numpy.rad2deg()`. */
+/** @function Alias of `jax.numpy.rad2deg()`. */
 export const degrees = rad2deg;
 
 /** Computes first array raised to power of second array, element-wise. */
@@ -877,7 +897,7 @@ export function power(x1: ArrayLike, x2: ArrayLike): Array {
   return exp(log(x1).mul(x2));
 }
 
-/** Alias of `jax.numpy.power()`. */
+/** @function Alias of `jax.numpy.power()`. */
 export const pow = power;
 
 /** Calculate the element-wise cube root of the input array. */
