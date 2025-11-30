@@ -16,10 +16,10 @@ Other features just aren't implemented yet. But those can probably be added easi
 
 In the tables below, we use a color legend to refer to functions in JAX:
 
-- 🟢 = supported
-- 🟡 = supported, with API limitations
-- 🟠 = not supported, easy to add (<1 day)
-- 🔴 = not supported
+- 🟢 = supported **(~35%)**
+- 🟡 = supported, with API limitations **(~1%)**
+- 🟠 = not supported, easy to add (<1 day) **(~40%)**
+- 🔴 = not supported **(~25%)**
 - ⚪️ = not applicable, will not be supported (see notes)
 
 ## [`jax`](https://docs.jax.dev/en/latest/jax.html)
