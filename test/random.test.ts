@@ -79,4 +79,19 @@ suite.each(devices)("device:%s", (device) => {
     expect(twosigma / count).toBeCloseTo(0.9545);
     expect(threesigma / count).toBeCloseTo(0.9973);
   });
+
+  test("bernoulli distribution", () => {
+    const key = random.key(2024);
+    const count = 500;
+    const p = np.array([[0.25], [0.8]]); // try array of p
+    const samples: boolean[][] = random.bernoulli(key, p, [2, count]).js();
+    const trues = [0, 0];
+    for (let i = 0; i < 2; i++) {
+      for (const s of samples[i]) {
+        if (s) trues[i]++;
+      }
+    }
+    expect(trues[0] / count).toBeCloseTo(0.25, 1);
+    expect(trues[1] / count).toBeCloseTo(0.8, 1);
+  });
 });

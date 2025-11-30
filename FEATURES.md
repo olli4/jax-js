@@ -565,8 +565,7 @@ modeling their transcendental CDFs (e.g., normal via Box-Muller).
 | API                    | Support | Notes |
 | ---------------------- | ------- | ----- |
 | `ball`                 | 🟠      |       |
-| `ball`                 | 🟠      |       |
-| `bernoulli`            | 🟠      |       |
+| `bernoulli`            | 🟢      |       |
 | `beta`                 | 🟠      |       |
 | `binomial`             | 🟠      |       |
 | `bits`                 | 🟢      |       |

@@ -1,9 +1,11 @@
 // Port of the `jax.random` module.
 
+import { fudgeArray } from "./frontend/array";
 import { bitcast, randomBits } from "./frontend/core";
 import {
   array,
   Array,
+  ArrayLike,
   cos,
   DType,
   log1p,
@@ -89,6 +91,21 @@ export function uniform(
   } else {
     return rand.mul(maxval - minval).add(minval);
   }
+}
+
+/**
+ * Sample Bernoulli random variables with given mean (0,1 categorical).
+ *
+ * Returns a random Boolean array with the specified shape. `p` can be an array
+ * and must be broadcastable to `shape`.
+ */
+export function bernoulli(
+  key: Array,
+  p: ArrayLike = 0.5,
+  shape: number[] = [],
+): Array {
+  p = fudgeArray(p);
+  return uniform(key, shape).less(p);
 }
 
 /** Sample exponential random values according to `p(x) = exp(-x)`. */
