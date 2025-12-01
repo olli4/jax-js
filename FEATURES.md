@@ -645,7 +645,7 @@ would need substantial changes to work well in JavaScript.
 | ------------------------------- | ------- | ------------------------ |
 | `softmax`                       | 🟢      |                          |
 | `log_softmax`                   | 🟢      |                          |
-| `logmeanexp`                    | 🟠      |                          |
+| `logmeanexp`                    | 🟢      |                          |
 | `logsumexp`                     | 🟢      |                          |
 | `standardize`                   | 🟠      |                          |
 | `one_hot`                       | 🟢      |                          |

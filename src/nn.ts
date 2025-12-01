@@ -22,7 +22,7 @@ import {
   where,
 } from "./numpy";
 import { Pair } from "./shape";
-import { checkAxis, range } from "./utils";
+import { checkAxis, normalizeAxis } from "./utils";
 
 /**
  * Rectified Linear Unit (ReLU) activation function:
@@ -267,18 +267,22 @@ export function logSoftmax(x: ArrayLike, axis?: number | number[]): Array {
  */
 export function logsumexp(x: ArrayLike, axis?: number | number[]): Array {
   x = fudgeArray(x);
-  if (axis === undefined) {
-    axis = range(x.ndim); // default to all axes
-  } else if (typeof axis === "number") {
-    axis = [axis];
-  }
-
+  axis = normalizeAxis(axis, x.ndim);
   if (axis.length === 0) return x;
 
   const xMax = stopGradient(max(x.ref, axis)) as Array;
   const xMaxDims = broadcast(xMax.ref, x.shape, axis); // keep dims
   const shifted = x.sub(xMaxDims);
   return xMax.add(log(exp(shifted).sum(axis)));
+}
+
+/** Log-mean-exp reduction, like `jax.nn.logsumexp()` but subtracts `log(n)`. */
+export function logmeanexp(x: ArrayLike, axis?: number | number[]): Array {
+  x = fudgeArray(x);
+  axis = normalizeAxis(axis, x.ndim);
+  if (axis.length === 0) return x;
+  const n = axis.reduce((acc, a) => acc * x.shape[a], 1);
+  return logsumexp(x, axis).sub(Math.log(n));
 }
 
 /**

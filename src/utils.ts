@@ -129,6 +129,20 @@ export function checkAxis(axis: number, ndim: number): number {
   return axis < 0 ? axis + ndim : axis;
 }
 
+/** Normalize common axis argument for functions, defaulting to all axes. */
+export function normalizeAxis(
+  axis: number | number[] | undefined,
+  ndim: number,
+): number[] {
+  if (axis === undefined) {
+    return range(ndim); // default to all axes
+  } else if (typeof axis === "number") {
+    return [checkAxis(axis, ndim)];
+  } else {
+    return unique(axis.map((a) => checkAxis(a, ndim)));
+  }
+}
+
 /** Return sorted unique items in the list of values. */
 export function unique(values: number[]): number[] {
   const newValues: number[] = [];

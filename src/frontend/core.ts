@@ -12,10 +12,10 @@ import {
   DEBUG,
   isNumberPair,
   isPermutation,
+  normalizeAxis,
   prod,
   range,
   rep,
-  unique,
 } from "../utils";
 import type { ConvParams } from "./convolution";
 import type { Jaxpr } from "./jaxpr";
@@ -194,14 +194,7 @@ export function reduce(
   if (!AluGroup.Reduce.has(op)) {
     throw new TypeError(`Invalid reduce operation: ${op}`);
   }
-  if (axis === undefined) {
-    if (x instanceof Tracer) axis = range(x.shape.length);
-    else axis = [];
-  } else if (typeof axis === "number") {
-    axis = [checkAxis(axis, ndim(x))];
-  } else {
-    axis = unique(axis.map((a) => checkAxis(a, ndim(x))));
-  }
+  axis = normalizeAxis(axis, ndim(x));
   const originalShape = getShape(x);
   let result = bind1(Primitive.Reduce, [x], { op, axis });
   if (opts?.keepdims) {
@@ -272,7 +265,7 @@ export function transpose(x: TracerValue, perm?: number[]) {
 }
 
 export function broadcast(x: TracerValue, shape: number[], axis: number[]) {
-  axis = unique(axis.map((a) => checkAxis(a, shape.length)));
+  axis = normalizeAxis(axis, shape.length);
   return bind1(Primitive.Broadcast, [x], { shape, axis });
 }
 
@@ -298,7 +291,7 @@ export function reshape(x: TracerValue, shape: number | number[]) {
 }
 
 export function flip(x: TracerValue, axis: number[]) {
-  axis = unique(axis.map((a) => checkAxis(a, ndim(x))));
+  axis = normalizeAxis(axis, ndim(x));
   return bind1(Primitive.Flip, [x], { axis });
 }
 
@@ -565,13 +558,7 @@ export abstract class Tracer {
 
   /** Compute the average of the array elements along the specified axis. */
   mean(axis?: number | number[], opts?: ReduceOpts) {
-    if (axis === undefined) {
-      axis = range(this.ndim);
-    } else if (typeof axis === "number") {
-      axis = [checkAxis(axis, this.ndim)];
-    } else {
-      axis = unique(axis.map((a) => checkAxis(a, this.ndim)));
-    }
+    axis = normalizeAxis(axis, this.ndim);
     const n = axis.reduce((acc, a) => acc * this.shape[a], 1);
     if (n === 0) {
       throw new Error("mean: cannot compute mean over zero-length axis");
