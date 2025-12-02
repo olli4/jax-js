@@ -1,5 +1,12 @@
 <script lang="ts">
-  import { defaultDevice, init, jit, numpy as np, tree } from "@jax-js/jax";
+  import {
+    defaultDevice,
+    init,
+    jit,
+    numpy as np,
+    setDebug,
+    tree,
+  } from "@jax-js/jax";
   import { cachedFetch, opfs, safetensors, tokenizers } from "@jax-js/loaders";
   import { FileTextIcon, ImageIcon } from "lucide-svelte";
 
@@ -97,9 +104,22 @@
       const tokens = np.array(tokenizer.encode("hello world"), {
         dtype: np.uint32,
       });
-      const encoded = runEncoder(tree.ref(model.text), tokens);
       console.log("-------- ENCODED --------");
+      setDebug(3);
+      const encoded = runEncoder(tree.ref(model.text), tokens.ref);
       console.log(await encoded.jsAsync());
+      for (let i = 0; i < 5; i++) {
+        performance.mark("clip-start");
+        const t0 = performance.now();
+        const result = runEncoder(tree.ref(model.text), tokens.ref);
+        await result.blockUntilReady();
+        result.dispose();
+        const t1 = performance.now();
+        performance.mark("clip-end");
+        performance.measure("clip", "clip-start", "clip-end");
+        console.log(`Run ${i + 1}: ${t1 - t0} ms`);
+      }
+      tokens.dispose();
     } catch (error) {
       console.error("Error in main:", error);
     }

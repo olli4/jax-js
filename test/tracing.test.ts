@@ -80,7 +80,8 @@ suite("jax.makeJaxpr()", () => {
     expect(consts).toEqual([]);
     expect(jaxpr.toString()).toMatchInlineSnapshot(`
       "{ lambda a:float32[] .
-        let b:float32[] = jit_call [ jaxpr={ lambda a:float32[] .
+        let b:float32[] = jit_call [ name=f
+                                     jaxpr={ lambda a:float32[] .
                                        let b:float32[] = add a 2
                                            c:float32[] = mul a a
                                            d:float32[] = add c b
