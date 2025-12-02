@@ -244,12 +244,13 @@ const jvpRules: { [P in Primitive]: JvpRule<P> } = {
       [gather(dx, indicesRef, axis, outDim)],
     ];
   },
-  [Primitive.JitCall](primals, tangents, { jaxpr }) {
+  [Primitive.JitCall](primals, tangents, { name, jaxpr }) {
     const { newJaxpr, newConsts } = jvpJaxpr(jaxpr);
     const outs = bind(
       Primitive.JitCall,
       [...newConsts.map((c) => c.ref), ...primals, ...tangents],
       {
+        name: `${name}_jvp`,
         jaxpr: newJaxpr,
         numConsts: newConsts.length,
       },

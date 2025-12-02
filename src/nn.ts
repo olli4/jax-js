@@ -81,7 +81,9 @@ export function softSign(x: ArrayLike): Array {
  *
  * Reference: https://en.wikipedia.org/wiki/Swish_function
  */
-export const silu = jit((x: Array) => x.ref.mul(sigmoid(x)));
+export const silu = jit(function silu(x: Array) {
+  return x.ref.mul(sigmoid(x));
+});
 
 /**
  * @function
@@ -152,7 +154,7 @@ export function celu(x: ArrayLike, alpha: ArrayLike = 1.0): Array {
  *
  * This will be improved in the future.
  */
-export const gelu = jit((x: Array): Array => {
+export const gelu = jit(function gelu(x: Array): Array {
   const SQRT_2_OVER_PI = Math.sqrt(2 / Math.PI);
   return x.ref
     .mul(0.5)

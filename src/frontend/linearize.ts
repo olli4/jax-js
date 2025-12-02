@@ -297,8 +297,9 @@ class PartialEvalTrace extends Trace {
       // Special case, needs its own PartialEvalTrace handling because unlike
       // other primtiives, JitCall can have subexpressions that are known while
       // other outputs are unknown.
-      const { jaxpr, numConsts } = params as PrimitiveParams<Primitive.JitCall>;
-      return this.#partialEvalJaxpr(jaxpr, numConsts, tracers);
+      const { name, jaxpr, numConsts } =
+        params as PrimitiveParams<Primitive.JitCall>;
+      return this.#partialEvalJaxpr(name, jaxpr, numConsts, tracers);
     }
     const tracersIn = tracers.map((t) => this.instantiateConst(t));
     const avalsIn = tracersIn.map((t) => t.pval.aval);
@@ -330,6 +331,7 @@ class PartialEvalTrace extends Trace {
    * Used when encountering a JitCall rule during the trace.
    */
   #partialEvalJaxpr(
+    name: string,
     jaxpr: Jaxpr,
     numConsts: number,
     tracers: PartialEvalTracer[],
@@ -348,7 +350,7 @@ class PartialEvalTrace extends Trace {
     const outs1Res = bind(
       Primitive.JitCall,
       knownTracers.map((t) => t.ref.fullLower()),
-      { jaxpr: jaxpr1, numConsts: 0 },
+      { name: `${name}_peval`, jaxpr: jaxpr1, numConsts: 0 },
     );
     const outs1 = outs1Res.slice(0, jaxpr1.outs.length - numRes);
     const res = outs1Res.slice(jaxpr1.outs.length - numRes);
@@ -360,7 +362,7 @@ class PartialEvalTrace extends Trace {
       type: "JaxprEqn",
       prim: Primitive.JitCall,
       tracersIn: resTracers.concat(unknownTracers),
-      params: { jaxpr: jaxpr2, numConsts: 0 },
+      params: { name: `${name}_resid`, jaxpr: jaxpr2, numConsts: 0 },
       avalsOut: jaxpr2.outs.map((x) => x.aval),
       tracerRefsOut: [], // populated later
     };
@@ -845,7 +847,7 @@ const transposeRules: Partial<{ [P in Primitive]: TransposeRule<P> }> = {
       "Gather transpose rule is not yet implemented, requires complex Scatter sum operation",
     );
   },
-  [Primitive.JitCall](cts, args, { jaxpr }) {
+  [Primitive.JitCall](cts, args, { name, jaxpr }) {
     // We need this one because the jvp() rule for JitCall generates a JitCall
     // with the transformed Jaxpr. So grad-of-jit will result in a transposed
     // JitCall, which we need to handle.
@@ -856,6 +858,7 @@ const transposeRules: Partial<{ [P in Primitive]: TransposeRule<P> }> = {
       Primitive.JitCall,
       [...newConsts.map((c) => c.ref), ...residuals, ...cts],
       {
+        name: `${name}_t`,
         jaxpr: newJaxpr,
         numConsts: newConsts.length,
       },

@@ -298,12 +298,13 @@ const vmapRules: Partial<{ [P in Primitive]: VmapRule<P> }> = {
     const newWidth = width.toSpliced(xBdim, 0, [0, 0]);
     return [[pad(x, newWidth)], [xBdim]];
   },
-  [Primitive.JitCall](axisSize, args, dims, { jaxpr }) {
+  [Primitive.JitCall](axisSize, args, dims, { name, jaxpr }) {
     const { newJaxpr, newConsts } = vmapJaxpr(jaxpr, axisSize, dims);
     const outs = bind(
       Primitive.JitCall,
       [...newConsts.map((c) => c.ref), ...args],
       {
+        name: `${name}_vmap`,
         jaxpr: newJaxpr,
         numConsts: newConsts.length,
       },

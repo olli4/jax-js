@@ -87,7 +87,7 @@ interface PrimitiveParamsImpl extends Record<Primitive, Record<string, any>> {
   [Primitive.Shrink]: { slice: Pair[] };
   [Primitive.Pad]: { width: Pair[] };
   [Primitive.Gather]: { axis: number[]; outDim: number };
-  [Primitive.JitCall]: { jaxpr: Jaxpr; numConsts: number };
+  [Primitive.JitCall]: { name: string; jaxpr: Jaxpr; numConsts: number };
 }
 
 /** Type of parameters taken by each primitive. */

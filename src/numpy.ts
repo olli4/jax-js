@@ -923,7 +923,7 @@ export function acos(x: ArrayLike): Array {
  * stable than sqrt(x1**2 + x2**2). We don't currently implement those stability
  * improvements.
  */
-export const hypot = jit((x1: Array, x2: Array) => {
+export const hypot = jit(function hypot(x1: Array, x2: Array) {
   return sqrt(square(x1).add(square(x2)));
 });
 
@@ -940,7 +940,7 @@ export const hypot = jit((x1: Array, x2: Array) => {
  *
  * The output is ill-defined when both x and y are zero.
  */
-export const atan2 = jit((y: Array, x: Array) => {
+export const atan2 = jit(function atan2(y: Array, x: Array) {
   const r = sqrt(square(x.ref).add(square(y.ref)));
   const xNeg = less(x.ref, 0);
 
@@ -1035,7 +1035,7 @@ export const degrees = rad2deg;
  * @function
  * Computes first array raised to power of second array, element-wise.
  */
-export const power = jit((x1: Array, x2: Array) => {
+export const power = jit(function power(x1: Array, x2: Array) {
   return exp(log(x1).mul(x2));
 });
 
@@ -1043,7 +1043,7 @@ export const power = jit((x1: Array, x2: Array) => {
 export const pow = power;
 
 /** @function Calculate the element-wise cube root of the input array. */
-export const cbrt = jit((x: Array) => {
+export const cbrt = jit(function cbrt(x: Array) {
   // This isn't just power(x, 1/3) since we need to handle negative numbers.
   const sgn = where(less(x.ref, 0), -1, 1);
   return sgn.ref.mul(exp(log(x.mul(sgn)).mul(1 / 3)));
@@ -1055,7 +1055,7 @@ export const cbrt = jit((x: Array) => {
  *
  * `sinh(x) = (exp(x) - exp(-x)) / 2`
  */
-export const sinh = jit((x: Array) => {
+export const sinh = jit(function sinh(x: Array) {
   const ex = exp(x);
   const emx = reciprocal(ex.ref);
   return ex.sub(emx).mul(0.5);
@@ -1067,7 +1067,7 @@ export const sinh = jit((x: Array) => {
  *
  * `cosh(x) = (exp(x) + exp(-x)) / 2`
  */
-export const cosh = jit((x: Array) => {
+export const cosh = jit(function cosh(x: Array) {
   const ex = exp(x);
   const emx = reciprocal(ex.ref);
   return ex.add(emx).mul(0.5);
@@ -1079,7 +1079,7 @@ export const cosh = jit((x: Array) => {
  *
  * `tanh(x) = sinh(x)/cosh(x) = (exp(x) - exp(-x)) / (exp(x) + exp(-x))`
  */
-export const tanh = jit((x: Array) => {
+export const tanh = jit(function tanh(x: Array) {
   // Avoid overflow for large x by taking advantage of alternate representations:
   // tanh(x) = -tanh(-x) = (1 - e^{-2x}) / (1 + e^{-2x})
   const negsgn = where(less(x.ref, 0), 1, -1);
@@ -1093,7 +1093,7 @@ export const tanh = jit((x: Array) => {
  *
  * `arcsinh(x) = ln(x + sqrt(x^2 + 1))`
  */
-export const arcsinh = jit((x: Array) => {
+export const arcsinh = jit(function arcsinh(x: Array) {
   return log(x.ref.add(sqrt(square(x).add(1))));
 });
 
@@ -1103,7 +1103,7 @@ export const arcsinh = jit((x: Array) => {
  *
  * `arccosh(x) = ln(x + sqrt(x^2 - 1))`
  */
-export const arccosh = jit((x: Array) => {
+export const arccosh = jit(function arccosh(x: Array) {
   return log(x.ref.add(sqrt(square(x).sub(1))));
 });
 
@@ -1113,7 +1113,7 @@ export const arccosh = jit((x: Array) => {
  *
  * `arctanh(x) = 0.5 * ln((1 + x) / (1 - x))`
  */
-export const arctanh = jit((x: Array) => {
+export const arctanh = jit(function arctanh(x: Array) {
   return log(add(1, x.ref).div(subtract(1, x))).mul(0.5);
 });
 

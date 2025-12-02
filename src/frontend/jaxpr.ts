@@ -966,6 +966,7 @@ export function jit<F extends (...args: any[]) => any>(
       Primitive.JitCall,
       [...consts.map((c) => c.ref), ...argsFlat],
       {
+        name: f.name || "closure",
         jaxpr,
         numConsts: consts.length,
       },
