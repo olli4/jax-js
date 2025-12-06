@@ -2,6 +2,7 @@
 
 import { fudgeArray } from "./frontend/array";
 import { bitcast, randomBits } from "./frontend/core";
+import { jit } from "./frontend/jaxpr";
 import {
   array,
   Array,
@@ -69,29 +70,35 @@ export function bits(key: Array, shape: number[] = []): Array {
   ) as Array;
 }
 
-/** Sample uniform random values in [minval, maxval) with given shape. */
-export function uniform(
-  key: Array,
-  shape: number[] = [],
-  { minval = 0, maxval = 1 }: { minval?: number; maxval?: number } = {},
-): Array {
-  if (minval >= maxval) {
-    throw new Error(`Invalid range: [${minval}, ${maxval}).`);
-  }
-  // Float32 has sign bit, 8 bits of exponent, and 23 bits of mantissa.
-  const mantissa = bits(key, shape).div(
-    array(1 << 9, { dtype: DType.Uint32, device: key.device }),
-  );
-  const float12 = mantissa.add(
-    array(0x3f800000, { dtype: DType.Uint32, device: key.device }),
-  ); // Add 1.0 in IEEE 754, now it's a float in [1, 2).
-  const rand = bitcast(float12, DType.Float32).sub(1) as Array; // [0, 1) range
-  if (minval === 0 && maxval === 1) {
-    return rand;
-  } else {
-    return rand.mul(maxval - minval).add(minval);
-  }
-}
+/**
+ * @function
+ * Sample uniform random values in [minval, maxval) with given shape.
+ */
+export const uniform = jit(
+  function uniform(
+    key: Array,
+    shape: number[] = [],
+    { minval = 0, maxval = 1 }: { minval?: number; maxval?: number } = {},
+  ): Array {
+    if (minval >= maxval) {
+      throw new Error(`Invalid range: [${minval}, ${maxval}).`);
+    }
+    // Float32 has sign bit, 8 bits of exponent, and 23 bits of mantissa.
+    const mantissa = bits(key, shape).div(
+      array(1 << 9, { dtype: DType.Uint32, device: key.device }),
+    );
+    const float12 = mantissa.add(
+      array(0x3f800000, { dtype: DType.Uint32, device: key.device }),
+    ); // Add 1.0 in IEEE 754, now it's a float in [1, 2).
+    const rand = bitcast(float12, DType.Float32).sub(1) as Array; // [0, 1) range
+    if (minval === 0 && maxval === 1) {
+      return rand;
+    } else {
+      return rand.mul(maxval - minval).add(minval);
+    }
+  },
+  { staticArgnums: [1, 2] },
+);
 
 /**
  * Sample Bernoulli random variables with given mean (0,1 categorical).
@@ -108,28 +115,38 @@ export function bernoulli(
   return uniform(key, shape).less(p);
 }
 
-/** Sample exponential random values according to `p(x) = exp(-x)`. */
-export function exponential(key: Array, shape: number[] = []): Array {
-  const u = uniform(key, shape);
-  return negative(log1p(negative(u))) as Array; // log(1-u) to avoid log(0)
-}
+/**
+ * @function
+ * Sample exponential random values according to `p(x) = exp(-x)`.
+ */
+export const exponential = jit(
+  function exponential(key: Array, shape: number[] = []): Array {
+    const u = uniform(key, shape);
+    return negative(log1p(negative(u))) as Array; // log(1-u) to avoid log(0)
+  },
+  { staticArgnums: [1] },
+);
 
 /**
+ * @function
  * Sample random values according to `p(x) = 1/sqrt(2pi) * exp(-x^2/2)`.
  *
  * Unlike JAX, this uses the Box-Muller transform. JAX uses the erf_inv primitive instead and
  * directly inverts the CDF, but we don't have support for that yet. Outputs will not be
  * bitwise identical to JAX.
  */
-export function normal(key: Array, shape: number[] = []): Array {
-  // Box-Muller transform:
-  //   z0 = sqrt(-2 * log(u1)) * cos(2pi * u2)
-  //   z1 = sqrt(-2 * log(u1)) * sin(2pi * u2)
-  // We only use z0 for simplicity.
-  const [k1, k2] = split(key, 2);
-  const u1 = uniform(k1, shape);
-  const u2 = uniform(k2, shape);
-  const radius = sqrt(log1p(negative(u1)).mul(-2)); // taking 1-u1 to avoid log(0)
-  const theta = u2.mul(2 * Math.PI);
-  return radius.mul(cos(theta)) as Array;
-}
+export const normal = jit(
+  function normal(key: Array, shape: number[] = []): Array {
+    // Box-Muller transform:
+    //   z0 = sqrt(-2 * log(u1)) * cos(2pi * u2)
+    //   z1 = sqrt(-2 * log(u1)) * sin(2pi * u2)
+    // We only use z0 for simplicity.
+    const [k1, k2] = split(key, 2);
+    const u1 = uniform(k1, shape);
+    const u2 = uniform(k2, shape);
+    const radius = sqrt(log1p(negative(u1)).mul(-2)); // taking 1-u1 to avoid log(0)
+    const theta = u2.mul(2 * Math.PI);
+    return radius.mul(cos(theta)) as Array;
+  },
+  { staticArgnums: [1] },
+);

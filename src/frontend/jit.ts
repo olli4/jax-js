@@ -492,7 +492,7 @@ const jitRules: { [P in Primitive]: JitRule<P> } = {
     const k1 = reshapeViews(keys[1], mapping);
     const c0 = AluExp.u32(0);
     const c1 = AluExp.cast(DType.Uint32, AluVar.gidx);
-    const exp = AluExp.threefry2x32(c0, c1, k0, k1, mode);
+    const exp = AluExp.threefry2x32(k0, k1, c0, c1, mode);
     return new Kernel(nargs, prod(shape), exp);
   },
   [Primitive.Sin]: unopJit(AluExp.sin),
@@ -655,12 +655,15 @@ function splitGraphDataflow(backend: Backend, jaxpr: Jaxpr): Set<Var> {
   //
   // - Kernel outputs
   // - Reductions (intermediates cannot have reductions)
-  // - Gather operation (violates rule on GlobalView indices)
+  // - Gather/RandomBits operations (violates rule that kernels must have
+  //   homogeneous GlobalView indices)
   //
   // Also, mark a node black if there are at least two black nodes that can be
   // reached from it, while only going through non-black nodes.
   //
   // TODO: Don't do the above for 'simple' nodes: reshape, cast, etc.
+  //
+  // TODO: Reductions can have epilogues.
   const blackNodes = new Set<Var>();
   const p1NextBlack = new Map<Var, Var>();
   for (const v of jaxpr.outs) {
@@ -675,11 +678,12 @@ function splitGraphDataflow(backend: Backend, jaxpr: Jaxpr): Set<Var> {
     Primitive.Conv,
     Primitive.PoolTranspose,
   ];
+  const heterogeneousViewPrimitives = [Primitive.Gather, Primitive.RandomBits];
   for (let i = jaxpr.eqns.length - 1; i >= 0; i--) {
     const eqn = jaxpr.eqns[i];
     if (
       reducePrimitives.includes(eqn.primitive) ||
-      eqn.primitive === Primitive.Gather ||
+      heterogeneousViewPrimitives.includes(eqn.primitive) ||
       eqn.outBinders.some((v) => blackNodes.has(v))
     ) {
       for (const v of eqn.outBinders) {
