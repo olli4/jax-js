@@ -3,7 +3,7 @@
 
   import type tf from "@tensorflow/tfjs";
 
-  import { importTfjs } from "$lib/benchmark";
+  import { getWebgpuDevice, importTfjs, runBenchmark } from "$lib/benchmark";
 
   const batchSize = 1;
   const channels = 64;
@@ -47,35 +47,7 @@
     abstract workgroups(): [number, number, number];
 
     async run(): Promise<number> {
-      const adapter = await navigator.gpu.requestAdapter({
-        powerPreference: "high-performance",
-      });
-      if (!adapter) {
-        alert("WebGPU not supported");
-        return -1;
-      }
-
-      let device: GPUDevice;
-      try {
-        device = await adapter.requestDevice({
-          requiredLimits: {
-            maxComputeInvocationsPerWorkgroup:
-              adapter.limits.maxComputeInvocationsPerWorkgroup,
-            maxComputeWorkgroupSizeX: adapter.limits.maxComputeWorkgroupSizeX,
-            maxComputeWorkgroupSizeY: adapter.limits.maxComputeWorkgroupSizeY,
-            maxComputeWorkgroupSizeZ: adapter.limits.maxComputeWorkgroupSizeZ,
-            maxComputeWorkgroupStorageSize:
-              adapter.limits.maxComputeWorkgroupStorageSize,
-            maxComputeWorkgroupsPerDimension:
-              adapter.limits.maxComputeWorkgroupsPerDimension,
-            maxStorageBufferBindingSize:
-              adapter.limits.maxStorageBufferBindingSize,
-          },
-        });
-      } catch (error) {
-        console.warn("Error when creating device:", error);
-        return -1;
-      }
+      const device = await getWebgpuDevice();
 
       const usage =
         GPUBufferUsage.STORAGE |
@@ -101,38 +73,36 @@
           layout: "auto",
         });
 
-        const bindGroup = device.createBindGroup({
-          layout: pipeline.getBindGroupLayout(0),
-          entries: [
-            { binding: 0, resource: { buffer: input } },
-            { binding: 1, resource: { buffer: filter } },
-            { binding: 2, resource: { buffer: output } },
-          ],
+        return await runBenchmark("webgpu", async () => {
+          const bindGroup = device.createBindGroup({
+            layout: pipeline.getBindGroupLayout(0),
+            entries: [
+              { binding: 0, resource: { buffer: input } },
+              { binding: 1, resource: { buffer: filter } },
+              { binding: 2, resource: { buffer: output } },
+            ],
+          });
+
+          const commandEncoder = device.createCommandEncoder();
+          const passEncoder = commandEncoder.beginComputePass();
+          passEncoder.setPipeline(pipeline);
+          passEncoder.setBindGroup(0, bindGroup);
+          passEncoder.dispatchWorkgroups(...this.workgroups());
+          passEncoder.end();
+          commandEncoder.copyBufferToBuffer(
+            output,
+            0,
+            staging,
+            0,
+            outputSize * 4,
+          );
+          device.queue.submit([commandEncoder.finish()]);
+
+          await staging.mapAsync(GPUMapMode.READ, 0, outputSize * 4);
+          const buf = new Float32Array(staging.getMappedRange());
+          printBufferItems(buf);
+          staging.unmap();
         });
-
-        const commandEncoder = device.createCommandEncoder();
-        const passEncoder = commandEncoder.beginComputePass();
-        passEncoder.setPipeline(pipeline);
-        passEncoder.setBindGroup(0, bindGroup);
-        passEncoder.dispatchWorkgroups(...this.workgroups());
-        passEncoder.end();
-        commandEncoder.copyBufferToBuffer(
-          output,
-          0,
-          staging,
-          0,
-          outputSize * 4,
-        );
-        device.queue.submit([commandEncoder.finish()]);
-
-        const start = performance.now();
-
-        await staging.mapAsync(GPUMapMode.READ, 0, outputSize * 4);
-        const buf = new Float32Array(staging.getMappedRange());
-        printBufferItems(buf);
-        staging.unmap();
-
-        return (performance.now() - start) / 1000;
       } finally {
         input.destroy();
         filter.destroy();
@@ -257,23 +227,17 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
       const filter = tf.transpose(filterOIHW, [2, 3, 1, 0]); // OIHW -> HWIO
       await Promise.all([input.data(), filter.data()]);
 
-      performance.mark("tfjs-start");
-      const start = performance.now();
-      const output = tf
-        .conv2d(input, filter, 1, "same", "NHWC")
-        .transpose<tf.Tensor4D>([0, 3, 1, 2]); // NHWC -> NCHW
-      const ar = (await output.data()) as Float32Array;
-      printBufferItems(ar);
-      const time = performance.now() - start;
-      performance.mark("tfjs-end");
-      performance.measure("tfjs", "tfjs-start", "tfjs-end");
-
-      input.dispose();
-      filterOIHW.dispose();
-      filter.dispose();
-      output.dispose();
-
-      return time / 1000;
+      return await runBenchmark("tfjs", async () => {
+        const output = tf
+          .conv2d(input, filter, 1, "same", "NHWC")
+          .transpose<tf.Tensor4D>([0, 3, 1, 2]); // NHWC -> NCHW
+        const ar = (await output.data()) as Float32Array;
+        printBufferItems(ar);
+        input.dispose();
+        filterOIHW.dispose();
+        filter.dispose();
+        output.dispose();
+      });
     }
   }
 
@@ -442,18 +406,14 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
         ]);
 
         // Actual benchmark run
-        performance.mark("onnx-start");
-        const start = performance.now();
-        const results = await session.run({
-          input: tensorInput,
-          filter: tensorFilter,
+        return await runBenchmark("onnx", async () => {
+          const results = await session!.run({
+            input: tensorInput,
+            filter: tensorFilter,
+          });
+          const outputData = results.output.data as Float32Array;
+          printBufferItems(outputData);
         });
-        const outputData = results.output.data as Float32Array;
-        printBufferItems(outputData);
-        const time = performance.now() - start;
-        performance.mark("onnx-end");
-
-        return time / 1000; // seconds
       } catch (error) {
         console.error("ONNX Runtime error:", error);
         return -1;
@@ -482,7 +442,7 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
       jax.defaultDevice("webgpu");
       const np = jax.numpy;
 
-      const input = np
+      const x = np
         .array(randomInput, {
           shape: [batchSize, channels, height, width],
         })
@@ -492,18 +452,13 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
           shape: [outChannels, channels, filterHeight, filterWidth],
         })
         .astype(this.fp16 ? np.float16 : np.float32);
-      await jax.blockUntilReady([input, filter]);
+      await jax.blockUntilReady([x, filter]);
 
-      performance.mark("jax-start");
-      const start = performance.now();
-      const output = jax.lax.convGeneralDilated(input, filter, [1, 1], "SAME");
-      const ar = (await output.data()) as Float32Array;
-      printBufferItems(ar);
-      const time = performance.now() - start;
-      performance.mark("jax-end");
-      performance.measure("jax", "jax-start", "jax-end");
-
-      return time / 1000;
+      return await runBenchmark("jax", async () => {
+        const output = jax.lax.convGeneralDilated(x, filter, [1, 1], "SAME");
+        const ar = (await output.data()) as Float32Array;
+        printBufferItems(ar);
+      });
     }
   }
 

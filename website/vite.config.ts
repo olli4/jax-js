@@ -19,4 +19,10 @@ export default defineConfig({
     // Increase chunk size warning limit for ML libraries.
     chunkSizeWarningLimit: 4000,
   },
+  server: {
+    headers: {
+      "Cross-Origin-Opener-Policy": "same-origin",
+      "Cross-Origin-Embedder-Policy": "require-corp",
+    },
+  },
 });

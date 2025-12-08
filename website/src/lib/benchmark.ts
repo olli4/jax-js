@@ -1,5 +1,18 @@
 import type tf from "@tensorflow/tfjs";
 
+export async function runBenchmark(
+  name: string,
+  fn: () => Promise<void>,
+): Promise<number> {
+  performance.mark(`${name}-start`);
+  const start = performance.now();
+  await fn();
+  const time = performance.now() - start;
+  performance.mark(`${name}-end`);
+  performance.measure(name, `${name}-start`, `${name}-end`);
+  return time / 1000;
+}
+
 export async function importTfjs(
   backend: "wasm" | "webgpu",
 ): Promise<typeof tf> {
@@ -24,4 +37,33 @@ export async function importTfjs(
     throw new Error(`Unsupported backend: ${backend}`);
   }
   return tf;
+}
+
+export async function getWebgpuDevice(): Promise<GPUDevice> {
+  const adapter = await navigator.gpu.requestAdapter({
+    powerPreference: "high-performance",
+  });
+  if (!adapter) {
+    alert("WebGPU not supported");
+    throw new Error("WebGPU not supported");
+  }
+
+  try {
+    return await adapter.requestDevice({
+      requiredLimits: {
+        maxComputeInvocationsPerWorkgroup:
+          adapter.limits.maxComputeInvocationsPerWorkgroup,
+        maxComputeWorkgroupSizeX: adapter.limits.maxComputeWorkgroupSizeX,
+        maxComputeWorkgroupSizeY: adapter.limits.maxComputeWorkgroupSizeY,
+        maxComputeWorkgroupSizeZ: adapter.limits.maxComputeWorkgroupSizeZ,
+        maxComputeWorkgroupStorageSize:
+          adapter.limits.maxComputeWorkgroupStorageSize,
+        maxComputeWorkgroupsPerDimension:
+          adapter.limits.maxComputeWorkgroupsPerDimension,
+        maxStorageBufferBindingSize: adapter.limits.maxStorageBufferBindingSize,
+      },
+    });
+  } catch (error) {
+    throw new Error("Error when creating device: " + error);
+  }
 }

@@ -1,7 +1,7 @@
 <script lang="ts">
   import { browser } from "$app/environment";
 
-  import { importTfjs } from "$lib/benchmark";
+  import { getWebgpuDevice, importTfjs, runBenchmark } from "$lib/benchmark";
 
   const n = 4096;
 
@@ -44,35 +44,7 @@
     abstract workgroups(): [number, number, number];
 
     async run(): Promise<number> {
-      const adapter = await navigator.gpu.requestAdapter({
-        powerPreference: "high-performance",
-      });
-      if (!adapter) {
-        alert("WebGPU not supported");
-        return -1;
-      }
-
-      let device: GPUDevice;
-      try {
-        device = await adapter.requestDevice({
-          requiredLimits: {
-            maxComputeInvocationsPerWorkgroup:
-              adapter.limits.maxComputeInvocationsPerWorkgroup,
-            maxComputeWorkgroupSizeX: adapter.limits.maxComputeWorkgroupSizeX,
-            maxComputeWorkgroupSizeY: adapter.limits.maxComputeWorkgroupSizeY,
-            maxComputeWorkgroupSizeZ: adapter.limits.maxComputeWorkgroupSizeZ,
-            maxComputeWorkgroupStorageSize:
-              adapter.limits.maxComputeWorkgroupStorageSize,
-            maxComputeWorkgroupsPerDimension:
-              adapter.limits.maxComputeWorkgroupsPerDimension,
-            maxStorageBufferBindingSize:
-              adapter.limits.maxStorageBufferBindingSize,
-          },
-        });
-      } catch (error) {
-        console.warn("Error when creating device:", error);
-        return -1;
-      }
+      const device = await getWebgpuDevice();
 
       const usage =
         GPUBufferUsage.STORAGE |
@@ -98,32 +70,30 @@
           layout: "auto",
         });
 
-        const bindGroup = device.createBindGroup({
-          layout: pipeline.getBindGroupLayout(0),
-          entries: [
-            { binding: 0, resource: { buffer: a } },
-            { binding: 1, resource: { buffer: b } },
-            { binding: 2, resource: { buffer: c } },
-          ],
+        return await runBenchmark("webgpu", async () => {
+          const bindGroup = device.createBindGroup({
+            layout: pipeline.getBindGroupLayout(0),
+            entries: [
+              { binding: 0, resource: { buffer: a } },
+              { binding: 1, resource: { buffer: b } },
+              { binding: 2, resource: { buffer: c } },
+            ],
+          });
+
+          const commandEncoder = device.createCommandEncoder();
+          const passEncoder = commandEncoder.beginComputePass();
+          passEncoder.setPipeline(pipeline);
+          passEncoder.setBindGroup(0, bindGroup);
+          passEncoder.dispatchWorkgroups(...this.workgroups());
+          passEncoder.end();
+          commandEncoder.copyBufferToBuffer(c, 0, staging, 0, n * n * 4);
+          device.queue.submit([commandEncoder.finish()]);
+
+          await staging.mapAsync(GPUMapMode.READ, 0, n * n * 4);
+          const buf = new Float32Array(staging.getMappedRange());
+          printBufferItems(buf);
+          staging.unmap(); // Do not need to actually read it.
         });
-
-        const commandEncoder = device.createCommandEncoder();
-        const passEncoder = commandEncoder.beginComputePass();
-        passEncoder.setPipeline(pipeline);
-        passEncoder.setBindGroup(0, bindGroup);
-        passEncoder.dispatchWorkgroups(...this.workgroups());
-        passEncoder.end();
-        commandEncoder.copyBufferToBuffer(c, 0, staging, 0, n * n * 4);
-        device.queue.submit([commandEncoder.finish()]);
-
-        const start = performance.now();
-
-        await staging.mapAsync(GPUMapMode.READ, 0, n * n * 4);
-        const buf = new Float32Array(staging.getMappedRange());
-        printBufferItems(buf);
-        staging.unmap(); // Do not need to actually read it.
-
-        return (performance.now() - start) / 1000;
       } finally {
         a.destroy();
         b.destroy();
@@ -697,20 +667,14 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
       const b = tf.tensor(randomBuffer, [n, n]);
       await Promise.all([a.data(), b.data()]); // Make sure tensors are ready.
 
-      performance.mark("tfjs-start");
-      const start = performance.now();
-      const c = tf.matMul(a, b);
-      const ar = (await c.data()) as Float32Array;
-      printBufferItems(ar);
-      const time = performance.now() - start;
-      performance.mark("tfjs-end");
-      performance.measure("tfjs", "tfjs-start", "tfjs-end");
-
-      a.dispose();
-      b.dispose();
-      c.dispose();
-
-      return time / 1000; // seconds
+      return await runBenchmark("tfjs", async () => {
+        const c = tf.matMul(a, b);
+        const ar = (await c.data()) as Float32Array;
+        printBufferItems(ar);
+        a.dispose();
+        b.dispose();
+        c.dispose();
+      });
     }
   }
 
@@ -832,16 +796,11 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
         const tensorB = new ort.Tensor(ortType, buffer, [n, n]);
 
         // Actual benchmark run
-        performance.mark("onnx-start");
-        const start = performance.now();
-        const results = await session.run({ A: tensorA, B: tensorB });
-        const outputData = results.C.data as Float32Array | Float16Array;
-        printBufferItems(outputData);
-        const time = performance.now() - start;
-        performance.mark("onnx-end");
-        performance.measure("onnx", "onnx-start", "onnx-end");
-
-        return time / 1000; // seconds
+        return await runBenchmark("onnx", async () => {
+          const results = await session!.run({ A: tensorA, B: tensorB });
+          const outputData = results.C.data as Float32Array | Float16Array;
+          printBufferItems(outputData);
+        });
       } catch (error) {
         console.error("ONNX Runtime error:", error);
         return -1;
@@ -878,16 +837,11 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
         .astype(this.fp16 ? np.float16 : np.float32);
       await jax.blockUntilReady([a, b]); // Make sure tensors are ready.
 
-      performance.mark("jax-start");
-      const start = performance.now();
-      const c = np.dot(a, b);
-      const ar = (await c.data()) as Float16Array;
-      printBufferItems(ar);
-      const time = performance.now() - start;
-      performance.mark("jax-end");
-      performance.measure("jax", "jax-start", "jax-end");
-
-      return time / 1000; // seconds
+      return await runBenchmark("jax", async () => {
+        const c = np.dot(a, b);
+        const ar = (await c.data()) as Float16Array;
+        printBufferItems(ar);
+      });
     }
   }
 
