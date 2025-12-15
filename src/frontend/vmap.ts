@@ -1,12 +1,4 @@
-import {
-  assertNonNull,
-  checkAxis,
-  deepEqual,
-  range,
-  rep,
-  unzip2,
-  zip,
-} from "../utils";
+import { assertNonNull, checkAxis, range, rep, unzip2, zip } from "../utils";
 import { eye, pureArray } from "./array";
 import {
   AbstractValue,
@@ -50,6 +42,7 @@ import {
   TracerValue,
   transpose,
   TreeMismatchError,
+  where,
 } from "./core";
 import {
   JsTree,
@@ -187,46 +180,42 @@ type VmapRule<P extends Primitive> = (
   params: PrimitiveParams<P>,
 ) => [Tracer[], (number | null)[]];
 
-function handleScalarBroadcasting(nd: number, x: Tracer, d: number | null) {
-  if (d === null || nd === ndim(x)) {
-    return x;
-  } else {
-    const axis = range(ndim(x), nd);
-    const shape = [...x.shape, ...axis.map(() => 1)];
-    return broadcast(x, shape, axis);
-  }
-}
-
-/** Process a primitive with built-in broadcasting. */
+/**
+ * Process a primitive with built-in broadcasting.
+ *
+ * Reference: https://github.com/jax-ml/jax/blob/jax-v0.8.1/jax/_src/interpreters/batching.py#L1029
+ */
 function broadcastBatcher(op: (...x: Tracer[]) => Tracer): VmapRule<Primitive> {
   return (axisSize, args, dims) => {
     if (args.length === 0) {
       throw new Error("Empty list in broadcastBatcher");
     }
-
-    const idx = dims.findIndex((d) => d !== null);
+    const nd = Math.max(...args.map(ndim));
+    const firstIdx = dims.findIndex((d) => d !== null);
+    const firstBdim = dims[firstIdx]! - args[firstIdx].ndim; // e.g., -1 if last dim
     if (
       // If only agreeing batch dims, or scalars, just call the primitive.
       zip(args, dims).every(
         ([x, d]) =>
-          ndim(x) === 0 ||
-          (deepEqual(x.shape, args[idx].shape) && d === dims[idx]),
+          ndim(x) < -firstBdim || (d !== null && d - x.ndim === firstBdim),
       )
     ) {
-      return [[op(...args)], [dims[idx]]];
+      return [[op(...args)], [nd + firstBdim]];
     }
 
-    // TODO: I wrote this like 5 months ago. I do not know what the code below
-    // does, but it seems to be wrong. Revisit this later.
-
-    args = args.map((x, i) =>
-      ndim(x) > 0 ? moveBatchAxis(axisSize, dims[i], 0, x) : x,
-    );
-    // Now the batch axis has been added to the front. Handle special-case of
-    // scalar broadcasting, since unmapped axes may have a singleton axis
-    // inserted and then rely on the built-in broadcasting of the primitive.
-    const nd = Math.max(...args.map(ndim));
-    args = args.map((x, i) => handleScalarBroadcasting(nd, x, dims[i]));
+    // Move the batch axes to the front. If needed, expand arrays so that all
+    // inputs have the same number of dimensions.
+    args = args.map((x, i) => {
+      if (ndim(x) === 0) return x;
+      x = moveBatchAxis(axisSize, dims[i], 0, x);
+      if (x.ndim < nd)
+        x = x.reshape([
+          x.shape[0],
+          ...rep(nd - x.ndim, 1),
+          ...x.shape.slice(1),
+        ]);
+      return x;
+    });
     return [[op(...args)], [0]];
   };
 }
@@ -282,7 +271,7 @@ const vmapRules: Partial<{ [P in Primitive]: VmapRule<P> }> = {
       {},
     );
   },
-  // TODO: where
+  [Primitive.Where]: broadcastBatcher(where),
   [Primitive.Transpose](axisSize, [x], [xBdim], { perm }) {
     assertNonNull(xBdim);
     const newPerm = perm.map((p) => p + (xBdim <= p ? 1 : 0));
