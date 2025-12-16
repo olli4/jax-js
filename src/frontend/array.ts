@@ -129,6 +129,7 @@ type ArrayConstructorArgs = {
   dtype: DType;
   weakType: boolean;
   backend: Backend;
+  committed: boolean;
   pending?: Iterable<PendingExecute>;
 };
 
@@ -151,6 +152,7 @@ export class Array extends Tracer {
   #source: AluExp | Slot;
   #st: ShapeTracker;
   #backend: Backend;
+  #committed: boolean; // if array is committed to device (passed explicitly)
   #rc: number; // reference count for this specific Array object
 
   #pendingSet: Set<PendingExecute> | null; // only if source is `Slot`
@@ -169,6 +171,7 @@ export class Array extends Tracer {
     this.#source = args.source;
     this.#st = args.st;
     this.#backend = args.backend;
+    this.#committed = args.committed;
     this.#rc = 1;
 
     this.#pendingSet = new Set(args.pending);
@@ -205,6 +208,7 @@ export class Array extends Tracer {
       dtype: args.dtype ?? this.#dtype,
       weakType: this.#weakType,
       backend: args.backend ?? this.#backend,
+      committed: args.committed ?? this.#committed,
       pending: args.pending ?? this.#pending ?? undefined,
     });
   }
@@ -277,15 +281,17 @@ export class Array extends Tracer {
   #gather(indices: Array[], axis: number[], outDim: number): Array {
     this.#check();
 
-    if (indices.some((a) => a.#backend !== this.#backend)) {
-      throw new TypeError(
-        `Gather indices must have the same backend: ${this.#backend.type}`,
-      );
-    }
     const axisSet = new Set(axis);
     if (axisSet.size !== axis.length) {
       throw new TypeError("Gather axis must not have duplicates");
     }
+
+    if (indices.some((a) => a.#committed && a.#backend !== this.#backend)) {
+      throw new TypeError(
+        `Gather indices must have the same backend: ${this.#backend.type}`,
+      );
+    }
+    indices = indices.map((ar) => ar._putSync(this.#backend));
 
     // First, broadcast each integer array in `indices`.
     indices = Array.#broadcastArrays(indices);
@@ -388,6 +394,7 @@ export class Array extends Tracer {
     // Short circuit if the array is already AluExp.
     if (this.#source instanceof AluExp) {
       const exp = new AluExp(op, dtypeOutput, [this.#source]);
+      this.dispose();
       return this.#newArrayFrom({
         source: exp.simplify(),
         dtype: dtypeOutput,
@@ -437,7 +444,6 @@ export class Array extends Tracer {
     } = {},
   ): Array {
     const n = arrays.length;
-    const backend = arrays[0].#backend;
     if (n === 0) throw new TypeError(`No inputs for ${name}`);
 
     for (const ar of arrays) ar.#check();
@@ -463,14 +469,11 @@ export class Array extends Tracer {
           ));
         }
       }
-      if (arrays[i].#backend !== backend) {
-        throw new TypeError(
-          `Backend mismatch in ${name}: ${backend.type} vs ${arrays[i].#backend.type}`,
-        );
-      }
     }
     const weakType = castWeakType && !strongTypeOutput;
 
+    const { backend, committed } = Array.#computeBackend(name, arrays);
+    arrays = arrays.map((ar) => ar._putSync(backend));
     arrays = Array.#broadcastArrays(arrays);
     const newShape = [...arrays[0].shape];
 
@@ -486,12 +489,14 @@ export class Array extends Tracer {
       if (arrays.every((ar) => deepEqual(ar.#st, arrays[0].#st))) {
         // All are AluExp and have the same shape tracker.
         const exp = custom(sources);
+        arrays.forEach((ar) => ar.dispose());
         return new Array({
           source: exp.simplify(),
           st: arrays[0].#st,
           dtype: exp.dtype,
           weakType: weakType,
           backend,
+          committed,
         });
       }
       // If their shape trackers are different, we need to normalize them.
@@ -503,12 +508,14 @@ export class Array extends Tracer {
         }),
       );
       const st = ShapeTracker.fromShape(newShape);
+      arrays.forEach((ar) => ar.dispose());
       return new Array({
         source: exp.simplify(),
         st,
         dtype: exp.dtype,
         weakType,
         backend,
+        committed,
       });
     }
 
@@ -550,13 +557,14 @@ export class Array extends Tracer {
     for (const exe of pending) exe.updateRc(+1);
     pending.add(new PendingExecute(backend, kernel, inputs, [output]));
 
-    for (const ar of arrays) ar.dispose(); // Dispose of inputs after creating PendingExecute.
+    arrays.forEach((ar) => ar.dispose()); // Dispose of inputs after creating PendingExecute.
     return new Array({
       source: output,
       st: ShapeTracker.fromShape(newShape),
       dtype: kernel.dtype,
       weakType,
       backend,
+      committed,
       pending,
     });
   }
@@ -658,6 +666,34 @@ export class Array extends Tracer {
         ar.#st.broadcast(newShape, range(newShape.length - ar.ndim)),
       );
     });
+  }
+
+  static #computeBackend(
+    name: string,
+    arrays: Array[],
+  ): {
+    backend: Backend;
+    committed: boolean;
+  } {
+    // First, check if any arrays are committed.
+    const committed = arrays.filter((ar) => ar.#committed);
+    if (committed.length > 0) {
+      const backend = committed[0].#backend;
+      for (const ar of committed) {
+        if (ar.#backend !== backend) {
+          throw new Error(
+            `Device mismatch in ${name} between committed arrays on ` +
+              `(${backend.type}, ${ar.#backend.type}), ` +
+              `please move to the same device with devicePut()`,
+          );
+        }
+      }
+      return { backend, committed: true };
+    } else {
+      // No committed arrays, pick the backend of the first operand.
+      const backend = arrays.length > 0 ? arrays[0].#backend : getBackend();
+      return { backend, committed: false };
+    }
   }
 
   /** Realize the array and return it as data. */
@@ -763,6 +799,10 @@ export class Array extends Tracer {
     }
     return this.dataSync()[0];
   }
+
+  //
+  // Internal methods follow, not public API. Do not use.
+  //
 
   /** @private Internal plumbing method for Array / Tracer ops. */
   static _implRules(): typeof implRules {
@@ -942,7 +982,10 @@ export class Array extends Tracer {
             `jit_call expects ${jaxpr.inBinders.length} args, got ${args.length}`,
           );
         }
-        const backend = getBackend(); // TODO: Use correct backend.
+
+        const { backend, committed } = Array.#computeBackend("jit_call", args);
+        args = args.map((ar) => ar._putSync(backend));
+
         const consts = args.slice(0, numConsts);
         const tracers = args.slice(numConsts);
         const jp = jitCompile(backend, jaxpr, consts);
@@ -963,6 +1006,7 @@ export class Array extends Tracer {
             dtype: jaxpr.outs[i].aval.dtype,
             weakType: jaxpr.outs[i].aval.weakType,
             backend,
+            committed,
             pending,
           });
         });
@@ -970,10 +1014,50 @@ export class Array extends Tracer {
     };
   }
 
-  // Internal methods, not public API. Do not use.
+  /** @private */
   _realizeSource() {
     this.#realize();
     return this.#source as number; // Because #realize() was called.
+  }
+
+  /** @private Put this array on a new backend, asynchronously. */
+  async _put(backend: Backend): Promise<Array> {
+    if (this.#backend === backend) return this;
+    if (this.#source instanceof AluExp) {
+      // Not realized yet, just dump the AluExp on the target backend.
+      const ar = this.#newArrayFrom({ backend, committed: true });
+      this.dispose();
+      return ar;
+    } else {
+      // Realize the array and copy data to the new backend.
+      const data = await this.data();
+      return arrayFromData(
+        data,
+        this.shape,
+        { dtype: this.#dtype, device: backend.type },
+        this.#weakType,
+      );
+    }
+  }
+
+  /** @private Put this array on a new backend, synchronously. */
+  _putSync(backend: Backend): Array {
+    if (this.#backend === backend) return this;
+    if (this.#source instanceof AluExp) {
+      // Not realized yet, just dump the AluExp on the target backend.
+      const ar = this.#newArrayFrom({ backend, committed: true });
+      this.dispose();
+      return ar;
+    } else {
+      // Realize the array and copy data to the new backend.
+      const data = this.dataSync();
+      return arrayFromData(
+        data,
+        this.shape,
+        { dtype: this.#dtype, device: backend.type },
+        this.#weakType,
+      );
+    }
   }
 }
 
@@ -1087,6 +1171,7 @@ function arrayFromData(
     dtype,
     weakType,
     backend,
+    committed: device != undefined,
   });
 }
 
@@ -1151,6 +1236,7 @@ export function fullInternal(
     dtype: aval.dtype,
     weakType: aval.weakType,
     backend: getBackend(device),
+    committed: device != undefined,
   });
 }
 
@@ -1174,7 +1260,6 @@ export function fullLike(
     // expanding the array.
     throw new Error("numpy.fullLike() with array argument not implemented yet");
   }
-  // TODO: Use correct device.
   const sa = new ShapedArray(aval.shape, dtype ?? aval.dtype, aval.weakType);
   return fullInternal(sa, fillValue);
 }
@@ -1256,6 +1341,7 @@ export function eye(
     dtype,
     weakType,
     backend: getBackend(device),
+    committed: device != undefined,
   });
 }
 
@@ -1314,6 +1400,7 @@ export function arange(
     dtype,
     weakType: false,
     backend: getBackend(device),
+    committed: device != undefined,
   });
 }
 
@@ -1367,6 +1454,7 @@ export function linspace(
     dtype,
     weakType: false,
     backend: getBackend(device),
+    committed: device != undefined,
   });
 }
 
