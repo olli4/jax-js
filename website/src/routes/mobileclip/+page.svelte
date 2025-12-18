@@ -351,6 +351,14 @@
                 <BookMarkedIcon size={20} />
                 <span><em>Great Expectations</em> by Charles Dickens</span>
               </button>
+              <button
+                class="btn"
+                onclick={() => setupBook("wilde-dorian-gray")}
+                disabled={isDownloadingWeights || isDownloadingData}
+              >
+                <BookMarkedIcon size={20} />
+                <span><em>The Picture of Dorian Gray</em> by Oscar Wilde</span>
+              </button>
             </div>
           </div>
 

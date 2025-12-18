@@ -24,6 +24,8 @@ export async function downloadBook(id: string): Promise<Book> {
   switch (id) {
     case "dickens-great-expectations":
       return await dickensGreatExpectations();
+    case "wilde-dorian-gray":
+      return await wildeDorianGray();
     default:
       throw new Error(`Unknown book ID: ${id}`);
   }
@@ -110,6 +112,42 @@ async function dickensGreatExpectations(): Promise<Book> {
   return {
     title: "Great Expectations",
     author: "Charles Dickens",
+    chapters,
+  };
+}
+
+async function wildeDorianGray(): Promise<Book> {
+  // https://www.gutenberg.org/ebooks/4078
+  const url =
+    "https://huggingface.co/datasets/ekzhang/jax-js-examples/raw/main/pg4078.txt";
+
+  const dataBytes = await cachedFetch(url);
+  const content = new TextDecoder().decode(dataBytes).replace(/\r/g, "");
+
+  // Split by chapter headings (CHAPTER I, CHAPTER II, etc.)
+  const chapterRegex = /\nCHAPTER ([IVXLC]+)\n/g;
+  const chapters: Chapter[] = [];
+
+  const matches = [...content.matchAll(chapterRegex)];
+
+  for (let i = 0; i < matches.length; i++) {
+    const match = matches[i];
+    const startIndex = match.index! + match[0].length;
+    const endIndex =
+      i < matches.length - 1 ? matches[i + 1].index! : content.length;
+
+    const chapterText = content.slice(startIndex, endIndex).trim();
+    const excerpts = splitExcerpts(chapterText);
+
+    chapters.push({
+      title: `Chapter ${match[1]}`,
+      excerpts,
+    });
+  }
+
+  return {
+    title: "The Picture of Dorian Gray",
+    author: "Oscar Wilde",
     chapters,
   };
 }
