@@ -255,7 +255,10 @@
       // Compute cosine similarity scores: query @ embeddings.T
       // queryEmbed is [D_EMBED], embeddingArray is [N, D_EMBED]
       const scores: number[] = await np
-        .dot(embeddingArray.ref, queryEmbed)
+        .dot(
+          embeddingArray.ref.astype(np.float32),
+          queryEmbed.astype(np.float32),
+        )
         .jsAsync();
 
       // Argsort descending
