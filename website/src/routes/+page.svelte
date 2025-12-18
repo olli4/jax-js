@@ -202,16 +202,18 @@ console.log(vmap(grad(np.square))(x));
       </a>
 
       <a
-        href={resolve("/repl")}
+        href={resolve("/mobileclip")}
         class="bg-primary/5 hover:bg-primary/15 transition-colors p-4 rounded-lg"
       >
         <h3 class="mb-2">
-          REPL <ArrowUpRight
+          MobileCLIP2 Inference <ArrowUpRight
             size={18}
             class="inline-block text-gray-400 mb-px"
           />
         </h3>
-        <p class="text-sm text-gray-600">Try writing code in your browser.</p>
+        <p class="text-sm text-gray-600">
+          Generate embeddings for books and search them in real time.
+        </p>
       </a>
     </div>
   </section>

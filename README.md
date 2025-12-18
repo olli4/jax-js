@@ -310,6 +310,7 @@ That's all for this short tutorial. Please see the generated
 If you make something cool with jax-js, don't be a stranger! We can feature it here.
 
 - [Training neural networks on MNIST](https://jax-js.com/mnist)
+- [CLIP embeddings for books in-browser](https://jax-js.com/mobileclip)
 - [In-browser REPL](https://jax-js.com/repl)
 - [Matmul benchmark](https://jax-js.com/bench/matmul)
 - [Conv2d benchmark](https://jax-js.com/bench/conv2d)
