@@ -32,7 +32,6 @@
   let webcamStream: MediaStream | null = null;
   let inputSource: "example" | "webcam" = $state("example");
   let isFrontCamera = $state(false);
-  let loopEnabled = $state(false);
   let isLooping = $state(false);
 
   interface Detection {
@@ -297,11 +296,8 @@
     const detections = await processOutput(logitsData!, boxesData!);
     drawDetections(imageData, detections);
 
-    if (loopEnabled) {
-      isLooping = true;
+    if (isLooping) {
       requestAnimationFrame(() => loadAndRun());
-    } else {
-      isLooping = false;
     }
   }
 
@@ -366,16 +362,13 @@
     const detections = await processOutput(logitsData!, boxesData!);
     drawDetections(loadedImage.imageData, detections);
 
-    if (loopEnabled) {
-      isLooping = true;
+    if (isLooping) {
       requestAnimationFrame(() => loadAndRunOrt());
-    } else {
-      isLooping = false;
     }
   }
 
   function stopLoop() {
-    loopEnabled = false;
+    isLooping = false;
   }
 </script>
 
@@ -389,7 +382,7 @@
         <select
           bind:value={inputSource}
           onchange={onInputSourceChange}
-          class="border px-1"
+          class="border px-1 rounded"
         >
           <option value="example">Example images</option>
           <option value="webcam">Webcam</option>
@@ -398,18 +391,24 @@
     </div>
     <div class="flex gap-2 items-center">
       {#if isLooping}
-        <button onclick={stopLoop} class="border px-2"> Stop </button>
+        <button onclick={stopLoop} class="border px-2">Stop</button>
       {:else}
-        <button onclick={loadAndRun} class="border px-2">
+        <button
+          onclick={() => {
+            if (inputSource === "webcam") isLooping = true;
+            loadAndRun();
+          }}
+        >
           Load & Run (jax-js)
         </button>
-        <button onclick={loadAndRunOrt} class="border px-2">
-          Load & Run (onnxruntime-web)
+        <button
+          onclick={() => {
+            if (inputSource === "webcam") isLooping = true;
+            loadAndRunOrt();
+          }}
+        >
+          Load & Run (onnx)
         </button>
-        <label class="flex items-center gap-1">
-          <input type="checkbox" bind:checked={loopEnabled} />
-          Loop
-        </label>
       {/if}
     </div>
   </div>
@@ -423,7 +422,15 @@
       playsinline
       muted
     ></video>
-    <canvas bind:this={canvasEl} class="border" width="800" height="800"
+    <canvas bind:this={canvasEl} class="max-w-full" width="800" height="800"
     ></canvas>
   </div>
 </main>
+
+<style lang="postcss">
+  @reference "$app.css";
+
+  button {
+    @apply border rounded px-2 hover:bg-gray-100 active:scale-95;
+  }
+</style>
