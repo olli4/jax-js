@@ -51,6 +51,7 @@ export class WebGPUBackend implements Backend {
   nextSlot: number;
 
   #cachedShaderMap = new Map<bigint, ShaderInfo>();
+  #reusableZsb: GPUBuffer;
 
   constructor(readonly device: GPUDevice) {
     if (DEBUG >= 3 && device.adapterInfo) {
@@ -66,6 +67,15 @@ export class WebGPUBackend implements Backend {
     this.buffers = new Map();
     this.nextSlot = 1;
 
+    // Special "zero-size buffer" that's reused across all allocations of size
+    // zero, backing slots for those allocations.
+    //
+    // WebGPU allows creating buffers of size 0, but you cannot actually make
+    // bindings of size 0 when calling `createBindGroup()`. The simplest way to
+    // handle this is to just create a buffer of minimum size (4 bytes) and
+    // reuse that across all zero-size allocations.
+    this.#reusableZsb = this.#createBuffer(4);
+
     device.addEventListener("uncapturederror", (event) => {
       console.error("Uncaptured error in WebGPU backend:", event.error.message);
     });
@@ -76,7 +86,9 @@ export class WebGPUBackend implements Backend {
     // All GPUBuffer must be a multiple of 4 bytes in length, to support copy
     // operations. Pad it to a multiple of 4.
     const paddedSize = Math.ceil(size / 4) * 4;
-    if (initialData) {
+    if (size === 0) {
+      buffer = this.#reusableZsb;
+    } else if (initialData) {
       if (initialData.byteLength !== size) {
         throw new Error("initialData size does not match buffer size");
       }
@@ -121,7 +133,9 @@ export class WebGPUBackend implements Backend {
       this.buffers.delete(slot);
       // The GPUBuffer.destroy() method does not actually free the memory until
       // pending work is done.
-      buffer.buffer.destroy();
+      if (buffer.buffer !== this.#reusableZsb) {
+        buffer.buffer.destroy();
+      }
     }
   }
 
