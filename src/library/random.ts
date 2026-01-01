@@ -1,15 +1,19 @@
 // Port of the `jax.random` module.
 
 import {
+  absolute,
   array,
   Array,
   ArrayLike,
   cos,
   DType,
+  log,
   log1p,
   negative,
+  sign,
   sqrt,
   stack,
+  tan,
 } from "./numpy";
 import { fudgeArray } from "../frontend/array";
 import { bitcast, randomBits } from "../frontend/core";
@@ -117,12 +121,65 @@ export function bernoulli(
 
 /**
  * @function
+ * Sample from a Cauchy distribution with location 0 and scale 1.
+ *
+ * Uses inverse transform sampling: `x = tan(π * (u - 0.5))` where u ~ Uniform(0, 1).
+ */
+export const cauchy = jit(
+  function cauchy(key: Array, shape: number[] = []): Array {
+    const u = uniform(key, shape);
+    // Inverse CDF of Cauchy: tan(π * (u - 0.5))
+    return tan(u.sub(0.5).mul(Math.PI));
+  },
+  { staticArgnums: [1] },
+);
+
+/**
+ * @function
  * Sample exponential random values according to `p(x) = exp(-x)`.
  */
 export const exponential = jit(
   function exponential(key: Array, shape: number[] = []): Array {
     const u = uniform(key, shape);
     return negative(log1p(negative(u))) as Array; // log(1-u) to avoid log(0)
+  },
+  { staticArgnums: [1] },
+);
+
+/**
+ * @function
+ * Sample from a Gumbel distribution with location 0 and scale 1.
+ *
+ * Uses inverse transform sampling: `x = -log(-log(u))` where u ~ Uniform(0, 1).
+ */
+export const gumbel = jit(
+  function gumbel(key: Array, shape: number[] = []): Array {
+    const u = uniform(key, shape);
+    // Use -log(1-u) instead of -log(u) to avoid log(0) at u=0
+    // Then the formula becomes -log(-log(1-u))
+    return negative(log(negative(log1p(negative(u)))));
+  },
+  { staticArgnums: [1] },
+);
+
+/**
+ * @function
+ * Sample from a Laplace distribution with location 0 and scale 1.
+ *
+ * Uses inverse transform sampling: the CDF is `F(x) = 0.5 + 0.5 * sign(x) * (1 - exp(-|x|))`.
+ * Inverting: `x = -sign(u - 0.5) * log(1 - 2 * |u - 0.5|)`.
+ */
+export const laplace = jit(
+  function laplace(key: Array, shape: number[] = []): Array {
+    const u = uniform(key, shape);
+    // u - 0.5 is in [-0.5, 0.5)
+    const centered = u.sub(0.5);
+    const s = sign(centered.ref);
+    // |u - 0.5| ranges from 0 to 0.5, so 2*|u-0.5| ranges from 0 to 1
+    // We use log1p(-(2*|centered|)) = log(1 - 2*|centered|) to avoid log(0)
+    // when centered is close to ±0.5
+    const absVal = absolute(centered);
+    return s.mul(log1p(absVal.mul(-2)).mul(-1));
   },
   { staticArgnums: [1] },
 );
