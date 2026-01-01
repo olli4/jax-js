@@ -145,6 +145,7 @@ export class WebGPUBackend implements Backend {
     count?: number,
   ): Promise<Uint8Array<ArrayBuffer>> {
     const { buffer, size } = this.#getBuffer(slot);
+    if (buffer === this.#reusableZsb) return new Uint8Array();
     if (start === undefined) start = 0;
     if (count === undefined) count = size - start;
 
@@ -170,6 +171,7 @@ export class WebGPUBackend implements Backend {
     count?: number,
   ): Uint8Array<ArrayBuffer> {
     const { buffer, size } = this.#getBuffer(slot);
+    if (buffer === this.#reusableZsb) return new Uint8Array();
     if (start === undefined) start = 0;
     if (count === undefined) count = size - start;
     return this.syncReader.read(buffer, start, count);
