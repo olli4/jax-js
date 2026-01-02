@@ -80,6 +80,13 @@ suite("weak types", () => {
     b.dispose();
   });
 
+  test("arrays of numbers are not weak", () => {
+    const a = np.array([1, 2, 3]);
+    expect(a.dtype).toBe(np.float32);
+    expect(a.weakType).toBe(false);
+    a.dispose();
+  });
+
   test("constant as operand is cast to int32", () => {
     const a = np.array(5, { dtype: np.int32 });
     const b = a.add(3); // 3 is a JS number constant

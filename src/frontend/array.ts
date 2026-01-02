@@ -1190,7 +1190,7 @@ export function array(
       const data = new Int32Array(flat.map((x) => (x ? 1 : 0)));
       return arrayFromData(data, shape, { dtype, device });
     } else {
-      const weakType = dtype == undefined;
+      const weakType = dtype == undefined && shape.length === 0;
       dtype = dtype ?? DType.Float32;
       const data = dtypedJsArray(dtype, flat as number[]);
       return arrayFromData(data, shape, { dtype, device }, weakType);
@@ -1370,7 +1370,7 @@ export function full(
   fillValue: number | boolean | Array,
   { dtype, device }: DTypeAndDevice = {},
 ): Array {
-  let weakType = dtype == undefined;
+  let weakType = dtype == undefined && shape.length === 0;
   if (typeof fillValue === "number") {
     dtype = dtype ?? DType.Float32;
   } else if (typeof fillValue === "boolean") {
