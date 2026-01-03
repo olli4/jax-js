@@ -901,6 +901,16 @@ suite.each(devices)("device:%s", (device) => {
         [6, 7, 8, 9],
         [2, 3, 4, 5, 8, 9],
       );
+
+      // Tests with broadcasting dims
+      checkEinsumShapes("ii->i", [3, 3], [3]);
+      checkEinsumShapes("ii->i", [3, 1], [1]);
+      checkEinsumShapes("i,i->i", [3], [1], [3]);
+      checkEinsumShapes("i,i->i", [1], [3], [3]);
+      checkEinsumShapes("ii,i->i", [3, 3], [1], [3]);
+      checkEinsumShapes("ii,i->i", [1, 1], [3], [3]);
+      checkEinsumShapes("ij,ij->ij", [1, 10], [5, 1], [5, 10]);
+      checkEinsumShapes("...,...->...", [1, 10], [5, 1], [5, 10]);
     });
   });
 

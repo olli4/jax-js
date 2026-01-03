@@ -1705,16 +1705,21 @@ export function std(
 }
 
 /** Estimate the sample covariance of a set of variables. */
-export function cov(x: ArrayLike, y?: ArrayLike): Array {
+export function cov(
+  x: ArrayLike,
+  y: ArrayLike | null = null,
+  { rowvar = true }: { rowvar?: boolean } = {},
+): Array {
   // x should shape (M, N) or (N,), representing N observations of M variables.
   x = fudgeArray(x);
   if (x.ndim === 1) x = x.reshape([1, x.shape[0]]);
   // optional set of additional observations, concatenated to m
-  if (y !== undefined) {
+  if (y !== null) {
     y = fudgeArray(y);
     if (y.ndim === 1) y = y.reshape([1, y.shape[0]]);
     x = vstack([x, y]);
   }
+  if (!rowvar) x = x.transpose();
   const [_M, N] = x.shape;
   x = x.ref.sub(x.mean(1, { keepdims: true })); // Center variables
   return dot(x.ref, x.transpose()).div(N - 1); // [M, M]

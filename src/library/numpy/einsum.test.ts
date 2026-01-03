@@ -73,7 +73,7 @@ suite("parseEinsumExpression()", () => {
   test("supports numpy broadcasting", () => {
     const expr = parseEinsumExpression("..., ..., ...", [
       [],
-      [3, 4],
+      [1, 4],
       [5, 3, 4],
     ]);
     expect(expr.lhsIndices).toEqual([[], [1, 2], [0, 1, 2]]);

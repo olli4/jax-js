@@ -256,9 +256,9 @@ function computeSizeMap({
       const idx = lhsIndex[j];
       const dim = shape[j];
       const existing = sizeMap.get(idx);
-      if (existing === undefined) {
+      if (existing === undefined || existing === 1) {
         sizeMap.set(idx, dim);
-      } else if (existing !== dim) {
+      } else if (existing !== dim && dim !== 1) {
         throw new Error(
           `Inconsistent size for index ${idx} in einsum: ${existing} vs ${dim}`,
         );

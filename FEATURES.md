@@ -591,7 +591,7 @@ modeling their transcendental CDFs (e.g., normal via Box-Muller).
 | `lognormal`            | 🟠      |       |
 | `maxwell`              | 🟠      |       |
 | `multinomial`          | 🟠      |       |
-| `multivariate_normal`  | 🟠      |       |
+| `multivariate_normal`  | 🟢      |       |
 | `normal`               | 🟢      |       |
 | `orthogonal`           | 🟠      |       |
 | `pareto`               | 🟠      |       |

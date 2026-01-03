@@ -5,8 +5,10 @@ import {
   array,
   Array,
   ArrayLike,
+  broadcastShapes,
   cos,
   DType,
+  einsum,
   log,
   log1p,
   negative,
@@ -15,6 +17,7 @@ import {
   stack,
   tan,
 } from "./numpy";
+import { cholesky } from "./numpy-linalg";
 import { fudgeArray } from "../frontend/array";
 import * as core from "../frontend/core";
 import { bitcast, randomBits } from "../frontend/core";
@@ -197,6 +200,51 @@ export const laplace = jit(
     return s.mul(log1p(absVal.mul(-2)).mul(-1));
   },
   { staticArgnums: [1] },
+);
+
+/**
+ * @function
+ * Sample multivariate normal random values with given mean and covariance.
+ *
+ * The values are returned with the given shape, along with the final dimension
+ * used to represent the n-dimensional multivariate normal factors.
+ *
+ * This uses Cholesky decomposition on the covariance matrix.
+ *
+ * @param key - PRNG key
+ * @param mean - Mean vector of shape `[..., n]`
+ * @param cov - Covariance of shape `[..., n, n]`, must be positive-definite
+ * @param shape - Result batch shape, must be broadcastable with
+ *                `mean.shape[:-1]` and `cov.shape[:-2]`
+ * @param dtype - Data type of the result
+ * @returns Random samples of shape `[...shape, n]`
+ */
+export const multivariateNormal = jit(
+  function multivariateNormal(
+    key: Array,
+    mean: ArrayLike,
+    cov: ArrayLike,
+    shape: number[] = [],
+  ): Array {
+    mean = fudgeArray(mean);
+    cov = fudgeArray(cov);
+    const n = mean.shape[mean.ndim - 1];
+    if (cov.shape[cov.ndim - 1] !== n || cov.shape[cov.ndim - 2] !== n) {
+      throw new Error(
+        `Invalid covariance shape: ${cov.shape}. Expected last two ` +
+          `dimensions to be [${n}, ${n}].`,
+      );
+    }
+    const outputShape = broadcastShapes(
+      shape,
+      mean.shape.slice(0, -1),
+      cov.shape.slice(0, -2),
+    ).concat(n);
+    const L = cholesky(cov);
+    const z = normal(key, outputShape);
+    return einsum("...ij,...j->...i", L, z).add(mean);
+  },
+  { staticArgnums: [3] },
 );
 
 /**

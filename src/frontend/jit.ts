@@ -698,7 +698,8 @@ const jitRules: { [P in Primitive]: JitRule<P> } = {
     const c0 = AluExp.u32(0);
     const c1 = AluExp.mod(
       AluExp.cast(DType.Uint32, AluVar.gidx),
-      AluExp.u32(prod(shape.slice(keyShape.length))),
+      // max(..., 1) to avoid mod-by-zero compile error in degenerate case
+      AluExp.u32(Math.max(prod(shape.slice(keyShape.length)), 1)),
     );
     const exp = AluExp.threefry2x32(k0, k1, c0, c1, mode);
     return { exp: [exp] };

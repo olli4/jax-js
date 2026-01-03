@@ -177,5 +177,25 @@ suite.each(devices)("device:%s", (device) => {
       expect(mean).toBeCloseTo(eulerGamma, 1);
       expect(variance).toBeCloseTo(Math.PI ** 2 / 6, 1);
     });
+
+    if (device !== "webgpu") {
+      // TODO: cholesky not yet supported on webgpu
+      test("multivariate normal distribution", () => {
+        const key = random.key(42);
+        const count = 5000;
+        const mean = np.array([1.0, 2.0]);
+        const cov = np.array([
+          [1.0, 0.5],
+          [0.5, 2.0],
+        ]);
+        const y = random.multivariateNormal(key, mean.ref, cov.ref, [count]);
+        expect(y.shape).toEqual([count, 2]);
+
+        expect(np.mean(y.ref, 0)).toBeAllclose(mean, { atol: 3e-2 });
+        expect(np.cov(y, null, { rowvar: false })).toBeAllclose(cov, {
+          atol: 3e-2,
+        });
+      });
+    }
   });
 });
