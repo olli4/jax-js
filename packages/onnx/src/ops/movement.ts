@@ -1,6 +1,4 @@
 // Movement operations, changing shape and indexing.
-//
-// TODO: Split (vision_encoder)
 
 import { numpy as np } from "@jax-js/jax";
 
@@ -155,6 +153,48 @@ export function Concat(
 
   const arrays = inputs.map(operandToJax);
   return [np.concatenate(arrays, axis)];
+}
+
+export function Split(
+  [input, split]: Operand[],
+  {
+    axis = 0,
+    num_outputs,
+    split: splitBeforeOpset13,
+  }: { axis?: number; num_outputs?: number; split?: number[] },
+): Operand[] {
+  const splitSizes: number[] | undefined = split
+    ? operandToJs(split)
+    : splitBeforeOpset13;
+  const indices: number[] = [];
+  if (splitSizes) {
+    let cum = 0;
+    for (let i = 0; i < splitSizes.length - 1; i++) {
+      cum += splitSizes[i];
+      indices.push(cum);
+    }
+  } else if (num_outputs) {
+    const size = input.shape[axis + (axis < 0 ? input.shape.length : 0)];
+    // Split-18's specification does not make sense, consider splitting tensor
+    // of size 90 into 50 groups, there's no reasonable way to satisfy it.
+    //
+    //   "If the tensor is not evenly splittable into num_outputs, the last chunk
+    //    will be smaller."
+    //
+    // See also: https://github.com/onnx/onnx/issues/5766
+    if (size % num_outputs !== 0) {
+      throw new Error(
+        "Split: num_outputs that does not evenly divide the dimension is not supported",
+      );
+    }
+    const chunkSize = size / num_outputs;
+    for (let i = 1; i < num_outputs; i++) {
+      indices.push(i * chunkSize);
+    }
+  } else {
+    throw new Error("Split: either split or num_outputs must be provided");
+  }
+  return np.split(operandToJax(input), indices, axis);
 }
 
 export function Tile([input, repeats]: Operand[]): Operand[] {
