@@ -428,7 +428,7 @@ Most operations behave the same way as they do in JAX.
 | `std`                 | 🟢      |                                         |
 | `subtract`            | 🟢      |                                         |
 | `sum`                 | 🟢      |                                         |
-| `swapaxes`            | 🟠      | `transpose` is supported                |
+| `swapaxes`            | 🟢      |                                         |
 | `take`                | 🟢      |                                         |
 | `take_along_axis`     | 🟠      |                                         |
 | `tan`                 | 🟢      |                                         |
