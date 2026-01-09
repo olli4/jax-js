@@ -665,13 +665,18 @@ const jitRules: { [P in Primitive]: JitRule<P> } = {
     const ndim = avals[0].ndim;
     const sizes = avals.map((x) => x.shape[axis]);
     const finalSize = sizes.reduce((a, b) => a + b, 0);
-    const makePadAxis = (start: number, end: number): [number, number][] =>
+    const { dtype: dtypeOut } = avals
+      .map((x) => x.scalar())
+      .reduce(promoteAvals);
+    const makePadAxis = (start: number, end: number): Pair[] =>
       range(ndim).map((i) => (i === axis ? [start, end] : [0, 0]));
     let cum = 0;
     const src: AluExp[] = [];
     for (let i = 0; i < exps.length; i++) {
       const padding = makePadAxis(cum, finalSize - cum - sizes[i]);
-      src.push(reshapeViews(exps[i], (st) => st.pad(padding)));
+      src.push(
+        reshapeViews(AluExp.cast(dtypeOut, exps[i]), (st) => st.pad(padding)),
+      );
       cum += sizes[i];
     }
     return { exp: [src.reduce(AluExp.add)] };
@@ -906,6 +911,8 @@ function splitGraphDataflow(backend: Backend, jaxpr: Jaxpr): Set<Var> {
     Primitive.Gather,
   ];
   const needsCleanShapePrimitives = [
+    // Concatenate is based on Pad internally.
+    Primitive.Concatenate,
     // If Pad is applied to a non-clean input, the reshaped padding would apply
     // to the view _inside_ of the expression. Imagine `GlobalView(...)+1`: if
     // you reshape each view, it adds zeros into the inner expression, so the

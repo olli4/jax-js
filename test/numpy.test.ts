@@ -1631,6 +1631,12 @@ suite.each(devices)("device:%s", (device) => {
         ],
       ]);
     });
+
+    test("concatenate works in jit", () => {
+      const f = jit(np.concatenate);
+      const c = f([np.flip(np.array([1, 2])), np.array([3, 4]), np.array([5])]);
+      expect(c.js()).toEqual([2, 1, 3, 4, 5]);
+    });
   });
 
   suite("jax.numpy.argmax()", () => {
