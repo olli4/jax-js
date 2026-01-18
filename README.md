@@ -47,51 +47,50 @@ way to get started on a blank HTML page.
 
 Here's a quick, high-level comparison with other popular web ML runtimes:
 
-| Feature                         | jax-js               | TensorFlow.js        | onnxruntime-web    |
-| ------------------------------- | -------------------- | -------------------- | ------------------ |
-| **Overview**                    |                      |                      |                    |
-| Primary usage                   | Research + inference | Inference and arrays | Inference only     |
-| API style                       | JAX/NumPy compatible | TensorFlow-like      | ONNX graph runtime |
-| Latest release                  | 2026                 | ⚠️ 2024              | 2026               |
-| Speed                           | Fastest              | Fast                 | Fastest            |
-| Bundle size (gzip)              | 80 KB                | 269 KB               | 90 KB + 61 MB Wasm |
-| **Autodiff & JIT**              |                      |                      |                    |
-| Gradients                       | ✅                   | ✅                   | ❌                 |
-| Jacobian and Hessian            | ✅                   | ❌                   | ❌                 |
-| `jvp()` forward differentiation | ✅                   | ❌                   | ❌                 |
-| `jit()` kernel fusion           | ✅                   | ❌                   | ❌                 |
-| `vmap()` auto-vectorization     | ✅                   | ❌                   | ❌                 |
-| Graph capture                   | ✅                   | ❌                   | ✅                 |
-| **Backends & Data**             |                      |                      |                    |
-| WebGPU backend                  | ✅                   | 🟡 Preview           | ✅                 |
-| WebGL backend                   | ✅                   | ✅                   | ✅                 |
-| Wasm (CPU) backend              | ✅                   | ✅                   | ✅                 |
-| Eager array API                 | ✅                   | ✅                   | ❌                 |
-| Run ONNX models                 | ✅                   | ❌                   | ✅                 |
-| Read safetensors                | ✅                   | ❌                   | ❌                 |
-| Float64                         | ✅                   | ❌                   | ❌                 |
-| Float32                         | ✅                   | ✅                   | ✅                 |
-| Float16                         | ✅                   | ❌                   | ✅                 |
-| BFloat16                        | ❌                   | ❌                   | ❌                 |
-| Packed Uint8                    | ❌                   | ❌                   | 🟡 Partial         |
-| Mixed precision                 | ✅                   | ❌                   | ✅                 |
-| Mixed devices                   | ✅                   | ❌                   | ❌                 |
-| **Ops & Numerics**              |                      |                      |                    |
-| Arithmetic functions            | ✅                   | ✅                   | ✅                 |
-| Matrix multiplication           | ✅                   | ✅                   | ✅                 |
-| General einsum                  | ✅                   | 🟡 Partial           | 🟡 Partial         |
-| Sorting                         | ✅                   | ❌                   | ❌                 |
-| Activation functions            | ✅                   | ✅                   | ✅                 |
-| NaN/Inf numerics                | ✅                   | ✅                   | ✅                 |
-| Basic convolutions              | ✅                   | ✅                   | ✅                 |
-| n-d convolutions                | ✅                   | ❌                   | ✅                 |
-| Strided/dilated convolution     | ✅                   | ✅                   | ✅                 |
-| Cholesky / Lstsq                | ✅                   | ❌                   | ❌                 |
-| LU / Solve / Determinant        | ✅                   | ❌                   | ❌                 |
-| SVD                             | ✅                   | ❌                   | ❌                 |
-| FFT                             | ✅                   | ✅                   | ✅                 |
-| Basic RNG (Uniform, Normal)     | ✅                   | ✅                   | ✅                 |
-| Advanced RNG                    | ✅                   | ❌                   | ❌                 |
+| Feature                         | jax-js     | TensorFlow.js   | onnxruntime-web    |
+| ------------------------------- | ---------- | --------------- | ------------------ |
+| **Overview**                    |            |                 |                    |
+| API style                       | JAX/NumPy  | TensorFlow-like | Static ONNX graphs |
+| Latest release                  | 2026       | ⚠️ 2024         | 2026               |
+| Speed                           | Fastest    | Fast            | Fastest            |
+| Bundle size (gzip)              | 80 KB      | 269 KB          | 90 KB + 24 MB Wasm |
+| **Autodiff & JIT**              |            |                 |                    |
+| Gradients                       | ✅         | ✅              | ❌                 |
+| Jacobian and Hessian            | ✅         | ❌              | ❌                 |
+| `jvp()` forward differentiation | ✅         | ❌              | ❌                 |
+| `jit()` kernel fusion           | ✅         | ❌              | ❌                 |
+| `vmap()` auto-vectorization     | ✅         | ❌              | ❌                 |
+| Graph capture                   | ✅         | ❌              | ✅                 |
+| **Backends & Data**             |            |                 |                    |
+| WebGPU backend                  | ✅         | 🟡 Preview      | ✅                 |
+| WebGL backend                   | ✅         | ✅              | ✅                 |
+| Wasm (CPU) backend              | ✅         | ✅              | ✅                 |
+| Eager array API                 | ✅         | ✅              | ❌                 |
+| Run ONNX models                 | 🟡 Partial | ❌              | ✅                 |
+| Read safetensors                | ✅         | ❌              | ❌                 |
+| Float64                         | ✅         | ❌              | ❌                 |
+| Float32                         | ✅         | ✅              | ✅                 |
+| Float16                         | ✅         | ❌              | ✅                 |
+| BFloat16                        | ❌         | ❌              | ❌                 |
+| Packed Uint8                    | ❌         | ❌              | 🟡 Partial         |
+| Mixed precision                 | ✅         | ❌              | ✅                 |
+| Mixed devices                   | ✅         | ❌              | ❌                 |
+| **Ops & Numerics**              |            |                 |                    |
+| Arithmetic functions            | ✅         | ✅              | ✅                 |
+| Matrix multiplication           | ✅         | ✅              | ✅                 |
+| General einsum                  | ✅         | 🟡 Partial      | 🟡 Partial         |
+| Sorting                         | ✅         | ❌              | ❌                 |
+| Activation functions            | ✅         | ✅              | ✅                 |
+| NaN/Inf numerics                | ✅         | ✅              | ✅                 |
+| Basic convolutions              | ✅         | ✅              | ✅                 |
+| n-d convolutions                | ✅         | ❌              | ✅                 |
+| Strided/dilated convolution     | ✅         | ✅              | ✅                 |
+| Cholesky, Lstsq                 | ✅         | ❌              | ❌                 |
+| LU, Solve, Determinant          | ✅         | ❌              | ❌                 |
+| SVD                             | ❌         | ❌              | ❌                 |
+| FFT                             | ✅         | ✅              | ✅                 |
+| Basic RNG (Uniform, Normal)     | ✅         | ✅              | ✅                 |
+| Advanced RNG                    | ✅         | ❌              | ❌                 |
 
 ## Tutorial
 
