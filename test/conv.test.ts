@@ -356,4 +356,82 @@ suite.each(devices)("device:%s", (device) => {
     expect(result.shape).toEqual([2, 1, 1, 1, 2]);
     expect(result.js()).toEqual([[[[[6, 8]]]], [[[[8, 10]]]]]);
   });
+
+  function checkConvTransposeShape(
+    xShape: number[],
+    kShape: number[],
+    strides: number[],
+    padding: lax.PaddingType,
+    expectedShape: number[],
+  ) {
+    const x = np.zeros(xShape);
+    const k = np.zeros(kShape);
+    const result = lax.convTranspose(x, k, strides, padding);
+    expect(result.shape).toEqual(expectedShape);
+    result.dispose();
+  }
+
+  test("convTranspose shape tests", () => {
+    // 1D tests
+    // SAME padding: output spatial = input spatial * stride
+    checkConvTransposeShape([1, 1, 4], [1, 1, 3], [2], "SAME", [1, 1, 8]);
+    checkConvTransposeShape([1, 1, 5], [1, 1, 3], [2], "SAME", [1, 1, 10]);
+    checkConvTransposeShape([2, 3, 6], [5, 3, 4], [3], "SAME", [2, 5, 18]);
+
+    // VALID padding: output = (input - 1) * stride + kernel
+    checkConvTransposeShape([1, 1, 4], [1, 1, 3], [2], "VALID", [1, 1, 9]);
+    checkConvTransposeShape([1, 1, 5], [1, 1, 3], [2], "VALID", [1, 1, 11]);
+    checkConvTransposeShape([2, 3, 6], [5, 3, 4], [3], "VALID", [2, 5, 19]);
+
+    // 2D tests
+    // SAME padding
+    checkConvTransposeShape(
+      [1, 1, 4, 4],
+      [1, 1, 3, 3],
+      [2, 2],
+      "SAME",
+      [1, 1, 8, 8],
+    );
+    checkConvTransposeShape(
+      [2, 3, 8, 8],
+      [5, 3, 3, 3],
+      [2, 2],
+      "SAME",
+      [2, 5, 16, 16],
+    );
+    checkConvTransposeShape(
+      [1, 2, 5, 7],
+      [4, 2, 4, 4],
+      [2, 3],
+      "SAME",
+      [1, 4, 10, 21],
+    );
+
+    // VALID padding
+    checkConvTransposeShape(
+      [1, 1, 4, 4],
+      [1, 1, 3, 3],
+      [2, 2],
+      "VALID",
+      [1, 1, 9, 9],
+    );
+    checkConvTransposeShape(
+      [1, 2, 5, 5],
+      [4, 2, 4, 4],
+      [2, 2],
+      "VALID",
+      [1, 4, 12, 12],
+    );
+  });
+
+  test("convTranspose 1d 2x upscale", () => {
+    // 2x upscaling with stride 2 and kernel [1, 1]
+    // Stretched input: [1, 0, 2, 0, 3, 0] conv [1, 1] -> [1, 1, 2, 2, 3, 3]
+    const x = np.array([[[1, 2, 3]]]); // [N=1, C=1, W=3]
+    const k = np.array([[[1, 1]]]); // [C_out=1, C_in=1, kW=2]
+
+    const result = lax.convTranspose(x, k, [2], "SAME", {});
+    expect(result.shape).toEqual([1, 1, 6]);
+    expect(result.slice(0, 0).js()).toEqual([1, 1, 2, 2, 3, 3]);
+  });
 });

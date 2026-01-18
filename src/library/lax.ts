@@ -3,6 +3,8 @@
 // Unlike in JAX, this does not actually underpin `jax.numpy` as a more "core"
 // set of operations, as they both build open the same foundations.
 
+const JsArray = globalThis.Array;
+
 import { Array, ArrayLike } from "../frontend/array";
 import * as core from "../frontend/core";
 import { bind1, Primitive } from "../frontend/core";
@@ -161,7 +163,11 @@ function padtypeToPads(
  * The semantics of this operation mimic the `jax.lax.conv_general_dilated`
  * function in JAX, which wraps XLA's general convolution operator.
  *
- * Grouped convolutions are not supported right now.
+ * @param lhs - Input tensor; shape `[N, C_in, ...xs]`
+ * @param rhs - Convolution kernel; shape `[C_out, C_in / G, ...ks]`
+ * @param windowStrides - Strides for each spatial dimension
+ * @param padding - Padding for each spatial dimension, or a string
+ *   (`"VALID"`, `"SAME"`, or `"SAME_LOWER"`)
  */
 export function convGeneralDilated(
   lhs: Array,
@@ -264,6 +270,92 @@ export function conv(
   padding: PaddingType,
 ): Array {
   return convGeneralDilated(lhs, rhs, windowStrides, padding);
+}
+
+/**
+ * Convenience wrapper for calculating the N-d convolution "transpose".
+ *
+ * This function directly calculates a fractionally strided conv rather than
+ * indirectly calculating the gradient (transpose) of a forward convolution.
+ * It is equivalent to the JAX version, except:
+ *
+ * - The `use_consistent_padding` option is not available. We only have the
+ *   consistent padding case (JAX version >0.8.4).
+ * - The order of dimensions matches `lax.conv_general_dilated`.
+ *
+ * Unlike PyTorch/TensorFlow, by default we don't reverse the kernel's spatial
+ * dimensions or the `(C_out, C_in)` axis order. To get this behavior, set
+ * `transposeKernel` to true.
+ *
+ * @param lhs - Input tensor; shape `[N, C_in, ...xs]`
+ * @param rhs - Convolution kernel; shape `[C_out, C_in, ...ks]`
+ * @param strides - Sequence of n integers, sets fractional stride
+ * @param padding - Apply padding of `dilation * (kernel_size - 1) - padding` to
+ *   each side of the input, so it acts like gradient of `conv()`
+ * @param rhsDilation - Atrous dilation for the kernel
+ * @param transposeKernel - Flip spatial axes and swap the input/output channels
+ *   of the kernel; its shape should be `[C_in, C_out, ...ks]`
+ */
+export function convTranspose(
+  lhs: Array,
+  rhs: Array,
+  strides: number[],
+  padding: PaddingType,
+  {
+    rhsDilation,
+    transposeKernel = false,
+  }: {
+    rhsDilation?: number[];
+    transposeKernel?: boolean;
+  } = {},
+): Array {
+  // Reference: https://github.com/jax-ml/jax/blob/c656803/jax/_src/lax/convolution.py#L296
+  const kernelShape = rhs.shape.slice(2);
+  // Calculate correct output shape from padding and strides.
+  rhsDilation = rhsDilation ?? rep(kernelShape.length, 1);
+  const effectiveKernel = kernelShape.map((k, i) =>
+    Math.max(0, (k - 1) * rhsDilation[i] + 1),
+  );
+  const pads = effectiveKernel.map((k, i) =>
+    convTransposePadding(
+      k,
+      strides[i],
+      typeof padding === "string" ? padding : padding[i],
+    ),
+  );
+  if (transposeKernel) {
+    // Flip spatial axes and swap C_out/C_in.
+    rhs = core.flip(rhs, range(2, rhs.ndim)) as Array;
+    rhs = moveaxis(rhs, 0, 1) as Array;
+  }
+  return convGeneralDilated(lhs, rhs, rep(lhs.ndim - 2, 1), pads, {
+    lhsDilation: strides,
+    rhsDilation,
+  });
+}
+
+// Reference: https://github.com/jax-ml/jax/pull/32268
+function convTransposePadding(
+  k: number,
+  s: number,
+  padding: string | Pair,
+): Pair {
+  let padLen: number;
+  let pad1: number;
+  if (padding === "SAME") {
+    padLen = k + s - 2;
+    pad1 = s > k - 1 ? k - 1 : Math.ceil(padLen / 2);
+  } else if (padding === "VALID") {
+    padLen = k + s - 2 + Math.max(k - s, 0);
+    pad1 = k - 1;
+  } else if (JsArray.isArray(padding)) {
+    const pads = [k - 1 - padding[0], k - 1 - padding[1]];
+    pad1 = pads[0];
+    padLen = pads[0] + pads[1];
+  } else {
+    throw new Error(`convTranspose: Invalid padding type ${padding}`);
+  }
+  return [pad1, padLen - pad1];
 }
 
 /** Reduce a computation over padded windows. */
