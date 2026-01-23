@@ -322,10 +322,10 @@ self-contained way in other projects.
 
 The WebGPU runtime includes an ML compiler with tile-aware optimizations, tuned for indiidual
 browsers. Also, this library uniquely has the `jit()` feature that fuses operations together and
-records an execution graph. The kernels achieve over 3000 GFLOP/s for matrix multiplication on an M4
-Pro chip ([try it](https://jax-js.com/bench/matmul)).
+records an execution graph. jax-js achieves **over 7000 GFLOP/s** for matrix multiplication on an
+Apple M4 Max chip ([try it](https://jax-js.com/bench/matmul)).
 
-On that example, it's significantly faster than both
+For that example, it's significantly faster than both
 [TensorFlow.js](https://github.com/tensorflow/tfjs) and
 [ONNX Runtime Web](https://www.npmjs.com/package/onnxruntime-web), which both use handwritten
 libraries of custom kernels.
