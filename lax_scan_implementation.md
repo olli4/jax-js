@@ -78,7 +78,8 @@ In JAX/XLA, `scan` compiles to a native `WhileOp` primitive that:
 2. **Backend lowering:**
    - WebGPU: Lower to compute shader with loop constructs
    - WASM: Generate loop-based code in the compiled module
-   - Both backends must handle iteration internally
+   - WebGL (compatibility): Similar approach with shader-based loops
+   - All backends must handle iteration internally
 
 3. **Autodiff support:**
    - Forward-mode (JVP): Propagate tangents through loop iterations
@@ -97,7 +98,7 @@ This requires significant architectural work:
 - Extending the Jaxpr IR to support sub-computations
 - Backend code generation for loop constructs
 - Gradient rules for differentiation through loops
-- Testing across all backends (WebGPU, WASM, WebGL)
+- Testing across all backends (WebGPU, WASM, WebGL for compatibility)
 
 ## Architecture Context
 
@@ -109,7 +110,7 @@ Control flow primitives like `scan`, `while_loop`, and `cond` are essential for:
 - Sequence processing (time series, text generation)
 - Differentiable dynamic programming
 
-Without backend-native loops, these patterns require manual unrolling or inefficient Python/JavaScript loops.
+Without backend-native loops, these patterns require manual unrolling or inefficient JavaScript loops.
 
 ### Integration with Existing Infrastructure
 
