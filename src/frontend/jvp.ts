@@ -408,6 +408,9 @@ const jvpRules: { [P in Primitive]: JvpRule<P> } = {
     const [primalsOut, tangentsOut] = [outs.slice(0, n), outs.slice(n)];
     return [primalsOut, tangentsOut];
   },
+  [Primitive.Scan]() {
+    throw new Error("jvp: Scan primitive JVP rule not yet implemented");
+  },
 };
 
 const jvpJaxprCache = new Map<Jaxpr, ClosedJaxpr>();

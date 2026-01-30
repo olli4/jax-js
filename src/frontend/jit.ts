@@ -54,7 +54,37 @@ export type JitStep =
   | {
       type: "free";
       input: JitId;
+    }
+  | {
+      type: "scan";
+      bodyProgram: JitProgram;
+      bodyJaxpr: Jaxpr;
+      length: number;
+      numCarry: number;
+      numConsts: number;
+      numX: number;
+      numY: number;
+      consts: JitId[];
+      initCarry: JitId[];
+      xs: JitId[];
+      outputs: JitId[]; // [carry_out..., stacked_ys...]
     };
+
+/** Callback type for running scan steps during JitProgram execution. */
+export type ScanRunner = (
+  bodyProgram: JitProgram,
+  backend: Backend,
+  jaxpr: Jaxpr,
+  length: number,
+  numCarry: number,
+  numConsts: number,
+  numX: number,
+  numY: number,
+  constSlots: Slot[],
+  initCarrySlots: Slot[],
+  xsSlots: Slot[],
+  outputSlots: Slot[],
+) => { outputs: Slot[], pending: PendingExecute[] };
 
 /** Result of compiling a Jaxpr. Can be evaluated on a series of inputs. */
 export class JitProgram {
@@ -91,6 +121,11 @@ export class JitProgram {
           return PPrint.pp(`incref ${step.input}`);
         case "free":
           return PPrint.pp(`free ${step.input}`);
+        case "scan":
+          return PPrint.pp(`scan length=${step.length} numCarry=${step.numCarry} numConsts=${step.numConsts}`)
+            .concat(PPrint.pp(`  consts=[${step.consts.join(", ")}] initCarry=[${step.initCarry.join(", ")}] xs=[${step.xs.join(", ")}]`))
+            .concat(PPrint.pp(`  outputs=[${step.outputs.join(", ")}]`))
+            .concat(PPrint.pp("  body=").concat(PPrint.pp(step.bodyJaxpr.toString()).indent(4)));
       }
     });
     const display = PPrint.prototype.concat(
@@ -107,8 +142,13 @@ export class JitProgram {
     return this.pprint().toString();
   }
 
-  /** Execute the JitProgram with the given inputs. */
-  execute(inputs: Slot[]): { outputs: Slot[]; pending: PendingExecute[] } {
+  /** Execute the JitProgram with the given inputs. 
+   * @param scanRunner - Optional callback to run scan steps. Required if program contains scan steps.
+   */
+  execute(
+    inputs: Slot[],
+    scanRunner?: ScanRunner
+  ): { outputs: Slot[]; pending: PendingExecute[] } {
     const scope = new Map<JitId, Slot>();
     if (inputs.length !== this.inputs.length) {
       throw new TypeError(
@@ -149,6 +189,38 @@ export class JitProgram {
           const slot = scope.get(step.input)!;
           this.backend.decRef(slot);
           scope.delete(step.input);
+          break;
+        }
+        case "scan": {
+          if (!scanRunner) {
+            throw new Error("internal: scan step requires scanRunner callback");
+          }
+          // Get outer scope slots
+          const constSlots = step.consts.map((id) => scope.get(id)!);
+          const initCarrySlots = step.initCarry.map((id) => scope.get(id)!);
+          const xsSlots = step.xs.map((id) => scope.get(id)!);
+          const outputSlots = step.outputs.map((id) => scope.get(id)!);
+
+          // Delegate to scanRunner callback - it returns the output slots
+          const result = scanRunner(
+            step.bodyProgram,
+            this.backend,
+            step.bodyJaxpr,
+            step.length,
+            step.numCarry,
+            step.numConsts,
+            step.numX,
+            step.numY,
+            constSlots,
+            initCarrySlots,
+            xsSlots,
+            outputSlots,
+          );
+          // Put returned outputs into scope
+          for (let i = 0; i < step.outputs.length; i++) {
+            scope.set(step.outputs[i], result.outputs[i]);
+          }
+          pending.push(...result.pending);
           break;
         }
         default:
@@ -235,7 +307,9 @@ class JitProgramBuilder {
         (s) =>
           (s.type === "execute" &&
             (s.outputs.includes(id) || s.inputs.includes(id))) ||
-          (s.type === "malloc" && s.output === id),
+          (s.type === "malloc" && s.output === id) ||
+          (s.type === "scan" &&
+            (s.consts.includes(id) || s.initCarry.includes(id) || s.xs.includes(id) || s.outputs.includes(id))),
       )!;
       this.steps.splice(lastUsage + 1, 0, {
         type: "free",
@@ -266,9 +340,6 @@ export function jitCompile(backend: Backend, jaxpr: Jaxpr): JitProgram {
   const cached = jitCompileCache.get(cacheKey);
   if (cached) return cached;
 
-  if (DEBUG >= 1) {
-    console.info("=========== JIT Compile ===========\n" + jaxpr.toString());
-  }
 
   jaxpr = jaxpr.flatten().simplify();
   const nargs = jaxpr.inBinders.length;
@@ -324,6 +395,64 @@ export function jitCompile(backend: Backend, jaxpr: Jaxpr): JitProgram {
         ctx.set(outVar, { type: "imm", arg: outId });
       }
       builder.pushRoutine(routine, inputs, outputs);
+      continue;
+    }
+
+    // Handle Scan primitive specially - store jaxpr and run interpreter at execute time
+    if (eqn.primitive === Primitive.Scan) {
+      const params = eqn.params as PrimitiveParams<typeof Primitive.Scan>;
+      const { jaxpr: bodyJaxpr, numCarry, numConsts, length } = params;
+      const numX = bodyJaxpr.inBinders.length - numConsts - numCarry;
+      const numY = bodyJaxpr.outs.length - numCarry;
+
+      // Get input JitIds from context (layout: [consts..., carry..., xs...])
+      const inputs: JitId[] = [];
+      for (const input of eqn.inputs) {
+        if (input instanceof Var) {
+          const jv = ctx.get(input)!;
+          if (jv.type !== "imm") {
+            throw new Error(`jit: scan primitive input is not imm`);
+          }
+          inputs.push(jv.arg);
+        } else if (input instanceof Lit) {
+          inputs.push(builder.pushLit(input));
+        }
+      }
+
+      // Split inputs by role
+      const constsIds = inputs.slice(0, numConsts);
+      const initCarryIds = inputs.slice(numConsts, numConsts + numCarry);
+      const xsIds = inputs.slice(numConsts + numCarry);
+
+
+      // Create output buffers (layout: [carry_out..., stacked_ys...])
+      const outputs: JitId[] = [];
+      for (const outVar of eqn.outBinders) {
+        const outId = builder.pushBuffer(
+          outVar.aval.size * byteWidth(outVar.aval.dtype),
+        );
+        outputs.push(outId);
+        ctx.set(outVar, { type: "imm", arg: outId });
+      }
+
+      // Compile the body jaxpr to a JitProgram for efficient per-iteration execution
+      const bodyProgram = jitCompile(backend, bodyJaxpr);
+
+      // Push scan step
+      builder.steps.push({
+        type: "scan",
+        bodyProgram,
+        bodyJaxpr,
+        length,
+        numCarry,
+        numConsts,
+        numX,
+        numY,
+        consts: constsIds,
+        initCarry: initCarryIds,
+        xs: xsIds,
+        outputs,
+      });
       continue;
     }
 
@@ -463,7 +592,6 @@ export function jitCompile(backend: Backend, jaxpr: Jaxpr): JitProgram {
   builder.insertFreeSteps(outputIds);
 
   const jp = new JitProgram(backend, builder.steps, range(0, nargs), outputIds);
-  if (DEBUG >= 4) console.info(jp.toString());
   jitCompileCache.set(cacheKey, jp);
   return jp;
 }
@@ -775,6 +903,11 @@ const jitRules: { [P in Primitive]: JitRule<P> } = {
   [Primitive.Jit]() {
     throw new Error(
       "internal: Jit should have been flattened before JIT compilation",
+    );
+  },
+  [Primitive.Scan]() {
+    throw new Error(
+      "internal: Scan is handled specially in jitCompile, not via jitRules",
     );
   },
 };

@@ -408,3 +408,6 @@ export function erfc(x: ArrayLike): Array {
 export function stopGradient(x: ArrayLike): Array {
   return core.stopGradient(x) as Array;
 }
+
+// Scan operations for recurrent computations
+export { scan, stackPyTree } from "./lax-scan";

@@ -50,8 +50,13 @@ import {
   UseAfterFreeError,
   where,
 } from "./core";
-import { abstractEvalRules } from "./jaxpr";
-import { jitCompile } from "./jit";
+import { abstractEvalRules, evalJaxpr } from "./jaxpr";
+import {
+  concatenate as coreConcatenate,
+  reshape as coreReshape,
+  shrink as coreShrink,
+} from "./core";
+import { jitCompile, ScanRunner } from "./jit";
 
 const JsArray = globalThis.Array;
 
@@ -289,6 +294,7 @@ export class Array extends Tracer {
     this.dispose(); // After constructing Array, so we don't free this.#source early.
     return ar;
   }
+
 
   /**
    * Underlying implementation of the Gather primitive. This indexes an array
@@ -1092,8 +1098,146 @@ export class Array extends Tracer {
         args = args.map((ar) => ar._putSync(backend));
 
         const jp = jitCompile(backend, jaxpr);
+        
+        // Create scanRunner callback that executes scan body using compiled bodyProgram
+        const scanRunner: ScanRunner = (
+          bodyProgram,
+          _backend,
+          bodyJaxpr,
+          length,
+          numCarry,
+          _numConsts,
+          _numX,
+          numY,
+          constSlots,
+          initCarrySlots,
+          xsSlots,
+          _outputSlots,
+        ) => {
+          // Get avals from bodyJaxpr for wrapping slots
+          const carryAvals = bodyJaxpr.inBinders.slice(constSlots.length, constSlots.length + numCarry).map((v) => v.aval);
+          
+          // Get xs avals from outer jaxpr (they have the leading dimension)
+          const xsOuterAvals = jaxpr.inBinders.slice(constSlots.length + numCarry).map((v) => v.aval);
+          
+          // OPTIMIZATION: Const slots are already realized, use directly
+          const constSlotsRealized = constSlots as number[];
+          
+          // Wrap xs slots as Arrays for ShapeTracker slicing
+          const xs = xsSlots.map((slot, i) => new Array({
+            source: slot,
+            st: ShapeTracker.fromShape(xsOuterAvals[i].shape),
+            dtype: xsOuterAvals[i].dtype,
+            weakType: xsOuterAvals[i].weakType,
+            backend,
+            committed,
+            pending: [],
+          }));
+          
+          // Pre-compute slice ShapeTrackers for all xs
+          const xSliceSts: ShapeTracker[][] = xs.map((x) => {
+            const sliceSts: ShapeTracker[] = [];
+            const squeezedShape = x.shape.slice(1);
+            for (let i = 0; i < length; i++) {
+              const slicePairs: Pair[] = x.shape.map((s, axis) =>
+                axis === 0 ? [i, i + 1] : [0, s]
+              );
+              sliceSts.push(x.#st.shrink(slicePairs).reshape(squeezedShape));
+            }
+            return sliceSts;
+          });
+          
+          // Initialize carry as Arrays from slots
+          let carry = initCarrySlots.map((slot, i) => new Array({
+            source: slot,
+            st: ShapeTracker.fromShape(carryAvals[i].shape),
+            dtype: carryAvals[i].dtype,
+            weakType: carryAvals[i].weakType,
+            backend,
+            committed,
+            pending: [],
+          }));
+          
+          // Accumulate y slices
+          const ySlices: Array[][] = [];
+          for (let j = 0; j < numY; j++) ySlices.push([]);
+          
+          const allPending: PendingExecute[] = [];
+          const bodyOutAvals = bodyJaxpr.outs.map((v) => v.aval);
+          
+          for (let i = 0; i < length; i++) {
+            // Create views for x slices (ref prevents dispose, #reshape applies new ST)
+            const xSlice = xs.map((x, xIdx) => x.ref.#reshape(xSliceSts[xIdx][i]));
+            
+            // Realize inputs to get Slots for bodyProgram.execute()
+            const carrySlots = carry.map((c) => c._realizeSource());
+            const xSliceSlots = xSlice.map((x) => x._realizeSource());
+            
+            // Execute compiled body program!
+            const { outputs: bodyOuts, pending } = bodyProgram.execute(
+              [...constSlotsRealized, ...carrySlots, ...xSliceSlots]
+            );
+            allPending.push(...pending);
+            
+            // Dispose x slices (they were consumed)
+            xSlice.forEach((x) => x.dispose());
+            
+            // Wrap output slots as Arrays
+            const outArrays = bodyOuts.map((slot, j) => new Array({
+              source: slot,
+              st: ShapeTracker.fromShape(bodyOutAvals[j].shape),
+              dtype: bodyOutAvals[j].dtype,
+              weakType: bodyOutAvals[j].weakType,
+              backend,
+              committed,
+              pending: [...pending],
+            }));
+            
+            // Split outputs
+            const newCarry = outArrays.slice(0, numCarry);
+            const ySlice = outArrays.slice(numCarry);
+            
+            // Store y slices
+            for (let j = 0; j < numY; j++) {
+              ySlices[j].push(ySlice[j]);
+            }
+            
+            // Dispose old carry (except first iteration)
+            if (i > 0) {
+              carry.forEach((c) => c.dispose());
+            }
+            carry = newCarry;
+          }
+          
+          // Stack y outputs
+          const stackedYs = ySlices.map((slices) => {
+            const reshaped = slices.map((s) => {
+              // ref.#reshape: ref prevents s from being freed, #reshape creates new Array with expanded dims
+              const expanded = s.ref.#reshape(s.#st.reshape([1, ...s.shape]));
+              s.dispose();
+              return expanded;
+            });
+            const stacked = coreConcatenate(reshaped, 0) as Array;
+            return stacked;
+          });
+          
+          // Realize outputs to get final slots
+          const carryOutSlots = carry.map((c) => c._realizeSource());
+          const yOutSlots = stackedYs.map((y) => y._realizeSource());
+          
+          // Dispose carry and stacked arrays (we've extracted their slots)
+          carry.forEach((c) => c.dispose());
+          stackedYs.forEach((y) => y.dispose());
+          
+          return {
+            outputs: [...carryOutSlots, ...yOutSlots],
+            pending: allPending,
+          };
+        };
+        
         const { outputs, pending } = jp.execute(
           args.map((x) => x._realizeSource()),
+          scanRunner,
         );
         for (const exe of pending) exe.updateRc(+outputs.length - 1);
 
@@ -1113,6 +1257,100 @@ export class Array extends Tracer {
             pending,
           });
         });
+      },
+            [Primitive.Scan](args, { jaxpr, numCarry, numConsts, length }) {
+        // Scan primitive: executes jaxpr in a loop, threading carry state
+        // Args layout: [...consts, ...initCarry, ...xs]
+        // jaxpr inputs: [...consts, ...carry, ...x_slice]
+        // jaxpr outputs: [...newCarry, ...y_slice]
+        
+        const consts = args.slice(0, numConsts);
+        const initCarry = args.slice(numConsts, numConsts + numCarry);
+        const xs = args.slice(numConsts + numCarry);
+        
+        const numX = xs.length;
+        const numY = jaxpr.outs.length - numCarry;
+        
+        // Validate jaxpr inputs match expected count
+        if (jaxpr.inBinders.length !== numConsts + numCarry + numX) {
+          throw new Error(
+            `scan jaxpr expects ${jaxpr.inBinders.length} inputs, got ${numConsts + numCarry + numX}`,
+          );
+        }
+        
+        // PRE-COMPUTE: Slice ShapeTrackers for all xs and all iterations
+        const xSliceSts: ShapeTracker[][] = xs.map((x) => {
+          const sliceSts: ShapeTracker[] = [];
+          const squeezedShape = x.shape.slice(1);
+          for (let i = 0; i < length; i++) {
+            const slicePairs: Pair[] = x.shape.map((s, axis) =>
+              axis === 0 ? [i, i + 1] : [0, s]
+            );
+            sliceSts.push(x.#st.shrink(slicePairs).reshape(squeezedShape));
+          }
+          return sliceSts;
+        });
+        
+        // PRE-CREATE: Const refs (created once, reused each iteration via .ref)
+        // Using ref.#reshape with same ST is equivalent to creating a non-consuming copy
+        const constViews = consts.map((c) => c.ref.#reshape(c.#st));
+        
+        // Accumulate output slices for each y
+        const ySlices: Array[][] = [];
+        for (let j = 0; j < numY; j++) ySlices.push([]);
+        
+        let carry = initCarry;
+        
+        for (let i = 0; i < length; i++) {
+          // Create views using pre-computed ShapeTrackers (ref prevents dispose)
+          const xSlice = xs.map((x, xIdx) => x.ref.#reshape(xSliceSts[xIdx][i]));
+          
+          // Build jaxpr inputs: consts + carry + x_slice
+          const jaxprInputs = [
+            ...constViews.map((c) => c.ref),
+            ...carry.map((c) => c.ref),
+            ...xSlice,
+          ];
+          
+          // Execute jaxpr - this consumes jaxprInputs
+          const outs = evalJaxpr(jaxpr, jaxprInputs) as Array[];
+          
+          // Split outputs into new carry and y_slice
+          const newCarry = outs.slice(0, numCarry);
+          const ySlice = outs.slice(numCarry);
+          
+          // Store y_slice for stacking
+          for (let j = 0; j < numY; j++) {
+            ySlices[j].push(ySlice[j]);
+          }
+          
+          // Dispose old carry (except on first iteration where it's initCarry)
+          if (i > 0) {
+            carry.forEach((c) => c.dispose());
+          }
+          carry = newCarry;
+        }
+        
+        // Dispose inputs
+        initCarry.forEach((c) => c.dispose());
+        xs.forEach((x) => x.dispose());
+        consts.forEach((c) => c.dispose());
+        constViews.forEach((c) => c.dispose());
+        
+        // Stack y outputs along axis 0
+        const stackedYs = ySlices.map((slices) => {
+          const reshaped = slices.map((s) => {
+            // ref.#reshape: ref prevents s from being freed, #reshape creates new Array with expanded dims
+            const expanded = s.ref.#reshape(s.#st.reshape([1, ...s.shape]));
+            s.dispose();
+            return expanded;
+          });
+          // Concatenate using core primitive
+          const stacked = coreConcatenate(reshaped, 0) as Array;
+          return stacked;
+        });
+        
+        return [...carry, ...stackedYs];
       },
     };
   }
