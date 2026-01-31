@@ -85,8 +85,10 @@ export type JitStep =
       batchedParams: any; // BatchedScanParams from webgpu.ts
       length: number;
       numCarry: number;
+      numConsts: number;
       numX: number;
       numY: number;
+      consts: JitId[];
       initCarry: JitId[];
       xs: JitId[];
       outputs: JitId[]; // [carry_out..., stacked_ys...]
@@ -153,7 +155,7 @@ export class JitProgram {
             .concat(PPrint.pp(`  initCarry=[${step.initCarry.join(", ")}] xs=[${step.xs.join(", ")}]`))
             .concat(PPrint.pp(`  outputs=[${step.outputs.join(", ")}]`));
         case "batched-scan":
-          return PPrint.pp(`batched-scan length=${step.length} numCarry=${step.numCarry}`)
+          return PPrint.pp(`batched-scan length=${step.length} numCarry=${step.numCarry} numConsts=${step.numConsts}`)
             .concat(PPrint.pp(`  initCarry=[${step.initCarry.join(", ")}] xs=[${step.xs.join(", ")}]`))
             .concat(PPrint.pp(`  outputs=[${step.outputs.join(", ")}]`));
       }
@@ -294,6 +296,7 @@ export class JitProgram {
           }
           pending.length = 0;  // Clear the pending array
           
+          const constSlots = step.consts.map((id) => scope.get(id)!);
           const initCarrySlots = step.initCarry.map((id) => scope.get(id)!);
           const xsSlots = step.xs.map((id) => scope.get(id)!);
           const outputSlots = step.outputs.map((id) => scope.get(id)!);
@@ -307,6 +310,7 @@ export class JitProgram {
           if (typeof backend.dispatchBatchedScan === "function") {
             backend.dispatchBatchedScan(
               step.batchedParams,  // PreparedBatchedScan
+              constSlots,
               initCarrySlots,
               xsSlots,
               carryOutSlots,
@@ -580,8 +584,10 @@ export function jitCompile(backend: Backend, jaxpr: Jaxpr): JitProgram {
           batchedParams,
           length,
           numCarry,
+          numConsts,
           numX,
           numY,
+          consts: constsIds,
           initCarry: initCarryIds,
           xs: xsIds,
           outputs,
@@ -1341,11 +1347,7 @@ function tryPrepareBatchedScan(
     return null;
   }
 
-  // MVP: No constants support
-  if (numConsts > 0) {
-    if (DEBUG >= 2) console.log("Batched scan: skipped, has constants");
-    return null;
-  }
+  // Constants are supported - they're bound with no offset (same each iteration)
 
   // Find the single execute step with a Routine
   const executeSteps = bodyProgram.steps.filter(s => s.type === "execute");

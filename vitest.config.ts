@@ -22,7 +22,7 @@ export default defineConfig({
       enabled: false,
       provider: "v8",
     },
-    exclude: ["**/node_modules/**", "**/dist/**", "test/deno/**"],
+    exclude: ["**/node_modules/**", "**/dist/**", "test/deno/**", "tmp/**"],
     setupFiles: ["test/setup.ts"],
   },
 });

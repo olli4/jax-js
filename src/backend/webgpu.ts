@@ -481,6 +481,7 @@ export class WebGPUBackend implements Backend {
    */
   dispatchBatchedScan(
     prepared: PreparedBatchedScan,
+    constSlots: Slot[],
     initCarrySlots: Slot[],
     xsSlots: Slot[],
     carryOutSlots: Slot[],
@@ -489,6 +490,7 @@ export class WebGPUBackend implements Backend {
     const { params, wrappedShaders, offsetBuffer, offsetAlignment } = prepared;
     const { length, carrySizes, numCarry, numX, numY, numConsts } = params;
 
+    const constBuffers = constSlots.map((slot) => this.#getBuffer(slot).buffer);
     const initCarryBuffers = initCarrySlots.map((slot) => this.#getBuffer(slot).buffer);
     const xsBuffers = xsSlots.map((slot) => this.#getBuffer(slot).buffer);
     const carryOutBuffers = carryOutSlots.map((slot) => this.#getBuffer(slot).buffer);
@@ -516,10 +518,6 @@ export class WebGPUBackend implements Backend {
       
       // Build storage buffer entries (group 0)
       // Layout: inputs = [consts..., carry_in..., x...], outputs = [carry_out..., y...]
-      const storageEntries: GPUBindGroupEntry[] = [];
-      
-      // Note: consts would come before carry in inputs, but we don't have them here
-      // They should be passed separately if needed
       
       // Create bind groups for ping and pong configurations
       // Even iterations: read from carryPing, write to carryPong
@@ -530,10 +528,12 @@ export class WebGPUBackend implements Backend {
         let binding = 0;
         
         // Inputs: [consts..., carry_in..., x...]
-        // Skip consts for now (numConsts = 0 in most cases)
-        // TODO: handle consts if needed
+        // Constants (same buffer each iteration - no offset needed)
+        for (let c = 0; c < numConsts; c++) {
+          entries.push({ binding: binding++, resource: { buffer: constBuffers[c] } });
+        }
         
-        // Carry inputs (read)
+        // Carry inputs (read from ping or pong)
         for (let c = 0; c < numCarry; c++) {
           entries.push({ binding: binding++, resource: { buffer: readCarry[c] } });
         }
