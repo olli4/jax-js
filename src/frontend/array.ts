@@ -1177,6 +1177,11 @@ export class Array extends Tracer {
             const { outputs: bodyOuts, pending } = bodyProgram.execute(
               [...constSlotsRealized, ...carrySlots, ...xSliceSlots]
             );
+            // Increment RC for allPending reference + for sharing among output Arrays
+            // pending starts with RC=1 from PendingExecute constructor
+            // We need: +1 for allPending, +(numOutputs-1) for output Arrays beyond the first
+            const numOutputs = bodyOuts.length;
+            for (const exe of pending) exe.updateRc(numOutputs); // +1 for allPending + (numOutputs-1) for arrays
             allPending.push(...pending);
             
             // Dispose x slices (they were consumed)
