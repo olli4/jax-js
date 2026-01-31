@@ -541,7 +541,7 @@ export function jitCompile(backend: Backend, jaxpr: Jaxpr): JitProgram {
       const bodyProgram = jitCompile(backend, bodyJaxpr);
 
       // Try to use native scan if possible (WASM/WebGPU, single kernel body)
-      const nativeScanExe = tryPrepareNativeScan(
+      let nativeScanExe = tryPrepareNativeScan(
         backend,
         bodyProgram,
         bodyJaxpr,
@@ -552,6 +552,20 @@ export function jitCompile(backend: Backend, jaxpr: Jaxpr): JitProgram {
         numY,
         eqn,
       );
+      
+      // If single-kernel native scan failed, try multi-kernel native scan
+      if (!nativeScanExe) {
+        nativeScanExe = tryPrepareNativeScanMulti(
+          backend,
+          bodyProgram,
+          bodyJaxpr,
+          length,
+          numCarry,
+          numConsts,
+          numX,
+          numY,
+        );
+      }
 
       if (nativeScanExe) {
         // Use native scan
@@ -1459,7 +1473,9 @@ function tryPrepareNativeScan(
   // Find the single execute step with a Kernel
   const executeSteps = bodyProgram.steps.filter(s => s.type === "execute");
   if (executeSteps.length !== 1) {
-    if (DEBUG >= 2) console.log(`Native scan: skipped, ${executeSteps.length} execute steps`);
+    if (DEBUG >= 2) {
+      console.log(`Native scan: skipped, ${executeSteps.length} execute steps`);
+    }
     return null;
   }
   
@@ -1538,6 +1554,126 @@ function tryPrepareNativeScan(
   } catch (e) {
     if (DEBUG >= 2) {
       console.warn("Native scan preparation failed:", e);
+    }
+    return null;
+  }
+}
+
+/**
+ * Try to prepare a multi-kernel native scan for WASM.
+ * This handles scan bodies with multiple independent kernels (e.g., 2 matmuls).
+ */
+function tryPrepareNativeScanMulti(
+  backend: Backend,
+  bodyProgram: JitProgram,
+  bodyJaxpr: Jaxpr,
+  length: number,
+  numCarry: number,
+  numConsts: number,
+  numX: number,
+  numY: number,
+): Executable | null {
+  // Only WASM backend for now
+  if (backend.type !== "wasm") {
+    return null;
+  }
+  
+  // Get all execute steps
+  const executeSteps = bodyProgram.steps.filter(s => s.type === "execute") as Extract<JitStep, { type: "execute" }>[];
+  
+  // All execute steps must be Kernels (no Routines)
+  if (!executeSteps.every(s => s.source instanceof Kernel)) {
+    if (DEBUG >= 2) console.log("Multi-kernel native scan: skipped, has non-Kernel execute steps");
+    return null;
+  }
+  
+  // MVP: Only support case where numCarry === numY
+  if (numCarry !== numY) {
+    if (DEBUG >= 2) console.log("Multi-kernel native scan: skipped, numCarry !== numY");
+    return null;
+  }
+  
+  // MVP: Execute steps should equal numCarry (one kernel per carry output)
+  if (executeSteps.length !== numCarry) {
+    if (DEBUG >= 2) console.log(`Multi-kernel native scan: skipped, ${executeSteps.length} kernels != ${numCarry} carries`);
+    return null;
+  }
+  
+  // Build output mapping: which output slot corresponds to which carry index
+  // bodyProgram.outputs = [...carryOuts, ...ys] where carryOuts and ys may reference same slots
+  const carryOutSlots = bodyProgram.outputs.slice(0, numCarry);
+  
+  // Get avals for computing sizes and strides
+  const constAvals = bodyJaxpr.inBinders.slice(0, numConsts).map(v => v.aval);
+  const carryAvals = bodyJaxpr.inBinders.slice(numConsts, numConsts + numCarry).map(v => v.aval);
+  const xAvals = bodyJaxpr.inBinders.slice(numConsts + numCarry, numConsts + numCarry + numX).map(v => v.aval);
+  
+  const constSizes = constAvals.map(a => a.size * byteWidth(a.dtype));
+  const carrySizes = carryAvals.map(a => a.size * byteWidth(a.dtype));
+  const xsStrides = xAvals.map(a => a.size * byteWidth(a.dtype));
+  const ysStrides = carrySizes.slice();  // Same as carry sizes for MVP
+  
+  // Build NativeScanStep for each execute step
+  const steps: { kernel: Kernel; inputs: number[]; outputCarryIdx: number; outputSize: number }[] = [];
+  
+  for (const execStep of executeSteps) {
+    const kernel = execStep.source as Kernel;
+    
+    // Find which carry output this step writes to
+    const outSlot = execStep.outputs[0];  // Assuming single output per kernel
+    const carryIdx = carryOutSlots.indexOf(outSlot);
+    if (carryIdx === -1) {
+      if (DEBUG >= 2) console.log("Multi-kernel native scan: output slot not in carry outputs");
+      return null;
+    }
+    
+    // Reindex kernel gids to match jaxpr input order
+    const reindexMap = execStep.inputs;
+    const reindexedExp = kernel.exp.reindexGids(reindexMap);
+    const reindexedKernel = new Kernel(
+      bodyJaxpr.inBinders.length,
+      kernel.size,
+      reindexedExp,
+      kernel.reduction,
+    );
+    
+    steps.push({
+      kernel: reindexedKernel,
+      inputs: execStep.inputs,
+      outputCarryIdx: carryIdx,
+      outputSize: carrySizes[carryIdx],
+    });
+  }
+  
+  // Try to prepare native scan with multiple kernels
+  const nativeBackend = backend as any;
+  if (typeof nativeBackend.prepareNativeScanMulti !== "function") {
+    if (DEBUG >= 2) console.log("Multi-kernel native scan: backend has no prepareNativeScanMulti");
+    return null;
+  }
+  
+  const params = {
+    length,
+    numConsts,
+    constSizes,
+    numCarry,
+    carrySizes,
+    numX,
+    xsStrides,
+    numY,
+    ysStrides,
+    steps,
+  };
+  
+  try {
+    const exe = nativeBackend.prepareNativeScanMulti(params);
+    if (exe) {
+      if (DEBUG >= 1) console.log(`Multi-kernel native scan: SUCCESS! Using ${backend.type.toUpperCase()} native scan with ${steps.length} kernels`);
+    }
+    return exe;
+  } catch (e) {
+    if (DEBUG >= 2) {
+      console.warn("Multi-kernel native scan preparation failed:", e);
     }
     return null;
   }
