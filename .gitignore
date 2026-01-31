@@ -11,3 +11,4 @@ docs-json/
 # Test files from vitest
 __screenshots__/
 coverage/
+deno.lock

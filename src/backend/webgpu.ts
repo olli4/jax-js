@@ -761,6 +761,13 @@ class ShaderPipelineCache {
   }
 
   async prepare(shader: ShaderInfo): Promise<GPUComputePipeline> {
+    // Workaround: Deno's createComputePipelineAsync has a WebIDL binding bug
+    // where the 'compute' field is not recognized. Use sync version instead.
+    // See: https://github.com/denoland/deno/issues/XXXXX
+    if (typeof Deno !== "undefined") {
+      return this.prepareSync(shader);
+    }
+
     const existingPipeline = this.cache.get(shader.code);
     if (existingPipeline) return existingPipeline;
 
@@ -818,15 +825,19 @@ class ShaderPipelineCache {
         entryPoint: "main",
       },
     });
-    this.device.popErrorScope().then(async (scope) => {
-      // This happens asynchronously, so we can't throw here. But shader syntax
-      // validation errors should never occur in correct code. Any issues here
-      // reflect bugs in jax-js.
-      if (scope !== null) {
-        const emsg = await compileError(shaderModule, scope, shader.code);
-        console.error(emsg);
-      }
-    });
+    // Workaround: Deno's popErrorScope() may return null instead of Promise
+    const errorScopePromise = this.device.popErrorScope();
+    if (errorScopePromise) {
+      errorScopePromise.then(async (scope) => {
+        // This happens asynchronously, so we can't throw here. But shader syntax
+        // validation errors should never occur in correct code. Any issues here
+        // reflect bugs in jax-js.
+        if (scope !== null) {
+          const emsg = await compileError(shaderModule, scope, shader.code);
+          console.error(emsg);
+        }
+      });
+    }
     this.cache.set(shader.code, pipeline);
     return pipeline;
   }

@@ -23,25 +23,63 @@ pnpm run lint && pnpm run format   # ESLint + Prettier
 pnpm -C website dev                # local dev server for demos
 ```
 
+### WebGPU testing on headless servers
+For GPU tests on a headless dev server (no display), Chrome requires specific flags:
+```bash
+google-chrome --headless=new --use-angle=vulkan --enable-features=Vulkan \
+  --disable-vulkan-surface --enable-unsafe-webgpu --disable-software-rasterizer
+```
+
+**Prerequisites:**
+- NVIDIA Vulkan ICD: `sudo apt install libnvidia-gl-<version>` (e.g., `libnvidia-gl-565`)
+- Verify Vulkan: `vulkaninfo --summary` should show your GPU
+
+**Known limitation:** Chrome's headless mode may not expose `navigator.gpu` on some systems even with correct Vulkan setup. In that case, WebGPU tests will be skipped; cpu and wasm backends still run. To test WebGPU, use a machine with a display or run headed Chrome via xvfb:
+```bash
+sudo apt-get install -y xvfb
+xvfb-run -a pnpm test run
+```
+
+**Alternative: Deno for headless hardware WebGPU**
+Deno's WebGPU implementation (based on wgpu-rs) works headless without X11:
+```bash
+# Install Deno
+curl -fsSL https://deno.land/install.sh | sh
+
+# Verify hardware GPU access (no display required)
+deno eval --unstable-webgpu 'const a = await navigator.gpu.requestAdapter(); console.log(a?.info)'
+# Should print: { description: "NVIDIA GeForce RTX 4070 Ti SUPER", ... }
+
+# Run Deno-based tests
+pnpm run test:deno                # runs test/deno/*.test.ts
+```
+
+**Deno WebGPU workaround:** Deno's `createComputePipelineAsync` has a WebIDL binding bug where the `compute` field is not recognized. jax-js automatically uses the synchronous `createComputePipeline` when running in Deno, enabling full WebGPU support on hardware GPUs headlessly.
+
 ## Reference-counting & ownership (critical)
-Function arguments are **consumed by default** (refcount −1). Reuse an array by accessing `.ref` (refcount +1). Call `.dispose()` when done.
+Function arguments are **consumed by default** (refcount −1). Reuse an array by accessing `.ref` (refcount +1). The `.data()` method also **consumes the array** after reading.
 ```ts
 // BAD: consumes x twice
 function foo(x) { return x.add(x.mul(y)); }
 
 // GOOD: .ref keeps x alive for the second use
 function foo(x) { return x.ref.add(x.mul(y)); }
+
+// .data() consumes - don't dispose after!
+const result = await arr.data();  // arr is now consumed
+// arr.dispose(); // WRONG - would double-free
 ```
-Canonical examples: `test/refcount.test.ts`, `test/conv.test.ts`.
+Canonical examples: `test/refcount.test.ts`, `test/conv.test.ts`, `test/deno/webgpu.test.ts`.
 
 ### Memory lifecycle in detail
 1. **Array creation** — `np.array(...)` allocates a backend `Slot` (buffer) with refcount = 1.
 2. **`.ref` accessor** — increments the *Array object's* `#rc`; same underlying Slot.
 3. **Function call** — passing an Array decrements `#rc` by 1 (ownership transfer).
-4. **`.dispose()`** — decrements `#rc`; when it hits 0:
+4. **`.data()` / `.dataSync()`** — reads the buffer, then calls `dispose()` internally (consumes the array).
+5. **`.dispose()`** — decrements `#rc`; when it hits 0:
    - Cancels any pending `PendingExecute` not yet submitted.
    - Calls `backend.decRef(slot)` → frees GPU/Wasm memory when slot refcount = 0.
-5. **Pending ops** — `PendingExecute` holds refs on input/output Slots until `submit()` to prevent premature free.
+6. **Pending ops** — `PendingExecute` holds refs on input/output Slots until `submit()` to prevent premature free.
 
 ### Backend memory (Wasm vs WebGPU)
 | Aspect | Wasm (`src/backend/wasm.ts`) | WebGPU (`src/backend/webgpu.ts`) |
@@ -85,6 +123,20 @@ All public symbols must be exported from `src/index.ts`. Key exports:
 - Always exercise `.ref` / `.dispose()` semantics in new tests.
 - Use `website/src/routes/repl/*` and `website/src/routes/mobileclip/*` as integration smoke tests.
 
+### GPU device permissions (Linux)
+To run WebGPU tests on Linux, the user must have access to GPU render devices:
+```bash
+# Check current groups
+id
+
+# Add user to render and video groups (requires sudo)
+sudo usermod -a -G render,video $USER
+
+# Log out and back in for changes to take effect
+# Or use `sg render -c 'command'` to run a single command with the new group
+```
+The render devices (`/dev/dri/renderD*`) are owned by the `render` group.
+
 ## Common pitfalls
 - Forgetting `.ref` → double-consume → `ReferenceError` in tests.
 - Exporting a symbol from a library file but not from `src/index.ts` → missing from published types.
@@ -121,8 +173,75 @@ The JIT system lives in `src/frontend/jit.ts` and `src/frontend/jaxpr.ts`.
 3. Update `FEATURES.md` and website examples for user-visible changes.
 4. For backend work, add a micro-benchmark in `bench/` where relevant.
 
+## Scan Primitive (`lax.scan`)
+`lax.scan` applies a function over the leading axis of arrays, threading carry state. Located in `src/library/lax-scan.ts`.
+
+**Signature:**
+```ts
+const [finalCarry, stackedOutputs] = await lax.scan(f, initCarry, xs);
+// f: (carry, x) => [newCarry, y]
+```
+
+**Architecture:**
+```
+lax.scan(f, init, xs)
+  → Trace f → bodyJaxpr (once)
+  → Primitive.Scan(jaxpr, numCarry, numConsts, length)
+  → scanRunner (JS loop):
+      for i in 0..length:
+        xSlice = xs[i] via ShapeTracker (zero-copy view)
+        [carry, y] = bodyProgram.execute(carry, xSlice)
+      return [carry, stack(ys)]
+```
+
+**Key files:**
+| File | Role |
+|------|------|
+| `src/frontend/core.ts` | `Primitive.Scan` enum + params type |
+| `src/frontend/jaxpr.ts` | Abstract eval rule |
+| `src/frontend/array.ts` | Scan impl rule with `scanRunner` callback |
+| `src/frontend/jit.ts` | `JitStep.scan` with compiled `bodyProgram` |
+| `src/library/lax-scan.ts` | Public API |
+
+**Argument layout:**
+```
+Primitive args:   [...consts, ...initCarry, ...xs]
+Body jaxpr input: [...consts, ...carry, ...x_slice]
+```
+
+**Critical patterns:**
+1. **Pending ops before sync reads** — call `_realizeSource()` on args, submit pending BEFORE `jp.execute()`.
+2. **Slot refcount on extraction** — `backend.incRef(slot)` before disposing the Array wrapper.
+3. **WASM instance caching** — `WeakMap<WebAssembly.Module, WebAssembly.Instance>` gives ~2× speedup.
+4. **`.ref` for dual-use values** — when a value appears in both carry and output:
+   ```ts
+   const newSum = carry.sum.ref.add(x.ref);
+   return [{ sum: newSum.ref }, newSum];  // .ref keeps it alive
+   ```
+
+**Current status (Jan 2026):**
+- ✅ CPU + WASM + WebGPU backends tested
+- ✅ WebGPU tested via Deno on NVIDIA RTX 4070 Ti SUPER (headless, no X11)
+- The JS loop runs on CPU, but `bodyProgram.execute()` runs on the active backend (WebGPU/WASM)
+- Data stays on GPU between iterations (zero-copy slicing via ShapeTracker)
+
+**Future: backend-native loop**
+Move the JS loop into the backend to eliminate per-iteration boundary crossings:
+| Backend | Strategy |
+|---------|----------|
+| CPU | Keep JS loop (no overhead) |
+| WASM | WASM loop function with `call` |
+| WebGPU | Shader inlining (WGSL has no fn pointers) |
+
+**Development strategy**: Implement WASM loop inlining first, then port the approach to WebGPU.
+- WASM is more debuggable (step through, inspect memory directly)
+- WASM has proper `call` instruction for body kernels; patterns learned transfer to WebGPU
+- WebGPU requires shader inlining (no function pointers in WGSL) — harder to debug
+- Test coverage on WASM validates the loop structure before tackling GPU complexity
+
 ## Where to start reading
 - Entry & exports: [src/index.ts](src/index.ts)
 - Memory model: README.md § "Reference counting", [test/refcount.test.ts](test/refcount.test.ts)
 - Backends: [src/backend/webgpu/](src/backend/webgpu/), [src/backend/wasm/](src/backend/wasm/)
 - Demos: [website/src/routes/repl/](website/src/routes/repl/), [website/src/routes/mobileclip/](website/src/routes/mobileclip/)
+- Deno WebGPU tests: [test/deno/webgpu.test.ts](test/deno/webgpu.test.ts) — headless hardware GPU testing

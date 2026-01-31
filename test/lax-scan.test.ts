@@ -2,8 +2,10 @@
  * Tests for lax.scan implementation
  */
 
-import { describe, it, expect, beforeAll } from "vitest";
-import { init, defaultDevice, numpy as np, lax, tree } from "../src";
+import { describe, it, expect, beforeAll, beforeEach, suite, test } from "vitest";
+import { init, defaultDevice, numpy as np, lax, tree, devices, jit, Device } from "../src";
+
+const devicesAvailable = await init();
 
 describe("lax.scan", () => {
   beforeAll(async () => {
@@ -125,5 +127,116 @@ describe("lax.scan", () => {
       const finalData = await final.data();
       expect(finalData[0]).toBeCloseTo(66.0);
     });
+  });
+});
+
+/**
+ * Multi-backend scan tests - runs on all available devices including WebGPU
+ */
+suite.each(devices)("lax.scan device:%s", (device) => {
+  const skipped = !devicesAvailable.includes(device);
+  beforeEach(({ skip }) => {
+    if (skipped) skip();
+    defaultDevice(device);
+  });
+
+  test("cumulative sum", async () => {
+    const step = (carry: np.Array, x: np.Array): [np.Array, np.Array] => {
+      const newCarry = np.add(carry, x);
+      return [newCarry, newCarry.ref];
+    };
+
+    const initCarry = np.array([0.0]);
+    const xs = np.array([[1.0], [2.0], [3.0], [4.0], [5.0]]);
+
+    const [finalCarry, outputs] = await lax.scan(step, initCarry, xs);
+
+    const finalData = await finalCarry.data();
+    expect(finalData[0]).toBeCloseTo(15.0);
+
+    const outputData = await outputs.data();
+    expect(Array.from(outputData)).toEqual([1, 3, 6, 10, 15]);
+  });
+
+  test("jit + scan", async () => {
+    // Note: lax.scan is async, so we test jit on the step function itself
+    const step = jit((carry: np.Array, x: np.Array): [np.Array, np.Array] => {
+      const newCarry = np.add(carry, x);
+      return [newCarry, newCarry.ref];
+    });
+
+    const initCarry = np.array([0.0]);
+    const xs = np.array([[1.0], [2.0], [3.0]]);
+
+    const [finalCarry, outputs] = await lax.scan(step, initCarry, xs);
+
+    const finalData = await finalCarry.data();
+    expect(finalData[0]).toBeCloseTo(6.0);
+
+    const outputData = await outputs.data();
+    expect(Array.from(outputData)).toEqual([1, 3, 6]);
+  });
+
+  test("pytree carry with multiple arrays", async () => {
+    type Carry = { sum: np.Array; product: np.Array };
+
+    const step = (carry: Carry, x: np.Array): [Carry, np.Array] => {
+      const newSum = np.add(carry.sum.ref, x.ref);
+      const newProduct = np.multiply(carry.product, x);
+      return [
+        { sum: newSum, product: newProduct },
+        newSum.ref,
+      ];
+    };
+
+    const initCarry = { sum: np.array([0.0]), product: np.array([1.0]) };
+    const xs = np.array([[2.0], [3.0], [4.0]]);
+
+    const [final, outputs] = await lax.scan(step, initCarry, xs);
+
+    const sumData = await final.sum.data();
+    const productData = await final.product.data();
+
+    expect(sumData[0]).toBeCloseTo(9.0);      // 2+3+4
+    expect(productData[0]).toBeCloseTo(24.0); // 2*3*4
+
+    const outputData = await outputs.data();
+    expect(Array.from(outputData)).toEqual([2, 5, 9]);
+  });
+
+  test("larger iteration count", async () => {
+    const step = (carry: np.Array, x: np.Array): [np.Array, np.Array] => {
+      const newCarry = np.add(carry, x);
+      return [newCarry, newCarry.ref];
+    };
+
+    const n = 100;
+    const initCarry = np.array([0.0]);
+    const xs = np.ones([n, 1]);
+
+    const [finalCarry, _outputs] = await lax.scan(step, initCarry, xs);
+
+    const finalData = await finalCarry.data();
+    expect(finalData[0]).toBeCloseTo(n);
+  });
+
+  test("elementwise ops in scan body", async () => {
+    // More complex body: carry = tanh(carry + x * 0.1)
+    const step = (carry: np.Array, x: np.Array): [np.Array, np.Array] => {
+      const scaled = np.multiply(x, np.array([0.1]));
+      const added = np.add(carry, scaled);
+      const newCarry = np.tanh(added);
+      return [newCarry, newCarry.ref];
+    };
+
+    const initCarry = np.array([0.0]);
+    const xs = np.array([[1.0], [1.0], [1.0], [1.0], [1.0]]);
+
+    const [finalCarry, outputs] = await lax.scan(step, initCarry, xs);
+
+    // Should converge towards tanh saturation
+    const finalData = await finalCarry.data();
+    expect(finalData[0]).toBeGreaterThan(0);
+    expect(finalData[0]).toBeLessThan(1);
   });
 });
