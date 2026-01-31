@@ -229,16 +229,17 @@ Body jaxpr input: [...consts, ...carry, ...x_slice]
 **Current status (Jan 2026):**
 - ✅ CPU + WASM + WebGPU backends tested
 - ✅ WebGPU tested via Deno on NVIDIA RTX 4070 Ti SUPER (headless, no X11)
-- ✅ **WASM native scan loop** — ~130× faster than JS loop for eligible scans
+- ✅ **WASM native scan loop** — ~130× faster than JS loop for single-kernel scans
+- ✅ **WASM multi-kernel native scan** — ~4,000× faster for multi-kernel bodies (e.g., Kalman filter with 2 matmuls)
 - The JS loop runs on CPU, but `bodyProgram.execute()` runs on the active backend (WebGPU/WASM)
 - Data stays on GPU between iterations (zero-copy slicing via ShapeTracker)
 
-**WASM native scan (implemented):**
+**WASM native scan — single kernel (implemented):**
 Eligible scans (single elementwise body kernel, no reduction, numCarry === numY)
 are compiled to a single WASM module with the outer loop inlined. **Constants are now supported** —
 captured variables (like scale factors, offsets) are passed as pointers and used without iteration offsets.
 
-Key implementation:
+Key implementation (single kernel):
 | File | Component |
 |------|-----------|
 | `src/backend/wasm.ts` | `NativeScanParams`, `prepareNativeScan()`, `dispatchNativeScan()`, `codegenNativeScan()` |
@@ -256,13 +257,80 @@ submitted before the native scan dispatches. Two flush points are required:
 | Backend | Status | Constraint |
 |---------|--------|------------|
 | CPU | JS loop only | — |
-| WASM | ✅ Native loop | Single kernel body (elementwise or reduction) |
+| WASM | ✅ Native loop (single) | Single kernel body (elementwise or reduction) |
+| WASM | ✅ Native loop (multi) | Multiple independent kernels (e.g., 2 matmuls) |
 | WebGPU | ✅ Native loop | Elementwise bodies only (no reductions) |
 | WebGPU | ✅ Batched scan | Routine bodies (TriangularSolve, Cholesky, LU) |
 | WASM | ❌ Batched scan | Not needed — reductions work in native loop |
 
-**Note:** WASM native scan now supports reduction kernels (e.g., matmul = Mul→Sum).
+**Note:** WASM native scan supports reduction kernels (e.g., matmul = Mul→Sum).
 Kalman filter with matrix ops runs entirely in WASM with inlined loop.
+
+### WASM Multi-Kernel Native Scan (Jan 2026)
+
+When a scan body compiles to **multiple independent kernels** (e.g., Kalman filter with 2 matmuls),
+the single-kernel native scan path fails. Multi-kernel native scan compiles all kernels into
+a single WASM module with the outer loop inlined.
+
+**Performance:** ~4,000× faster than JS loop (8.5M iterations/sec vs 2K iterations/sec for 2×2 matmuls).
+
+**Architecture:**
+```
+tryPrepareNativeScanMulti():
+  1. Detect: body has N execute steps, each with a Kernel (not Routine)
+  2. Verify: each kernel writes exactly one carry output (1:1 mapping)
+  3. Extract: kernel expressions, input slot mappings, output sizes
+  4. Return: NativeScanMultiParams with steps[] describing each kernel
+
+codegenNativeScanMulti():
+  1. Allocate WASM locals: iteration counter, element index, slot pointers
+  2. Generate outer loop (i = 0..length):
+     - Compute xs/ys offsets for iteration i
+     - For each kernel step:
+       - inner loop (elem = 0..outputSize):
+         - Compute each input value (carry, xs, consts)
+         - Evaluate kernel ALU expression
+         - Store to carry output buffer
+  3. Return WebAssembly.Module with inlined loop
+```
+
+**Key types:**
+| Type | File | Role |
+|------|------|------|
+| `NativeScanMultiParams` | `wasm.ts` | Multi-kernel scan parameters |
+| `NativeScanStep` | `wasm.ts` | Per-kernel step descriptor |
+| `tryPrepareNativeScanMulti()` | `jit.ts` | Detection and preparation |
+| `codegenNativeScanMulti()` | `wasm.ts` | WASM bytecode generation |
+| `prepareNativeScanMulti()` | `wasm.ts` | Backend method |
+
+**NativeScanStep interface:**
+```ts
+interface NativeScanStep {
+  kernel: Kernel;           // The ALU kernel to execute
+  inputs: number[];         // Jaxpr input indices for this kernel
+  outputCarryIdx: number;   // Which carry slot this kernel writes (0-based)
+  outputSize: number;       // Number of elements in output
+}
+```
+
+**Eligibility constraints:**
+- WASM backend only
+- Body must compile to multiple execute steps (single-kernel handled separately)
+- Each execute step must be a Kernel (not Routine)
+- Each kernel must write exactly one carry output
+- `numCarry === numY` (carry and output are the same values)
+- Number of kernels must equal numCarry
+
+**Input classification in multi-kernel:**
+Each kernel's inputs are classified by their jaxpr index:
+- `idx < numConsts`: constant (no offset, fixed pointer)
+- `idx < numConsts + numCarry`: carry input (read from carry buffer)
+- `idx >= numConsts + numCarry`: xs input (offset by `iteration * size`)
+
+**Output handling:**
+Each kernel writes to a specific carry buffer. The `outputCarryIdx` field determines
+which carry slot the kernel updates. Carry buffers are reused across iterations
+(no ping-pong needed since kernels are independent).
 
 **WebGPU native scan design:**
 For elementwise body kernels (no reductions), each element's scan is completely independent:
