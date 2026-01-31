@@ -271,7 +271,7 @@ communication. Multiple workgroups can run independent scan loops without synchr
 - `numCarry === numY` (carry and output are the same values)
 
 **WebGPU batched scan for routines (verified Jan 2026):**
-For routine bodies (matmul, conv, triangular solve), we use uniform-based offsets.
+For routine bodies (triangular solve, cholesky, LU), we use uniform-based offsets.
 **Numerically verified** via Deno WebGPU tests on NVIDIA RTX 4070 Ti SUPER.
 
 | File | Component |
@@ -279,8 +279,18 @@ For routine bodies (matmul, conv, triangular solve), we use uniform-based offset
 | `src/backend/webgpu/scan-wrapper.ts` | WGSL shader transformer for uniform-based offsets |
 | `src/backend/webgpu/scan-wrapper.test.ts` | Unit tests (8 tests) |
 | `src/backend/webgpu.ts` | `PreparedBatchedScan`, `prepareBatchedScan()`, `dispatchBatchedScan()` |
-| `src/frontend/jit.ts` | `JitStep["batched-scan"]` handler |
+| `src/frontend/jit.ts` | `tryPrepareBatchedScan()`, `JitStep["batched-scan"]` handler |
 | `test/deno/batched-scan.test.ts` | End-to-end GPU verification (5 tests) |
+
+**Batched scan eligibility constraints:**
+- WebGPU backend only
+- Body must be single execute step with a Routine (not Kernel)
+- Routine must not already use uniforms (excludes Sort/Argsort)
+- No constants in scan body (MVP)
+- `numCarry === numY` (carry and output are the same values)
+
+**Note:** Matmul/Dot is NOT a Routine — it's lowered to Mul→Reduce Kernel. Common routines
+that qualify: TriangularSolve, Cholesky, LU (but complex bodies with reshapes don't qualify).
 
 **Why uniform-based offsets (not buffer offsets):**
 - `minStorageBufferOffsetAlignment` is 256 bytes on most GPUs

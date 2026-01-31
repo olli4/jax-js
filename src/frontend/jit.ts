@@ -532,7 +532,7 @@ export function jitCompile(backend: Backend, jaxpr: Jaxpr): JitProgram {
       // Compile the body jaxpr to a JitProgram for efficient per-iteration execution
       const bodyProgram = jitCompile(backend, bodyJaxpr);
 
-      // Try to use native scan if possible (WASM backend only, single kernel body)
+      // Try to use native scan if possible (WASM/WebGPU, single kernel body)
       const nativeScanExe = tryPrepareNativeScan(
         backend,
         bodyProgram,
@@ -557,23 +557,53 @@ export function jitCompile(backend: Backend, jaxpr: Jaxpr): JitProgram {
           xs: xsIds,
           outputs,
         });
-      } else {
-        // Fall back to JS loop scan
+        continue;
+      }
+
+      // Try to use batched scan for routine bodies (WebGPU only, matmul/conv/etc.)
+      const batchedParams = tryPrepareBatchedScan(
+        backend,
+        bodyProgram,
+        bodyJaxpr,
+        length,
+        numCarry,
+        numConsts,
+        numX,
+        numY,
+        eqn,
+      );
+
+      if (batchedParams) {
+        // Use batched scan
         builder.steps.push({
-          type: "scan",
-          bodyProgram,
-          bodyJaxpr,
+          type: "batched-scan",
+          batchedParams,
           length,
           numCarry,
-          numConsts,
           numX,
           numY,
-          consts: constsIds,
           initCarry: initCarryIds,
           xs: xsIds,
           outputs,
         });
+        continue;
       }
+
+      // Fall back to JS loop scan
+      builder.steps.push({
+        type: "scan",
+        bodyProgram,
+        bodyJaxpr,
+        length,
+        numCarry,
+        numConsts,
+        numX,
+        numY,
+        consts: constsIds,
+        initCarry: initCarryIds,
+        xs: xsIds,
+        outputs,
+      });
       continue;
     }
 
@@ -1284,6 +1314,122 @@ function splitGraphDataflow(backend: Backend, jaxpr: Jaxpr): Set<Var> {
  * 3. No constants (for MVP simplicity)
  * 4. No reduction in the body kernel
  */
+/**
+ * Try to prepare a batched scan for routine bodies (matmul, conv, etc.).
+ * Returns the PreparedBatchedScan params if possible, null otherwise.
+ *
+ * Batched scan is only supported when:
+ * 1. Backend is WebGPU
+ * 2. Body program contains exactly one execute step with a Routine (not Kernel)
+ * 3. MVP: No constants support
+ * 4. MVP: numCarry === numY (carry and output are the same)
+ */
+function tryPrepareBatchedScan(
+  backend: Backend,
+  bodyProgram: JitProgram,
+  bodyJaxpr: Jaxpr,
+  length: number,
+  numCarry: number,
+  numConsts: number,
+  numX: number,
+  numY: number,
+  eqn: { inputs: (Var | Lit)[]; outBinders: Var[] },
+): any | null {  // Returns PreparedBatchedScan or null
+  // Only WebGPU backend supports batched scan
+  if (backend.type !== "webgpu") {
+    if (DEBUG >= 2) console.log("Batched scan: skipped, unsupported backend");
+    return null;
+  }
+
+  // MVP: No constants support
+  if (numConsts > 0) {
+    if (DEBUG >= 2) console.log("Batched scan: skipped, has constants");
+    return null;
+  }
+
+  // Find the single execute step with a Routine
+  const executeSteps = bodyProgram.steps.filter(s => s.type === "execute");
+  if (executeSteps.length !== 1) {
+    if (DEBUG >= 2) console.log(`Batched scan: skipped, ${executeSteps.length} execute steps (need exactly 1)`);
+    return null;
+  }
+
+  const execStep = executeSteps[0] as Extract<JitStep, { type: "execute" }>;
+  if (!(execStep.source instanceof Routine)) {
+    if (DEBUG >= 2) console.log("Batched scan: skipped, not a Routine");
+    return null;
+  }
+
+  const bodyRoutine = execStep.source;
+
+  // MVP: Only support case where carry and y are the same (like cumulative matmul)
+  // This means numCarry === numY and the outputs reference the same variables
+  if (numCarry !== numY) {
+    if (DEBUG >= 2) console.log(`Batched scan: skipped, numCarry=${numCarry} !== numY=${numY}`);
+    return null;
+  }
+
+  // Get avals for computing sizes and strides
+  const carryAvals = bodyJaxpr.inBinders.slice(numConsts, numConsts + numCarry).map(v => v.aval);
+  const xAvals = bodyJaxpr.inBinders.slice(numConsts + numCarry).map(v => v.aval);
+
+  // Compute carry sizes in bytes
+  const carrySizes = carryAvals.map(a => a.size * byteWidth(a.dtype));
+
+  // Compute xs strides (ELEMENTS per iteration along axis 0)
+  // xs has leading dimension = length, so stride = size_without_leading_dim
+  const xsElemStrides = xAvals.map(a => a.size);  // elements per slice
+
+  // Compute ys strides (same as carry for MVP)
+  const ysElemStrides = carryAvals.map(a => a.size);  // elements per slice
+
+  // Try to prepare the routine executable
+  const webgpuBackend = backend as any;
+  if (typeof webgpuBackend.prepareRoutineSync !== "function") {
+    if (DEBUG >= 2) console.log("Batched scan: skipped, backend has no prepareRoutineSync");
+    return null;
+  }
+
+  let bodyRoutineExe;
+  try {
+    bodyRoutineExe = webgpuBackend.prepareRoutineSync(bodyRoutine);
+  } catch (e) {
+    if (DEBUG >= 2) console.warn("Batched scan: prepareRoutineSync failed:", e);
+    return null;
+  }
+
+  // Try to prepare batched scan
+  if (typeof webgpuBackend.prepareBatchedScan !== "function") {
+    if (DEBUG >= 2) console.log("Batched scan: skipped, backend has no prepareBatchedScan");
+    return null;
+  }
+
+  const batchedScanParams = {
+    length,
+    carrySizes,
+    xsElemStrides,
+    ysElemStrides,
+    bodyRoutine: bodyRoutineExe,
+    numCarry,
+    numX,
+    numY,
+    numConsts,
+  };
+
+  try {
+    const prepared = webgpuBackend.prepareBatchedScan(batchedScanParams);
+    if (prepared) {
+      if (DEBUG >= 1) console.log(`Batched scan: SUCCESS! Using WebGPU batched scan for ${bodyRoutine.name}`);
+    }
+    return prepared;
+  } catch (e) {
+    if (DEBUG >= 2) {
+      console.warn("Batched scan preparation failed:", e);
+    }
+    return null;
+  }
+}
+
 function tryPrepareNativeScan(
   backend: Backend,
   bodyProgram: JitProgram,

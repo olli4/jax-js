@@ -412,6 +412,12 @@ export class WebGPUBackend implements Backend {
     // Wrap each shader in the routine with offset support
     const wrappedShaders: ShaderDispatch[] = [];
     for (const shader of bodyRoutine.data) {
+      // Skip routines that already use uniforms (like Sort) - they conflict with our offset uniform
+      if (shader.hasUniform) {
+        if (DEBUG >= 2) console.log("Batched scan: shader already has uniform, skipping");
+        return null;
+      }
+
       const wrapped = wrapRoutineForScan(shader, scanInfo);
       if (!wrapped.hasUniform) {
         // No bindings need offsets, fall back
