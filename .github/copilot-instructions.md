@@ -243,15 +243,35 @@ submitted before the native scan dispatches. Two flush points are required:
 1. In `array.ts`: submit input args' pending ops before calling `jp.execute()`
 2. In `jit.ts`: flush accumulated pending ops before `"native-scan"` step dispatch
 
-**Future: WebGPU native loop**
-| Backend | Status |
-|---------|--------|
-| CPU | JS loop (no overhead) |
-| WASM | ✅ Native loop (implemented) |
-| WebGPU | 🔄 Shader inlining (WGSL has no fn pointers) — TODO |
+**Native scan status:**
+| Backend | Status | Constraint |
+|---------|--------|------------|
+| CPU | JS loop (no overhead) | — |
+| WASM | ✅ Native loop | No size limit |
+| WebGPU | ✅ Native loop (small arrays) | kernelSize ≤ 256 |
 
-WebGPU native scan requires inlining the body kernel into the scan shader since WGSL
-lacks function pointers. This is more complex but the WASM implementation validates the approach.
+**WebGPU native scan limitations:**
+WebGPU native scan uses a single workgroup with `workgroupBarrier()` for synchronization
+between iterations. This limits it to arrays where `kernelSize ≤ 256` (max workgroup size).
+
+For larger arrays, the JS-driven loop is used where each GPU dispatch acts as an implicit
+global barrier. This is correct but has per-iteration CPU dispatch overhead.
+
+**Why this limitation exists:**
+1. Multiple workgroups cannot synchronize with each other within a single dispatch
+2. `workgroupBarrier()` only synchronizes threads within one workgroup
+3. Without global barriers, iteration N+1 could read stale data from iteration N
+4. The only way to synchronize across workgroups is to end the dispatch (implicit barrier)
+
+**When WebGPU native scan helps:**
+- Small hidden states (e.g., RNN/LSTM with hidden_size ≤ 256)
+- Small batch sizes where total elements fit in one workgroup
+- Eliminates ~100µs per-iteration CPU dispatch overhead
+
+**When to use JS loop (automatic fallback):**
+- Large batch sizes (e.g., 10,000 samples)
+- Large hidden states (e.g., transformer with d_model > 256)
+- Any case where correctness requires global synchronization
 
 ## Where to start reading
 - Entry & exports: [src/index.ts](src/index.ts)

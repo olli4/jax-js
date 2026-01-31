@@ -1231,7 +1231,7 @@ function splitGraphDataflow(backend: Backend, jaxpr: Jaxpr): Set<Var> {
  * Returns the executable if native scan is possible, null otherwise.
  * 
  * Native scan is only supported when:
- * 1. Backend is WASM
+ * 1. Backend is WASM or WebGPU
  * 2. Body program contains exactly one execute step with a Kernel (no routines)
  * 3. No constants (for MVP simplicity)
  * 4. No reduction in the body kernel
@@ -1247,9 +1247,9 @@ function tryPrepareNativeScan(
   numY: number,
   eqn: { inputs: (Var | Lit)[]; outBinders: Var[] },
 ): Executable | null {
-  // Only WASM backend supports native scan for now
-  if (backend.type !== "wasm") {
-    if (DEBUG >= 2) console.log("Native scan: skipped, not WASM backend");
+  // Only WASM and WebGPU backends support native scan
+  if (backend.type !== "wasm" && backend.type !== "webgpu") {
+    if (DEBUG >= 2) console.log("Native scan: skipped, unsupported backend");
     return null;
   }
   
@@ -1303,8 +1303,8 @@ function tryPrepareNativeScan(
   const ysStrides = carrySizes.slice();
   
   // Try to prepare native scan
-  const wasmBackend = backend as any;
-  if (typeof wasmBackend.prepareNativeScan !== "function") {
+  const nativeBackend = backend as any;
+  if (typeof nativeBackend.prepareNativeScan !== "function") {
     if (DEBUG >= 2) console.log("Native scan: skipped, backend has no prepareNativeScan");
     return null;
   }
@@ -1319,9 +1319,9 @@ function tryPrepareNativeScan(
   };
   
   try {
-    const exe = wasmBackend.prepareNativeScan(nativeScanParams);
+    const exe = nativeBackend.prepareNativeScan(nativeScanParams);
     if (exe) {
-      if (DEBUG >= 1) console.log("Native scan: SUCCESS! Using WASM native scan loop");
+      if (DEBUG >= 1) console.log(`Native scan: SUCCESS! Using ${backend.type.toUpperCase()} native scan loop`);
     }
     return exe;
   } catch (e) {
