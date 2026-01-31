@@ -24,6 +24,9 @@ pnpm run lint && pnpm run format   # ESLint + Prettier
 pnpm -C website dev                # local dev server for demos
 ```
 
+### Temporary files
+Use `tmp/` in the project root for temporary/scratch files instead of `/tmp`. This directory is gitignored and allows file operations without manual approval in VS Code. Create it if needed: `mkdir -p tmp`.
+
 ### WebGPU testing on headless servers
 For GPU tests on a headless dev server (no display), Chrome requires specific flags:
 ```bash

@@ -492,9 +492,6 @@ const jvpRules: { [P in Primitive]: JvpRule<P> } = {
       const carryT_out = jvpOutputs.slice(numCarry + numY, numCarry * 2 + numY);
       const yT_out = jvpOutputs.slice(numCarry * 2 + numY);
       
-      // Dispose the input refs we created
-      scanOrderArgs.forEach(x => x.dispose());
-      
       return [...carryP_out, ...carryT_out, ...yP_out, ...yT_out];
     })(...wrapperInAvals);
     
@@ -529,9 +526,9 @@ const jvpRules: { [P in Primitive]: JvpRule<P> } = {
       },
     );
     
-    // Dispose the wrapper and jvpBody 
+    // Dispose the wrapper jaxpr (not cached)
+    // Note: jvpBody is cached via jvpJaxprCache, so we don't dispose it
     wrapperJaxpr.dispose();
-    jvpBody.dispose();
     
     // Results layout from wrapper: [carryP..., carryT..., yP..., yT...]
     const carryOutP = results.slice(0, numCarry);
