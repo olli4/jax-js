@@ -408,8 +408,141 @@ const jvpRules: { [P in Primitive]: JvpRule<P> } = {
     const [primalsOut, tangentsOut] = [outs.slice(0, n), outs.slice(n)];
     return [primalsOut, tangentsOut];
   },
-  [Primitive.Scan]() {
-    throw new Error("jvp: Scan primitive JVP rule not yet implemented");
+  [Primitive.Scan](primals, tangents, { jaxpr, numCarry, numConsts, length }) {
+    // JVP of scan: run a combined scan that processes both primals and tangents.
+    //
+    // Original scan:
+    //   body: (consts, carry, x) -> (new_carry, y)
+    //   scan: (consts, init_carry, xs) -> (final_carry, ys)
+    //
+    // JVP body from jvpJaxpr expects inputs as: [all primals..., all tangents...]
+    //   i.e., [consts, carry, x, consts_dot, carry_dot, x_dot]
+    // And outputs: [primal_outs..., tangent_outs...]
+    //   i.e., [new_carry, y, new_carry_dot, y_dot]
+    //
+    // But scan feeds body as: [consts..., carry..., x...]
+    // So for JVP scan with doubled carry/xs, body receives:
+    //   [constsP, constsT, carryP, carryT, xP, xT]  (scan order)
+    // 
+    // We need to reorder to match jvpJaxpr expectations:
+    //   [constsP, carryP, xP, constsT, carryT, xT]  (jvp order)
+    //
+    // Similarly for outputs, jvpJaxpr produces:
+    //   [new_carryP, yP, new_carryT, yT]  (jvp order)
+    // But scan expects:
+    //   [new_carryP, new_carryT, yP, yT]  (scan order, carry then ys)
+    //
+    // Actually wait - the scan output layout is [carry..., y...] so:
+    // For JVP scan with numCarry*2 carries and numY*2 outputs:
+    //   scan produces [carryP, carryT, yP, yT] which is correct for interleaved!
+    // But jvpJaxpr body returns [carryP, yP, carryT, yT].
+    //
+    // So we need a wrapper that:
+    //   1. Reorders scan inputs [constsP, constsT, carryP, carryT, xP, xT] 
+    //      to jvp order [constsP, carryP, xP, constsT, carryT, xT]
+    //   2. Calls jvpBody
+    //   3. Reorders jvp outputs [carryP, yP, carryT, yT]
+    //      to scan order [carryP, carryT, yP, yT]
+    
+    const numX = primals.length - numConsts - numCarry;
+    const numY = jaxpr.outs.length - numCarry;
+    
+    // Transform the body jaxpr to compute JVP
+    const jvpBody = jvpJaxpr(jaxpr);
+    
+    // Create a wrapper jaxpr that reorders inputs/outputs for scan compatibility
+    // Wrapper takes: [constsP..., constsT..., carryP..., carryT..., xP..., xT...]
+    // Reorders to: [constsP..., carryP..., xP..., constsT..., carryT..., xT...]
+    // Calls jvpBody
+    // Gets: [new_carryP..., yP..., new_carryT..., yT...]
+    // Reorders to: [new_carryP..., new_carryT..., yP..., yT...]
+    
+    const wrapperInAvals = jvpBody.jaxpr.inBinders.map(v => v.aval);
+    const { jaxpr: wrapperJaxpr } = makeJaxpr((...scanOrderArgs: Tracer[]): Tracer[] => {
+      // scanOrderArgs layout: [constsP, constsT, carryP, carryT, xP, xT]
+      // where constsP has numConsts elements, constsT has numConsts elements, etc.
+      const constsP_in = scanOrderArgs.slice(0, numConsts);
+      const constsT_in = scanOrderArgs.slice(numConsts, numConsts * 2);
+      const carryP_in = scanOrderArgs.slice(numConsts * 2, numConsts * 2 + numCarry);
+      const carryT_in = scanOrderArgs.slice(numConsts * 2 + numCarry, numConsts * 2 + numCarry * 2);
+      const xP_in = scanOrderArgs.slice(numConsts * 2 + numCarry * 2, numConsts * 2 + numCarry * 2 + numX);
+      const xT_in = scanOrderArgs.slice(numConsts * 2 + numCarry * 2 + numX);
+      
+      // Reorder to jvp order: [constsP, carryP, xP, constsT, carryT, xT]
+      const jvpOrderArgs = [
+        ...constsP_in.map(x => x.ref),
+        ...carryP_in.map(x => x.ref),
+        ...xP_in.map(x => x.ref),
+        ...constsT_in.map(x => x.ref),
+        ...carryT_in.map(x => x.ref),
+        ...xT_in.map(x => x.ref),
+      ];
+      
+      // Call the jvpBody jaxpr
+      const jvpOutputs = bind(
+        Primitive.Jit,
+        [...jvpBody.consts.map(c => c.ref), ...jvpOrderArgs],
+        { jaxpr: jvpBody.jaxpr, numConsts: jvpBody.consts.length, name: 'jvp_body' },
+      );
+      
+      // jvpOutputs layout: [carryP..., yP..., carryT..., yT...]
+      // Reorder to scan output order: [carryP..., carryT..., yP..., yT...]
+      const carryP_out = jvpOutputs.slice(0, numCarry);
+      const yP_out = jvpOutputs.slice(numCarry, numCarry + numY);
+      const carryT_out = jvpOutputs.slice(numCarry + numY, numCarry * 2 + numY);
+      const yT_out = jvpOutputs.slice(numCarry * 2 + numY);
+      
+      // Dispose the input refs we created
+      scanOrderArgs.forEach(x => x.dispose());
+      
+      return [...carryP_out, ...carryT_out, ...yP_out, ...yT_out];
+    })(...wrapperInAvals);
+    
+    // Original args: consts (numConsts), carry (numCarry), xs (numX)
+    const constsP = primals.slice(0, numConsts);
+    const carryP = primals.slice(numConsts, numConsts + numCarry);
+    const xsP = primals.slice(numConsts + numCarry);
+    
+    const constsT = tangents.slice(0, numConsts);
+    const carryT = tangents.slice(numConsts, numConsts + numCarry);
+    const xsT = tangents.slice(numConsts + numCarry);
+    
+    // Build scan args in scan order: [constsP, constsT, carryP, carryT, xsP, xsT]
+    const scanArgsJvp = [
+      ...wrapperJaxpr.consts.map(c => c.ref),
+      ...constsP.map(c => c.ref),
+      ...constsT.map(c => c.ref),
+      ...carryP.map(c => c.ref),
+      ...carryT.map(c => c.ref),
+      ...xsP.map(x => x.ref),
+      ...xsT.map(x => x.ref),
+    ];
+    
+    const results = bind(
+      Primitive.Scan,
+      scanArgsJvp,
+      {
+        jaxpr: wrapperJaxpr.jaxpr,
+        numCarry: numCarry * 2,
+        numConsts: wrapperJaxpr.consts.length + numConsts * 2,
+        length,
+      },
+    );
+    
+    // Dispose the wrapper and jvpBody 
+    wrapperJaxpr.dispose();
+    jvpBody.dispose();
+    
+    // Results layout from wrapper: [carryP..., carryT..., yP..., yT...]
+    const carryOutP = results.slice(0, numCarry);
+    const carryOutT = results.slice(numCarry, numCarry * 2);
+    const ysP = results.slice(numCarry * 2, numCarry * 2 + numY);
+    const ysT = results.slice(numCarry * 2 + numY);
+    
+    const primalsOut = [...carryOutP, ...ysP];
+    const tangentsOut = [...carryOutT, ...ysT];
+    
+    return [primalsOut, tangentsOut];
   },
 };
 

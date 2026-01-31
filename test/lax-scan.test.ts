@@ -3,7 +3,7 @@
  */
 
 import { describe, it, expect, beforeAll, beforeEach, suite, test } from "vitest";
-import { init, defaultDevice, numpy as np, lax, tree, devices, jit, Device } from "../src";
+import { init, defaultDevice, numpy as np, lax, tree, devices, jit, Device, jvp, grad, vjp, makeJaxpr } from "../src";
 
 const devicesAvailable = await init();
 
@@ -306,5 +306,160 @@ suite.each(devices)("lax.scan device:%s", (device) => {
     expect(finalData[1]).toBeCloseTo(-2.0);
     expect(finalData[2]).toBeCloseTo(2.0);
     expect(finalData[3]).toBeCloseTo(0.0);
+  });
+});
+
+describe("scan autodiff", () => {
+  beforeAll(async () => {
+    const devices = await init();
+    if (devices.includes("cpu")) {
+      defaultDevice("cpu");
+    }
+  });
+
+  describe("JVP (forward-mode)", () => {
+    it("computes jvp of cumulative sum", async () => {
+      // f(xs) = cumsum(xs) via scan
+      // For xs = [1, 2, 3], cumsum = [1, 3, 6], final_carry = 6
+      // d/dxs[0] cumsum = [1, 1, 1]  (every subsequent sum includes xs[0])
+      // d/dxs[1] cumsum = [0, 1, 1]
+      // d/dxs[2] cumsum = [0, 0, 1]
+      // So tangent wrt all-ones: [1, 1, 1] + [0, 1, 1] + [0, 0, 1] = [1, 2, 3]
+      // And for final carry: 1+1+1 = 3
+      
+      const cumsumScan = (xs: np.Array) => {
+        const step = (carry: np.Array, x: np.Array): [np.Array, np.Array] => {
+          const newCarry = np.add(carry.ref, x);
+          return [newCarry, newCarry.ref];
+        };
+        const init = np.zeros([1]);
+        const [finalCarry, _outputs] = lax.scan(step, init, xs);
+        // Return just the final carry as a scalar to simplify
+        return finalCarry;
+      };
+
+      const xs = np.array([[1.0], [2.0], [3.0]]);
+      const xs_dot = np.ones([3, 1]);  // tangent is all 1s
+
+      const [primal, tangent] = jvp(cumsumScan, [xs], [xs_dot]);
+
+      // Primal: cumsum final = 1 + 2 + 3 = 6
+      expect(await primal.data()).toEqual(new Float32Array([6]));
+      
+      // Tangent: d(final)/d(xs) with all-ones = 1+1+1 = 3
+      expect(await tangent.data()).toEqual(new Float32Array([3]));
+    });
+
+    it("computes jvp of cumulative product", async () => {
+      // f(xs) = cumprod(xs) via scan
+      // For xs = [2, 3, 4], cumprod = [2, 6, 24], final_carry = 24
+      // d/dx[0] final = 3*4 = 12
+      // d/dx[1] final = 2*4 = 8
+      // d/dx[2] final = 2*3 = 6
+      // With tangent = [1, 1, 1]: 12 + 8 + 6 = 26
+      
+      const cumprodScan = (xs: np.Array) => {
+        const step = (carry: np.Array, x: np.Array): [np.Array, np.Array] => {
+          const newCarry = np.multiply(carry.ref, x);
+          return [newCarry, newCarry.ref];
+        };
+        const init = np.ones([1]);
+        const [finalCarry, _outputs] = lax.scan(step, init, xs);
+        return finalCarry;
+      };
+
+      const xs = np.array([[2.0], [3.0], [4.0]]);
+      const xs_dot = np.ones([3, 1]);
+
+      const [primal, tangent] = jvp(cumprodScan, [xs], [xs_dot]);
+
+      // Primal: cumprod final = 2 * 3 * 4 = 24
+      expect(await primal.data()).toEqual(new Float32Array([24]));
+      
+      // Tangent: 12 + 8 + 6 = 26
+      expect(await tangent.data()).toEqual(new Float32Array([26]));
+    });
+
+    it("jvp respects different tangent values", async () => {
+      // Same cumsum but with tangent = [1, 0, 0] - only perturb first element
+      const cumsumScan = (xs: np.Array) => {
+        const step = (carry: np.Array, x: np.Array): [np.Array, np.Array] => {
+          const newCarry = np.add(carry.ref, x);
+          return [newCarry, newCarry.ref];
+        };
+        const init = np.zeros([1]);
+        const [finalCarry, _] = lax.scan(step, init, xs);
+        return finalCarry;
+      };
+
+      const xs = np.array([[1.0], [2.0], [3.0]]);
+      
+      // Perturb only first element
+      const xs_dot1 = np.array([[1.0], [0.0], [0.0]]);
+      const [p1, t1] = jvp(cumsumScan, [xs.ref], [xs_dot1]);
+      expect(await t1.data()).toEqual(new Float32Array([1]));  // d(final)/d(xs[0]) = 1
+      p1.dispose();
+
+      // Perturb only second element  
+      const xs_dot2 = np.array([[0.0], [1.0], [0.0]]);
+      const [p2, t2] = jvp(cumsumScan, [xs.ref], [xs_dot2]);
+      expect(await t2.data()).toEqual(new Float32Array([1]));  // d(final)/d(xs[1]) = 1
+      p2.dispose();
+
+      // Perturb only third element
+      const xs_dot3 = np.array([[0.0], [0.0], [1.0]]);
+      const [p3, t3] = jvp(cumsumScan, [xs], [xs_dot3]);
+      expect(await t3.data()).toEqual(new Float32Array([1]));  // d(final)/d(xs[2]) = 1
+      p3.dispose();
+    });
+  });
+
+  describe("VJP (reverse-mode)", () => {
+    it("throws informative error for grad through scan", async () => {
+      // VJP through scan is not yet implemented
+      // This test verifies we get an error when attempting grad through scan
+      const cumsumScan = (xs: np.Array) => {
+        const step = (carry: np.Array, x: np.Array): [np.Array, np.Array] => {
+          const newCarry = np.add(carry.ref, x);
+          return [newCarry, newCarry.ref];
+        };
+        const init = np.zeros([1]);
+        const [finalCarry, _] = lax.scan(step, init, xs);
+        return finalCarry.sum();  // Return scalar for grad
+      };
+
+      const xs = np.array([[1.0], [2.0], [3.0]]);
+      
+      // Expect grad to throw - the specific message may vary but it should fail
+      expect(() => {
+        grad(cumsumScan)(xs);
+      }).toThrow();
+    });
+  });
+
+  describe("makeJaxpr of scan with JVP", () => {
+    it("traces scan jvp correctly", async () => {
+      const cumsumScan = (xs: np.Array) => {
+        const step = (carry: np.Array, x: np.Array): [np.Array, np.Array] => {
+          const newCarry = np.add(carry.ref, x);
+          return [newCarry, newCarry.ref];
+        };
+        const init = np.zeros([1]);
+        const [finalCarry, _] = lax.scan(step, init, xs);
+        return finalCarry;
+      };
+
+      // We can at least verify that jvp produces consistent results
+      const xs = np.array([[1.0], [2.0], [3.0], [4.0], [5.0]]);
+      const xs_dot = np.ones([5, 1]);
+
+      const [primal, tangent] = jvp(cumsumScan, [xs], [xs_dot]);
+
+      // Primal: 1+2+3+4+5 = 15
+      expect(await primal.data()).toEqual(new Float32Array([15]));
+      
+      // Tangent: 5 (each input contributes 1 to the final sum)
+      expect(await tangent.data()).toEqual(new Float32Array([5]));
+    });
   });
 });

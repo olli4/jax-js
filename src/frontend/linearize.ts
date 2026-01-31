@@ -909,6 +909,140 @@ const transposeRules: Partial<{ [P in Primitive]: TransposeRule<P> }> = {
     let i = 0;
     return undefPrimals.map((isUndef) => (isUndef ? outs[i++] : null));
   },
+  [Primitive.Scan](cts, args, { jaxpr, numCarry, numConsts, length }) {
+    // Scan transpose rule with "store all" approach (recompute forward pass).
+    //
+    // Forward scan: (consts, init_carry, xs) -> (final_carry, ys)
+    // body: (consts, carry, x) -> (new_carry, y)
+    //
+    // Backward scan runs in reverse, using saved/recomputed intermediates.
+    //
+    // This implementation assumes the scan comes from a JVP-transformed scan,
+    // where the arguments are laid out as:
+    //   [jvpConsts..., constsP..., constsT..., carryP..., carryT..., xsP..., xsT...]
+    //
+    // The primal parts (constsP, carryP, xsP) are residuals (Tracer).
+    // The tangent parts (constsT, carryT, xsT) are UndefPrimal.
+    // We compute cotangents for the tangent parts.
+    
+    const numX = args.length - numConsts - numCarry;
+    const numY = cts.length - numCarry;
+    
+    // Identify which args are UndefPrimal (need cotangents) vs Tracer (residuals)
+    const undefMask = args.map((x) => x instanceof UndefPrimal);
+    
+    // For the JVP-transformed scan:
+    // - numConsts includes jvpBody.consts + constsP + constsT
+    // - numCarry is carryP.length + carryT.length = 2 * original numCarry
+    // - numX is xsP.length + xsT.length = 2 * original numX
+    //
+    // The JVP body jaxpr expects:
+    //   inputs: [constsP, carryP, xP, constsT, carryT, xT]
+    //   outputs: [carryP_out, yP, carryT_out, yT]
+    
+    // For now, implement a basic transpose that handles the common case.
+    // This requires transposing through the JVP'd body.
+    
+    // Build transposed body jaxpr
+    const bodyUndefPrimals = args.map((_, i) => {
+      if (i < numConsts) {
+        // Const position: check if it's a tangent
+        return undefMask[i];
+      } else if (i < numConsts + numCarry) {
+        // Carry position
+        return undefMask[i];
+      } else {
+        // X position
+        return undefMask[i];
+      }
+    });
+    
+    // The body jaxpr is the original (not JVP'd) body for a plain scan,
+    // or the JVP'd body for a JVP scan. We need to transpose it.
+    const transposedBody = transposeJaxpr(jaxpr, bodyUndefPrimals.slice(0, jaxpr.inBinders.length));
+    
+    // Split cotangents: [ct_carry..., ct_ys...]
+    const ctCarry = cts.slice(0, numCarry);
+    const ctYs = cts.slice(numCarry);
+    
+    // Get residual (primal) values
+    const residuals = args.filter((a, i) => !undefMask[i]) as Tracer[];
+    
+    // The transposed scan runs in reverse.
+    // It takes residuals and output cotangents, and produces input cotangents.
+    //
+    // Inputs to transposed scan: [residuals..., ct_carry_init, ct_ys...]
+    // where ct_carry_init = ct_final_carry (from cts)
+    //
+    // The transposed body:
+    //   inputs: [residuals for one iteration..., ct_carry_out, ct_y]
+    //   outputs: [ct_carry_in, ct_x, ct_const_contribution]
+    //
+    // Since we need per-iteration residuals (carry[i] and x[i]), we'd need to:
+    // 1. Re-run forward to get all carries
+    // 2. Run backward scan with those carries
+    //
+    // For now, we'll implement this by running the transposed body for each iteration.
+    // This is O(n) in the number of iterations, same as forward.
+    
+    // However, we don't have a clean way to get per-iteration carries without
+    // re-running the forward pass. The residuals we receive are the inputs to
+    // the scan, not the intermediate carries.
+    //
+    // For a proper implementation, we'd need:
+    // 1. The JVP rule to save all intermediate carries as additional scan outputs
+    // 2. These become residuals available here
+    //
+    // For the initial "store all" implementation, let's run the transposed
+    // body jaxpr in a reverse loop (not a Scan primitive) using evalJaxpr.
+    
+    // First, we need to reconstruct intermediate carries by re-running forward.
+    // This is expensive but correct for "store all".
+    
+    // Extract original (non-JVP'd) dimensions from the JVP'd scan
+    // For JVP scan: numCarry = 2 * originalNumCarry, numX = 2 * originalNumX
+    // numY = 2 * originalNumY
+    
+    // Actually the jaxpr here is the JVP'd body, so its structure is:
+    // inputs: [jvpConsts..., constsP, constsT, carryP, carryT, xP, xT]  (per iteration, without stacking)
+    // outputs: [carryP_out, yP, carryT_out, yT]
+    
+    // The transposed body should compute:
+    // Given: residuals (known primals) + cotangents for outputs
+    // Produce: cotangents for tangent inputs
+    
+    // Run the transposed scan
+    // For reverse scan: 
+    // - Initial "carry" is ct_final_carry
+    // - Iterate backwards through ctYs slices
+    // - Accumulate cotangents for xs and consts
+    
+    // Since implementing this fully requires restructuring, let's provide
+    // a clear error for now and note that JVP is working.
+    
+    // Check if we can at least handle the simple case
+    const numResiduals = residuals.length;
+    const numUndef = undefMask.filter(x => x).length;
+    
+    if (numResiduals === 0) {
+      throw new Error(
+        "Scan transpose: no residuals available. This can happen when all " +
+        "scan inputs are treated as tangents. grad() through scan requires " +
+        "primal values to be available as residuals."
+      );
+    }
+    
+    // Dispose transposed body since we can't fully use it yet
+    transposedBody.dispose();
+    
+    // For the initial implementation, we'll implement a loop-based backward pass
+    // that evaluates the transposed body at each iteration.
+    throw new Error(
+      "Scan transpose (grad through scan) not yet fully implemented. " +
+      "The JVP rule works; the VJP rule requires storing all intermediate carries. " +
+      "This will be implemented with O(n) memory ('store all' approach)."
+    );
+  },
 };
 
 const transposeJaxprCache = new Map<Jaxpr, Map<string, ClosedJaxpr>>();
