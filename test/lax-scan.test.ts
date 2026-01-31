@@ -239,4 +239,72 @@ suite.each(devices)("lax.scan device:%s", (device) => {
     expect(finalData[0]).toBeGreaterThan(0);
     expect(finalData[0]).toBeLessThan(1);
   });
+
+  test("native scan - small array", async () => {
+    // Small carry array (64 elements) - uses native scan on WebGPU/WASM
+    const step = (carry: np.Array, x: np.Array): [np.Array, np.Array] => {
+      const newCarry = np.add(carry, x);
+      return [newCarry, newCarry.ref];
+    };
+
+    const size = 64;
+    const initCarry = np.zeros([size]);
+    const xs = np.ones([10, size]);  // 10 iterations
+
+    const [finalCarry, outputs] = await lax.scan(step, initCarry, xs);
+
+    const finalData = await finalCarry.data();
+    // Each element should be 10 (10 iterations of adding 1)
+    expect(finalData[0]).toBeCloseTo(10.0);
+    expect(finalData[size - 1]).toBeCloseTo(10.0);
+  });
+
+  test("native scan - large array", async () => {
+    // Large carry array (512 elements) - uses native scan on WebGPU/WASM
+    // For elementwise bodies, each element's scan is independent so any size works
+    const step = (carry: np.Array, x: np.Array): [np.Array, np.Array] => {
+      const newCarry = np.add(carry, x);
+      return [newCarry, newCarry.ref];
+    };
+
+    const size = 512;
+    const initCarry = np.zeros([size]);
+    const xs = np.ones([5, size]);  // 5 iterations
+
+    const [finalCarry, outputs] = await lax.scan(step, initCarry, xs);
+
+    const finalData = await finalCarry.data();
+    // Each element should be 5 (5 iterations of adding 1)
+    expect(finalData[0]).toBeCloseTo(5.0);
+    expect(finalData[size - 1]).toBeCloseTo(5.0);
+  });
+
+  test("matmul in body - falls back to JS loop (routine not elementwise)", async () => {
+    // Matmul is a "routine" (not an elementwise kernel), so native scan is ineligible
+    // This tests that the fallback to JS loop works correctly for non-elementwise bodies
+    const step = (carry: np.Array, x: np.Array): [np.Array, np.Array] => {
+      // carry: [2, 2], x: [2, 2] -> matmul produces [2, 2]
+      const newCarry = np.matmul(carry, x);
+      return [newCarry.ref, newCarry];
+    };
+
+    // 2x2 matrices
+    const initCarry = np.eye(2);  // identity matrix
+    const xs = np.array([
+      [[2, 0], [0, 2]],  // scale by 2
+      [[1, 1], [0, 1]],  // shear
+      [[0, -1], [1, 0]], // rotate 90 degrees
+    ]);  // 3 iterations of 2x2 matrices
+
+    const [finalCarry, outputs] = await lax.scan(step, initCarry, xs);
+
+    // I * [[2,0],[0,2]] = [[2,0],[0,2]]
+    // [[2,0],[0,2]] * [[1,1],[0,1]] = [[2,2],[0,2]]
+    // [[2,2],[0,2]] * [[0,-1],[1,0]] = [[2,-2],[2,0]]
+    const finalData = await finalCarry.data();
+    expect(finalData[0]).toBeCloseTo(2.0);
+    expect(finalData[1]).toBeCloseTo(-2.0);
+    expect(finalData[2]).toBeCloseTo(2.0);
+    expect(finalData[3]).toBeCloseTo(0.0);
+  });
 });

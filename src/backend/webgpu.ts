@@ -728,30 +728,20 @@ function nativeScanShaderSource(
   const numY = ysStrides.length;
   const dtype = bodyKernel.dtype;
   const resultTy = dtypeToWgsl(dtype, true);
-  const elementsPerCarry = carrySizes.map((size) => size / byteWidth(dtype));
 
   // For MVP, we support single carry/output with matching sizes
   if (numCarry !== 1 || numY !== 1) {
     throw new Error("Native scan: only single carry/output supported for now");
   }
-  const kernelSize = elementsPerCarry[0];
+  
+  // kernelSize = number of elements to process per iteration
+  // This is the body kernel's output size, which equals the carry size
+  const kernelSize = bodyKernel.size;
 
-  // CRITICAL: WebGPU native scan is limited to single-workgroup execution.
-  // A workgroup can have at most ~256 threads (maxComputeInvocationsPerWorkgroup).
-  // For larger arrays, we must fall back to the JS-driven loop where each
-  // dispatch acts as an implicit global barrier between iterations.
-  //
-  // This is because:
-  // 1. Multiple workgroups cannot synchronize with each other
-  // 2. workgroupBarrier() only synchronizes threads within one workgroup
-  // 3. Without global barriers, iteration N+1 could read stale data from iteration N
-  const maxWorkgroupSize = 256; // Conservative limit (some GPUs support 1024)
-  if (kernelSize > maxWorkgroupSize) {
-    throw new Error(
-      `Native scan: kernel size ${kernelSize} exceeds max workgroup size ${maxWorkgroupSize}. ` +
-      `Falling back to JS loop for correctness.`
-    );
-  }
+  // For elementwise body kernels (no reduction), each element's scan is
+  // completely independent. Element i only depends on carry[i] and xs[:,i].
+  // This means we can dispatch multiple workgroups where each thread runs
+  // its own independent scan loop - no cross-workgroup synchronization needed!
 
   const shader: string[] = [];
   let indent = "";
@@ -823,10 +813,11 @@ function nativeScanShaderSource(
     emit(`carry${i}[gidx] = initCarry${i}[gidx];`);
   }
   emit(popIndent, "}");
-  emit("workgroupBarrier();");
   emit("");
 
   // Step 2: Main scan loop
+  // Each thread runs its own independent scan - no barriers needed since
+  // thread i only reads/writes carry[i], which no other thread touches.
   emit(`// Main scan loop over ${length} iterations`);
   emit(`for (var iter: u32 = 0u; iter < ${length}u; iter++) {`, pushIndent);
   emit("if (inBounds) {");
@@ -851,7 +842,6 @@ function nativeScanShaderSource(
   emit(`carry0[gidx] = result_val;`);
 
   emit(popIndent, "}");
-  emit("workgroupBarrier();");
   emit(popIndent, "}");
 
   emit(popIndent, "}");

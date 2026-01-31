@@ -248,30 +248,24 @@ submitted before the native scan dispatches. Two flush points are required:
 |---------|--------|------------|
 | CPU | JS loop (no overhead) | — |
 | WASM | ✅ Native loop | No size limit |
-| WebGPU | ✅ Native loop (small arrays) | kernelSize ≤ 256 |
+| WebGPU | ✅ Native loop | No size limit (elementwise bodies only) |
 
-**WebGPU native scan limitations:**
-WebGPU native scan uses a single workgroup with `workgroupBarrier()` for synchronization
-between iterations. This limits it to arrays where `kernelSize ≤ 256` (max workgroup size).
+**WebGPU native scan design:**
+For elementwise body kernels (no reductions), each element's scan is completely independent:
+- Element 0: `carry[0] → f(carry[0], xs[0,0]) → f(..., xs[1,0]) → ...`
+- Element 1: `carry[1] → f(carry[1], xs[0,1]) → f(..., xs[1,1]) → ...`
 
-For larger arrays, the JS-driven loop is used where each GPU dispatch acts as an implicit
-global barrier. This is correct but has per-iteration CPU dispatch overhead.
+Since thread `i` only reads/writes `carry[i]` and `xs[:,i]`, there's no cross-element
+communication. Multiple workgroups can run independent scan loops without synchronization.
 
-**Why this limitation exists:**
-1. Multiple workgroups cannot synchronize with each other within a single dispatch
-2. `workgroupBarrier()` only synchronizes threads within one workgroup
-3. Without global barriers, iteration N+1 could read stale data from iteration N
-4. The only way to synchronize across workgroups is to end the dispatch (implicit barrier)
+**No barriers needed:** Each thread runs its own for-loop over iterations. No
+`workgroupBarrier()` is required because there are no cross-element dependencies.
 
-**When WebGPU native scan helps:**
-- Small hidden states (e.g., RNN/LSTM with hidden_size ≤ 256)
-- Small batch sizes where total elements fit in one workgroup
-- Eliminates ~100µs per-iteration CPU dispatch overhead
-
-**When to use JS loop (automatic fallback):**
-- Large batch sizes (e.g., 10,000 samples)
-- Large hidden states (e.g., transformer with d_model > 256)
-- Any case where correctness requires global synchronization
+**Eligibility constraints:**
+- Single elementwise kernel body (rejects routines like matmul, conv)
+- No reductions in body (rejects sum, max, etc. which have cross-element dependencies)
+- No constants (MVP simplification)
+- `numCarry === numY` (carry and output are the same values)
 
 ## Where to start reading
 - Entry & exports: [src/index.ts](src/index.ts)

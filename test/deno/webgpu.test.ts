@@ -200,6 +200,107 @@ Deno.test({
 });
 
 Deno.test({
+  name: "lax.scan native - small array",
+  ignore: !hasWebGPU,
+  fn: async () => {
+    const devices = await init();
+    if (!devices.includes("webgpu")) {
+      console.log("webgpu not available, skipping");
+      return;
+    }
+
+    defaultDevice("webgpu");
+
+    // 64 elements - uses native WebGPU scan
+    const step = (carry: np.Array, x: np.Array): [np.Array, np.Array] => {
+      const newCarry = np.add(carry, x);
+      return [newCarry.ref, newCarry];
+    };
+
+    const size = 64;
+    const initCarry = np.zeros([size]);
+    const xs = np.ones([10, size]);  // 10 iterations
+
+    const [finalCarry, _outputs] = await lax.scan(step, initCarry, xs);
+
+    const finalData = await finalCarry.data();
+    // Each element should be 10 (10 iterations of adding 1)
+    assertAlmostEquals(finalData[0], 10.0, 1e-5);
+    assertAlmostEquals(finalData[size - 1], 10.0, 1e-5);
+  },
+});
+
+Deno.test({
+  name: "lax.scan native - large array",
+  ignore: !hasWebGPU,
+  fn: async () => {
+    const devices = await init();
+    if (!devices.includes("webgpu")) {
+      console.log("webgpu not available, skipping");
+      return;
+    }
+
+    defaultDevice("webgpu");
+
+    // 512 elements - uses native WebGPU scan (independent per-element scans)
+    const step = (carry: np.Array, x: np.Array): [np.Array, np.Array] => {
+      const newCarry = np.add(carry, x);
+      return [newCarry.ref, newCarry];
+    };
+
+    const size = 512;
+    const initCarry = np.zeros([size]);
+    const xs = np.ones([5, size]);  // 5 iterations
+
+    const [finalCarry, _outputs] = await lax.scan(step, initCarry, xs);
+
+    const finalData = await finalCarry.data();
+    // Each element should be 5 (5 iterations of adding 1)
+    assertAlmostEquals(finalData[0], 5.0, 1e-5);
+    assertAlmostEquals(finalData[size - 1], 5.0, 1e-5);
+  },
+});
+
+Deno.test({
+  name: "lax.scan with matmul - JS loop fallback",
+  ignore: !hasWebGPU,
+  fn: async () => {
+    const devices = await init();
+    if (!devices.includes("webgpu")) {
+      console.log("webgpu not available, skipping");
+      return;
+    }
+
+    defaultDevice("webgpu");
+
+    // Matmul is a "routine" (not elementwise), so native scan is ineligible
+    // This tests that the JS loop fallback works correctly
+    const step = (carry: np.Array, x: np.Array): [np.Array, np.Array] => {
+      const newCarry = np.matmul(carry, x);
+      return [newCarry.ref, newCarry];
+    };
+
+    const initCarry = np.eye(2);  // 2x2 identity matrix
+    const xs = np.array([
+      [[2, 0], [0, 2]],  // scale by 2
+      [[1, 1], [0, 1]],  // shear
+      [[0, -1], [1, 0]], // rotate 90 degrees
+    ]);  // 3 iterations
+
+    const [finalCarry, _outputs] = await lax.scan(step, initCarry, xs);
+
+    // I * [[2,0],[0,2]] = [[2,0],[0,2]]
+    // [[2,0],[0,2]] * [[1,1],[0,1]] = [[2,2],[0,2]]
+    // [[2,2],[0,2]] * [[0,-1],[1,0]] = [[2,-2],[2,0]]
+    const finalData = await finalCarry.data();
+    assertAlmostEquals(finalData[0], 2.0, 1e-5);
+    assertAlmostEquals(finalData[1], -2.0, 1e-5);
+    assertAlmostEquals(finalData[2], 2.0, 1e-5);
+    assertAlmostEquals(finalData[3], 0.0, 1e-5);
+  },
+});
+
+Deno.test({
   name: "reduction operations on webgpu",
   ignore: !hasWebGPU,
   fn: async () => {
