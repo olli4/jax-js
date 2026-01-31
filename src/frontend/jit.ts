@@ -74,7 +74,9 @@ export type JitStep =
       executable: Executable;
       length: number;
       numCarry: number;
+      numConsts: number;
       numY: number;
+      consts: JitId[];
       initCarry: JitId[];
       xs: JitId[];
       outputs: JitId[]; // [carry_out..., stacked_ys...]
@@ -264,6 +266,7 @@ export class JitProgram {
           }
           pending.length = 0;  // Clear the pending array
           
+          const constSlots = step.consts.map((id) => scope.get(id)!);
           const initCarrySlots = step.initCarry.map((id) => scope.get(id)!);
           const xsSlots = step.xs.map((id) => scope.get(id)!);
           const outputSlots = step.outputs.map((id) => scope.get(id)!);
@@ -277,6 +280,7 @@ export class JitProgram {
           if (typeof backend.dispatchNativeScan === "function") {
             backend.dispatchNativeScan(
               step.executable,
+              constSlots,
               initCarrySlots,
               xsSlots,
               carryOutSlots,
@@ -556,7 +560,9 @@ export function jitCompile(backend: Backend, jaxpr: Jaxpr): JitProgram {
           executable: nativeScanExe,
           length,
           numCarry,
+          numConsts,
           numY,
+          consts: constsIds,
           initCarry: initCarryIds,
           xs: xsIds,
           outputs,
@@ -1443,15 +1449,10 @@ function tryPrepareNativeScan(
   numY: number,
   eqn: { inputs: (Var | Lit)[]; outBinders: Var[] },
 ): Executable | null {
-  // Only WASM and WebGPU backends support native scan
-  if (backend.type !== "wasm" && backend.type !== "webgpu") {
-    if (DEBUG >= 2) console.log("Native scan: skipped, unsupported backend");
-    return null;
-  }
-  
-  // MVP: No constants support
-  if (numConsts > 0) {
-    if (DEBUG >= 2) console.log("Native scan: skipped, has constants");
+  // Only WASM backend supports native scan with constants (for now)
+  // WebGPU batched-scan has its own path
+  if (backend.type !== "wasm") {
+    if (DEBUG >= 2) console.log("Native scan: skipped, only WASM supports constants");
     return null;
   }
   
@@ -1468,7 +1469,21 @@ function tryPrepareNativeScan(
     return null;
   }
   
-  const bodyKernel = execStep.source;
+  // The kernel's gids correspond to execStep.inputs order, but we need them
+  // to match the jaxpr input order (which is [0, 1, 2, ...]).
+  // Build a reindex mapping: old gid -> new gid (jaxpr input index)
+  // execStep.inputs[oldGid] = JitId, and jaxpr input JitIds are 0..nargs-1
+  // So new gid = execStep.inputs[oldGid] (which IS the jaxpr input index)
+  const reindexMap = execStep.inputs;
+  
+  // Reindex the kernel's expression so gids match jaxpr input indices
+  const reindexedExp = execStep.source.exp.reindexGids(reindexMap);
+  const bodyKernel = new Kernel(
+    bodyJaxpr.inBinders.length, // nargs = number of jaxpr inputs
+    execStep.source.size,
+    reindexedExp,
+    execStep.source.reduction,
+  );
   
   // No reduction support yet
   if (bodyKernel.reduction) {
@@ -1484,8 +1499,12 @@ function tryPrepareNativeScan(
   }
   
   // Get avals for computing sizes and strides
-  const carryAvals = bodyJaxpr.inBinders.slice(0, numCarry).map(v => v.aval);
-  const xAvals = bodyJaxpr.inBinders.slice(numCarry, numCarry + numX).map(v => v.aval);
+  const constAvals = bodyJaxpr.inBinders.slice(0, numConsts).map(v => v.aval);
+  const carryAvals = bodyJaxpr.inBinders.slice(numConsts, numConsts + numCarry).map(v => v.aval);
+  const xAvals = bodyJaxpr.inBinders.slice(numConsts + numCarry, numConsts + numCarry + numX).map(v => v.aval);
+  
+  // Compute const sizes in bytes
+  const constSizes = constAvals.map(a => a.size * byteWidth(a.dtype));
   
   // Compute carry sizes in bytes
   const carrySizes = carryAvals.map(a => a.size * byteWidth(a.dtype));
@@ -1507,6 +1526,8 @@ function tryPrepareNativeScan(
   
   const nativeScanParams = {
     length,
+    numConsts,
+    constSizes,
     carrySizes,
     xsStrides,
     ysStrides,

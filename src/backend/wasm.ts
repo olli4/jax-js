@@ -46,6 +46,10 @@ interface WasmProgram {
 export interface NativeScanParams {
   /** Number of scan iterations (length of xs along axis 0). */
   length: number;
+  /** Number of constant arrays (passed to body but unchanged). */
+  numConsts: number;
+  /** Sizes of each constant buffer in bytes. */
+  constSizes: number[];
   /** Sizes of each carry buffer in bytes. */
   carrySizes: number[];
   /** Strides (in bytes) along axis 0 for each xs input. */
@@ -211,6 +215,7 @@ export class WasmBackend implements Backend {
   /**
    * Dispatch a native scan operation.
    * @param exe - The prepared native scan executable
+   * @param consts - Constant buffer slots (unchanged across iterations)
    * @param initCarry - Initial carry buffer slots
    * @param xs - Input xs buffer slots  
    * @param carryOut - Output carry buffer slots
@@ -218,6 +223,7 @@ export class WasmBackend implements Backend {
    */
   dispatchNativeScan(
     exe: Executable<WasmProgram>,
+    consts: Slot[],
     initCarry: Slot[],
     xs: Slot[],
     carryOut: Slot[],
@@ -232,6 +238,7 @@ export class WasmBackend implements Backend {
     }
     const func = instance.exports.scan as (...args: number[]) => void;
     const ptrs = [
+      ...consts.map((slot) => this.#buffers.get(slot)!.ptr),
       ...initCarry.map((slot) => this.#buffers.get(slot)!.ptr),
       ...xs.map((slot) => this.#buffers.get(slot)!.ptr),
       ...carryOut.map((slot) => this.#buffers.get(slot)!.ptr),
@@ -412,7 +419,7 @@ function codegenWasm(kernel: Kernel): Uint8Array<ArrayBuffer> {
  *   3. Final carry is already in carryOut
  */
 function codegenNativeScan(params: NativeScanParams): Uint8Array<ArrayBuffer> {
-  const { length, carrySizes, xsStrides, ysStrides, bodyKernel, numCarry } = params;
+  const { length, numConsts, constSizes, carrySizes, xsStrides, ysStrides, bodyKernel, numCarry } = params;
   
   // For the initial MVP, we only support a simple case:
   // - Single output that is both carry and y (like cumsum)
@@ -422,6 +429,14 @@ function codegenNativeScan(params: NativeScanParams): Uint8Array<ArrayBuffer> {
   }
   
   const tune = tuneNullopt(bodyKernel);
+  
+  if (DEBUG >= 2) {
+    console.log("codegenNativeScan params:", {
+      length, numConsts, numCarry, constSizes, carrySizes, xsStrides, ysStrides,
+      bodyKernelNargs: bodyKernel.nargs,
+      bodyKernelSize: bodyKernel.size,
+    });
+  }
   
   const cg = new CodeGenerator();
   cg.memory.import("env", "memory");
@@ -441,10 +456,10 @@ function codegenNativeScan(params: NativeScanParams): Uint8Array<ArrayBuffer> {
   if (distinctOps.has(AluOp.Threefry2x32)) funcs.threefry2x32 = wasm_threefry2x32(cg);
   
   // Function arguments:
-  // [...initCarry (numCarry), ...xs (numX), ...carryOut (numCarry), ...ysStacked (numY)]
+  // [...consts (numConsts), ...initCarry (numCarry), ...xs (numX), ...carryOut (numCarry), ...ysStacked (numY)]
   const numX = xsStrides.length;
   const numY = ysStrides.length;
-  const numArgs = numCarry + numX + numCarry + numY;
+  const numArgs = numConsts + numCarry + numX + numCarry + numY;
   
   const scanFunc = cg.function(rep(numArgs, cg.i32), [], () => {
     // Local variables
@@ -452,10 +467,11 @@ function codegenNativeScan(params: NativeScanParams): Uint8Array<ArrayBuffer> {
     const gidx = cg.local.declare(cg.i32);  // body kernel loop index
     
     // Argument indices
-    const initCarryBase = 0;
-    const xsBase = numCarry;
-    const carryOutBase = numCarry + numX;
-    const ysStackedBase = numCarry + numX + numCarry;
+    const constsBase = 0;
+    const initCarryBase = numConsts;
+    const xsBase = numConsts + numCarry;
+    const carryOutBase = numConsts + numCarry + numX;
+    const ysStackedBase = numConsts + numCarry + numX + numCarry;
     
     // Step 1: Copy initCarry to carryOut (working buffer)
     for (let c = 0; c < numCarry; c++) {
@@ -532,6 +548,9 @@ function codegenNativeScan(params: NativeScanParams): Uint8Array<ArrayBuffer> {
         translateExpWithScanContext(cg, funcs, tune.exp, {
           gidx,
           iter,
+          constsBase,
+          constSizes,
+          numConsts,
           xsBase,
           xsStrides,
           carryBase: carryOutBase,  // read from carryOut as working buffer
@@ -554,6 +573,9 @@ function codegenNativeScan(params: NativeScanParams): Uint8Array<ArrayBuffer> {
         translateExpWithScanContext(cg, funcs, tune.exp, {
           gidx,
           iter,
+          constsBase,
+          constSizes,
+          numConsts,
           xsBase,
           xsStrides,
           carryBase: carryOutBase,
@@ -606,6 +628,9 @@ function translateExpWithScanContext(
   ctx: {
     gidx: number;
     iter: number;
+    constsBase: number;
+    constSizes: number[];
+    numConsts: number;
     xsBase: number;
     xsStrides: number[];
     carryBase: number;
@@ -632,42 +657,11 @@ function translateExpWithScanContext(
     const { op, src, dtype, arg } = e;
 
     // Handle GlobalView specially for scan context
-    if (op === AluOp.GlobalView) {
-      const gid = arg.gid as number;
-      const offset = arg.offset as AluExp;
-      const bw = byteWidth(dtype);
-      
-      if (gid < ctx.numCarry) {
-        // Carry input: carryBase + gid ptr + offset * bw
-        cg.local.get(ctx.carryBase + gid);
-        gen(offset);
-        cg.i32.const(bw);
-        cg.i32.mul();
-        cg.i32.add();
-      } else {
-        // X input: xsBase + (gid - numCarry) ptr + iter * stride + offset * bw
-        const xIdx = gid - ctx.numCarry;
-        cg.local.get(ctx.xsBase + xIdx);
-        cg.local.get(ctx.iter);
-        cg.i32.const(ctx.xsStrides[xIdx]);
-        cg.i32.mul();
-        cg.i32.add();
-        gen(offset);
-        cg.i32.const(bw);
-        cg.i32.mul();
-        cg.i32.add();
-      }
-      
-      // Load the value
-      dty(cg, op, dtype).load(Math.log2(bw));
-      
-      if ((references.get(e) ?? 0) > 1) {
-        const local = cg.local.declare(dty(cg, op, dtype));
-        cg.local.tee(local);
-        expContext.set(e, local);
-      }
-      return;
-    }
+    // Body jaxpr input layout: [consts..., carry..., xs...]
+    // gid 0..numConsts-1 → constants (no iteration offset)
+    // gid numConsts..numConsts+numCarry-1 → carry
+    // gid numConsts+numCarry.. → xs (with iteration offset)
+    // Note: GlobalView is converted to GlobalIndex by tuneNullopt's rewriteGlobalViews()
 
     // Handle other ops - subset supported for MVP
     if (op === AluOp.Add) {
@@ -703,15 +697,20 @@ function translateExpWithScanContext(
     } else if (op === AluOp.GlobalIndex) {
       // GlobalIndex: arg = [gid, len], src = [bufidx]
       // Load from buffer at gidx position
+      // gid follows same layout as GlobalView: [consts..., carry..., xs...]
       const gid = arg[0] as number;
       const bw = byteWidth(dtype);
       
-      if (gid < ctx.numCarry) {
+      if (gid < ctx.numConsts) {
+        // Constant input (no iteration offset)
+        cg.local.get(ctx.constsBase + gid);
+      } else if (gid < ctx.numConsts + ctx.numCarry) {
         // Carry input
-        cg.local.get(ctx.carryBase + gid);
+        const carryIdx = gid - ctx.numConsts;
+        cg.local.get(ctx.carryBase + carryIdx);
       } else {
         // X input with iteration offset
-        const xIdx = gid - ctx.numCarry;
+        const xIdx = gid - ctx.numConsts - ctx.numCarry;
         cg.local.get(ctx.xsBase + xIdx);
         cg.local.get(ctx.iter);
         cg.i32.const(ctx.xsStrides[xIdx]);

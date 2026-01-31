@@ -234,8 +234,11 @@ Body jaxpr input: [...consts, ...carry, ...x_slice]
 - Data stays on GPU between iterations (zero-copy slicing via ShapeTracker)
 
 **WASM native scan (implemented):**
-Eligible scans (single elementwise body kernel, no constants, no reduction, numCarry === numY)
-are compiled to a single WASM module with the outer loop inlined. Key implementation:
+Eligible scans (single elementwise body kernel, no reduction, numCarry === numY)
+are compiled to a single WASM module with the outer loop inlined. **Constants are now supported** —
+captured variables (like scale factors, offsets) are passed as pointers and used without iteration offsets.
+
+Key implementation:
 | File | Component |
 |------|-----------|
 | `src/backend/wasm.ts` | `NativeScanParams`, `prepareNativeScan()`, `dispatchNativeScan()`, `codegenNativeScan()` |
@@ -252,10 +255,14 @@ submitted before the native scan dispatches. Two flush points are required:
 **Native scan status:**
 | Backend | Status | Constraint |
 |---------|--------|------------|
-| CPU | JS loop (no overhead) | — |
-| WASM | ✅ Native loop | No size limit |
-| WebGPU | ✅ Native loop | No size limit (elementwise bodies only) |
-| WebGPU | ✅ Batched scan | Routine bodies — uniform offset approach verified |
+| CPU | JS loop only | — |
+| WASM | ✅ Native loop | Elementwise bodies only (no reductions) |
+| WebGPU | ✅ Native loop | Elementwise bodies only (no reductions) |
+| WebGPU | ✅ Batched scan | Routine bodies (TriangularSolve, Cholesky, LU) |
+| WASM | ❌ Batched scan | Not implemented |
+
+**Note:** Matmul/Dot uses reduction (Mul→Sum), so it does NOT qualify for native scan.
+Kalman filter with matrix ops falls back to JS loop on WASM.
 
 **WebGPU native scan design:**
 For elementwise body kernels (no reductions), each element's scan is completely independent:
@@ -271,8 +278,14 @@ communication. Multiple workgroups can run independent scan loops without synchr
 **Eligibility constraints:**
 - Single elementwise kernel body (rejects routines like matmul, conv)
 - No reductions in body (rejects sum, max, etc. which have cross-element dependencies)
-- No constants (MVP simplification)
+- ✅ Constants now supported (captured variables like scale factors)
 - `numCarry === numY` (carry and output are the same values)
+
+**Kernel gid reindexing (critical):**
+When extracting the body kernel for native scan, the kernel's GlobalIndex gids may not match
+the jaxpr input order (due to lazy expression building order). In `tryPrepareNativeScan()`,
+we reindex the kernel expression using `execStep.inputs` to ensure gids match jaxpr input indices.
+This is essential for correct constant/carry/xs slot mapping.
 
 **WebGPU batched scan for routines (verified Jan 2026):**
 For routine bodies (triangular solve, cholesky, LU), we use uniform-based offsets.
