@@ -200,8 +200,10 @@ lax.scan(f, init, xs)
 | `src/frontend/core.ts` | `Primitive.Scan` enum + params type |
 | `src/frontend/jaxpr.ts` | Abstract eval rule |
 | `src/frontend/array.ts` | Scan impl rule with `scanRunner` callback; pending op submission |
-| `src/frontend/jit.ts` | `JitStep.scan` (JS loop), `JitStep["native-scan"]` (WASM), `tryPrepareNativeScan()` |
+| `src/frontend/jit.ts` | `JitStep.scan` (JS loop), `JitStep["native-scan"]` (WASM/WebGPU), `JitStep["batched-scan"]` (routines) |
 | `src/backend/wasm.ts` | `codegenNativeScan()`, `translateExpWithScanContext()` |
+| `src/backend/webgpu.ts` | `NativeScanParams`, `BatchedScanParams`, `PreparedBatchedScan` |
+| `src/backend/webgpu/scan-wrapper.ts` | WGSL transformer for uniform-based offsets |
 | `src/library/lax-scan.ts` | Public API |
 
 **Argument layout:**
@@ -249,6 +251,7 @@ submitted before the native scan dispatches. Two flush points are required:
 | CPU | JS loop (no overhead) | — |
 | WASM | ✅ Native loop | No size limit |
 | WebGPU | ✅ Native loop | No size limit (elementwise bodies only) |
+| WebGPU | ✅ Batched scan | Routine bodies — uniform offset approach verified |
 
 **WebGPU native scan design:**
 For elementwise body kernels (no reductions), each element's scan is completely independent:
@@ -266,6 +269,54 @@ communication. Multiple workgroups can run independent scan loops without synchr
 - No reductions in body (rejects sum, max, etc. which have cross-element dependencies)
 - No constants (MVP simplification)
 - `numCarry === numY` (carry and output are the same values)
+
+**WebGPU batched scan for routines (verified Jan 2026):**
+For routine bodies (matmul, conv, triangular solve), we use uniform-based offsets.
+**Numerically verified** via Deno WebGPU tests on NVIDIA RTX 4070 Ti SUPER.
+
+| File | Component |
+|------|-----------|
+| `src/backend/webgpu/scan-wrapper.ts` | WGSL shader transformer for uniform-based offsets |
+| `src/backend/webgpu/scan-wrapper.test.ts` | Unit tests (8 tests) |
+| `src/backend/webgpu.ts` | `PreparedBatchedScan`, `prepareBatchedScan()`, `dispatchBatchedScan()` |
+| `src/frontend/jit.ts` | `JitStep["batched-scan"]` handler |
+| `test/deno/batched-scan.test.ts` | End-to-end GPU verification (5 tests) |
+
+**Why uniform-based offsets (not buffer offsets):**
+- `minStorageBufferOffsetAlignment` is 256 bytes on most GPUs
+- Buffer offset bindings fail for typical data (e.g., 30×4 = 120 bytes stride)
+- Solution: Bind entire buffers, add offset as uniform variable in shader
+- Shader reads `buffer[offset + idx]` where offset comes from uniform
+
+**Critical: Dynamic uniform buffer offsets require explicit layout:**
+Using `layout: "auto"` doesn't work for dynamic offsets. Must create
+`GPUBindGroupLayout` with `hasDynamicOffset: true` for the uniform binding.
+
+**Architecture:**
+```
+prepareBatchedScan():
+  1. Wrap each routine shader with uniform offset variables (group 1)
+     - Only xs/ys bindings get offsets (not carry/consts)
+     - Uses scan signature (numConsts, numCarry, numX, numY) to identify bindings
+  2. Create combined uniform buffer with all iteration offsets (aligned)
+  3. Return PreparedBatchedScan with wrapped shaders + offset buffer
+
+dispatchBatchedScan():
+  1. Create ping-pong buffers for carry state
+  2. Create bind groups with full buffer bindings (group 0)
+  3. Use dynamic uniform offsets for iteration-specific offsets (group 1)
+  4. Encode all iterations in single command buffer
+  5. Submit once → zero JS roundtrip overhead
+```
+
+**Scan signature layout:**
+```
+Inputs:  [consts..., carry_in..., x...]
+Outputs: [carry_out..., y...]
+```
+- `consts`: unchanged across iterations (no offset)
+- `carry`: ping-pong buffers (no offset)
+- `xs/ys`: need per-iteration offset (uniform-based)
 
 ## Where to start reading
 - Entry & exports: [src/index.ts](src/index.ts)

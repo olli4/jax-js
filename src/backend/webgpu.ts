@@ -28,12 +28,17 @@ import {
 } from "./webgpu/codegen";
 import { SyncReader } from "./webgpu/reader";
 import { createRoutineShader } from "./webgpu/routines";
+import {
+  wrapRoutineForScan,
+  createAllIterationsOffsetsBuffer,
+  ScanBindingInfo,
+} from "./webgpu/scan-wrapper";
 
 interface ShaderDispatch extends ShaderInfo {
   pipeline: GPUComputePipeline; // Compiled pipeline for the shader.
 }
 
-/** Parameters for native scan execution on WebGPU. */
+/** Parameters for native scan execution on WebGPU (elementwise kernel body). */
 export interface NativeScanParams {
   /** Number of scan iterations (length of xs along axis 0). */
   length: number;
@@ -47,6 +52,39 @@ export interface NativeScanParams {
   bodyKernel: Kernel;
   /** Number of carry arrays. */
   numCarry: number;
+}
+
+/** Parameters for batched scan execution on WebGPU (routine body like matmul). */
+export interface BatchedScanParams {
+  /** Number of scan iterations (length of xs along axis 0). */
+  length: number;
+  /** Sizes of each carry buffer in bytes. */
+  carrySizes: number[];
+  /** Strides (in ELEMENTS) along axis 0 for each xs input. Used for uniform offsets. */
+  xsElemStrides: number[];
+  /** Strides (in ELEMENTS) along axis 0 for each stacked y output. Used for uniform offsets. */
+  ysElemStrides: number[];
+  /** The prepared routine executable for the body. */
+  bodyRoutine: Executable<ShaderDispatch[]>;
+  /** Number of carry arrays. */
+  numCarry: number;
+  /** Number of xs inputs. */
+  numX: number;
+  /** Number of ys outputs. */
+  numY: number;
+  /** Number of const inputs (bound before carry). */
+  numConsts: number;
+}
+
+/** Prepared batched scan with wrapped shaders and offset buffer. */
+export interface PreparedBatchedScan {
+  params: BatchedScanParams;
+  /** Shaders with uniform offset support. */
+  wrappedShaders: ShaderDispatch[];
+  /** GPU buffer containing all iteration offsets. */
+  offsetBuffer: GPUBuffer;
+  /** Alignment of each iteration's offset data in the buffer. */
+  offsetAlignment: number;
 }
 
 /** Implementation of `Backend` that uses WebGPU in browsers. */
@@ -321,6 +359,254 @@ export class WebGPUBackend implements Backend {
       }
     }
     this.device.queue.submit([commandEncoder.finish()]);
+  }
+
+  /**
+   * Check if batched scan can be used for a routine body.
+   * Returns the minimum uniform buffer offset alignment for dynamic offsets.
+   */
+  getBatchedScanAlignment(): number {
+    // Use minUniformBufferOffsetAlignment for dynamic uniform offsets
+    // This is typically 256 bytes on most GPUs
+    return this.device.limits.minUniformBufferOffsetAlignment ?? 256;
+  }
+
+  /**
+   * Prepare a batched scan operation for routine bodies (matmul, conv, etc.).
+   * Returns the prepared executable if successful, null otherwise.
+   * 
+   * Batched scan encodes all iteration dispatches in a single command buffer,
+   * eliminating JS roundtrip overhead per iteration. Uses ping-pong buffers
+   * for carry state and uniform-based offset bindings for xs/ys slicing.
+   * 
+   * This approach avoids minStorageBufferOffsetAlignment issues by:
+   * 1. Binding full buffers (no offset in GPUBufferBinding)
+   * 2. Adding uniform offset variables to the shader
+   * 3. Using dynamic uniform buffer offsets for per-iteration offsets
+   */
+  prepareBatchedScan(params: BatchedScanParams): PreparedBatchedScan | null {
+    const { xsElemStrides, ysElemStrides, bodyRoutine, numConsts, numCarry, numX, numY, length } = params;
+
+    // Verify the routine is valid
+    if (!bodyRoutine || bodyRoutine.data.length === 0) {
+      if (DEBUG >= 2) console.log("Batched scan: invalid routine");
+      return null;
+    }
+
+    // Skip if no xs/ys to offset (pure carry operation)
+    if (numX === 0 && numY === 0) {
+      if (DEBUG >= 2) console.log("Batched scan: no xs/ys, using direct dispatch");
+      // Could still optimize with batched command buffer, but simpler to fall back
+      return null;
+    }
+
+    const scanInfo: ScanBindingInfo = {
+      numConsts,
+      numCarry,
+      numX,
+      numY,
+      numInputs: bodyRoutine.data[0]?.numInputs ?? 0,
+      numOutputs: bodyRoutine.data[0]?.numOutputs ?? 0,
+    };
+
+    // Wrap each shader in the routine with offset support
+    const wrappedShaders: ShaderDispatch[] = [];
+    for (const shader of bodyRoutine.data) {
+      const wrapped = wrapRoutineForScan(shader, scanInfo);
+      if (!wrapped.hasUniform) {
+        // No bindings need offsets, fall back
+        if (DEBUG >= 2) console.log("Batched scan: shader doesn't need offsets");
+        return null;
+      }
+
+      // Create new pipeline with wrapped shader
+      const module = this.device.createShaderModule({ code: wrapped.code });
+      const pipeline = this.device.createComputePipeline({
+        layout: "auto",
+        compute: { module, entryPoint: "main" },
+      });
+
+      wrappedShaders.push({
+        ...shader,
+        code: wrapped.code,
+        hasUniform: true,
+        pipeline,
+      });
+    }
+
+    // Create the combined uniform buffer with all iteration offsets
+    const alignment = this.getBatchedScanAlignment();
+    const { buffer: offsetData, alignment: offsetAlignment } = createAllIterationsOffsetsBuffer(
+      numX,
+      numY,
+      length,
+      xsElemStrides,
+      ysElemStrides,
+      alignment,
+    );
+
+    // Create GPU buffer for offsets
+    const offsetBuffer = this.device.createBuffer({
+      size: offsetData.length,
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+      mappedAtCreation: true,
+    });
+    new Uint8Array(offsetBuffer.getMappedRange()).set(offsetData);
+    offsetBuffer.unmap();
+
+    if (DEBUG >= 1) {
+      console.log(`Batched scan: prepared for ${length} iterations with uniform offsets`);
+    }
+
+    return {
+      params,
+      wrappedShaders,
+      offsetBuffer,
+      offsetAlignment,
+    };
+  }
+
+  /**
+   * Dispatch a batched scan operation with routine body.
+   * 
+   * Uses ping-pong buffers for carry and uniform-based offsets for xs/ys.
+   * All iteration dispatches are encoded in a single command buffer.
+   * Dynamic uniform buffer offsets are used for per-iteration offset values.
+   */
+  dispatchBatchedScan(
+    prepared: PreparedBatchedScan,
+    initCarrySlots: Slot[],
+    xsSlots: Slot[],
+    carryOutSlots: Slot[],
+    ysStackedSlots: Slot[],
+  ): void {
+    const { params, wrappedShaders, offsetBuffer, offsetAlignment } = prepared;
+    const { length, carrySizes, numCarry, numX, numY, numConsts } = params;
+
+    const initCarryBuffers = initCarrySlots.map((slot) => this.#getBuffer(slot).buffer);
+    const xsBuffers = xsSlots.map((slot) => this.#getBuffer(slot).buffer);
+    const carryOutBuffers = carryOutSlots.map((slot) => this.#getBuffer(slot).buffer);
+    const ysStackedBuffers = ysStackedSlots.map((slot) => this.#getBuffer(slot).buffer);
+
+    // Create ping-pong buffers for carry state
+    const carryPing = carrySizes.map((size) => this.#createBuffer(size));
+    const carryPong = carrySizes.map((size) => this.#createBuffer(size));
+
+    const commandEncoder = this.device.createCommandEncoder();
+
+    // Copy initCarry to carryPing
+    for (let i = 0; i < numCarry; i++) {
+      commandEncoder.copyBufferToBuffer(
+        initCarryBuffers[i], 0,
+        carryPing[i], 0,
+        carrySizes[i],
+      );
+    }
+
+    // Create bind groups for each shader with full buffer bindings
+    // The uniform offset buffer uses dynamic offsets per iteration
+    for (const shader of wrappedShaders) {
+      const { pipeline, numInputs, passes } = shader;
+      
+      // Build storage buffer entries (group 0)
+      // Layout: inputs = [consts..., carry_in..., x...], outputs = [carry_out..., y...]
+      const storageEntries: GPUBindGroupEntry[] = [];
+      
+      // Note: consts would come before carry in inputs, but we don't have them here
+      // They should be passed separately if needed
+      
+      // Create bind groups for ping and pong configurations
+      // Even iterations: read from carryPing, write to carryPong
+      // Odd iterations: read from carryPong, write to carryPing
+      
+      const createStorageBindGroup = (readCarry: GPUBuffer[], writeCarry: GPUBuffer[]): GPUBindGroup => {
+        const entries: GPUBindGroupEntry[] = [];
+        let binding = 0;
+        
+        // Inputs: [consts..., carry_in..., x...]
+        // Skip consts for now (numConsts = 0 in most cases)
+        // TODO: handle consts if needed
+        
+        // Carry inputs (read)
+        for (let c = 0; c < numCarry; c++) {
+          entries.push({ binding: binding++, resource: { buffer: readCarry[c] } });
+        }
+        
+        // Xs inputs (full buffers - offsets handled by uniform)
+        for (let x = 0; x < numX; x++) {
+          entries.push({ binding: binding++, resource: { buffer: xsBuffers[x] } });
+        }
+        
+        // Outputs: [carry_out..., y...]
+        // Carry outputs (write)
+        for (let c = 0; c < numCarry; c++) {
+          entries.push({ binding: binding++, resource: { buffer: writeCarry[c] } });
+        }
+        
+        // Ys outputs (full buffers - offsets handled by uniform)
+        for (let y = 0; y < numY; y++) {
+          entries.push({ binding: binding++, resource: { buffer: ysStackedBuffers[y] } });
+        }
+        
+        return this.device.createBindGroup({
+          layout: pipeline.getBindGroupLayout(0),
+          entries,
+        });
+      };
+      
+      const pingBindGroup = createStorageBindGroup(carryPing, carryPong);
+      const pongBindGroup = createStorageBindGroup(carryPong, carryPing);
+      
+      // Create uniform bind group for offsets (group 1)
+      // This uses dynamic offsets - one binding, different offset per iteration
+      const uniformBindGroup = this.device.createBindGroup({
+        layout: pipeline.getBindGroupLayout(1),
+        entries: [{
+          binding: 0,
+          resource: { 
+            buffer: offsetBuffer, 
+            offset: 0, 
+            size: offsetAlignment,  // Size of one iteration's offsets
+          },
+        }],
+      });
+
+      // Dispatch all iterations
+      const filteredPasses = passes.filter(({ grid }) => prod(grid) > 0);
+      
+      for (let iter = 0; iter < length; iter++) {
+        const storageBindGroup = iter % 2 === 0 ? pingBindGroup : pongBindGroup;
+        const dynamicOffset = iter * offsetAlignment;
+        
+        for (const { grid } of filteredPasses) {
+          const passEncoder = commandEncoder.beginComputePass();
+          passEncoder.setPipeline(pipeline);
+          passEncoder.setBindGroup(0, storageBindGroup);
+          passEncoder.setBindGroup(1, uniformBindGroup, [dynamicOffset]);
+          passEncoder.dispatchWorkgroups(grid[0], grid[1]);
+          passEncoder.end();
+        }
+      }
+    }
+
+    // Copy final carry to carryOut
+    const finalCarry = length % 2 === 0 ? carryPing : carryPong;
+    for (let i = 0; i < numCarry; i++) {
+      commandEncoder.copyBufferToBuffer(
+        finalCarry[i], 0,
+        carryOutBuffers[i], 0,
+        carrySizes[i],
+      );
+    }
+
+    // Submit all commands in one batch
+    this.device.queue.submit([commandEncoder.finish()]);
+
+    // Clean up ping-pong buffers and offset buffer
+    for (const buf of [...carryPing, ...carryPong]) {
+      buf.destroy();
+    }
+    offsetBuffer.destroy();
   }
 
   #getBuffer(slot: Slot): { buffer: GPUBuffer; size: number } {

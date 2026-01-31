@@ -78,6 +78,18 @@ export type JitStep =
       initCarry: JitId[];
       xs: JitId[];
       outputs: JitId[]; // [carry_out..., stacked_ys...]
+    }
+  | {
+      type: "batched-scan";
+      /** Batched scan params (stored for dispatch). */
+      batchedParams: any; // BatchedScanParams from webgpu.ts
+      length: number;
+      numCarry: number;
+      numX: number;
+      numY: number;
+      initCarry: JitId[];
+      xs: JitId[];
+      outputs: JitId[]; // [carry_out..., stacked_ys...]
     };
 
 /** Callback type for running scan steps during JitProgram execution. */
@@ -138,6 +150,10 @@ export class JitProgram {
             .concat(PPrint.pp("  body=").concat(PPrint.pp(step.bodyJaxpr.toString()).indent(4)));
         case "native-scan":
           return PPrint.pp(`native-scan length=${step.length} numCarry=${step.numCarry}`)
+            .concat(PPrint.pp(`  initCarry=[${step.initCarry.join(", ")}] xs=[${step.xs.join(", ")}]`))
+            .concat(PPrint.pp(`  outputs=[${step.outputs.join(", ")}]`));
+        case "batched-scan":
+          return PPrint.pp(`batched-scan length=${step.length} numCarry=${step.numCarry}`)
             .concat(PPrint.pp(`  initCarry=[${step.initCarry.join(", ")}] xs=[${step.xs.join(", ")}]`))
             .concat(PPrint.pp(`  outputs=[${step.outputs.join(", ")}]`));
       }
@@ -266,6 +282,38 @@ export class JitProgram {
             );
           } else {
             throw new Error("internal: native-scan requires backend.dispatchNativeScan");
+          }
+          break;
+        }
+        case "batched-scan": {
+          // Batched scan for routine bodies (matmul, conv, etc.)
+          // IMPORTANT: Submit all pending operations first so input data is computed!
+          for (const p of pending) {
+            p.prepareSync();
+            p.submit();
+          }
+          pending.length = 0;  // Clear the pending array
+          
+          const initCarrySlots = step.initCarry.map((id) => scope.get(id)!);
+          const xsSlots = step.xs.map((id) => scope.get(id)!);
+          const outputSlots = step.outputs.map((id) => scope.get(id)!);
+          
+          // Split outputs into carryOut and ysStacked
+          const carryOutSlots = outputSlots.slice(0, step.numCarry);
+          const ysStackedSlots = outputSlots.slice(step.numCarry);
+          
+          // Check if backend supports batched scan dispatch
+          const backend = this.backend as any;
+          if (typeof backend.dispatchBatchedScan === "function") {
+            backend.dispatchBatchedScan(
+              step.batchedParams,  // PreparedBatchedScan
+              initCarrySlots,
+              xsSlots,
+              carryOutSlots,
+              ysStackedSlots,
+            );
+          } else {
+            throw new Error("internal: batched-scan requires backend.dispatchBatchedScan");
           }
           break;
         }
