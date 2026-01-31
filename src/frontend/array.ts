@@ -1210,6 +1210,7 @@ export class Array extends Tracer {
           }
           
           // Stack y outputs
+          // Use chunking to avoid exceeding WebGPU buffer limit (max 8 storage buffers per shader)
           const stackedYs = ySlices.map((slices) => {
             const reshaped = slices.map((s) => {
               // ref.#reshape: ref prevents s from being freed, #reshape creates new Array with expanded dims
@@ -1217,7 +1218,13 @@ export class Array extends Tracer {
               s.dispose();
               return expanded;
             });
-            const stacked = coreConcatenate(reshaped, 0) as Array;
+            // Concatenate in chunks of 6 to stay under buffer limit
+            // Each concat: 1 (accumulator) + 6 (chunk) = 7 inputs + 1 output = 8 buffers
+            let stacked = reshaped[0];
+            for (let i = 1; i < reshaped.length; i += 6) {
+              const chunk = reshaped.slice(i, i + 6);
+              stacked = coreConcatenate([stacked, ...chunk], 0) as Array;
+            }
             return stacked;
           });
           
@@ -1353,8 +1360,13 @@ export class Array extends Tracer {
             s.dispose();
             return expanded;
           });
-          // Concatenate using core primitive
-          const stacked = coreConcatenate(reshaped, 0) as Array;
+          // Concatenate in chunks of 6 to stay under buffer limit
+          // Each concat: 1 (accumulator) + 6 (chunk) = 7 inputs + 1 output = 8 buffers
+          let stacked = reshaped[0];
+          for (let i = 1; i < reshaped.length; i += 6) {
+            const chunk = reshaped.slice(i, i + 6);
+            stacked = coreConcatenate([stacked, ...chunk], 0) as Array;
+          }
           return stacked;
         });
         

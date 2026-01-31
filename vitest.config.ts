@@ -8,6 +8,7 @@ export default defineConfig({
     },
   },
   test: {
+    watch: false, // Run once and exit, don't wait for 'q'
     browser: {
       enabled: true,
       headless: true,

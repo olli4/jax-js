@@ -17,7 +17,8 @@ pnpm run build                     # tsdown → dist/*.js, dist/*.d.ts
 pnpm run build:watch               # watch mode
 pnpm exec playwright install       # one-time: install Chromium for WebGPU tests
 pnpm test                          # Vitest + Playwright (browser + node)
-pnpm test -- test/conv.test.ts     # single file
+pnpm test                          # Vitest + Playwright (browser + node)
+pnpm test test/conv.test.ts        # single file
 pnpm run check                     # tsc type-check
 pnpm run lint && pnpm run format   # ESLint + Prettier
 pnpm -C website dev                # local dev server for demos
