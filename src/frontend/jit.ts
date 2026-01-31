@@ -9,7 +9,7 @@ import {
   Kernel,
   Reduction,
 } from "../alu";
-import { Backend, Slot } from "../backend";
+import { Backend, Executable, Slot } from "../backend";
 import { PPrint } from "../pprint";
 import { Routine } from "../routine";
 import { Pair, ShapeTracker, unravelAlu } from "../shape";
@@ -65,6 +65,16 @@ export type JitStep =
       numX: number;
       numY: number;
       consts: JitId[];
+      initCarry: JitId[];
+      xs: JitId[];
+      outputs: JitId[]; // [carry_out..., stacked_ys...]
+    }
+  | {
+      type: "native-scan";
+      executable: Executable;
+      length: number;
+      numCarry: number;
+      numY: number;
       initCarry: JitId[];
       xs: JitId[];
       outputs: JitId[]; // [carry_out..., stacked_ys...]
@@ -126,6 +136,10 @@ export class JitProgram {
             .concat(PPrint.pp(`  consts=[${step.consts.join(", ")}] initCarry=[${step.initCarry.join(", ")}] xs=[${step.xs.join(", ")}]`))
             .concat(PPrint.pp(`  outputs=[${step.outputs.join(", ")}]`))
             .concat(PPrint.pp("  body=").concat(PPrint.pp(step.bodyJaxpr.toString()).indent(4)));
+        case "native-scan":
+          return PPrint.pp(`native-scan length=${step.length} numCarry=${step.numCarry}`)
+            .concat(PPrint.pp(`  initCarry=[${step.initCarry.join(", ")}] xs=[${step.xs.join(", ")}]`))
+            .concat(PPrint.pp(`  outputs=[${step.outputs.join(", ")}]`));
       }
     });
     const display = PPrint.prototype.concat(
@@ -221,6 +235,38 @@ export class JitProgram {
             scope.set(step.outputs[i], result.outputs[i]);
           }
           pending.push(...result.pending);
+          break;
+        }
+        case "native-scan": {
+          // Native scan - dispatch directly to backend
+          // IMPORTANT: Submit all pending operations first so input data is computed!
+          for (const p of pending) {
+            p.prepareSync();
+            p.submit();
+          }
+          pending.length = 0;  // Clear the pending array
+          
+          const initCarrySlots = step.initCarry.map((id) => scope.get(id)!);
+          const xsSlots = step.xs.map((id) => scope.get(id)!);
+          const outputSlots = step.outputs.map((id) => scope.get(id)!);
+          
+          // Split outputs into carryOut and ysStacked
+          const carryOutSlots = outputSlots.slice(0, step.numCarry);
+          const ysStackedSlots = outputSlots.slice(step.numCarry);
+          
+          // Check if backend supports native scan dispatch
+          const backend = this.backend as any;
+          if (typeof backend.dispatchNativeScan === "function") {
+            backend.dispatchNativeScan(
+              step.executable,
+              initCarrySlots,
+              xsSlots,
+              carryOutSlots,
+              ysStackedSlots,
+            );
+          } else {
+            throw new Error("internal: native-scan requires backend.dispatchNativeScan");
+          }
           break;
         }
         default:
@@ -438,9 +484,9 @@ export function jitCompile(backend: Backend, jaxpr: Jaxpr): JitProgram {
       // Compile the body jaxpr to a JitProgram for efficient per-iteration execution
       const bodyProgram = jitCompile(backend, bodyJaxpr);
 
-      // Push scan step
-      builder.steps.push({
-        type: "scan",
+      // Try to use native scan if possible (WASM backend only, single kernel body)
+      const nativeScanExe = tryPrepareNativeScan(
+        backend,
         bodyProgram,
         bodyJaxpr,
         length,
@@ -448,11 +494,38 @@ export function jitCompile(backend: Backend, jaxpr: Jaxpr): JitProgram {
         numConsts,
         numX,
         numY,
-        consts: constsIds,
-        initCarry: initCarryIds,
-        xs: xsIds,
-        outputs,
-      });
+        eqn,
+      );
+
+      if (nativeScanExe) {
+        // Use native scan
+        builder.steps.push({
+          type: "native-scan",
+          executable: nativeScanExe,
+          length,
+          numCarry,
+          numY,
+          initCarry: initCarryIds,
+          xs: xsIds,
+          outputs,
+        });
+      } else {
+        // Fall back to JS loop scan
+        builder.steps.push({
+          type: "scan",
+          bodyProgram,
+          bodyJaxpr,
+          length,
+          numCarry,
+          numConsts,
+          numX,
+          numY,
+          consts: constsIds,
+          initCarry: initCarryIds,
+          xs: xsIds,
+          outputs,
+        });
+      }
       continue;
     }
 
@@ -1151,4 +1224,110 @@ function splitGraphDataflow(backend: Backend, jaxpr: Jaxpr): Set<Var> {
   }
 
   return blackNodes;
+}
+
+/**
+ * Try to prepare a native scan executable.
+ * Returns the executable if native scan is possible, null otherwise.
+ * 
+ * Native scan is only supported when:
+ * 1. Backend is WASM
+ * 2. Body program contains exactly one execute step with a Kernel (no routines)
+ * 3. No constants (for MVP simplicity)
+ * 4. No reduction in the body kernel
+ */
+function tryPrepareNativeScan(
+  backend: Backend,
+  bodyProgram: JitProgram,
+  bodyJaxpr: Jaxpr,
+  length: number,
+  numCarry: number,
+  numConsts: number,
+  numX: number,
+  numY: number,
+  eqn: { inputs: (Var | Lit)[]; outBinders: Var[] },
+): Executable | null {
+  // Only WASM backend supports native scan for now
+  if (backend.type !== "wasm") {
+    if (DEBUG >= 2) console.log("Native scan: skipped, not WASM backend");
+    return null;
+  }
+  
+  // MVP: No constants support
+  if (numConsts > 0) {
+    if (DEBUG >= 2) console.log("Native scan: skipped, has constants");
+    return null;
+  }
+  
+  // Find the single execute step with a Kernel
+  const executeSteps = bodyProgram.steps.filter(s => s.type === "execute");
+  if (executeSteps.length !== 1) {
+    if (DEBUG >= 2) console.log(`Native scan: skipped, ${executeSteps.length} execute steps`);
+    return null;
+  }
+  
+  const execStep = executeSteps[0] as Extract<JitStep, { type: "execute" }>;
+  if (!(execStep.source instanceof Kernel)) {
+    if (DEBUG >= 2) console.log("Native scan: skipped, not a Kernel");
+    return null;
+  }
+  
+  const bodyKernel = execStep.source;
+  
+  // No reduction support yet
+  if (bodyKernel.reduction) {
+    if (DEBUG >= 2) console.log("Native scan: skipped, has reduction");
+    return null;
+  }
+  
+  // MVP: Only support case where carry and y are the same (like cumsum)
+  // This means numCarry === numY and the outputs reference the same variables
+  if (numCarry !== numY) {
+    if (DEBUG >= 2) console.log(`Native scan: skipped, numCarry=${numCarry} !== numY=${numY}`);
+    return null;
+  }
+  
+  // Get avals for computing sizes and strides
+  const carryAvals = bodyJaxpr.inBinders.slice(0, numCarry).map(v => v.aval);
+  const xAvals = bodyJaxpr.inBinders.slice(numCarry, numCarry + numX).map(v => v.aval);
+  
+  // Compute carry sizes in bytes
+  const carrySizes = carryAvals.map(a => a.size * byteWidth(a.dtype));
+  
+  // Compute xs strides (bytes per iteration along axis 0)
+  // xs has leading dimension = length, so stride = size_without_leading_dim * bytes
+  // Note: We need to look at the outer xs avals (with leading dim), not the sliced ones
+  const xsStrides = xAvals.map(a => a.size * byteWidth(a.dtype));
+  
+  // Compute ys strides (same as carry sizes for MVP)
+  const ysStrides = carrySizes.slice();
+  
+  // Try to prepare native scan
+  const wasmBackend = backend as any;
+  if (typeof wasmBackend.prepareNativeScan !== "function") {
+    if (DEBUG >= 2) console.log("Native scan: skipped, backend has no prepareNativeScan");
+    return null;
+  }
+  
+  const nativeScanParams = {
+    length,
+    carrySizes,
+    xsStrides,
+    ysStrides,
+    bodyKernel,
+    numCarry,
+  };
+  
+  try {
+    const exe = wasmBackend.prepareNativeScan(nativeScanParams);
+    if (exe) {
+      if (DEBUG >= 1) console.log("Native scan: SUCCESS! Using WASM native scan loop");
+    }
+    return exe;
+  } catch (e) {
+    if (DEBUG >= 2) {
+      console.warn("Native scan preparation failed:", e);
+    }
+    return null;
+  }
 }

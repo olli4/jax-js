@@ -199,8 +199,9 @@ lax.scan(f, init, xs)
 |------|------|
 | `src/frontend/core.ts` | `Primitive.Scan` enum + params type |
 | `src/frontend/jaxpr.ts` | Abstract eval rule |
-| `src/frontend/array.ts` | Scan impl rule with `scanRunner` callback |
-| `src/frontend/jit.ts` | `JitStep.scan` with compiled `bodyProgram` |
+| `src/frontend/array.ts` | Scan impl rule with `scanRunner` callback; pending op submission |
+| `src/frontend/jit.ts` | `JitStep.scan` (JS loop), `JitStep["native-scan"]` (WASM), `tryPrepareNativeScan()` |
+| `src/backend/wasm.ts` | `codegenNativeScan()`, `translateExpWithScanContext()` |
 | `src/library/lax-scan.ts` | Public API |
 
 **Argument layout:**
@@ -222,22 +223,35 @@ Body jaxpr input: [...consts, ...carry, ...x_slice]
 **Current status (Jan 2026):**
 - ✅ CPU + WASM + WebGPU backends tested
 - ✅ WebGPU tested via Deno on NVIDIA RTX 4070 Ti SUPER (headless, no X11)
+- ✅ **WASM native scan loop** — ~130× faster than JS loop for eligible scans
 - The JS loop runs on CPU, but `bodyProgram.execute()` runs on the active backend (WebGPU/WASM)
 - Data stays on GPU between iterations (zero-copy slicing via ShapeTracker)
 
-**Future: backend-native loop**
-Move the JS loop into the backend to eliminate per-iteration boundary crossings:
-| Backend | Strategy |
-|---------|----------|
-| CPU | Keep JS loop (no overhead) |
-| WASM | WASM loop function with `call` |
-| WebGPU | Shader inlining (WGSL has no fn pointers) |
+**WASM native scan (implemented):**
+Eligible scans (single elementwise body kernel, no constants, no reduction, numCarry === numY)
+are compiled to a single WASM module with the outer loop inlined. Key implementation:
+| File | Component |
+|------|-----------|
+| `src/backend/wasm.ts` | `NativeScanParams`, `prepareNativeScan()`, `dispatchNativeScan()`, `codegenNativeScan()` |
+| `src/frontend/jit.ts` | `JitStep["native-scan"]`, `tryPrepareNativeScan()` |
+| `src/frontend/array.ts` | Submit input pending ops before `jp.execute()` |
 
-**Development strategy**: Implement WASM loop inlining first, then port the approach to WebGPU.
-- WASM is more debuggable (step through, inspect memory directly)
-- WASM has proper `call` instruction for body kernels; patterns learned transfer to WebGPU
-- WebGPU requires shader inlining (no function pointers in WGSL) — harder to debug
-- Test coverage on WASM validates the loop structure before tackling GPU complexity
+**Critical pattern — pending ops submission:**
+Native scan reads synchronously from WASM memory. Input arrays created via lazy ops
+(e.g., `arange().reshape().astype()`) have pending `PendingExecute` objects that must be
+submitted before the native scan dispatches. Two flush points are required:
+1. In `array.ts`: submit input args' pending ops before calling `jp.execute()`
+2. In `jit.ts`: flush accumulated pending ops before `"native-scan"` step dispatch
+
+**Future: WebGPU native loop**
+| Backend | Status |
+|---------|--------|
+| CPU | JS loop (no overhead) |
+| WASM | ✅ Native loop (implemented) |
+| WebGPU | 🔄 Shader inlining (WGSL has no fn pointers) — TODO |
+
+WebGPU native scan requires inlining the body kernel into the scan shader since WGSL
+lacks function pointers. This is more complex but the WASM implementation validates the approach.
 
 ## Where to start reading
 - Entry & exports: [src/index.ts](src/index.ts)

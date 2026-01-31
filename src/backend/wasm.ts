@@ -42,6 +42,22 @@ interface WasmProgram {
   module: WebAssembly.Module;
 }
 
+/** Parameters for native scan execution. */
+export interface NativeScanParams {
+  /** Number of scan iterations (length of xs along axis 0). */
+  length: number;
+  /** Sizes of each carry buffer in bytes. */
+  carrySizes: number[];
+  /** Strides (in bytes) along axis 0 for each xs input. */
+  xsStrides: number[];
+  /** Strides (in bytes) along axis 0 for each stacked y output. */
+  ysStrides: number[];
+  /** The body kernel to execute each iteration. */
+  bodyKernel: Kernel;
+  /** Number of carry arrays. */
+  numCarry: number;
+}
+
 const moduleCache = new Map<string, WebAssembly.Module>();
 
 /** Backend that compiles into WebAssembly bytecode for immediate execution. */
@@ -161,6 +177,66 @@ export class WasmBackend implements Backend {
     const ptrs = [...inputs, ...outputs].map(
       (slot) => this.#buffers.get(slot)!.ptr,
     );
+    func(...ptrs);
+  }
+
+  /**
+   * Prepare a native scan operation for efficient execution.
+   * Returns null if the scan cannot be natively executed (e.g., has routines).
+   */
+  prepareNativeScan(params: NativeScanParams): Executable<WasmProgram> | null {
+    // For now, only support scans with a single body kernel (no routines)
+    const { bodyKernel } = params;
+    if (!bodyKernel) return null;
+    
+    try {
+      const bytes = codegenNativeScan(params);
+      const module = new WebAssembly.Module(bytes);
+      // Use a synthetic Kernel as the source for the Executable
+      const syntheticKernel = new Kernel(
+        bodyKernel.nargs,
+        bodyKernel.size,
+        bodyKernel.exp,
+        bodyKernel.reduction,
+      );
+      return new Executable(syntheticKernel, { module });
+    } catch (e) {
+      if (DEBUG >= 2) {
+        console.warn("Native scan codegen failed:", e);
+      }
+      return null;
+    }
+  }
+
+  /**
+   * Dispatch a native scan operation.
+   * @param exe - The prepared native scan executable
+   * @param initCarry - Initial carry buffer slots
+   * @param xs - Input xs buffer slots  
+   * @param carryOut - Output carry buffer slots
+   * @param ysStacked - Output stacked ys buffer slots
+   */
+  dispatchNativeScan(
+    exe: Executable<WasmProgram>,
+    initCarry: Slot[],
+    xs: Slot[],
+    carryOut: Slot[],
+    ysStacked: Slot[],
+  ): void {
+    let instance = this.#instanceCache.get(exe.data.module);
+    if (!instance) {
+      instance = new WebAssembly.Instance(exe.data.module, {
+        env: { memory: this.#memory },
+      });
+      this.#instanceCache.set(exe.data.module, instance);
+    }
+    const func = instance.exports.scan as (...args: number[]) => void;
+    const ptrs = [
+      ...initCarry.map((slot) => this.#buffers.get(slot)!.ptr),
+      ...xs.map((slot) => this.#buffers.get(slot)!.ptr),
+      ...carryOut.map((slot) => this.#buffers.get(slot)!.ptr),
+      ...ysStacked.map((slot) => this.#buffers.get(slot)!.ptr),
+    ];
     func(...ptrs);
   }
 
@@ -312,6 +388,394 @@ function codegenWasm(kernel: Kernel): Uint8Array<ArrayBuffer> {
   cg.export(kernelFunc, "kernel");
 
   return cg.finish();
+}
+
+/**
+ * Generate WASM bytecode for a native scan operation.
+ * 
+ * The generated function takes pointers to:
+ *   [...initCarry, ...xs, ...carryOut, ...ysStacked]
+ * 
+ * Memory layout:
+ *   - initCarry[i]: buffer of size carrySizes[i]
+ *   - xs[i]: buffer of size length * xsStrides[i]
+ *   - carryOut[i]: buffer of size carrySizes[i]
+ *   - ysStacked[i]: buffer of size length * ysStrides[i]
+ * 
+ * Algorithm:
+ *   1. Copy initCarry to working carry buffers (use carryOut as working buffer)
+ *   2. For iter = 0..length:
+ *        - Compute x_ptr = xs[i] + iter * xsStrides[i]
+ *        - Compute y_ptr = ysStacked[i] + iter * ysStrides[i]
+ *        - Execute body kernel reading from carry and x, writing to y
+ *        - Copy appropriate outputs to carry for next iteration
+ *   3. Final carry is already in carryOut
+ */
+function codegenNativeScan(params: NativeScanParams): Uint8Array<ArrayBuffer> {
+  const { length, carrySizes, xsStrides, ysStrides, bodyKernel, numCarry } = params;
+  
+  // For the initial MVP, we only support a simple case:
+  // - Single output that is both carry and y (like cumsum)
+  // - No reduction in body kernel
+  if (bodyKernel.reduction) {
+    throw new Error("Native scan: body kernel with reduction not yet supported");
+  }
+  
+  const tune = tuneNullopt(bodyKernel);
+  
+  const cg = new CodeGenerator();
+  cg.memory.import("env", "memory");
+  
+  // Import helper functions needed by the body kernel
+  const distinctOps = tune.exp.distinctOps();
+  const funcs: Record<string, number> = {};
+  if (distinctOps.has(AluOp.Sin)) funcs.sin = wasm_sin(cg);
+  if (distinctOps.has(AluOp.Cos)) funcs.cos = wasm_cos(cg);
+  if (distinctOps.has(AluOp.Asin)) funcs.asin = wasm_asin(cg);
+  if (distinctOps.has(AluOp.Atan)) funcs.atan = wasm_atan(cg);
+  if (distinctOps.has(AluOp.Exp) || distinctOps.has(AluOp.Erf) || distinctOps.has(AluOp.Erfc))
+    funcs.exp = wasm_exp(cg);
+  if (distinctOps.has(AluOp.Log)) funcs.log = wasm_log(cg);
+  if (distinctOps.has(AluOp.Erf)) funcs.erf = wasm_erf(cg, funcs.exp);
+  if (distinctOps.has(AluOp.Erfc)) funcs.erfc = wasm_erfc(cg, funcs.exp);
+  if (distinctOps.has(AluOp.Threefry2x32)) funcs.threefry2x32 = wasm_threefry2x32(cg);
+  
+  // Function arguments:
+  // [...initCarry (numCarry), ...xs (numX), ...carryOut (numCarry), ...ysStacked (numY)]
+  const numX = xsStrides.length;
+  const numY = ysStrides.length;
+  const numArgs = numCarry + numX + numCarry + numY;
+  
+  const scanFunc = cg.function(rep(numArgs, cg.i32), [], () => {
+    // Local variables
+    const iter = cg.local.declare(cg.i32);  // scan iteration counter
+    const gidx = cg.local.declare(cg.i32);  // body kernel loop index
+    
+    // Argument indices
+    const initCarryBase = 0;
+    const xsBase = numCarry;
+    const carryOutBase = numCarry + numX;
+    const ysStackedBase = numCarry + numX + numCarry;
+    
+    // Step 1: Copy initCarry to carryOut (working buffer)
+    for (let c = 0; c < numCarry; c++) {
+      const size = carrySizes[c];
+      // Simple byte-by-byte copy (could optimize with memory.copy if available)
+      const copyIdx = cg.local.declare(cg.i32);
+      cg.i32.const(0);
+      cg.local.set(copyIdx);
+      cg.loop(cg.void);
+      {
+        cg.block(cg.void);
+        cg.local.get(copyIdx);
+        cg.i32.const(size);
+        cg.i32.ge_u();
+        cg.br_if(0);
+        
+        // carryOut[c][copyIdx] = initCarry[c][copyIdx]
+        cg.local.get(carryOutBase + c);  // dest base
+        cg.local.get(copyIdx);
+        cg.i32.add();
+        cg.local.get(initCarryBase + c);  // src base
+        cg.local.get(copyIdx);
+        cg.i32.add();
+        cg.i32.load8_u(0);
+        cg.i32.store8(0);
+        
+        cg.local.get(copyIdx);
+        cg.i32.const(1);
+        cg.i32.add();
+        cg.local.set(copyIdx);
+        cg.br(1);
+        cg.end();
+      }
+      cg.end();
+    }
+    
+    // Step 2: Main scan loop
+    cg.i32.const(0);
+    cg.local.set(iter);
+    cg.loop(cg.void);
+    {
+      cg.block(cg.void);
+      cg.local.get(iter);
+      cg.i32.const(length);
+      cg.i32.ge_u();
+      cg.br_if(0);
+      
+      // Inner loop over kernel elements
+      cg.i32.const(0);
+      cg.local.set(gidx);
+      cg.loop(cg.void);
+      {
+        cg.block(cg.void);
+        cg.local.get(gidx);
+        cg.i32.const(bodyKernel.size);
+        cg.i32.ge_u();
+        cg.br_if(0);
+        
+        // Compute output address: ysStacked[0] + iter * ysStrides[0] + gidx * elementSize
+        // For MVP, assume single y output matching first carry
+        cg.local.get(ysStackedBase);  // ysStacked[0] base ptr
+        cg.local.get(iter);
+        cg.i32.const(ysStrides[0]);
+        cg.i32.mul();
+        cg.i32.add();
+        cg.local.get(gidx);
+        cg.i32.const(byteWidth(bodyKernel.dtype));
+        cg.i32.mul();
+        cg.i32.add();
+        
+        // Generate body kernel expression with modified context
+        // The expression expects: gidx, plus dynamic pointer offsets for inputs
+        // We need to modify how translateExp handles GlobalView to account for iteration offsets
+        translateExpWithScanContext(cg, funcs, tune.exp, {
+          gidx,
+          iter,
+          xsBase,
+          xsStrides,
+          carryBase: carryOutBase,  // read from carryOut as working buffer
+          carrySizes,
+          numCarry,
+        });
+        
+        // Store result
+        dty(cg, null, bodyKernel.dtype).store(Math.log2(byteWidth(bodyKernel.dtype)));
+        
+        // Also update carry for next iteration
+        // carryOut[0] + gidx * elementSize
+        cg.local.get(carryOutBase);
+        cg.local.get(gidx);
+        cg.i32.const(byteWidth(bodyKernel.dtype));
+        cg.i32.mul();
+        cg.i32.add();
+        
+        // Re-compute the value (or we could store in a local)
+        translateExpWithScanContext(cg, funcs, tune.exp, {
+          gidx,
+          iter,
+          xsBase,
+          xsStrides,
+          carryBase: carryOutBase,
+          carrySizes,
+          numCarry,
+        });
+        
+        dty(cg, null, bodyKernel.dtype).store(Math.log2(byteWidth(bodyKernel.dtype)));
+        
+        // gidx++
+        cg.local.get(gidx);
+        cg.i32.const(1);
+        cg.i32.add();
+        cg.local.set(gidx);
+        
+        cg.br(1);
+        cg.end();
+      }
+      cg.end();
+      
+      // iter++
+      cg.local.get(iter);
+      cg.i32.const(1);
+      cg.i32.add();
+      cg.local.set(iter);
+      
+      cg.br(1);
+      cg.end();
+    }
+    cg.end();
+  });
+  
+  cg.export(scanFunc, "scan");
+  return cg.finish();
+}
+
+/**
+ * Translate an AluExp to WASM code within a scan context.
+ * This differs from translateExp by handling GlobalView with iteration-dependent offsets.
+ * 
+ * For MVP, supports:
+ * - Binary ops (Add, Sub, Mul) on GlobalView inputs
+ * - Const values
+ * - Simple unary ops (Reciprocal, etc.)
+ */
+function translateExpWithScanContext(
+  cg: CodeGenerator,
+  funcs: Record<string, number>,
+  exp: AluExp,
+  ctx: {
+    gidx: number;
+    iter: number;
+    xsBase: number;
+    xsStrides: number[];
+    carryBase: number;
+    carrySizes: number[];
+    numCarry: number;
+  },
+) {
+  const references = new Map<AluExp, number>();
+  const seen = new Set<AluExp>();
+  const countReferences = (e: AluExp) => {
+    references.set(e, (references.get(e) ?? 0) + 1);
+    if (!seen.has(e)) {
+      seen.add(e);
+      for (const src of e.src) countReferences(src);
+    }
+  };
+
+  const expContext = new Map<AluExp, number>();
+  const gen = (e: AluExp): void => {
+    if (expContext.has(e)) {
+      cg.local.get(expContext.get(e)!);
+      return;
+    }
+    const { op, src, dtype, arg } = e;
+
+    // Handle GlobalView specially for scan context
+    if (op === AluOp.GlobalView) {
+      const gid = arg.gid as number;
+      const offset = arg.offset as AluExp;
+      const bw = byteWidth(dtype);
+      
+      if (gid < ctx.numCarry) {
+        // Carry input: carryBase + gid ptr + offset * bw
+        cg.local.get(ctx.carryBase + gid);
+        gen(offset);
+        cg.i32.const(bw);
+        cg.i32.mul();
+        cg.i32.add();
+      } else {
+        // X input: xsBase + (gid - numCarry) ptr + iter * stride + offset * bw
+        const xIdx = gid - ctx.numCarry;
+        cg.local.get(ctx.xsBase + xIdx);
+        cg.local.get(ctx.iter);
+        cg.i32.const(ctx.xsStrides[xIdx]);
+        cg.i32.mul();
+        cg.i32.add();
+        gen(offset);
+        cg.i32.const(bw);
+        cg.i32.mul();
+        cg.i32.add();
+      }
+      
+      // Load the value
+      dty(cg, op, dtype).load(Math.log2(bw));
+      
+      if ((references.get(e) ?? 0) > 1) {
+        const local = cg.local.declare(dty(cg, op, dtype));
+        cg.local.tee(local);
+        expContext.set(e, local);
+      }
+      return;
+    }
+
+    // Handle other ops - subset supported for MVP
+    if (op === AluOp.Add) {
+      gen(src[0]);
+      gen(src[1]);
+      if (dtype === DType.Bool) cg.i32.or();
+      else dty(cg, op, dtype).add();
+    } else if (op === AluOp.Sub) {
+      gen(src[0]);
+      gen(src[1]);
+      dty(cg, op, dtype).sub();
+    } else if (op === AluOp.Mul) {
+      gen(src[0]);
+      gen(src[1]);
+      if (dtype === DType.Bool) cg.i32.and();
+      else dty(cg, op, dtype).mul();
+    } else if (op === AluOp.Min) {
+      gen(src[0]);
+      gen(src[1]);
+      if (isFloatDtype(dtype)) dtyF(cg, op, dtype).min();
+      else throw new Error("integer min in scan not yet supported");
+    } else if (op === AluOp.Max) {
+      gen(src[0]);
+      gen(src[1]);
+      if (isFloatDtype(dtype)) dtyF(cg, op, dtype).max();
+      else throw new Error("integer max in scan not yet supported");
+    } else if (op === AluOp.Const) {
+      dty(cg, op, dtype).const(arg);
+    } else if (op === AluOp.Special && arg[0] === "gidx") {
+      cg.local.get(ctx.gidx);
+    } else if (op === AluOp.Variable && arg === "gidx") {
+      cg.local.get(ctx.gidx);
+    } else if (op === AluOp.GlobalIndex) {
+      // GlobalIndex: arg = [gid, len], src = [bufidx]
+      // Load from buffer at gidx position
+      const gid = arg[0] as number;
+      const bw = byteWidth(dtype);
+      
+      if (gid < ctx.numCarry) {
+        // Carry input
+        cg.local.get(ctx.carryBase + gid);
+      } else {
+        // X input with iteration offset
+        const xIdx = gid - ctx.numCarry;
+        cg.local.get(ctx.xsBase + xIdx);
+        cg.local.get(ctx.iter);
+        cg.i32.const(ctx.xsStrides[xIdx]);
+        cg.i32.mul();
+        cg.i32.add();
+      }
+      
+      // Add gidx * bytewidth offset
+      gen(src[0]);  // This gives the element index
+      cg.i32.const(bw);
+      cg.i32.mul();
+      cg.i32.add();
+      
+      // Load the value
+      dty(cg, op, dtype).load(Math.log2(bw));
+    } else if (op === AluOp.Reciprocal) {
+      dtyF(cg, op, dtype).const(1.0);
+      gen(src[0]);
+      dtyF(cg, op, dtype).div();
+    } else if (op === AluOp.Sqrt) {
+      gen(src[0]);
+      dtyF(cg, op, dtype).sqrt();
+    } else if (op === AluOp.Cmplt) {
+      gen(src[0]);
+      gen(src[1]);
+      const srcDtype = src[0].dtype;
+      if (isFloatDtype(srcDtype)) dtyF(cg, op, srcDtype).lt();
+      else if (srcDtype === DType.Int32) cg.i32.lt_s();
+      else cg.i32.lt_u();
+    } else if (op === AluOp.Cmpne) {
+      gen(src[0]);
+      gen(src[1]);
+      dty(cg, op, src[0].dtype).ne();
+    } else if (op === AluOp.Where) {
+      gen(src[1]);  // true value
+      gen(src[2]);  // false value
+      gen(src[0]);  // condition
+      cg.select();
+    } else if (op === AluOp.Cast) {
+      gen(src[0]);
+      const srcDtype = src[0].dtype;
+      // Handle common casts
+      if (srcDtype === dtype) {
+        // no-op
+      } else if (srcDtype === DType.Float32 && dtype === DType.Int32) {
+        cg.i32.trunc_sat_f32_s();
+      } else if (srcDtype === DType.Int32 && dtype === DType.Float32) {
+        cg.f32.convert_i32_s();
+      } else {
+        throw new Error(`Cast ${srcDtype} -> ${dtype} in scan not yet supported`);
+      }
+    } else {
+      throw new Error(`translateExpWithScanContext: unsupported op ${op}`);
+    }
+
+    if ((references.get(e) ?? 0) > 1) {
+      const local = cg.local.declare(dty(cg, op, dtype));
+      cg.local.tee(local);
+      expContext.set(e, local);
+    }
+  };
+
+  countReferences(exp);
+  gen(exp);
 }
 
 function translateExp(

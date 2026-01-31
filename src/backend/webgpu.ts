@@ -764,7 +764,8 @@ class ShaderPipelineCache {
     // Workaround: Deno's createComputePipelineAsync has a WebIDL binding bug
     // where the 'compute' field is not recognized. Use sync version instead.
     // See: https://github.com/denoland/deno/issues/XXXXX
-    if (typeof Deno !== "undefined") {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    if (typeof (globalThis as any).Deno !== "undefined") {
       return this.prepareSync(shader);
     }
 

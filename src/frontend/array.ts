@@ -1235,15 +1235,23 @@ export class Array extends Tracer {
           };
         };
         
+        // Realize inputs and collect their pending operations
+        const realizedInputs = args.map((x) => x._realizeSource());
+        const prevPending = [...new Set(args.flatMap((x) => x.#pending))];
+        
+        // Submit input pending operations BEFORE executing JIT program
+        // This is necessary because native-scan reads from buffers synchronously
+        for (const exe of prevPending) {
+          exe.prepareSync();
+          exe.submit();
+        }
+        
         const { outputs, pending } = jp.execute(
-          args.map((x) => x._realizeSource()),
+          realizedInputs,
           scanRunner,
         );
         for (const exe of pending) exe.updateRc(+outputs.length - 1);
 
-        const prevPending = [...new Set(args.flatMap((x) => x.#pending))];
-        for (const exe of prevPending) exe.updateRc(+outputs.length);
-        pending.splice(0, 0, ...prevPending); // Dispatch order of pending kernels is important.
         args.forEach((x) => x.dispose()); // Dispose of args after dispatch.
 
         return outputs.map((source, i) => {
