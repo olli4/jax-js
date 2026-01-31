@@ -421,28 +421,28 @@ function codegenWasm(kernel: Kernel): Uint8Array<ArrayBuffer> {
 function codegenNativeScan(params: NativeScanParams): Uint8Array<ArrayBuffer> {
   const { length, numConsts, constSizes, carrySizes, xsStrides, ysStrides, bodyKernel, numCarry } = params;
   
-  // For the initial MVP, we only support a simple case:
-  // - Single output that is both carry and y (like cumsum)
-  // - No reduction in body kernel
-  if (bodyKernel.reduction) {
-    throw new Error("Native scan: body kernel with reduction not yet supported");
-  }
-  
   const tune = tuneNullopt(bodyKernel);
+  const re = bodyKernel.reduction;
   
   if (DEBUG >= 2) {
     console.log("codegenNativeScan params:", {
       length, numConsts, numCarry, constSizes, carrySizes, xsStrides, ysStrides,
       bodyKernelNargs: bodyKernel.nargs,
       bodyKernelSize: bodyKernel.size,
+      hasReduction: !!re,
+      reductionSize: re?.size,
+      reductionOp: re?.op,
     });
   }
   
   const cg = new CodeGenerator();
   cg.memory.import("env", "memory");
   
-  // Import helper functions needed by the body kernel
-  const distinctOps = tune.exp.distinctOps();
+  // Import helper functions needed by the body kernel (include epilogue ops)
+  const distinctOps = mapSetUnion(
+    tune.exp.distinctOps(),
+    tune.epilogue?.distinctOps(),
+  );
   const funcs: Record<string, number> = {};
   if (distinctOps.has(AluOp.Sin)) funcs.sin = wasm_sin(cg);
   if (distinctOps.has(AluOp.Cos)) funcs.cos = wasm_cos(cg);
@@ -519,7 +519,7 @@ function codegenNativeScan(params: NativeScanParams): Uint8Array<ArrayBuffer> {
       cg.i32.ge_u();
       cg.br_if(0);
       
-      // Inner loop over kernel elements
+      // Inner loop over kernel output elements
       cg.i32.const(0);
       cg.local.set(gidx);
       cg.loop(cg.void);
@@ -531,7 +531,6 @@ function codegenNativeScan(params: NativeScanParams): Uint8Array<ArrayBuffer> {
         cg.br_if(0);
         
         // Compute output address: ysStacked[0] + iter * ysStrides[0] + gidx * elementSize
-        // For MVP, assume single y output matching first carry
         cg.local.get(ysStackedBase);  // ysStacked[0] base ptr
         cg.local.get(iter);
         cg.i32.const(ysStrides[0]);
@@ -542,12 +541,11 @@ function codegenNativeScan(params: NativeScanParams): Uint8Array<ArrayBuffer> {
         cg.i32.mul();
         cg.i32.add();
         
-        // Generate body kernel expression with modified context
-        // The expression expects: gidx, plus dynamic pointer offsets for inputs
-        // We need to modify how translateExp handles GlobalView to account for iteration offsets
-        translateExpWithScanContext(cg, funcs, tune.exp, {
+        // Context for translateExpWithScanContext
+        const scanCtx = {
           gidx,
           iter,
+          ridx: -1,  // Will be set if reduction
           constsBase,
           constSizes,
           numConsts,
@@ -556,32 +554,166 @@ function codegenNativeScan(params: NativeScanParams): Uint8Array<ArrayBuffer> {
           carryBase: carryOutBase,  // read from carryOut as working buffer
           carrySizes,
           numCarry,
-        });
+        };
         
-        // Store result
+        if (re) {
+          // Reduction: define accumulator and inner ridx loop
+          const acc = cg.local.declare(dty(cg, null, bodyKernel.exp.dtype));
+          dty(cg, null, bodyKernel.exp.dtype).const(re.identity);
+          cg.local.set(acc);
+          
+          const ridx = cg.local.declare(cg.i32);
+          cg.i32.const(0);
+          cg.local.set(ridx);
+          scanCtx.ridx = ridx;
+          
+          cg.loop(cg.void);
+          {
+            // if (ridx >= reduction.size) break;
+            cg.block(cg.void);
+            cg.local.get(ridx);
+            cg.i32.const(re.size);
+            cg.i32.ge_u();
+            cg.br_if(0);
+            
+            // Translate tune.exp and push onto stack
+            translateExpWithScanContext(cg, funcs, tune.exp, scanCtx);
+            
+            // acc = reduction.evaluate(acc, exp)
+            if (re.op === AluOp.Add) {
+              cg.local.get(acc);
+              if (re.dtype === DType.Bool) cg.i32.or();
+              else dty(cg, re.op, re.dtype).add();
+            } else if (re.op === AluOp.Mul) {
+              cg.local.get(acc);
+              if (re.dtype === DType.Bool) cg.i32.and();
+              else dty(cg, re.op, re.dtype).mul();
+            } else if (re.op === AluOp.Min || re.op === AluOp.Max) {
+              if (isFloatDtype(re.dtype)) {
+                cg.local.get(acc);
+                if (re.op === AluOp.Min) dtyF(cg, re.op, re.dtype).min();
+                else dtyF(cg, re.op, re.dtype).max();
+              } else if ([DType.Int32, DType.Uint32, DType.Bool].includes(re.dtype)) {
+                // Wasm has no i32.min/max, so emulate with select
+                const local = cg.local.declare(cg.i32);
+                cg.local.tee(local);
+                cg.local.get(acc);
+                cg.local.get(local);
+                cg.local.get(acc);
+                if (re.op === AluOp.Min) {
+                  if (re.dtype === DType.Int32) cg.i32.lt_s();
+                  else cg.i32.lt_u();
+                } else {
+                  if (re.dtype === DType.Int32) cg.i32.gt_s();
+                  else cg.i32.gt_u();
+                }
+                cg.select();
+              } else {
+                throw new Error(`invalid reduction min/max over ${re.dtype}`);
+              }
+            } else {
+              throw new Error(`invalid wasm reduction op: ${re.op}`);
+            }
+            cg.local.set(acc);
+            
+            // ridx++
+            cg.local.get(ridx);
+            cg.i32.const(1);
+            cg.i32.add();
+            cg.local.set(ridx);
+            
+            cg.br(1); // continue ridx loop
+            cg.end();
+          }
+          cg.end();
+          
+          // Apply epilogue: uses acc and gidx
+          translateExpWithScanContext(cg, funcs, tune.epilogue!, { ...scanCtx, acc });
+        } else {
+          // No reduction: just translate the expression
+          translateExpWithScanContext(cg, funcs, tune.exp, scanCtx);
+        }
+        
+        // Store result to ysStacked (address already on stack from above)
         dty(cg, null, bodyKernel.dtype).store(Math.log2(byteWidth(bodyKernel.dtype)));
         
-        // Also update carry for next iteration
-        // carryOut[0] + gidx * elementSize
+        // Also update carry for next iteration: carryOut[0] + gidx * elementSize
         cg.local.get(carryOutBase);
         cg.local.get(gidx);
         cg.i32.const(byteWidth(bodyKernel.dtype));
         cg.i32.mul();
         cg.i32.add();
         
-        // Re-compute the value (or we could store in a local)
-        translateExpWithScanContext(cg, funcs, tune.exp, {
-          gidx,
-          iter,
-          constsBase,
-          constSizes,
-          numConsts,
-          xsBase,
-          xsStrides,
-          carryBase: carryOutBase,
-          carrySizes,
-          numCarry,
-        });
+        // Re-compute the value for carry update (same logic as above)
+        if (re) {
+          const acc2 = cg.local.declare(dty(cg, null, bodyKernel.exp.dtype));
+          dty(cg, null, bodyKernel.exp.dtype).const(re.identity);
+          cg.local.set(acc2);
+          
+          const ridx2 = cg.local.declare(cg.i32);
+          cg.i32.const(0);
+          cg.local.set(ridx2);
+          const scanCtx2 = { ...scanCtx, ridx: ridx2 };
+          
+          cg.loop(cg.void);
+          {
+            cg.block(cg.void);
+            cg.local.get(ridx2);
+            cg.i32.const(re.size);
+            cg.i32.ge_u();
+            cg.br_if(0);
+            
+            translateExpWithScanContext(cg, funcs, tune.exp, scanCtx2);
+            
+            if (re.op === AluOp.Add) {
+              cg.local.get(acc2);
+              if (re.dtype === DType.Bool) cg.i32.or();
+              else dty(cg, re.op, re.dtype).add();
+            } else if (re.op === AluOp.Mul) {
+              cg.local.get(acc2);
+              if (re.dtype === DType.Bool) cg.i32.and();
+              else dty(cg, re.op, re.dtype).mul();
+            } else if (re.op === AluOp.Min || re.op === AluOp.Max) {
+              if (isFloatDtype(re.dtype)) {
+                cg.local.get(acc2);
+                if (re.op === AluOp.Min) dtyF(cg, re.op, re.dtype).min();
+                else dtyF(cg, re.op, re.dtype).max();
+              } else if ([DType.Int32, DType.Uint32, DType.Bool].includes(re.dtype)) {
+                const local = cg.local.declare(cg.i32);
+                cg.local.tee(local);
+                cg.local.get(acc2);
+                cg.local.get(local);
+                cg.local.get(acc2);
+                if (re.op === AluOp.Min) {
+                  if (re.dtype === DType.Int32) cg.i32.lt_s();
+                  else cg.i32.lt_u();
+                } else {
+                  if (re.dtype === DType.Int32) cg.i32.gt_s();
+                  else cg.i32.gt_u();
+                }
+                cg.select();
+              } else {
+                throw new Error(`invalid reduction min/max over ${re.dtype}`);
+              }
+            } else {
+              throw new Error(`invalid wasm reduction op: ${re.op}`);
+            }
+            cg.local.set(acc2);
+            
+            cg.local.get(ridx2);
+            cg.i32.const(1);
+            cg.i32.add();
+            cg.local.set(ridx2);
+            
+            cg.br(1);
+            cg.end();
+          }
+          cg.end();
+          
+          translateExpWithScanContext(cg, funcs, tune.epilogue!, { ...scanCtx2, acc: acc2 });
+        } else {
+          translateExpWithScanContext(cg, funcs, tune.exp, scanCtx);
+        }
         
         dty(cg, null, bodyKernel.dtype).store(Math.log2(byteWidth(bodyKernel.dtype)));
         
@@ -614,12 +746,8 @@ function codegenNativeScan(params: NativeScanParams): Uint8Array<ArrayBuffer> {
 
 /**
  * Translate an AluExp to WASM code within a scan context.
- * This differs from translateExp by handling GlobalView with iteration-dependent offsets.
- * 
- * For MVP, supports:
- * - Binary ops (Add, Sub, Mul) on GlobalView inputs
- * - Const values
- * - Simple unary ops (Reciprocal, etc.)
+ * This differs from translateExp by handling GlobalView with iteration-dependent offsets
+ * and supporting ridx/acc for reductions.
  */
 function translateExpWithScanContext(
   cg: CodeGenerator,
@@ -628,6 +756,8 @@ function translateExpWithScanContext(
   ctx: {
     gidx: number;
     iter: number;
+    ridx?: number;  // Reduction index variable (if reduction)
+    acc?: number;   // Accumulator variable (for epilogue)
     constsBase: number;
     constSizes: number[];
     numConsts: number;
@@ -692,8 +822,17 @@ function translateExpWithScanContext(
       dty(cg, op, dtype).const(arg);
     } else if (op === AluOp.Special && arg[0] === "gidx") {
       cg.local.get(ctx.gidx);
+    } else if (op === AluOp.Special && arg[0] === "ridx") {
+      if (ctx.ridx === undefined) throw new Error("ridx used but not in reduction context");
+      cg.local.get(ctx.ridx);
     } else if (op === AluOp.Variable && arg === "gidx") {
       cg.local.get(ctx.gidx);
+    } else if (op === AluOp.Variable && arg === "ridx") {
+      if (ctx.ridx === undefined) throw new Error("ridx used but not in reduction context");
+      cg.local.get(ctx.ridx);
+    } else if (op === AluOp.Variable && arg === "acc") {
+      if (ctx.acc === undefined) throw new Error("acc used but not in epilogue context");
+      cg.local.get(ctx.acc);
     } else if (op === AluOp.GlobalIndex) {
       // GlobalIndex: arg = [gid, len], src = [bufidx]
       // Load from buffer at gidx position

@@ -256,13 +256,13 @@ submitted before the native scan dispatches. Two flush points are required:
 | Backend | Status | Constraint |
 |---------|--------|------------|
 | CPU | JS loop only | — |
-| WASM | ✅ Native loop | Elementwise bodies only (no reductions) |
+| WASM | ✅ Native loop | Single kernel body (elementwise or reduction) |
 | WebGPU | ✅ Native loop | Elementwise bodies only (no reductions) |
 | WebGPU | ✅ Batched scan | Routine bodies (TriangularSolve, Cholesky, LU) |
-| WASM | ❌ Batched scan | Not implemented |
+| WASM | ❌ Batched scan | Not needed — reductions work in native loop |
 
-**Note:** Matmul/Dot uses reduction (Mul→Sum), so it does NOT qualify for native scan.
-Kalman filter with matrix ops falls back to JS loop on WASM.
+**Note:** WASM native scan now supports reduction kernels (e.g., matmul = Mul→Sum).
+Kalman filter with matrix ops runs entirely in WASM with inlined loop.
 
 **WebGPU native scan design:**
 For elementwise body kernels (no reductions), each element's scan is completely independent:

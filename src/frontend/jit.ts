@@ -1485,12 +1485,6 @@ function tryPrepareNativeScan(
     execStep.source.reduction,
   );
   
-  // No reduction support yet
-  if (bodyKernel.reduction) {
-    if (DEBUG >= 2) console.log("Native scan: skipped, has reduction");
-    return null;
-  }
-  
   // MVP: Only support case where carry and y are the same (like cumsum)
   // This means numCarry === numY and the outputs reference the same variables
   if (numCarry !== numY) {
