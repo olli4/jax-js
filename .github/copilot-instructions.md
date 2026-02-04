@@ -981,6 +981,22 @@ Shader generation uses a shared emitter pattern:
 - Shader indent logic shared across 3 generation sites
 - Single/multi kernel paths share validation and setup
 
+**Backend API Unification:**
+
+The `Backend` interface previously had separate methods for single vs multi-output kernels:
+
+| Before                                            | After                           |
+| ------------------------------------------------- | ------------------------------- |
+| `prepareKernel()` + `prepareMultiKernel()`        | `prepareKernel()` only          |
+| `prepareKernelSync()` + `prepareMultiKernelSync()`| `prepareKernelSync()` only      |
+
+Each backend now checks `kernel.isMultiOutput` internally:
+- **WASM/CPU**: Were already identical, just removed duplicates
+- **WebGPU**: Merged multi-output expansion logic into `prepareKernel`
+- **WebGL**: Added `isMultiOutput` check that throws
+
+Call sites in `array.ts` no longer branch on `isMultiOutput`.
+
 ### Multi-output Kernel in Native Scan
 
 The `Kernel` class supports fusing multiple outputs into a single kernel dispatch via `Kernel.multi()`.
