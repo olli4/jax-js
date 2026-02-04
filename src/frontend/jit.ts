@@ -628,12 +628,19 @@ export function jitCompile(backend: Backend, jaxpr: Jaxpr): JitProgram {
   const flushPendingKernels = () => {
     if (pendingKernels.length === 0) return;
 
-    if (pendingKernels.length === 1) {
-      // Single output: use regular Kernel
-      const pk = pendingKernels[0];
-      const kernel = new Kernel(pk.inputArgs.length, pk.size, pk.exp);
-      const outId = builder.pushKernel(kernel, pk.inputArgs);
-      ctx.set(pk.outVar, { type: "imm", arg: outId });
+    // Check if MultiKernel would exceed backend's buffer limit
+    // numInputs + numOutputs must be <= maxArgs + 1 (maxArgs is inputs only)
+    const wouldExceedLimit =
+      pendingKernels.length > 1 &&
+      pendingInputArgsUnion.length + pendingKernels.length > backend.maxArgs + 1;
+
+    if (pendingKernels.length === 1 || wouldExceedLimit) {
+      // Single output or would exceed buffer limit: emit individual Kernels
+      for (const pk of pendingKernels) {
+        const kernel = new Kernel(pk.inputArgs.length, pk.size, pk.exp);
+        const outId = builder.pushKernel(kernel, pk.inputArgs);
+        ctx.set(pk.outVar, { type: "imm", arg: outId });
+      }
     } else {
       // Multiple outputs: use MultiKernel
       // Need to reindex each expression to use the unioned input args

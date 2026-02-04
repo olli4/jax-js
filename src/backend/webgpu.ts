@@ -318,21 +318,33 @@ export class WebGPUBackend implements Backend {
   }
 
   async prepareMultiKernel(
-    _multiKernel: MultiKernel,
+    multiKernel: MultiKernel,
   ): Promise<Executable<ShaderDispatch[]>> {
-    // For now, WebGPU falls back to executing multi-output kernels separately.
-    // TODO: Implement native multi-output kernel support for WebGPU.
-    throw new Error(
-      "MultiKernel not yet implemented for WebGPU - should fall back to single kernels",
-    );
+    // WebGPU expands MultiKernel into individual Kernel dispatches
+    // Each output becomes a separate shader dispatch
+    const dispatches: ShaderDispatch[] = [];
+    for (const output of multiKernel.outputs) {
+      const kernel = new Kernel(multiKernel.nargs, output.size, output.exp);
+      const shader = this.#cachedShader(kernel);
+      const pipeline = await this.pipelines.prepare(shader);
+      dispatches.push({ ...shader, pipeline });
+    }
+    return new Executable(multiKernel, dispatches);
   }
 
   prepareMultiKernelSync(
-    _multiKernel: MultiKernel,
+    multiKernel: MultiKernel,
   ): Executable<ShaderDispatch[]> {
-    throw new Error(
-      "MultiKernel not yet implemented for WebGPU - should fall back to single kernels",
-    );
+    // WebGPU expands MultiKernel into individual Kernel dispatches
+    // Each output becomes a separate shader dispatch
+    const dispatches: ShaderDispatch[] = [];
+    for (const output of multiKernel.outputs) {
+      const kernel = new Kernel(multiKernel.nargs, output.size, output.exp);
+      const shader = this.#cachedShader(kernel);
+      const pipeline = this.pipelines.prepareSync(shader);
+      dispatches.push({ ...shader, pipeline });
+    }
+    return new Executable(multiKernel, dispatches);
   }
 
   async prepareRoutine(
@@ -364,7 +376,27 @@ export class WebGPUBackend implements Backend {
   ): void {
     const inputBuffers = inputs.map((slot) => this.#getBuffer(slot).buffer);
     const outputBuffers = outputs.map((slot) => this.#getBuffer(slot).buffer);
-    pipelineSubmit(this.device, exe.data, inputBuffers, outputBuffers);
+
+    // For MultiKernel, each dispatch corresponds to a different output
+    if (exe.source instanceof MultiKernel) {
+      const multiKernel = exe.source;
+      if (exe.data.length !== multiKernel.outputs.length) {
+        throw new Error(
+          `webgpu: MultiKernel dispatch count mismatch: ${exe.data.length} vs ${multiKernel.outputs.length}`,
+        );
+      }
+      // Dispatch each kernel with its corresponding output
+      for (let i = 0; i < exe.data.length; i++) {
+        pipelineSubmit(
+          this.device,
+          [exe.data[i]],
+          inputBuffers,
+          [outputBuffers[i]],
+        );
+      }
+    } else {
+      pipelineSubmit(this.device, exe.data, inputBuffers, outputBuffers);
+    }
   }
 
   /**
