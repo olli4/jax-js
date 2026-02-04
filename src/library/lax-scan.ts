@@ -62,11 +62,11 @@ export interface ScanOptions {
  * scan(f, init, null, { length }) → [finalCarry, ys]  // carry-only scan
  *
  * // Where:
- * // f: (carry: C, x: X | null) => [C, Y]  -- step function
+ * // f: (carry: C, x: X | null) => [C, Y | null]  -- step function
  * // init: C                               -- initial carry
  * // xs: X[] | null                        -- input array or null for carry-only
  * // finalCarry: C                         -- carry after last iteration
- * // ys: Y[]                               -- stacked outputs from each iteration
+ * // ys: Y[] | null                        -- stacked outputs (null if Y=null)
  * ```
  *
  * ## Semantics
@@ -109,7 +109,7 @@ export interface ScanOptions {
  *   - `carry` is the current state (same structure as `init`)
  *   - `x` is a slice of `xs` along axis 0, or `null` if `xs` is null
  *   - `newCarry` is the updated state (same structure/shape as `carry`)
- *   - `y` is the output for this iteration
+ *   - `y` is the output for this iteration, or `null` to skip output stacking
  * @param init - Initial carry value. Can be a single array or a pytree of arrays.
  * @param xs - Input sequence to scan over, or `null` for carry-only scans.
  *   When an array/pytree, the leading axis is the scan dimension.
@@ -118,7 +118,8 @@ export interface ScanOptions {
  * @returns `[finalCarry, ys]` where:
  *   - `finalCarry` has the same structure as `init`
  *   - `ys` has the same structure as `y` from `f`, with each leaf having
- *     an additional leading axis of size `length`
+ *     an additional leading axis of size `length`. If `y` is `null`, `ys` is `null`
+ *     (no memory allocated for outputs).
  *
  * @example Cumulative sum
  * ```ts
@@ -193,6 +194,24 @@ export interface ScanOptions {
  *
  * console.log(await ys.data());  // [0, 1, 2, 3, 4]
  * console.log(await final.data());  // [5]
+ * ```
+ *
+ * @example Skip output stacking (Y=null)
+ * ```ts
+ * // When you only need the final carry and don't need intermediate outputs,
+ * // return null as the second element to skip allocating stacked outputs.
+ * // This saves memory for large iteration counts.
+ * const step = (carry, x) => {
+ *   const Asq = carry.A.ref.mul(carry.A);
+ *   const newA = Asq.add(x);
+ *   const newCount = carry.count.add(Asq.less(100).astype(np.int32));
+ *   return [{ A: newA, count: newCount }, null];  // null skips Y stacking
+ * };
+ *
+ * const init = { A: np.zeros([100]), count: np.zeros([100], np.int32) };
+ * const [final, ys] = await lax.scan(step, init, xs);
+ * // ys is null — no memory allocated for intermediate outputs
+ * // final.count contains the iteration count per element
  * ```
  *
  * @example jit(scan) - Compile the entire scan loop

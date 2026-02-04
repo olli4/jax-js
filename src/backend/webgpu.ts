@@ -387,12 +387,9 @@ export class WebGPUBackend implements Backend {
       }
       // Dispatch each kernel with its corresponding output
       for (let i = 0; i < exe.data.length; i++) {
-        pipelineSubmit(
-          this.device,
-          [exe.data[i]],
-          inputBuffers,
-          [outputBuffers[i]],
-        );
+        pipelineSubmit(this.device, [exe.data[i]], inputBuffers, [
+          outputBuffers[i],
+        ]);
       }
     } else {
       pipelineSubmit(this.device, exe.data, inputBuffers, outputBuffers);
@@ -1780,10 +1777,12 @@ function nativeScanMultiShaderSource(
       emit(`let result_val_${stepIdx}: ${resultTy} = ${expCode};`);
     }
 
-    // Write to ysStacked at dataIdx * stride + gidx
-    emit(
-      `ys${carryIdx}[i32(dataIdx) * ${ysElemStride} + gidx] = result_val_${stepIdx};`,
-    );
+    // Write to ysStacked at dataIdx * stride + gidx (only if we have Y outputs)
+    if (numY > 0 && carryIdx < numY) {
+      emit(
+        `ys${carryIdx}[i32(dataIdx) * ${ysElemStride} + gidx] = result_val_${stepIdx};`,
+      );
+    }
 
     // Update carry for next iteration
     emit(`carry${carryIdx}[gidx] = result_val_${stepIdx};`);

@@ -632,7 +632,8 @@ export function jitCompile(backend: Backend, jaxpr: Jaxpr): JitProgram {
     // numInputs + numOutputs must be <= maxArgs + 1 (maxArgs is inputs only)
     const wouldExceedLimit =
       pendingKernels.length > 1 &&
-      pendingInputArgsUnion.length + pendingKernels.length > backend.maxArgs + 1;
+      pendingInputArgsUnion.length + pendingKernels.length >
+        backend.maxArgs + 1;
 
     if (pendingKernels.length === 1 || wouldExceedLimit) {
       // Single output or would exceed buffer limit: emit individual Kernels
@@ -1883,11 +1884,24 @@ function tryPrepareWebGPUNativeScan(
   }
 
   // Multi-kernel path: use prepareNativeScanMulti
-  // Requirements: numCarry === numY (each carry has matching output)
-  if (numCarry !== numY) {
+  // Requirements: numCarry === numY (each carry has matching output) OR numY === 0 (no outputs)
+  if (numCarry !== numY && numY !== 0) {
     if (DEBUG >= 2)
       console.log(
-        `[webgpu-scan] multi-kernel requires numCarry === numY, got ${numCarry} !== ${numY}`,
+        `[webgpu-scan] multi-kernel requires numCarry === numY or numY === 0, got ${numCarry} !== ${numY}`,
+      );
+    return null;
+  }
+
+  // Check for internal buffer dependencies (step reading from another step's output)
+  // WebGPU native scan doesn't support internal buffers yet - fall back for these cases
+  const hasInternalDeps = executeSteps.some((step) =>
+    step.inputs.some((inputId) => inputId >= numInputs),
+  );
+  if (hasInternalDeps) {
+    if (DEBUG >= 2)
+      console.log(
+        `[webgpu-scan] multi-kernel: internal buffer dependencies not supported, falling back`,
       );
     return null;
   }

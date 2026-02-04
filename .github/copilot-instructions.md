@@ -579,14 +579,14 @@ stackedYs.dispose(); // or skip if Y=null
 
 **Common patterns:**
 
-| Pattern      | Code                                   | Notes                            |
-| ------------ | -------------------------------------- | -------------------------------- |
-| Simple body  | `return [newCarry, y]`                 | Two distinct arrays              |
-| Passthrough  | `return [newCarry.ref, newCarry]`      | Same array in both               |
-| Pytree carry | `return [{ a: a.ref, b }, { out: a }]` | Mix of refs                      |
-| Keep inputs  | `scan(f, init.ref, xs.ref)`            | Don't consume inputs             |
-| Carry-only   | `scan(f, init, null, { length: N })`   | No xs allocation (saves memory)  |
-| No Y output  | `return [newCarry, null]`              | No ys allocation (saves memory)  |
+| Pattern      | Code                                   | Notes                           |
+| ------------ | -------------------------------------- | ------------------------------- |
+| Simple body  | `return [newCarry, y]`                 | Two distinct arrays             |
+| Passthrough  | `return [newCarry.ref, newCarry]`      | Same array in both              |
+| Pytree carry | `return [{ a: a.ref, b }, { out: a }]` | Mix of refs                     |
+| Keep inputs  | `scan(f, init.ref, xs.ref)`            | Don't consume inputs            |
+| Carry-only   | `scan(f, init, null, { length: N })`   | No xs allocation (saves memory) |
+| No Y output  | `return [newCarry, null]`              | No ys allocation (saves memory) |
 
 ---
 
@@ -873,11 +873,17 @@ WASM. The gradient computation expresses the math in terms of these primitives.
 
 ### Current limitations
 
-| Limitation                       | Workaround                | Backend |
-| -------------------------------- | ------------------------- | ------- |
-| WebGPU routine bodies (compiled) | Uses fallback (JS loop)   | WebGPU  |
-| `numCarry ≠ numY` on WebGPU      | Falls back to JS loop     | WebGPU  |
-| `grad(scan)` memory O(N)         | None (stores all carries) | All     |
+| Limitation                          | Workaround                | Backend |
+| ----------------------------------- | ------------------------- | ------- |
+| WebGPU routine bodies (compiled)    | Uses fallback (JS loop)   | WebGPU  |
+| `numCarry ≠ numY` on WebGPU         | Falls back to JS loop     | WebGPU  |
+| WebGPU internal buffer deps in scan | Falls back to JS loop     | WebGPU  |
+| `grad(scan)` memory O(N)            | None (stores all carries) | All     |
+
+**Note on WebGPU internal buffer dependencies:** When a scan body has steps that depend on each
+other (e.g., Mandelbrot: `Asq = A*A` then `newA = Asq - Bsq + X`), WebGPU falls back to JS loop
+because its shader codegen doesn't support intermediate buffers between steps. WASM handles this
+case natively.
 
 **Resolved:**
 
