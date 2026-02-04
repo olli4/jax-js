@@ -2558,17 +2558,17 @@ describe("scan autodiff", () => {
       }
     });
 
-    it("Scan body multi-output: uses native scan with MultiKernel (WASM)", async () => {
-      // Multi-output kernel fusion is implemented via MultiKernel.
-      // Regular jit() and scan body compilation produce MultiKernel for
+    it("Scan body multi-output: uses native scan with multi-output kernel (WASM)", async () => {
+      // Multi-output kernel fusion is implemented via Kernel.multi().
+      // Regular jit() and scan body compilation produce multi-output Kernels for
       // multiple outputs with the same size.
       //
-      // Native scan (WASM compiled-loop) now supports MultiKernel, so scans
+      // Native scan (WASM compiled-loop) now supports multi-output kernels, so scans
       // with multi-output bodies use the fused path.
       //
       // This test verifies:
       // 1. Body compilation produces fewer execute steps (fusion working)
-      // 2. Native scan uses fused path with MultiKernel
+      // 2. Native scan uses fused path with multi-output kernel
       //
       // Testing note: Test each backend separately:
       // - WASM: this test (runs in vitest/node)
@@ -2634,24 +2634,24 @@ describe("scan autodiff", () => {
         "Scan path callback should have fired",
       ).not.toBeNull();
 
-      // Native scan now supports MultiKernel - should use fused path
+      // Native scan now supports multi-output kernels - should use fused path
       expect(capturedPath).toBe("fused");
 
-      // Body compilation produces fewer execute steps (MultiKernel fusion working)
-      // With MultiKernel: 2-3 steps (two multi-kernels)
-      // Without MultiKernel: 5-6 steps (separate kernels)
+      // Body compilation produces fewer execute steps (multi-output kernel fusion working)
+      // With multi-output kernel: 2-3 steps (two multi-kernels)
+      // Without multi-output kernel: 5-6 steps (separate kernels)
       expect(
         bodyExecuteSteps,
         `Body has ${bodyExecuteSteps} execute steps. ` +
-          "With MultiKernel fusion, should be 2-3. Without fusion, would be 5-6.",
+          "With multi-output kernel fusion, should be 2-3. Without fusion, would be 5-6.",
       ).toBeLessThanOrEqual(3);
     });
 
     it.skipIf(!devicesAvailable.includes("webgpu"))(
-      "Scan body multi-output: uses native scan with MultiKernel (WebGPU)",
+      "Scan body multi-output: uses native scan with multi-output kernel (WebGPU)",
       async () => {
         // Multi-output scan bodies now use native scan via prepareNativeScanMulti.
-        // Each output in a MultiKernel is extracted and converted to a separate
+        // Each output in a multi-output Kernel is extracted and converted to a separate
         // kernel step, enabling the fused path.
 
         defaultDevice("webgpu");

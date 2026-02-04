@@ -359,3 +359,10 @@ export async function devicePut<T extends JsTree<any>>(
   );
   return tree.unflatten(structure, yflat) as any;
 }
+
+// Testing utilities - exported for Deno WebGPU tests that need scan-wrapper functions
+// These should only be imported from dist, never from src, to avoid module isolation issues
+export {
+  wrapRoutineForScan,
+  createAllIterationsOffsetsBuffer,
+} from "./backend/webgpu/scan-wrapper";

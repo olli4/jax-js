@@ -6,7 +6,6 @@ import {
   DType,
   isFloatDtype,
   Kernel,
-  MultiKernel,
 } from "../alu";
 import {
   Backend,
@@ -47,10 +46,10 @@ interface WasmProgram {
 /** Describes a step in a general scan body (handles data dependencies). */
 export interface GeneralScanStep {
   /**
-   * The source: either a Kernel (single-output elementwise), MultiKernel
-   * (multi-output elementwise), or a Routine (special algorithm).
+   * The source: either a Kernel (single or multi-output elementwise),
+   * or a Routine (special algorithm).
    */
-  source: Kernel | MultiKernel | Routine;
+  source: Kernel | Routine;
   /**
    * Input slot indices. Can reference:
    * - [0, numConsts): constant slots
@@ -242,19 +241,17 @@ export class WasmBackend implements Backend {
     return new Executable(kernel, { module });
   }
 
-  async prepareMultiKernel(
-    multiKernel: MultiKernel,
-  ): Promise<Executable<WasmProgram>> {
-    return this.prepareMultiKernelSync(multiKernel);
+  async prepareMultiKernel(kernel: Kernel): Promise<Executable<WasmProgram>> {
+    return this.prepareMultiKernelSync(kernel);
   }
 
-  prepareMultiKernelSync(multiKernel: MultiKernel): Executable<WasmProgram> {
-    const kernelHash = FpHash.hash(multiKernel);
+  prepareMultiKernelSync(kernel: Kernel): Executable<WasmProgram> {
+    const kernelHash = FpHash.hash(kernel);
     const module = runWithCache(moduleCache, kernelHash.toString(), () => {
-      const bytes = codegenWasmMulti(multiKernel);
+      const bytes = codegenWasmMulti(kernel);
       return new WebAssembly.Module(bytes);
     });
-    return new Executable(multiKernel, { module });
+    return new Executable(kernel, { module });
   }
 
   async prepareRoutine(routine: Routine): Promise<Executable<WasmProgram>> {
@@ -537,14 +534,14 @@ export class WasmBackend implements Backend {
       if (!firstKernel) {
         // All steps are Routines - create a minimal dummy kernel for the Executable type
         // This is a hack but the Executable is just used to hold the module
-        firstKernel = new Kernel(
+        firstKernel = Kernel.single(
           0,
           0,
           AluExp.const(DType.Float32, 0),
           undefined,
         );
       }
-      const syntheticKernel = new Kernel(
+      const syntheticKernel = Kernel.single(
         firstKernel.nargs,
         firstKernel.size,
         firstKernel.exp,
@@ -839,18 +836,19 @@ function tuneNulloptExp(exp: AluExp, size: number): AluExp {
  * Memory layout for function arguments:
  * [...inputs (nargs), ...outputs (numOutputs)]
  */
-function codegenWasmMulti(multiKernel: MultiKernel): Uint8Array<ArrayBuffer> {
+function codegenWasmMulti(kernel: Kernel): Uint8Array<ArrayBuffer> {
   const cg = new CodeGenerator();
   cg.memory.import("env", "memory");
 
   // All outputs must have the same size (validated by jitCompile batching)
-  const size = multiKernel.outputs[0].size;
+  const size = kernel.outputs[0].size;
 
   // Tune all output expressions first (need size for this)
-  const tunedOutputs = multiKernel.outputs.map((out) => ({
+  // Compute dtype from expression (or reduction epilogue if present)
+  const tunedOutputs = kernel.outputs.map((out, i) => ({
     exp: tuneNulloptExp(out.exp, size),
     size: out.size,
-    dtype: out.dtype,
+    dtype: kernel.dtypeAt(i),
   }));
 
   // Collect all distinct operations from all tuned outputs
@@ -868,7 +866,7 @@ function codegenWasmMulti(multiKernel: MultiKernel): Uint8Array<ArrayBuffer> {
 
   // Function takes nargs inputs + numOutputs outputs
   const kernelFunc = cg.function(
-    rep(multiKernel.nargs + numOutputs, cg.i32),
+    rep(kernel.nargs + numOutputs, cg.i32),
     [],
     () => {
       const gidx = cg.local.declare(cg.i32);
@@ -886,7 +884,7 @@ function codegenWasmMulti(multiKernel: MultiKernel): Uint8Array<ArrayBuffer> {
           const out = tunedOutputs[outIdx];
 
           // Push memory index of this output onto stack
-          cg.local.get(multiKernel.nargs + outIdx); // output buffer argument
+          cg.local.get(kernel.nargs + outIdx); // output buffer argument
           cg.local.get(gidx);
           cg.i32.const(byteWidth(out.dtype));
           cg.i32.mul();
@@ -1061,7 +1059,7 @@ function codegenNativeScanGeneral(
     cg.i32.const(0);
     cg.local.set(iter);
 
-    // Helper to create base GeneralScanContext (used by both Kernel and MultiKernel steps)
+    // Helper to create base GeneralScanContext (used by both single and multi-output Kernel steps)
     const makeScanContext = (): GeneralScanContext => ({
       gidx,
       iter,
@@ -1226,18 +1224,18 @@ function codegenNativeScanGeneral(
 
           // Call the routine
           cg.call(funcIdx);
-        } else if (step.source instanceof MultiKernel) {
-          // MultiKernel step: compute all outputs in a single loop
-          const multiKernel = step.source;
+        } else if (step.source.isMultiOutput) {
+          // Multi-output Kernel step: compute all outputs in a single loop
+          const kernel = step.source;
           const outIndices = step.outputInternalIndices!;
 
           // All outputs have the same size (validated during fusion)
-          const size = multiKernel.outputs[0].size;
+          const size = kernel.outputs[0].size;
 
-          // Tune all output expressions
-          const tunedOutputs = multiKernel.outputs.map((out) => ({
+          // Tune all output expressions and compute dtypes
+          const tunedOutputs = kernel.outputs.map((out, i) => ({
             exp: tuneNulloptExp(out.exp, size),
-            dtype: out.dtype,
+            dtype: kernel.dtypeAt(i),
           }));
 
           // Inner loop over output elements

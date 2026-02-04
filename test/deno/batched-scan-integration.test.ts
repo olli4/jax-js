@@ -41,14 +41,8 @@ Deno.test({
   name: "sort-in-scan works on WebGPU (falls back to JS loop due to Sort using uniforms)",
   ignore: !navigator.gpu,
   fn: withLeakCheck(async () => {
-    const adapter = await navigator.gpu.requestAdapter();
-    if (!adapter) {
-      console.log("No WebGPU adapter, skipping");
-      return;
-    }
-
-    console.log("GPU adapter:", adapter.info);
-
+    // Use init() to check for WebGPU instead of requestAdapter() to avoid
+    // creating separate GPU devices that can destabilize other tests
     const availableDevices = await init();
     console.log("Available devices:", availableDevices);
 

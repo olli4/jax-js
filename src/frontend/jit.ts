@@ -7,7 +7,6 @@ import {
   byteWidth,
   DType,
   Kernel,
-  MultiKernel,
   Reduction,
 } from "../alu";
 import { Backend, Executable, Slot } from "../backend";
@@ -48,7 +47,7 @@ export type JitId = number;
 export type JitStep =
   | {
       type: "execute";
-      source: Kernel | MultiKernel | Routine;
+      source: Kernel | Routine;
       inputs: JitId[]; // mapped to backend Slot
       outputs: JitId[]; // mapped to backend Slot
     }
@@ -169,19 +168,16 @@ export class JitProgram {
             .join(", ");
           const outputsNice = step.outputs.map((id) => `%${id}`).join(", ");
           const executeText = `execute (${inputsNice}) -> ${outputsNice}`;
-          if (step.source instanceof Kernel) {
-            return PPrint.pp(`${executeText}, kernel`).concat(
-              step.source.pprint().indent(2),
-            );
-          } else if (step.source instanceof MultiKernel) {
+          if (step.source instanceof Routine) {
+            return PPrint.pp(`${executeText}, routine ${step.source.name}`);
+          } else if (step.source.isMultiOutput) {
             return PPrint.pp(`${executeText}, multi-kernel`).concat(
               step.source.pprint().indent(2),
             );
-          } else if (step.source instanceof Routine) {
-            return PPrint.pp(`${executeText}, routine ${step.source.name}`);
           } else {
-            step.source satisfies never; // static check
-            return PPrint.pp(executeText);
+            return PPrint.pp(`${executeText}, kernel`).concat(
+              step.source.pprint().indent(2),
+            );
           }
         }
         case "malloc":
@@ -477,7 +473,7 @@ class JitProgramBuilder {
   }
 
   pushLit(lit: Lit): JitId {
-    const kernel = new Kernel(
+    const kernel = Kernel.single(
       0,
       lit.aval.size,
       AluExp.const(lit.dtype, lit.value),
@@ -506,14 +502,14 @@ class JitProgramBuilder {
     return id;
   }
 
-  pushMultiKernel(multiKernel: MultiKernel, inputs: JitId[]): JitId[] {
+  pushMultiKernel(kernel: Kernel, inputs: JitId[]): JitId[] {
     const outputIds: JitId[] = [];
-    for (const bytes of multiKernel.bytesPerOutput) {
+    for (const bytes of kernel.bytesPerOutput) {
       outputIds.push(this.pushBuffer(bytes));
     }
     this.steps.push({
       type: "execute",
-      source: multiKernel,
+      source: kernel,
       inputs,
       outputs: outputIds,
     });
@@ -624,11 +620,11 @@ export function jitCompile(backend: Backend, jaxpr: Jaxpr): JitProgram {
   // Union of all pending kernel inputs - maps JitId to gid in merged kernel
   let pendingInputArgsUnion: JitId[] = [];
 
-  // Flush pending kernels as either single Kernel or MultiKernel.
+  // Flush pending kernels as either single Kernel or multi-output Kernel.
   const flushPendingKernels = () => {
     if (pendingKernels.length === 0) return;
 
-    // Check if MultiKernel would exceed backend's buffer limit
+    // Check if multi-output Kernel would exceed backend's buffer limit
     // numInputs + numOutputs must be <= maxArgs + 1 (maxArgs is inputs only)
     const wouldExceedLimit =
       pendingKernels.length > 1 &&
@@ -638,12 +634,12 @@ export function jitCompile(backend: Backend, jaxpr: Jaxpr): JitProgram {
     if (pendingKernels.length === 1 || wouldExceedLimit) {
       // Single output or would exceed buffer limit: emit individual Kernels
       for (const pk of pendingKernels) {
-        const kernel = new Kernel(pk.inputArgs.length, pk.size, pk.exp);
+        const kernel = Kernel.single(pk.inputArgs.length, pk.size, pk.exp);
         const outId = builder.pushKernel(kernel, pk.inputArgs);
         ctx.set(pk.outVar, { type: "imm", arg: outId });
       }
     } else {
-      // Multiple outputs: use MultiKernel
+      // Multiple outputs: use multi-output Kernel
       // Need to reindex each expression to use the unioned input args
       const outputs = pendingKernels.map((pk) => {
         // Build gid mapping from this kernel's args to the union
@@ -654,17 +650,10 @@ export function jitCompile(backend: Backend, jaxpr: Jaxpr): JitProgram {
         return {
           size: pk.size,
           exp: reindexedExp,
-          dtype: pk.exp.dtype,
         };
       });
-      const multiKernel = new MultiKernel(
-        pendingInputArgsUnion.length,
-        outputs,
-      );
-      const outIds = builder.pushMultiKernel(
-        multiKernel,
-        pendingInputArgsUnion,
-      );
+      const kernel = Kernel.multi(pendingInputArgsUnion.length, outputs);
+      const outIds = builder.pushMultiKernel(kernel, pendingInputArgsUnion);
       for (let i = 0; i < pendingKernels.length; i++) {
         ctx.set(pendingKernels[i].outVar, { type: "imm", arg: outIds[i] });
       }
@@ -985,7 +974,7 @@ export function jitCompile(backend: Backend, jaxpr: Jaxpr): JitProgram {
         if (reduction) {
           // Reductions cannot be batched - dispatch immediately.
           flushPendingKernels();
-          const kernel = new Kernel(nargs, size, exp[i], reduction);
+          const kernel = Kernel.single(nargs, size, exp[i], reduction);
           const outId = builder.pushKernel(kernel, inputArgs);
           ctx.set(outVar, { type: "imm", arg: outId });
         } else {
@@ -1842,7 +1831,7 @@ function tryPrepareWebGPUNativeScan(
     // Reindex kernel to use scan buffer layout
     const reindexedExp = kernel.exp.reindexGids(reindexMap);
     const reindexedReduction = kernel.reduction?.reindexGids(reindexMap);
-    const reindexedKernel = new Kernel(
+    const reindexedKernel = Kernel.single(
       numInputs, // nargs matches scan layout
       kernel.size,
       reindexedExp,
@@ -1910,8 +1899,8 @@ function tryPrepareWebGPUNativeScan(
   // Each step needs: kernel, inputs mapping, outputCarryIdx, outputSize
 
   // Map output slots to their source step+outputIdx
-  // For Kernel: one output per step
-  // For MultiKernel: multiple outputs per step
+  // For single-output Kernel: one output per step
+  // For multi-output Kernel: multiple outputs per step
   interface SlotSource {
     stepIdx: number;
     outputIdxInStep: number;
@@ -1973,8 +1962,8 @@ function tryPrepareWebGPUNativeScan(
   }
 
   // Build multiSteps: one step per carry output
-  // For Kernel: the step produces one output
-  // For MultiKernel: extract the specific output's expression and create a Kernel
+  // For single-output Kernel: the step produces one output
+  // For multi-output Kernel: extract the specific output's expression and create a Kernel
   const multiSteps: NativeScanMultiStep[] = [];
 
   // Count total number of outputs for internal buffer references
@@ -2017,26 +2006,16 @@ function tryPrepareWebGPUNativeScan(
 
     let reindexedKernel: Kernel;
 
+    // Use unified Kernel interface - handle single or multi-output
     if (stepSource instanceof Kernel) {
-      // Single-output kernel - use directly
-      const reindexedExp = stepSource.exp.reindexGids(inputs);
-      const reindexedReduction = stepSource.reduction?.reindexGids(inputs);
-      reindexedKernel = new Kernel(
+      const output = stepSource.outputs[outputIdxInStep];
+      const reindexedExp = output.exp.reindexGids(inputs);
+      const reindexedReduction = output.reduction?.reindexGids(inputs);
+      reindexedKernel = Kernel.single(
         numInputs + totalOutputs,
-        stepSource.size,
+        output.size,
         reindexedExp,
         reindexedReduction,
-      );
-    } else if (stepSource instanceof MultiKernel) {
-      // Multi-output kernel - extract the specific output
-      const multiOutput = stepSource.outputs[outputIdxInStep];
-      const reindexedExp = multiOutput.exp.reindexGids(inputs);
-      // MultiKernel outputs don't have reductions
-      reindexedKernel = new Kernel(
-        numInputs + totalOutputs,
-        multiOutput.size,
-        reindexedExp,
-        undefined,
       );
     } else {
       if (DEBUG >= 2)
@@ -2124,10 +2103,8 @@ function tryPrepareNativeScan(
     return null;
   }
 
-  // Check if all steps are Kernels or MultiKernels (no Routines)
-  const allKernels = executeSteps.every(
-    (s) => s.source instanceof Kernel || s.source instanceof MultiKernel,
-  );
+  // Check if all steps are Kernels (including multi-output), not Routines
+  const allKernels = executeSteps.every((s) => s.source instanceof Kernel);
 
   // WebGPU: kernel-only bodies use native GPU scan
   if (backend.type === "webgpu" && allKernels) {
@@ -2258,17 +2235,20 @@ function tryPrepareWasmNativeScan(
     stepToInternalBase.set(i, internalSizes.length);
 
     if (source instanceof Kernel) {
-      // Kernel: single output
-      const internalIdx = internalSizes.length;
-      slotToInternal.set(step.outputs[0], internalIdx);
-      internalSizes.push(source.size * byteWidth(source.dtype));
-    } else if (source instanceof MultiKernel) {
-      // MultiKernel: multiple outputs
-      for (let outIdx = 0; outIdx < source.outputs.length; outIdx++) {
+      if (source.isMultiOutput) {
+        // Multi-output Kernel: multiple outputs
+        for (let outIdx = 0; outIdx < source.outputs.length; outIdx++) {
+          const internalIdx = internalSizes.length;
+          slotToInternal.set(step.outputs[outIdx], internalIdx);
+          internalSizes.push(
+            source.outputs[outIdx].size * byteWidth(source.dtypeAt(outIdx)),
+          );
+        }
+      } else {
+        // Single-output Kernel
         const internalIdx = internalSizes.length;
-        slotToInternal.set(step.outputs[outIdx], internalIdx);
-        const out = source.outputs[outIdx];
-        internalSizes.push(out.size * byteWidth(out.dtype));
+        slotToInternal.set(step.outputs[0], internalIdx);
+        internalSizes.push(source.size * byteWidth(source.dtype));
       }
     } else {
       // Routine: may have multiple outputs
@@ -2314,7 +2294,7 @@ function tryPrepareWasmNativeScan(
   // - [numConsts+numCarry, numInputs): xs
   // - [numInputs, ...): internal buffer from previous step
   type LocalGeneralScanStep = {
-    source: Kernel | MultiKernel | Routine;
+    source: Kernel | Routine;
     inputSlots: number[];
     outputInternalIdx: number;
     outputInternalIndices?: number[];
@@ -2409,46 +2389,36 @@ function tryPrepareWasmNativeScan(
     if (source instanceof Kernel) {
       // Reindex kernel gids to use our inputSlots mapping
       const reindexMap = inputSlots;
-      const reindexedExp = source.exp.reindexGids(reindexMap);
-      // Also reindex the reduction's epilogue if present
-      const reindexedReduction = source.reduction?.reindexGids(reindexMap);
-      const reindexedKernel = new Kernel(
-        numInputs + internalSizes.length, // nargs: can read from jaxpr inputs + all internals
-        source.size,
-        reindexedExp,
-        reindexedReduction,
-      );
-
-      const internalBase = stepToInternalBase.get(i)!;
-      steps.push({
-        source: reindexedKernel,
-        inputSlots,
-        outputInternalIdx: internalBase,
-      });
-    } else if (source instanceof MultiKernel) {
-      // Reindex each output expression's gids to use our inputSlots mapping
-      const reindexMap = inputSlots;
+      // Handle both single and multi-output kernels uniformly
       const reindexedOutputs = source.outputs.map((out) => ({
         size: out.size,
         exp: out.exp.reindexGids(reindexMap),
-        dtype: out.dtype,
+        reduction: out.reduction?.reindexGids(reindexMap),
       }));
-      const reindexedMultiKernel = new MultiKernel(
+      const reindexedKernel = Kernel.multi(
         numInputs + internalSizes.length, // nargs: can read from jaxpr inputs + all internals
         reindexedOutputs,
       );
 
       const internalBase = stepToInternalBase.get(i)!;
-      const outputInternalIndices: number[] = [];
-      for (let outIdx = 0; outIdx < source.outputs.length; outIdx++) {
-        outputInternalIndices.push(internalBase + outIdx);
+      if (source.isMultiOutput) {
+        const outputInternalIndices: number[] = [];
+        for (let outIdx = 0; outIdx < source.outputs.length; outIdx++) {
+          outputInternalIndices.push(internalBase + outIdx);
+        }
+        steps.push({
+          source: reindexedKernel,
+          inputSlots,
+          outputInternalIdx: internalBase,
+          outputInternalIndices,
+        });
+      } else {
+        steps.push({
+          source: reindexedKernel,
+          inputSlots,
+          outputInternalIdx: internalBase,
+        });
       }
-      steps.push({
-        source: reindexedMultiKernel,
-        inputSlots,
-        outputInternalIdx: internalBase,
-        outputInternalIndices,
-      });
     } else {
       // Routine: build routineCallInfo with static params
       const routine = source as Routine;

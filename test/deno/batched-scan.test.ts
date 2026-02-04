@@ -11,11 +11,16 @@
 
 import { assertEquals } from "https://deno.land/std@0.224.0/assert/mod.ts";
 
-// Import scan-wrapper from source (these functions aren't exported in dist)
+// Import scan-wrapper functions from dist (not src!) to avoid module isolation issues
+// When mixing src and dist imports, Deno creates separate module graphs that don't
+// share the backend singleton, causing slot count mismatches in leak detection.
 import {
   wrapRoutineForScan,
   createAllIterationsOffsetsBuffer,
-} from "../../src/backend/webgpu/scan-wrapper.ts";
+} from "../../dist/index.js";
+
+// Import leak detection harness
+import { withLeakCheck } from "./harness.ts";
 
 const hasWebGPU = typeof navigator !== "undefined" && "gpu" in navigator;
 
@@ -51,7 +56,7 @@ async function getJaxJsWebGPUDevice(): Promise<GPUDevice | null> {
 Deno.test({
   name: "batched scan - JS loop matmul reference",
   ignore: !hasWebGPU,
-  fn: async () => {
+  fn: withLeakCheck(async () => {
     // Lazy import jax-js to avoid initializing WebGPU device early
     const {
       init,
@@ -164,13 +169,13 @@ Deno.test({
     y1.dispose();
 
     console.log("✓ JS loop scan with matmul body produces correct results");
-  },
+  }),
 });
 
 Deno.test({
   name: "batched scan - matmul with reverse",
   ignore: !hasWebGPU,
-  fn: async () => {
+  fn: withLeakCheck(async () => {
     // Test that reverse scan with routine body (matmul) processes xs in reverse order
     const {
       init,
@@ -241,7 +246,7 @@ Deno.test({
     ys.dispose();
 
     console.log("✓ Reverse scan with matmul body produces correct results");
-  },
+  }),
 });
 
 // ============================================================================
@@ -252,7 +257,7 @@ Deno.test({
 Deno.test({
   name: "batched scan - offset buffer has correct values",
   ignore: !hasWebGPU,
-  fn: async () => {
+  fn: withLeakCheck(async () => {
     // Use default alignment of 256 bytes (typical GPU value)
     const alignment = 256;
 
@@ -289,13 +294,13 @@ Deno.test({
     console.log(
       "✓ Offset buffer has correct element offsets for each iteration",
     );
-  },
+  }),
 });
 
 Deno.test({
   name: "batched scan - shader wrapper transforms correctly",
   ignore: !hasWebGPU,
-  fn: async () => {
+  fn: withLeakCheck(async () => {
     // Test shader wrapping with a matmul-like pattern - NO jax-js needed
     const mockShader = {
       code: `
@@ -380,13 +385,13 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     }
 
     console.log("✓ Shader wrapping correctly identifies xs/ys vs carry");
-  },
+  }),
 });
 
 Deno.test({
   name: "batched scan - end-to-end dispatch with uniform offsets",
   ignore: !hasWebGPU,
-  fn: async () => {
+  fn: withLeakCheck(async () => {
     // IMPORTANT: Reuse jax-js's WebGPU device. Creating a second GPUDevice can
     // destabilize Deno WebGPU and cause flakiness/segfaults across test files.
     const device = await getJaxJsWebGPUDevice();
@@ -675,13 +680,13 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
       // Don't destroy the shared jax-js device.
       for (const b of createdBuffers) b.destroy();
     }
-  },
+  }),
 });
 
 Deno.test({
   name: "batched scan - compile wrapped shader on GPU",
   ignore: !hasWebGPU,
-  fn: async () => {
+  fn: withLeakCheck(async () => {
     const device = await getJaxJsWebGPUDevice();
     if (!device) {
       console.log("WebGPU not available in jax-js, skipping");
@@ -745,5 +750,5 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     console.log(
       "✓ Pipeline has expected bind group layouts (group 0: storage, group 1: uniform)",
     );
-  },
+  }),
 });

@@ -1,4 +1,4 @@
-import { AluOp, DType, dtypedArray, Kernel, MultiKernel } from "../alu";
+import { AluOp, DType, dtypedArray, Kernel } from "../alu";
 import { Backend, Device, Executable, Slot, SlotError } from "../backend";
 import { Routine, runCpuRoutine } from "../routine";
 import { tuneNullopt } from "../tuner";
@@ -76,14 +76,12 @@ export class CpuBackend implements Backend {
     return new Executable(kernel, undefined);
   }
 
-  async prepareMultiKernel(
-    multiKernel: MultiKernel,
-  ): Promise<Executable<void>> {
-    return this.prepareMultiKernelSync(multiKernel);
+  async prepareMultiKernel(kernel: Kernel): Promise<Executable<void>> {
+    return this.prepareMultiKernelSync(kernel);
   }
 
-  prepareMultiKernelSync(multiKernel: MultiKernel): Executable<void> {
-    return new Executable(multiKernel, undefined);
+  prepareMultiKernelSync(kernel: Kernel): Executable<void> {
+    return new Executable(kernel, undefined);
   }
 
   async prepareRoutine(routine: Routine): Promise<Executable> {
@@ -103,11 +101,10 @@ export class CpuBackend implements Backend {
       );
     }
 
-    if (exe.source instanceof MultiKernel) {
-      return this.#dispatchMultiKernel(exe.source, inputs, outputs);
-    }
-
     const kernel = exe.source as Kernel;
+    if (kernel.isMultiOutput) {
+      return this.#dispatchMultiKernel(kernel, inputs, outputs);
+    }
     const { exp, epilogue } = tuneNullopt(kernel);
     const inputBuffers = inputs.map((slot) => this.#getBuffer(slot));
     const outputBuffers = outputs.map((slot) => this.#getBuffer(slot));
@@ -158,17 +155,13 @@ export class CpuBackend implements Backend {
     }
   }
 
-  #dispatchMultiKernel(
-    multiKernel: MultiKernel,
-    inputs: Slot[],
-    outputs: Slot[],
-  ): void {
+  #dispatchMultiKernel(kernel: Kernel, inputs: Slot[], outputs: Slot[]): void {
     const inputBuffers = inputs.map((slot) => this.#getBuffer(slot));
-    const size = multiKernel.outputs[0].size;
+    const size = kernel.outputs[0].size;
 
     // Collect all used args from all output expressions
     const allUsedArgs = new Map<number, DType>();
-    for (const out of multiKernel.outputs) {
+    for (const out of kernel.outputs) {
       const usedArgs = out.exp.collect(
         (exp) => exp.op === AluOp.GlobalIndex || exp.op === AluOp.GlobalView,
       );
@@ -184,7 +177,7 @@ export class CpuBackend implements Backend {
     });
 
     const outputArrays = outputs.map((slot, i) =>
-      dtypedArray(multiKernel.outputs[i].dtype, this.#getBuffer(slot)),
+      dtypedArray(kernel.dtypeAt(i), this.#getBuffer(slot)),
     );
 
     const globals = (gid: number, bufidx: number) => {
@@ -197,8 +190,8 @@ export class CpuBackend implements Backend {
 
     // Multi-output kernels have no reduction support
     for (let i = 0; i < size; i++) {
-      for (let outIdx = 0; outIdx < multiKernel.outputs.length; outIdx++) {
-        const out = multiKernel.outputs[outIdx];
+      for (let outIdx = 0; outIdx < kernel.outputs.length; outIdx++) {
+        const out = kernel.outputs[outIdx];
         outputArrays[outIdx][i] = out.exp.evaluate({ gidx: i }, globals);
       }
     }

@@ -186,28 +186,37 @@ The JIT system lives in `src/frontend/jit.ts` and `src/frontend/jaxpr.ts`.
 1. **Tracing** – `makeJaxpr(f)` traces a function to produce a `Jaxpr` (IR in ANF form)
 2. **Simplification** – `jaxpr.flatten().simplify()` canonicalizes the graph
 3. **Graph splitting** – `splitGraphDataflow()` identifies "black nodes" vs fusable ops
-4. **Kernel fusion** – Consecutive elementwise ops merge into a single `Kernel` or `MultiKernel`
+4. **Kernel fusion** – Consecutive elementwise ops merge into a single `Kernel` (multi-output if needed)
 5. **Compilation** – `jitCompile(backend, jaxpr)` emits a `JitProgram` (list of `JitStep`s)
 6. **Execution** – `JitProgram.execute(slots)` runs steps, managing memory lifetime
 
 **Multi-output kernel fusion:**
 
 When multiple black nodes have the same size and no reductions, they are batched into a
-`MultiKernel`. This reduces kernel dispatch overhead for functions with multiple outputs.
+multi-output `Kernel`. This reduces kernel dispatch overhead for functions with multiple outputs.
 
 - Inputs are unioned across all outputs, and expressions are reindexed accordingly
-- Example: `(a + b, a - b, a * b)` becomes one MultiKernel with 3 outputs and 2 inputs
+- Example: `(a + b, a - b, a * b)` becomes one Kernel with 3 outputs and 2 inputs
 - Batching triggers at flush points: reductions, routines, size changes, or end of compilation
 
 **Key types:**
 
-| Type                              | File         | Role                                       |
-| --------------------------------- | ------------ | ------------------------------------------ |
-| `Jaxpr`, `JaxprEqn`, `Var`, `Lit` | `jaxpr.ts`   | IR nodes and bindings                      |
-| `JitProgram`, `JitStep`           | `jit.ts`     | Compiled program + step types              |
-| `Kernel`                          | `alu.ts`     | Fused elementwise kernel (single output)   |
-| `MultiKernel`                     | `alu.ts`     | Fused multi-output kernel (no reductions)  |
-| `Routine`                         | `routine.ts` | Backend-specific op (sort, cholesky, etc.) |
+| Type                              | File         | Role                                               |
+| --------------------------------- | ------------ | -------------------------------------------------- |
+| `Jaxpr`, `JaxprEqn`, `Var`, `Lit` | `jaxpr.ts`   | IR nodes and bindings                              |
+| `JitProgram`, `JitStep`           | `jit.ts`     | Compiled program + step types                      |
+| `Kernel`                          | `alu.ts`     | Fused kernel (1..N outputs), `KernelOutput[]`      |
+| `KernelOutput`                    | `alu.ts`     | `{ size, exp, reduction? }` for each kernel output |
+| `Routine`                         | `routine.ts` | Backend-specific op (sort, cholesky, etc.)         |
+
+**Kernel class (unified single/multi-output):**
+
+The `Kernel` class uses an `outputs: KernelOutput[]` array to support 1..N outputs:
+
+- `Kernel.single(nargs, size, exp, reduction?)` — single-output kernel
+- `Kernel.multi(nargs, outputs[])` — multi-output kernel
+- `kernel.isMultiOutput` — true if `outputs.length > 1`
+- `kernel.dtypeAt(i)` — dtype of output `i`
 
 **Adding a new primitive:**
 
@@ -229,6 +238,21 @@ When multiple black nodes have the same size and no reductions, they are batched
 
 - **LU JVP finite-differences** (`test/lax-linalg.test.ts`): Occasionally fails with precision
   errors at the edge of f32 machine epsilon. Not a bug — inherent to finite-difference verification.
+- **Deno WebGPU tests** (`test/deno/`): When running all Deno test files together in a single
+  `deno test` invocation, GPU state pollution between files causes memory leak detection failures.
+  The `test:deno` script runs each file as a separate process to avoid this.
+
+> ⚠️ **IMPORTANT: Deno WebGPU test isolation** - Due to Deno's module caching and GPU state
+> persistence between test files, running all Deno tests together in a single process causes
+> spurious memory leak failures. The `test:deno` script runs each test file as a separate Deno
+> invocation to ensure proper isolation:
+>
+> ```bash
+> pnpm run test:deno  # Runs each file separately (RECOMMENDED)
+> ```
+>
+> Do NOT run `deno test test/deno/` directly - use the script instead.
+> All test files use `withLeakCheck` from harness.ts for memory leak detection.
 
 ## Commit checklist
 
@@ -888,8 +912,8 @@ case natively.
 **Resolved:**
 
 - WebGPU kernel-only bodies now use native scan via `tryPrepareWebGPUNativeScan()`.
-- **Scan body multi-output fusion** now works via `MultiKernel`. Body compilation produces fused
-  multi-output kernels, and WASM native scan now supports MultiKernel codegen.
+- **Scan body multi-output fusion** now works via `Kernel.multi()`. Body compilation produces fused
+  multi-output kernels, and WASM native scan supports multi-output kernel codegen.
 - **WASM scan cast operations** now support Bool→Float32, Bool→Int32, Bool→Float64, Int32→Float64,
   and Float64→Int32 in `translateExpWithGeneralScanContext()`. Previously, patterns like
   `.less(100).astype(np.float32)` in scan bodies would throw "Cast bool -> float32 not supported".
@@ -902,22 +926,72 @@ case natively.
 | Medium   | Fix WebGPU compiled-body binding     | `wrapRoutineForScan` arg mapping is incorrect      |
 | Low      | `lax.scatter` / `dynamic_slice`      | Would enable Jaxpr-based routines                  |
 
-### MultiKernel in Native Scan
+### Codegen Unification (In Progress)
 
-The `MultiKernel` class enables fusing multiple outputs into a single kernel dispatch. This is used
-in regular `jitCompile()` for functions with multiple same-size outputs.
+The scan codegen duplicates expression translation logic from the regular kernel compilation paths.
+This creates maintenance burden and risk of divergence when adding new `AluOp` operations.
+
+**WASM Backend Overlap:**
+
+| Function                               | Location              | Purpose                |
+| -------------------------------------- | --------------------- | ---------------------- |
+| `translateExp()`                       | `wasm.ts:1726`        | Regular kernel codegen |
+| `translateExpWithGeneralScanContext()` | `wasm.ts:1534`        | Scan-specific codegen  |
+
+~85% of logic is identical. Only difference is `GlobalIndex` resolution:
+- Regular: `ctx.gidx` + buffer offset
+- Scan: Classifies into const/carry/xs/internal + uses `dataIdx` for iteration
+
+**WebGPU Backend Overlap:**
+
+| Function                    | Location              | Purpose              |
+| --------------------------- | --------------------- | -------------------- |
+| `gen()` in `pipelineSource` | `webgpu.ts:997-1099`  | Regular shader codegen |
+| `genScanExpressionWithRidx` | `webgpu.ts:1456-1565` | Scan shader codegen  |
+
+~70% identical. Differences:
+- `GlobalIndex`: Regular uses `in${gid}[idx]`, scan uses `const${i}`, `carry${i}`, `xs${i}[dataIdx * stride + idx]`
+- Regular has CSE (common subexpression elimination), scan inlines everything
+- Regular supports `Threefry2x32`, `Erf/Erfc` with f32 precision wrapper; scan doesn't
+
+**Refactoring Plan:**
+
+1. **WASM: Extract `translateExpCore()`**
+   - Create helper that handles all `AluOp` cases except `GlobalIndex`
+   - Parameterize with callback: `resolveGlobalIndex: (gid: number, indexExp: AluExp) => void`
+   - Both `translateExp` and `translateExpWithGeneralScanContext` call the shared core
+
+2. **WebGPU: Extract `genAluOpWgsl()`**
+   - Create pure function: `genAluOpWgsl(op: AluOp, srcs: string[], dtype: DType): string`
+   - Handles binary/unary ops, casts, comparisons
+   - Both `gen()` in `pipelineSource` and `genScanExpressionWithRidx` use it
+
+3. **Add missing ops to scan paths**
+   - `Threefry2x32` (PRNG)
+   - `Floor`, `Ceil` (in WASM scan)
+   - `Erf`, `Erfc` (special functions)
+
+**Benefits:**
+- Adding new `AluOp` requires changes in 1 place instead of 4
+- Bug fixes apply to both regular and scan paths
+- Scan gains missing operations automatically
+
+### Multi-output Kernel in Native Scan
+
+The `Kernel` class supports fusing multiple outputs into a single kernel dispatch via `Kernel.multi()`.
+This is used in regular `jitCompile()` for functions with multiple same-size outputs.
 
 **Current status:**
 
-- Regular JIT: ✅ Uses MultiKernel for multi-output functions
-- Scan body compilation: ✅ Produces MultiKernel
-- Native scan (WASM): ✅ Supports MultiKernel codegen in `codegenNativeScanGeneral()`
-- Native scan (WebGPU): ✅ Supports MultiKernel via `prepareNativeScanMulti()` expansion
+- Regular JIT: ✅ Uses multi-output Kernel for multi-output functions
+- Scan body compilation: ✅ Produces multi-output Kernel
+- Native scan (WASM): ✅ Supports multi-output kernel codegen in `codegenNativeScanGeneral()`
+- Native scan (WebGPU): ✅ Supports multi-output via `prepareNativeScanMulti()` expansion
 
-**Example:** Mandelbrot body with 3 carry outputs compiles to 2-3 MultiKernel steps instead of 6
-separate Kernel steps, and runs via the fused native scan path on both WASM and WebGPU.
+**Example:** Mandelbrot body with 3 carry outputs compiles to 2-3 multi-output kernel steps instead of 6
+separate kernel steps, and runs via the fused native scan path on both WASM and WebGPU.
 
-See test: `test/lax-scan.test.ts` → "Scan body multi-output: uses native scan with MultiKernel"
+See test: `test/lax-scan.test.ts` → "Scan body multi-output: uses native scan with multi-output kernel"
 
 ### Fix Compiled-Body Binding Detection
 
@@ -1023,8 +1097,8 @@ function trackScanPaths() {
 | ----------------------------- | ------- | -------- | ------------------------ |
 | `scan basic`                  | CPU     | fallback | Core correctness         |
 | `compiled-loop scan`          | WASM    | fused    | Verify fusion works      |
-| `compiled-loop > reduction`   | WASM    | fallback | Known limitation         |
-| `compiled-body scan > matmul` | WASM    | fallback | Routine bodies           |
+| `compiled-loop > with consts` | WASM    | fused    | Constants in body        |
+| `matmul in body (routine)`    | WASM    | fused    | Routine bodies           |
 | `KNOWN LIMITATIONS`           | WebGPU  | fallback | Verify graceful fallback |
 
 Tests under "KNOWN LIMITATIONS" PASS when the limitation exists. If you fix a limitation, the test

@@ -6,7 +6,6 @@ import {
   DType,
   isFloatDtype,
   Kernel,
-  MultiKernel,
 } from "../alu";
 import {
   Backend,
@@ -318,33 +317,41 @@ export class WebGPUBackend implements Backend {
   }
 
   async prepareMultiKernel(
-    multiKernel: MultiKernel,
+    kernel: Kernel,
   ): Promise<Executable<ShaderDispatch[]>> {
-    // WebGPU expands MultiKernel into individual Kernel dispatches
+    // WebGPU expands multi-output Kernel into individual single-output dispatches
     // Each output becomes a separate shader dispatch
     const dispatches: ShaderDispatch[] = [];
-    for (const output of multiKernel.outputs) {
-      const kernel = new Kernel(multiKernel.nargs, output.size, output.exp);
-      const shader = this.#cachedShader(kernel);
+    for (const output of kernel.outputs) {
+      const singleKernel = Kernel.single(
+        kernel.nargs,
+        output.size,
+        output.exp,
+        output.reduction,
+      );
+      const shader = this.#cachedShader(singleKernel);
       const pipeline = await this.pipelines.prepare(shader);
       dispatches.push({ ...shader, pipeline });
     }
-    return new Executable(multiKernel, dispatches);
+    return new Executable(kernel, dispatches);
   }
 
-  prepareMultiKernelSync(
-    multiKernel: MultiKernel,
-  ): Executable<ShaderDispatch[]> {
-    // WebGPU expands MultiKernel into individual Kernel dispatches
+  prepareMultiKernelSync(kernel: Kernel): Executable<ShaderDispatch[]> {
+    // WebGPU expands multi-output Kernel into individual single-output dispatches
     // Each output becomes a separate shader dispatch
     const dispatches: ShaderDispatch[] = [];
-    for (const output of multiKernel.outputs) {
-      const kernel = new Kernel(multiKernel.nargs, output.size, output.exp);
-      const shader = this.#cachedShader(kernel);
+    for (const output of kernel.outputs) {
+      const singleKernel = Kernel.single(
+        kernel.nargs,
+        output.size,
+        output.exp,
+        output.reduction,
+      );
+      const shader = this.#cachedShader(singleKernel);
       const pipeline = this.pipelines.prepareSync(shader);
       dispatches.push({ ...shader, pipeline });
     }
-    return new Executable(multiKernel, dispatches);
+    return new Executable(kernel, dispatches);
   }
 
   async prepareRoutine(
@@ -377,12 +384,12 @@ export class WebGPUBackend implements Backend {
     const inputBuffers = inputs.map((slot) => this.#getBuffer(slot).buffer);
     const outputBuffers = outputs.map((slot) => this.#getBuffer(slot).buffer);
 
-    // For MultiKernel, each dispatch corresponds to a different output
-    if (exe.source instanceof MultiKernel) {
-      const multiKernel = exe.source;
-      if (exe.data.length !== multiKernel.outputs.length) {
+    // For multi-output Kernels, each dispatch corresponds to a different output
+    const kernel = exe.source as Kernel;
+    if (kernel.isMultiOutput) {
+      if (exe.data.length !== kernel.outputs.length) {
         throw new Error(
-          `webgpu: MultiKernel dispatch count mismatch: ${exe.data.length} vs ${multiKernel.outputs.length}`,
+          `webgpu: multi-output kernel dispatch count mismatch: ${exe.data.length} vs ${kernel.outputs.length}`,
         );
       }
       // Dispatch each kernel with its corresponding output
@@ -409,7 +416,7 @@ export class WebGPUBackend implements Backend {
     try {
       const shader = nativeScanShaderSource(this.device, params);
       const pipeline = this.pipelines.prepareSync(shader);
-      const syntheticKernel = new Kernel(
+      const syntheticKernel = Kernel.single(
         bodyKernel.nargs,
         bodyKernel.size,
         bodyKernel.exp,
@@ -1959,8 +1966,6 @@ class ShaderPipelineCache {
   async prepare(shader: ShaderInfo): Promise<GPUComputePipeline> {
     // Workaround: Deno's createComputePipelineAsync has a WebIDL binding bug
     // where the 'compute' field is not recognized. Use sync version instead.
-    // See: https://github.com/denoland/deno/issues/XXXXX
-
     if (typeof (globalThis as any).Deno !== "undefined") {
       return this.prepareSync(shader);
     }

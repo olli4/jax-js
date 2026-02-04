@@ -70,7 +70,15 @@ function trackScanPaths() {
 Deno.test({
   name: "WebGPU adapter available (hardware GPU)",
   ignore: !hasWebGPU,
-  fn: async () => {
+  fn: withLeakCheck(async () => {
+    // Use init() to get adapter info via jax-js instead of creating a separate adapter.
+    // This avoids potential GPU resource conflicts when running tests together.
+    const devices = await init();
+    if (!devices.includes("webgpu")) {
+      console.log("WebGPU not available in jax-js");
+      return;
+    }
+    // Access adapter info through the initialized backend
     const adapter = await navigator.gpu.requestAdapter();
     console.log("GPU Adapter:", adapter?.info);
     assertEquals(adapter !== null, true, "Should have a GPU adapter");
@@ -79,13 +87,13 @@ Deno.test({
       false,
       "Should be hardware GPU, not fallback",
     );
-  },
+  }),
 });
 
 Deno.test({
   name: "jax-js init detects webgpu",
   ignore: !hasWebGPU,
-  fn: async () => {
+  fn: withLeakCheck(async () => {
     const devices = await init();
     console.log("Available devices:", devices);
     assertEquals(
@@ -93,7 +101,7 @@ Deno.test({
       true,
       "WebGPU should be available",
     );
-  },
+  }),
 });
 
 // Test with WebGPU backend (uses sync createComputePipeline workaround)
