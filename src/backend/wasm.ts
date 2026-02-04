@@ -675,6 +675,259 @@ function importWasmHelperFuncs(
   return funcs;
 }
 
+// ============================================================================
+// Unified AluExp translation
+// ============================================================================
+
+/**
+ * Context for translating AluExp to WASM.
+ * The handleGlobalIndex callback is called to emit code that loads a value
+ * from a buffer. After it returns, the value should be on the WASM stack.
+ */
+interface TranslateExpContext {
+  /** Get the value of a variable (e.g., "gidx", "ridx", "acc") */
+  getVariable: (name: string) => number | undefined;
+  /** Emit code to handle GlobalIndex. Should leave the loaded value on stack. */
+  handleGlobalIndex: (
+    cg: CodeGenerator,
+    gen: (e: AluExp) => void,
+    gid: number,
+    len: number,
+    indexExp: AluExp,
+    dtype: DType,
+  ) => void;
+}
+
+/**
+ * Translate an AluExp tree to WASM code.
+ *
+ * This is the core expression translation shared by regular kernels and scan.
+ * The context provides callbacks for variable resolution and GlobalIndex handling.
+ */
+function translateExpCore(
+  cg: CodeGenerator,
+  funcs: Record<string, number>,
+  exp: AluExp,
+  ctx: TranslateExpContext,
+): void {
+  const references = new Map<AluExp, number>();
+  const seen = new Set<AluExp>();
+  const countReferences = (e: AluExp) => {
+    references.set(e, (references.get(e) ?? 0) + 1);
+    if (!seen.has(e)) {
+      seen.add(e);
+      for (const src of e.src) countReferences(src);
+    }
+  };
+
+  const expContext = new Map<AluExp, number>();
+  const gen = (e: AluExp): void => {
+    if (expContext.has(e)) {
+      cg.local.get(expContext.get(e)!);
+      return;
+    }
+    const { op, src, dtype, arg } = e;
+
+    // GlobalIndex is handled by the context (different for regular vs scan)
+    if (op === AluOp.GlobalIndex) {
+      const [gid, len] = arg as [number, number];
+      ctx.handleGlobalIndex(cg, gen, gid, len, src[0], dtype);
+    } else if (AluGroup.Binary.has(op) || AluGroup.Compare.has(op)) {
+      gen(src[0]);
+      gen(src[1]);
+      if (op === AluOp.Add) {
+        if (dtype === DType.Bool) cg.i32.or();
+        else dty(cg, op, dtype).add();
+      } else if (op === AluOp.Sub) {
+        dty(cg, op, dtype).sub();
+      } else if (op === AluOp.Mul) {
+        if (dtype === DType.Bool) cg.i32.and();
+        else dty(cg, op, dtype).mul();
+      } else if (op === AluOp.Idiv) {
+        if (isFloatDtype(dtype)) {
+          dtyF(cg, op, dtype).div();
+          dtyF(cg, op, dtype).trunc();
+        } else if (dtype === DType.Uint32) cg.i32.div_u();
+        else if (dtype === DType.Int32) cg.i32.div_s();
+        else throw new UnsupportedOpError(op, dtype, "wasm");
+      } else if (op === AluOp.Mod) {
+        if (isFloatDtype(dtype)) {
+          // Emulate a % b = a - trunc(a/b)*b
+          const dt = dtyF(cg, op, dtype);
+          const a = cg.local.declare(dt);
+          const b = cg.local.declare(dt);
+          cg.local.set(b);
+          cg.local.tee(a);
+          cg.local.get(a);
+          cg.local.get(b);
+          dt.div();
+          dt.trunc();
+          cg.local.get(b);
+          dt.mul();
+          dt.sub();
+        } else if (dtype === DType.Uint32) cg.i32.rem_u();
+        else if (dtype === DType.Int32) cg.i32.rem_s();
+        else throw new UnsupportedOpError(op, dtype, "wasm");
+      } else if (op === AluOp.Min || op === AluOp.Max) {
+        if (isFloatDtype(dtype)) {
+          if (op === AluOp.Min) dtyF(cg, op, dtype).min();
+          else dtyF(cg, op, dtype).max();
+        } else if (
+          dtype === DType.Int32 ||
+          dtype === DType.Uint32 ||
+          dtype === DType.Bool
+        ) {
+          // Wasm has no i32.min, so emulate with select
+          const a = cg.local.declare(cg.i32);
+          const b = cg.local.declare(cg.i32);
+          cg.local.set(b);
+          cg.local.tee(a);
+          cg.local.get(b);
+          cg.local.get(a);
+          cg.local.get(b);
+          if (dtype === DType.Int32) {
+            if (op === AluOp.Min) cg.i32.lt_s();
+            else cg.i32.gt_s();
+          } else {
+            if (op === AluOp.Min) cg.i32.lt_u();
+            else cg.i32.gt_u();
+          }
+          cg.select();
+        } else throw new UnsupportedOpError(op, dtype, "wasm");
+      } else if (op === AluOp.Cmplt) {
+        const srcDtype = src[0].dtype;
+        if (isFloatDtype(srcDtype)) dtyF(cg, op, srcDtype).lt();
+        else if (srcDtype === DType.Int32) cg.i32.lt_s();
+        else if (srcDtype === DType.Uint32) cg.i32.lt_u();
+        else throw new UnsupportedOpError(op, dtype, "wasm");
+      } else if (op === AluOp.Cmpne) {
+        dty(cg, op, src[0].dtype).ne();
+      } else {
+        throw new UnsupportedOpError(op, dtype, "wasm");
+      }
+    } else if (AluGroup.Unary.has(op)) {
+      // Math intrinsics - implemented in f32, cast for f64
+      const callFuncF32 = (func: number): void => {
+        if (dtype !== DType.Float32) {
+          if (dtype === DType.Float64) cg.f32.demote_f64();
+          else throw new UnsupportedOpError(op, dtype, "wasm");
+        }
+        cg.call(func);
+        if (dtype === DType.Float64) cg.f64.promote_f32();
+      };
+      if (op === AluOp.Sin) (gen(src[0]), callFuncF32(funcs.sin));
+      else if (op === AluOp.Cos) (gen(src[0]), callFuncF32(funcs.cos));
+      else if (op === AluOp.Asin) (gen(src[0]), callFuncF32(funcs.asin));
+      else if (op === AluOp.Atan) (gen(src[0]), callFuncF32(funcs.atan));
+      else if (op === AluOp.Exp) (gen(src[0]), callFuncF32(funcs.exp));
+      else if (op === AluOp.Log) (gen(src[0]), callFuncF32(funcs.log));
+      else if (op === AluOp.Erf) (gen(src[0]), callFuncF32(funcs.erf));
+      else if (op === AluOp.Erfc) (gen(src[0]), callFuncF32(funcs.erfc));
+      else if (op === AluOp.Sqrt) (gen(src[0]), dtyF(cg, op, dtype).sqrt());
+      else if (op === AluOp.Reciprocal) {
+        const dt = dtyF(cg, op, dtype);
+        dt.const(1);
+        gen(src[0]);
+        dt.div();
+      } else if (op === AluOp.Floor) (gen(src[0]), dtyF(cg, op, dtype).floor());
+      else if (op === AluOp.Ceil) (gen(src[0]), dtyF(cg, op, dtype).ceil());
+      else if (op === AluOp.Cast) {
+        gen(src[0]);
+        const dtype0 = src[0].dtype;
+        const i32repr =
+          dtype0 === DType.Int32 ||
+          dtype0 === DType.Uint32 ||
+          dtype0 === DType.Bool;
+        if (dtype === DType.Int32) {
+          if (dtype0 === DType.Float32) cg.i32.trunc_sat_f32_s();
+          else if (dtype0 === DType.Float64) cg.i32.trunc_sat_f64_s();
+          else if (i32repr) void 0;
+          else throw new UnsupportedOpError(op, dtype, "wasm", dtype0);
+        } else if (dtype === DType.Uint32) {
+          if (dtype0 === DType.Float32) cg.i32.trunc_sat_f32_u();
+          else if (dtype0 === DType.Float64) cg.i32.trunc_sat_f64_u();
+          else if (i32repr) void 0;
+          else throw new UnsupportedOpError(op, dtype, "wasm", dtype0);
+        } else if (dtype === DType.Float32) {
+          if (dtype0 === DType.Float32) void 0;
+          else if (dtype0 === DType.Float64) cg.f32.demote_f64();
+          else if (dtype0 === DType.Int32 || dtype0 === DType.Bool)
+            cg.f32.convert_i32_s();
+          else if (dtype0 === DType.Uint32) cg.f32.convert_i32_u();
+          else throw new UnsupportedOpError(op, dtype, "wasm", dtype0);
+        } else if (dtype === DType.Float64) {
+          if (dtype0 === DType.Float32) cg.f64.promote_f32();
+          else if (dtype0 === DType.Float64) void 0;
+          else if (dtype0 === DType.Int32 || dtype0 === DType.Bool)
+            cg.f64.convert_i32_s();
+          else if (dtype0 === DType.Uint32) cg.f64.convert_i32_u();
+          else throw new UnsupportedOpError(op, dtype, "wasm", dtype0);
+        } else if (dtype === DType.Bool) {
+          if (dtype0 === DType.Bool) void 0;
+          else if (i32repr) (cg.i32.const(0), cg.i32.ne());
+          else if (dtype0 === DType.Float32) (cg.f32.const(0), cg.f32.ne());
+          else if (dtype0 === DType.Float64) (cg.f64.const(0), cg.f64.ne());
+          else throw new UnsupportedOpError(op, dtype, "wasm", dtype0);
+        } else throw new UnsupportedOpError(op, dtype, "wasm");
+      } else if (op === AluOp.Bitcast) {
+        gen(src[0]);
+        const dtype0 = src[0].dtype;
+        if (dtype !== dtype0) {
+          const i32repr = dtype0 === DType.Int32 || dtype0 === DType.Uint32;
+          if (dtype === DType.Int32 || dtype === DType.Uint32) {
+            if (dtype0 === DType.Float32) cg.i32.reinterpret_f32();
+            else if (i32repr) void 0;
+            else throw new UnsupportedOpError(op, dtype, "wasm", dtype0);
+          } else if (dtype === DType.Float32) {
+            if (i32repr) cg.f32.reinterpret_i32();
+            else if (dtype0 === DType.Float32) void 0;
+            else throw new UnsupportedOpError(op, dtype, "wasm", dtype0);
+          } else throw new UnsupportedOpError(op, dtype, "wasm");
+        }
+      } else throw new UnsupportedOpError(op, dtype, "wasm");
+    } else if (op === AluOp.Where) {
+      gen(src[1]); // t
+      gen(src[2]); // f
+      gen(src[0]); // cond
+      cg.select();
+    } else if (op === AluOp.Threefry2x32) {
+      for (let i = 0; i < 4; i++) gen(src[i]);
+      cg.call(funcs.threefry2x32);
+      if (arg === "xor") cg.i32.xor();
+      else if (arg === 0) cg.drop();
+      else if (arg === 1) {
+        const local = cg.local.declare(cg.i32);
+        cg.local.set(local);
+        cg.drop();
+        cg.local.get(local);
+      } else throw new UnsupportedOpError(op, dtype, "wasm", arg);
+    } else if (op === AluOp.Const) {
+      dty(cg, op, dtype).const(arg as number);
+    } else if (op === AluOp.Special) {
+      const name = arg[0] as string;
+      const local = ctx.getVariable(name);
+      if (local === undefined) throw new Error(`Unknown special: ${name}`);
+      cg.local.get(local);
+    } else if (op === AluOp.Variable) {
+      const name = arg as string;
+      const local = ctx.getVariable(name);
+      if (local === undefined) throw new Error(`Unknown variable: ${name}`);
+      cg.local.get(local);
+    } else {
+      throw new UnsupportedOpError(op, dtype, "wasm");
+    }
+
+    if ((references.get(e) ?? 0) > 1) {
+      const local = cg.local.declare(dty(cg, op, dtype));
+      cg.local.tee(local);
+      expContext.set(e, local);
+    }
+  };
+
+  countReferences(exp);
+  gen(exp);
+}
+
 /**
  * Generate reduction accumulator update code.
  * Assumes the expression result is on the stack.
@@ -1529,7 +1782,7 @@ interface GeneralScanContext {
 
 /**
  * Translate an AluExp to WASM code within a general scan context.
- * Supports reading from internal buffers (for data dependencies between steps).
+ * This is a thin wrapper around translateExpCore with scan-specific GlobalIndex handling.
  */
 function translateExpWithGeneralScanContext(
   cg: CodeGenerator,
@@ -1537,36 +1790,28 @@ function translateExpWithGeneralScanContext(
   exp: AluExp,
   ctx: GeneralScanContext,
 ) {
-  const references = new Map<AluExp, number>();
-  const seen = new Set<AluExp>();
-  const countReferences = (e: AluExp) => {
-    references.set(e, (references.get(e) ?? 0) + 1);
-    if (!seen.has(e)) {
-      seen.add(e);
-      for (const src of e.src) countReferences(src);
-    }
-  };
-
-  const expContext = new Map<AluExp, number>();
-  const gen = (e: AluExp): void => {
-    if (expContext.has(e)) {
-      cg.local.get(expContext.get(e)!);
-      return;
-    }
-    const { op, src, dtype, arg } = e;
-
-    // Handle GlobalIndex: load from appropriate buffer based on slot classification
-    if (op === AluOp.GlobalIndex) {
-      // arg = [gid, len], src = [indexExp]
-      // Note: gid is already reindexed to be the jaxpr slot (const/carry/xs/internal index)
-      const gid = arg[0] as number;
-      const bw = byteWidth(dtype);
-
+  translateExpCore(cg, funcs, exp, {
+    getVariable: (name) => {
+      if (name === "gidx") return ctx.gidx;
+      if (name === "ridx") {
+        if (ctx.ridx < 0)
+          throw new Error("ridx used but not in reduction context");
+        return ctx.ridx;
+      }
+      if (name === "acc") {
+        if (ctx.acc === undefined)
+          throw new Error("acc used but not in epilogue context");
+        return ctx.acc;
+      }
+      return undefined;
+    },
+    handleGlobalIndex: (cg, gen, gid, _len, indexExp, dtype) => {
       // gid is the jaxpr slot after reindexing:
       // [0, numConsts): constant
       // [numConsts, numConsts+numCarry): carry
       // [numConsts+numCarry, numInputs): xs
       // [numInputs, numInputs+numInternal): internal buffer
+      const bw = byteWidth(dtype);
 
       if (gid < ctx.numConsts) {
         // Constant input (no iteration offset)
@@ -1590,335 +1835,31 @@ function translateExpWithGeneralScanContext(
       }
 
       // Add element index offset
-      gen(src[0]); // This gives the element index
+      gen(indexExp);
       cg.i32.const(bw);
       cg.i32.mul();
       cg.i32.add();
 
       // Load the value
-      dty(cg, op, dtype).load(Math.log2(bw));
-    } else if (op === AluOp.Add) {
-      gen(src[0]);
-      gen(src[1]);
-      if (dtype === DType.Bool) cg.i32.or();
-      else dty(cg, op, dtype).add();
-    } else if (op === AluOp.Sub) {
-      gen(src[0]);
-      gen(src[1]);
-      dty(cg, op, dtype).sub();
-    } else if (op === AluOp.Mul) {
-      gen(src[0]);
-      gen(src[1]);
-      if (dtype === DType.Bool) cg.i32.and();
-      else dty(cg, op, dtype).mul();
-    } else if (op === AluOp.Idiv) {
-      gen(src[0]);
-      gen(src[1]);
-      if (dtype === DType.Int32) cg.i32.div_s();
-      else cg.i32.div_u();
-    } else if (op === AluOp.Mod) {
-      gen(src[0]);
-      gen(src[1]);
-      if (dtype === DType.Int32) cg.i32.rem_s();
-      else cg.i32.rem_u();
-    } else if (op === AluOp.Min) {
-      gen(src[0]);
-      gen(src[1]);
-      if (isFloatDtype(dtype)) dtyF(cg, op, dtype).min();
-      else throw new Error("integer min in scan not yet supported");
-    } else if (op === AluOp.Max) {
-      gen(src[0]);
-      gen(src[1]);
-      if (isFloatDtype(dtype)) dtyF(cg, op, dtype).max();
-      else throw new Error("integer max in scan not yet supported");
-    } else if (op === AluOp.Const) {
-      dty(cg, op, dtype).const(arg);
-    } else if (op === AluOp.Special && arg[0] === "gidx") {
-      cg.local.get(ctx.gidx);
-    } else if (op === AluOp.Special && arg[0] === "ridx") {
-      if (ctx.ridx < 0)
-        throw new Error("ridx used but not in reduction context");
-      cg.local.get(ctx.ridx);
-    } else if (op === AluOp.Variable && arg === "gidx") {
-      cg.local.get(ctx.gidx);
-    } else if (op === AluOp.Variable && arg === "ridx") {
-      if (ctx.ridx < 0)
-        throw new Error("ridx used but not in reduction context");
-      cg.local.get(ctx.ridx);
-    } else if (op === AluOp.Variable && arg === "acc") {
-      if (ctx.acc === undefined)
-        throw new Error("acc used but not in epilogue context");
-      cg.local.get(ctx.acc);
-    } else if (op === AluOp.Reciprocal) {
-      dtyF(cg, op, dtype).const(1.0);
-      gen(src[0]);
-      dtyF(cg, op, dtype).div();
-    } else if (op === AluOp.Sqrt) {
-      gen(src[0]);
-      dtyF(cg, op, dtype).sqrt();
-    } else if (op === AluOp.Cmplt) {
-      gen(src[0]);
-      gen(src[1]);
-      const srcDtype = src[0].dtype;
-      if (isFloatDtype(srcDtype)) dtyF(cg, op, srcDtype).lt();
-      else if (srcDtype === DType.Int32) cg.i32.lt_s();
-      else cg.i32.lt_u();
-    } else if (op === AluOp.Cmpne) {
-      gen(src[0]);
-      gen(src[1]);
-      dty(cg, op, src[0].dtype).ne();
-    } else if (op === AluOp.Where) {
-      gen(src[1]); // true value
-      gen(src[2]); // false value
-      gen(src[0]); // condition
-      cg.select();
-    } else if (op === AluOp.Cast) {
-      gen(src[0]);
-      const srcDtype = src[0].dtype;
-      // Handle common casts
-      if (srcDtype === dtype) {
-        // no-op
-      } else if (srcDtype === DType.Float32 && dtype === DType.Int32) {
-        cg.i32.trunc_sat_f32_s();
-      } else if (srcDtype === DType.Int32 && dtype === DType.Float32) {
-        cg.f32.convert_i32_s();
-      } else if (srcDtype === DType.Bool && dtype === DType.Float32) {
-        // Bool is stored as i32 (0 or 1), convert to f32
-        cg.f32.convert_i32_s();
-      } else if (srcDtype === DType.Bool && dtype === DType.Int32) {
-        // Bool is already i32, no-op
-      } else if (srcDtype === DType.Float32 && dtype === DType.Float64) {
-        cg.f64.promote_f32();
-      } else if (srcDtype === DType.Float64 && dtype === DType.Float32) {
-        cg.f32.demote_f64();
-      } else if (srcDtype === DType.Uint32 && dtype === DType.Float32) {
-        cg.f32.convert_i32_u();
-      } else if (srcDtype === DType.Float32 && dtype === DType.Uint32) {
-        cg.i32.trunc_sat_f32_u();
-      } else if (srcDtype === DType.Int32 && dtype === DType.Float64) {
-        cg.f64.convert_i32_s();
-      } else if (srcDtype === DType.Bool && dtype === DType.Float64) {
-        cg.f64.convert_i32_s();
-      } else if (srcDtype === DType.Float64 && dtype === DType.Int32) {
-        cg.i32.trunc_sat_f64_s();
-      } else {
-        throw new Error(
-          `Cast ${srcDtype} -> ${dtype} in scan not yet supported`,
-        );
-      }
-    } else {
-      throw new Error(
-        `translateExpWithGeneralScanContext: unsupported op ${op}`,
-      );
-    }
-
-    if ((references.get(e) ?? 0) > 1) {
-      const local = cg.local.declare(dty(cg, op, dtype));
-      cg.local.tee(local);
-      expContext.set(e, local);
-    }
-  };
-
-  countReferences(exp);
-  gen(exp);
+      dty(cg, AluOp.GlobalIndex, dtype).load(Math.log2(bw));
+    },
+  });
 }
 
+/**
+ * Translate an AluExp to WASM code for a regular kernel.
+ * This is a thin wrapper around translateExpCore with kernel-specific GlobalIndex handling.
+ */
 function translateExp(
   cg: CodeGenerator,
   funcs: Record<string, number>,
   exp: AluExp,
   ctx: Record<string, number>,
 ) {
-  const references = new Map<AluExp, number>();
-  const seen = new Set<AluExp>();
-  const countReferences = (exp: AluExp) => {
-    references.set(exp, (references.get(exp) ?? 0) + 1);
-    if (!seen.has(exp)) {
-      seen.add(exp);
-      for (const src of exp.src) countReferences(src);
-    }
-  };
-
-  const expContext = new Map<AluExp, number>();
-  const gen = (exp: AluExp) => {
-    if (expContext.has(exp)) return cg.local.get(expContext.get(exp)!);
-    const { op, src, dtype, arg } = exp;
-
-    // Some of these cases early `return` to force-inline them (no local.set).
-    if (AluGroup.Binary.has(op) || AluGroup.Compare.has(op)) {
-      gen(src[0]);
-      gen(src[1]);
-      if (op === AluOp.Add) {
-        if (dtype === DType.Bool) cg.i32.or();
-        else dty(cg, op, dtype).add();
-      } else if (op === AluOp.Sub) {
-        dty(cg, op, dtype).sub();
-      } else if (op === AluOp.Mul) {
-        if (dtype === DType.Bool) cg.i32.and();
-        else dty(cg, op, dtype).mul();
-      } else if (op === AluOp.Idiv) {
-        if (isFloatDtype(dtype)) {
-          dtyF(cg, op, dtype).div();
-          dtyF(cg, op, dtype).trunc();
-        } else if (dtype === DType.Uint32) cg.i32.div_u();
-        else if (dtype === DType.Int32) cg.i32.div_s();
-        else throw new UnsupportedOpError(op, dtype, "wasm");
-      } else if (op === AluOp.Mod) {
-        if (isFloatDtype(dtype)) {
-          // Emulate a % b = a - trunc(a/b)*b
-          const dt = dtyF(cg, op, dtype);
-          const a = cg.local.declare(dt);
-          const b = cg.local.declare(dt);
-          cg.local.set(b);
-          cg.local.tee(a); // stack: a
-          cg.local.get(a);
-          cg.local.get(b);
-          dt.div();
-          dt.trunc(); // stack: a, trunc(a/b)
-          cg.local.get(b);
-          dt.mul(); // stack: a, trunc(a/b)*b
-          dt.sub();
-        } else if (dtype === DType.Uint32) cg.i32.rem_u();
-        else if (dtype === DType.Int32) cg.i32.rem_s();
-        else throw new UnsupportedOpError(op, dtype, "wasm");
-      } else if (op === AluOp.Min || op === AluOp.Max) {
-        if (isFloatDtype(dtype)) {
-          if (op === AluOp.Min) dtyF(cg, op, dtype).min();
-          else dtyF(cg, op, dtype).max();
-        } else if (
-          dtype === DType.Int32 ||
-          dtype === DType.Uint32 ||
-          dtype === DType.Bool
-        ) {
-          // Wasm has no i32.min, so emulate with select.
-          const a = cg.local.declare(cg.i32);
-          const b = cg.local.declare(cg.i32);
-          cg.local.set(b);
-          cg.local.tee(a);
-          cg.local.get(b);
-          cg.local.get(a);
-          cg.local.get(b);
-          if (dtype === DType.Int32) {
-            if (op === AluOp.Min) cg.i32.lt_s();
-            else cg.i32.gt_s();
-          } else {
-            if (op === AluOp.Min) cg.i32.lt_u();
-            else cg.i32.gt_u();
-          }
-          cg.select();
-        } else throw new UnsupportedOpError(op, dtype, "wasm");
-      } else if (op === AluOp.Cmplt) {
-        const srcDtype = src[0].dtype;
-        if (isFloatDtype(srcDtype)) dtyF(cg, op, srcDtype).lt();
-        else if (srcDtype === DType.Int32) cg.i32.lt_s();
-        else if (srcDtype === DType.Uint32) cg.i32.lt_u();
-        else throw new UnsupportedOpError(op, dtype, "wasm");
-      } else if (op === AluOp.Cmpne) dty(cg, op, src[0].dtype).ne();
-      else throw new UnsupportedOpError(op, dtype, "wasm");
-    } else if (AluGroup.Unary.has(op)) {
-      // TODO: Our intrinsics are only implemented in f32 precision currently,
-      // so we cast to f32 first for other floating-point inputs.
-      const callFuncF32 = (func: number): void => {
-        if (dtype !== DType.Float32) {
-          if (dtype === DType.Float64) cg.f32.demote_f64();
-          else throw new UnsupportedOpError(op, dtype, "wasm");
-        }
-        cg.call(func);
-        if (dtype === DType.Float64) cg.f64.promote_f32();
-      };
-      if (op === AluOp.Sin) (gen(src[0]), callFuncF32(funcs.sin));
-      else if (op === AluOp.Cos) (gen(src[0]), callFuncF32(funcs.cos));
-      else if (op === AluOp.Asin) (gen(src[0]), callFuncF32(funcs.asin));
-      else if (op === AluOp.Atan) (gen(src[0]), callFuncF32(funcs.atan));
-      else if (op === AluOp.Exp) (gen(src[0]), callFuncF32(funcs.exp));
-      else if (op === AluOp.Log) (gen(src[0]), callFuncF32(funcs.log));
-      else if (op === AluOp.Erf) (gen(src[0]), callFuncF32(funcs.erf));
-      else if (op === AluOp.Erfc) (gen(src[0]), callFuncF32(funcs.erfc));
-      else if (op === AluOp.Sqrt) (gen(src[0]), dtyF(cg, op, dtype).sqrt());
-      else if (op === AluOp.Reciprocal) {
-        const dt = dtyF(cg, op, dtype);
-        (dt.const(1), gen(src[0]), dt.div());
-      } else if (op === AluOp.Floor) (gen(src[0]), dtyF(cg, op, dtype).floor());
-      else if (op === AluOp.Ceil) (gen(src[0]), dtyF(cg, op, dtype).ceil());
-      else if (op === AluOp.Cast) {
-        gen(src[0]);
-        const dtype0 = src[0].dtype;
-        const i32repr =
-          dtype0 === DType.Int32 ||
-          dtype0 === DType.Uint32 ||
-          dtype0 === DType.Bool;
-        if (dtype === DType.Int32) {
-          if (dtype0 === DType.Float32) cg.i32.trunc_sat_f32_s();
-          else if (dtype0 === DType.Float64) cg.i32.trunc_sat_f64_s();
-          else if (i32repr) void 0;
-          else throw new UnsupportedOpError(op, dtype, "wasm", dtype0);
-        } else if (dtype === DType.Uint32) {
-          if (dtype0 === DType.Float32) cg.i32.trunc_sat_f32_u();
-          else if (dtype0 === DType.Float64) cg.i32.trunc_sat_f64_u();
-          else if (i32repr) void 0;
-          else throw new UnsupportedOpError(op, dtype, "wasm", dtype0);
-        } else if (dtype === DType.Float32) {
-          if (dtype0 === DType.Float32) void 0;
-          else if (dtype0 === DType.Float64) cg.f32.demote_f64();
-          else if (dtype0 === DType.Int32 || dtype0 === DType.Bool)
-            cg.f32.convert_i32_s();
-          else if (dtype0 === DType.Uint32) cg.f32.convert_i32_u();
-          else throw new UnsupportedOpError(op, dtype, "wasm", dtype0);
-        } else if (dtype === DType.Float64) {
-          if (dtype0 === DType.Float32) cg.f64.promote_f32();
-          else if (dtype0 === DType.Float64) void 0;
-          else if (dtype0 === DType.Int32 || dtype0 === DType.Bool)
-            cg.f64.convert_i32_s();
-          else if (dtype0 === DType.Uint32) cg.f64.convert_i32_u();
-          else throw new UnsupportedOpError(op, dtype, "wasm", dtype0);
-        } else if (dtype === DType.Bool) {
-          if (dtype0 === DType.Bool) void 0;
-          else if (i32repr) (cg.i32.const(0), cg.i32.ne());
-          else if (dtype0 === DType.Float32) (cg.f32.const(0), cg.f32.ne());
-          else if (dtype0 === DType.Float64) (cg.f64.const(0), cg.f64.ne());
-          else throw new UnsupportedOpError(op, dtype, "wasm", dtype0);
-        } else throw new UnsupportedOpError(op, dtype, "wasm");
-      } else if (op === AluOp.Bitcast) {
-        gen(src[0]);
-        const dtype0 = src[0].dtype;
-        if (dtype !== dtype0) {
-          const i32repr = dtype0 === DType.Int32 || dtype0 === DType.Uint32;
-          if (dtype === DType.Int32 || dtype === DType.Uint32) {
-            if (dtype0 === DType.Float32) cg.i32.reinterpret_f32();
-            else if (i32repr) void 0;
-            else throw new UnsupportedOpError(op, dtype, "wasm", dtype0);
-          } else if (dtype === DType.Float32) {
-            if (i32repr) cg.f32.reinterpret_i32();
-            else if (dtype0 === DType.Float32) void 0;
-            else throw new UnsupportedOpError(op, dtype, "wasm", dtype0);
-          } else throw new UnsupportedOpError(op, dtype, "wasm");
-        }
-      } else throw new UnsupportedOpError(op, dtype, "wasm");
-    } else if (op === AluOp.Where) {
-      gen(src[1]); // t
-      gen(src[2]); // f
-      gen(src[0]); // cond
-      cg.select();
-    } else if (op === AluOp.Threefry2x32) {
-      for (let i = 0; i < 4; i++) gen(src[i]);
-      cg.call(funcs.threefry2x32);
-      if (arg === "xor") cg.i32.xor();
-      else if (arg === 0) cg.drop();
-      else if (arg === 1) {
-        const local = cg.local.declare(cg.i32);
-        cg.local.set(local);
-        cg.drop();
-        cg.local.get(local);
-      } else throw new UnsupportedOpError(op, dtype, "wasm", arg);
-    } else if (op === AluOp.Const) {
-      return dty(cg, op, dtype).const(arg as number);
-    } else if (op === AluOp.Special) {
-      return cg.local.get(ctx[arg[0] as string]);
-    } else if (op === AluOp.Variable) {
-      return cg.local.get(ctx[arg as string]);
-    } else if (op === AluOp.GlobalIndex) {
-      const [gid, len] = arg as [number, number];
-      gen(src[0]);
+  translateExpCore(cg, funcs, exp, {
+    getVariable: (name) => ctx[name],
+    handleGlobalIndex: (cg, gen, gid, len, indexExp, dtype) => {
+      gen(indexExp);
 
       // If value is out-of-bounds, just set it to be zero.
       // This extra bounds-check is needed in Wasm because otherwise we will get
@@ -1926,25 +1867,18 @@ function translateExp(
       const local = cg.local.declare(cg.i32);
       cg.local.tee(local);
       cg.i32.const(0);
-      (cg.local.get(local), cg.i32.const(len), cg.i32.lt_u());
+      cg.local.get(local);
+      cg.i32.const(len);
+      cg.i32.lt_u();
       cg.select();
 
       cg.i32.const(byteWidth(dtype));
       cg.i32.mul();
       cg.local.get(gid); // base offset of array
       cg.i32.add();
-      dty(cg, op, dtype).load(Math.log2(byteWidth(dtype)));
-    } else throw new UnsupportedOpError(op, dtype, "wasm");
-
-    if ((references.get(exp) ?? 0) > 1) {
-      const local = cg.local.declare(dty(cg, op, dtype));
-      cg.local.tee(local);
-      expContext.set(exp, local);
-    }
-  };
-
-  countReferences(exp);
-  gen(exp);
+      dty(cg, AluOp.GlobalIndex, dtype).load(Math.log2(byteWidth(dtype)));
+    },
+  });
 }
 
 function dty(cg: CodeGenerator, op: AluOp | null, dtype: DType) {
