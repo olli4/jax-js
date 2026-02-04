@@ -2373,7 +2373,7 @@ describe("scan autodiff", () => {
    * ============================================================================
    */
   describe("KNOWN LIMITATIONS (pass = limitation exists, fail = limitation fixed)", () => {
-    it("WebGPU: Cholesky in scan body uses fallback instead of fused", async () => {
+    it("WebGPU: Cholesky in scan body uses fused (batched-scan)", async () => {
       const availableDevices = await init();
       if (!availableDevices.includes("webgpu")) {
         // Skip on non-WebGPU environments
@@ -2388,17 +2388,23 @@ describe("scan autodiff", () => {
       });
 
       try {
-        const step = (carry: np.Array, _x: np.Array): [np.Array, np.Array] => {
-          const L = lax.linalg.cholesky(carry);
-          const reconstructed = np.matmul(L.ref, L.transpose());
-          return [reconstructed, L];
+        // Simple body with just Cholesky (single routine step)
+        const step = (carry: np.Array, x: np.Array): [np.Array, np.Array] => {
+          const L = lax.linalg.cholesky(x.ref);
+          return [L.ref, L];
         };
 
-        const initCarry = np.array([
-          [4.0, 2.0],
-          [2.0, 5.0],
+        const initCarry = np.eye(2);
+        const xs = np.array([
+          [
+            [4.0, 2.0],
+            [2.0, 5.0],
+          ],
+          [
+            [5.0, 3.0],
+            [3.0, 6.0],
+          ],
         ]);
-        const xs = np.array([[1.0], [1.0], [1.0]]);
 
         const f = jit(() => lax.scan(step, initCarry, xs));
         const [carry, ys] = f();
@@ -2406,13 +2412,8 @@ describe("scan autodiff", () => {
         await ys.data();
         f.dispose();
 
-        // This test PASSES if the limitation still exists (uses fallback)
-        // If this FAILS, the limitation was fixed - update docs!
-        expect(
-          capturedPath,
-          "🎉 LIMITATION FIXED! Cholesky now uses fused. " +
-            "Please update .github/copilot-instructions.md and convert this to a normal test.",
-        ).not.toBe("fused");
+        // Cholesky now uses fused path via batched-scan
+        expect(capturedPath).toBe("fused");
       } finally {
         setScanPathCallback(null);
       }

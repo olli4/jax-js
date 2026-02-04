@@ -336,10 +336,12 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     const scanInfo = {
       numConsts: 0,
       numCarry: 1, // carry_in
-      numX: 1, // x
-      numY: 1, // y (carry_out is carry)
-      numInputs: 2,
-      numOutputs: 2,
+      // Routine inputs: [carry_in=0, x=1]
+      // With numConsts=0, numCarry=1: JitId 0 is carry, JitId 1 is xs
+      routineInputJitIds: [0, 1], // binding 0 → carry, binding 1 → xs
+      // Routine outputs: [carry_out=0, y=1]
+      // With numCarry=1: output 0 is carry, output 1 is ys
+      routineOutputJitIds: [0, 1], // binding 0 → carry, binding 1 → ys
     };
 
     const wrapped = wrapRoutineForScan(mockShader, scanInfo);
@@ -356,8 +358,11 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     if (!wrapped.code.includes("x_offset")) {
       throw new Error("Missing x_offset");
     }
-    if (!wrapped.code.includes("y_offset")) {
-      throw new Error("Missing y_offset");
+
+    // ys are handled via copy-after-iteration, not offset-based writes
+    // So y_offset should NOT be present
+    if (wrapped.code.includes("y_offset")) {
+      throw new Error("y should not have offset (uses copy-after-iteration)");
     }
 
     // carry_in and carry_out should NOT have offsets
@@ -368,12 +373,14 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
       throw new Error("carry_out should not have offset");
     }
 
-    // Verify x and y accesses are transformed
+    // Verify x accesses are transformed
     if (!wrapped.code.includes("x[x_offset +")) {
       throw new Error("x accesses should be transformed");
     }
-    if (!wrapped.code.includes("y[y_offset +")) {
-      throw new Error("y accesses should be transformed");
+
+    // y accesses should NOT be transformed (no offset)
+    if (wrapped.code.includes("y[y_offset +")) {
+      throw new Error("y accesses should NOT be transformed");
     }
 
     // Verify carry accesses are NOT transformed (should still have original form)
@@ -384,7 +391,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
       throw new Error("carry_out access should NOT be transformed");
     }
 
-    console.log("✓ Shader wrapping correctly identifies xs/ys vs carry");
+    console.log("✓ Shader wrapping correctly identifies xs vs carry (ys use copy-after-iteration)");
   }),
 });
 
@@ -721,10 +728,10 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     const scanInfo = {
       numConsts: 0,
       numCarry: 1,
-      numX: 1,
-      numY: 1,
-      numInputs: 2,
-      numOutputs: 2,
+      // Routine inputs: [carry_in=0, x=1]
+      routineInputJitIds: [0, 1], // binding 0 → carry, binding 1 → xs
+      // Routine outputs: [carry_out=0, y=1]
+      routineOutputJitIds: [0, 1], // binding 0 → carry, binding 1 → ys
     };
 
     const wrapped = wrapRoutineForScan(mockShader, scanInfo);

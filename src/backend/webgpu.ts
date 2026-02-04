@@ -133,6 +133,16 @@ export interface BatchedScanParams {
   numConsts: number;
   /** Whether to scan in reverse order. */
   reverse?: boolean;
+  /**
+   * For each routine input binding i, routineInputJitIds[i] is the body jaxpr JitId.
+   * Used to determine which routine bindings are xs (need offset) vs const/carry.
+   */
+  routineInputJitIds: number[];
+  /**
+   * For each routine output binding i, routineOutputJitIds[i] is the body output index.
+   * Used to determine which routine bindings are ys (need offset) vs carry.
+   */
+  routineOutputJitIds: number[];
 }
 
 /** Prepared batched scan with wrapped shaders and offset buffer. */
@@ -562,6 +572,8 @@ export class WebGPUBackend implements Backend {
       numY,
       length,
       reverse,
+      routineInputJitIds,
+      routineOutputJitIds,
     } = params;
 
     // Verify the routine is valid
@@ -578,13 +590,12 @@ export class WebGPUBackend implements Backend {
       return null;
     }
 
+    // Use the actual routine-to-scan mapping for correct binding detection
     const scanInfo: ScanBindingInfo = {
       numConsts,
       numCarry,
-      numX,
-      numY,
-      numInputs: bodyRoutine.data[0]?.numInputs ?? 0,
-      numOutputs: bodyRoutine.data[0]?.numOutputs ?? 0,
+      routineInputJitIds,
+      routineOutputJitIds,
     };
 
     // Wrap each shader in the routine with offset support
@@ -598,6 +609,10 @@ export class WebGPUBackend implements Backend {
       }
 
       const wrapped = wrapRoutineForScan(shader, scanInfo);
+      if (DEBUG >= 2) {
+        console.log("Wrapped shader code:", wrapped.code.substring(0, 500));
+        console.log("Wrapped hasUniform:", wrapped.hasUniform);
+      }
       if (!wrapped.hasUniform) {
         // No bindings need offsets, fall back
         if (DEBUG >= 2)
@@ -672,7 +687,14 @@ export class WebGPUBackend implements Backend {
     ysStackedSlots: Slot[],
   ): void {
     const { params, wrappedShaders, offsetBuffer, offsetAlignment } = prepared;
-    const { length, carrySizes, numCarry, numX, numY, numConsts } = params;
+    const {
+      length,
+      carrySizes,
+      numCarry,
+      numConsts,
+      routineInputJitIds,
+      routineOutputJitIds,
+    } = params;
 
     const constBuffers = constSlots.map((slot) => this.#getBuffer(slot).buffer);
     const initCarryBuffers = initCarrySlots.map(
@@ -703,17 +725,20 @@ export class WebGPUBackend implements Backend {
       );
     }
 
-    // Create bind groups for each shader with full buffer bindings
-    // The uniform offset buffer uses dynamic offsets per iteration
-    for (const shader of wrappedShaders) {
-      const { pipeline, numInputs: _numInputs, passes } = shader;
+    // Threshold for classifying JitIds
+    const xsStart = numConsts + numCarry;
 
-      // Build storage buffer entries (group 0)
-      // Layout: inputs = [consts..., carry_in..., x...], outputs = [carry_out..., y...]
+    // Create bind groups for each shader with buffer bindings
+    // matching the routine's ACTUAL binding layout (not scan layout)
+    for (const shader of wrappedShaders) {
+      const { pipeline, passes } = shader;
 
       // Create bind groups for ping and pong configurations
       // Even iterations: read from carryPing, write to carryPong
       // Odd iterations: read from carryPong, write to carryPing
+      //
+      // The bind group entries must match the routine shader's binding layout,
+      // which is determined by routineInputJitIds and routineOutputJitIds.
 
       const createStorageBindGroup = (
         readCarry: GPUBuffer[],
@@ -722,45 +747,61 @@ export class WebGPUBackend implements Backend {
         const entries: GPUBindGroupEntry[] = [];
         let binding = 0;
 
-        // Inputs: [consts..., carry_in..., x...]
-        // Constants (same buffer each iteration - no offset needed)
-        for (let c = 0; c < numConsts; c++) {
-          entries.push({
-            binding: binding++,
-            resource: { buffer: constBuffers[c] },
+        if (DEBUG >= 2) {
+          console.log("createStorageBindGroup:", {
+            numConsts,
+            numCarry,
+            xsStart,
+            routineInputJitIds,
+            routineOutputJitIds,
+            constBuffers: constBuffers.length,
+            xsBuffers: xsBuffers.length,
+            readCarry: readCarry.length,
+            writeCarry: writeCarry.length,
+            ysStackedBuffers: ysStackedBuffers.length,
           });
         }
 
-        // Carry inputs (read from ping or pong)
-        for (let c = 0; c < numCarry; c++) {
+        // Input bindings: for each routine input, determine its scan buffer
+        for (let i = 0; i < routineInputJitIds.length; i++) {
+          const jitId = routineInputJitIds[i];
+          let buffer: GPUBuffer;
+
+          if (jitId < numConsts) {
+            // Constant input
+            buffer = constBuffers[jitId];
+          } else if (jitId < xsStart) {
+            // Carry input - use ping/pong
+            const carryIdx = jitId - numConsts;
+            buffer = readCarry[carryIdx];
+          } else {
+            // Xs input - needs offset (handled by uniform)
+            const xIdx = jitId - xsStart;
+            buffer = xsBuffers[xIdx];
+          }
+
           entries.push({
             binding: binding++,
-            resource: { buffer: readCarry[c] },
+            resource: { buffer },
           });
         }
 
-        // Xs inputs (full buffers - offsets handled by uniform)
-        for (let x = 0; x < numX; x++) {
-          entries.push({
-            binding: binding++,
-            resource: { buffer: xsBuffers[x] },
-          });
-        }
+        // Output bindings: for each routine output, determine its scan buffer
+        // In the MVP (numCarry === numY, passthrough pattern), all routine outputs
+        // go to carry (ping-pong buffers). The ys are copied from carry after dispatch.
+        for (let i = 0; i < routineOutputJitIds.length; i++) {
+          // In passthrough pattern, routine output i → carry output i
+          const buffer = writeCarry[i];
+          if (!buffer) {
+            throw new Error(
+              `Batched scan: routine output ${i} has no corresponding carry buffer ` +
+                `(writeCarry.length=${writeCarry.length})`,
+            );
+          }
 
-        // Outputs: [carry_out..., y...]
-        // Carry outputs (write)
-        for (let c = 0; c < numCarry; c++) {
           entries.push({
             binding: binding++,
-            resource: { buffer: writeCarry[c] },
-          });
-        }
-
-        // Ys outputs (full buffers - offsets handled by uniform)
-        for (let y = 0; y < numY; y++) {
-          entries.push({
-            binding: binding++,
-            resource: { buffer: ysStackedBuffers[y] },
+            resource: { buffer },
           });
         }
 
@@ -773,36 +814,56 @@ export class WebGPUBackend implements Backend {
       const pingBindGroup = createStorageBindGroup(carryPing, carryPong);
       const pongBindGroup = createStorageBindGroup(carryPong, carryPing);
 
-      // Create uniform bind group for offsets (group 1)
-      // This uses dynamic offsets - one binding, different offset per iteration
-      const uniformBindGroup = this.device.createBindGroup({
-        layout: pipeline.getBindGroupLayout(1),
-        entries: [
-          {
-            binding: 0,
-            resource: {
-              buffer: offsetBuffer,
-              offset: 0,
-              size: offsetAlignment, // Size of one iteration's offsets
-            },
-          },
-        ],
-      });
+      // Create uniform bind groups for each iteration
+      // Dynamic uniform offsets require explicit hasDynamicOffset in bind group layout,
+      // which isn't supported with layout: "auto". So we create separate bind groups.
+      const uniformBindGroups: GPUBindGroup[] = [];
+      for (let iter = 0; iter < length; iter++) {
+        const iterOffset = iter * offsetAlignment;
+        uniformBindGroups.push(
+          this.device.createBindGroup({
+            layout: pipeline.getBindGroupLayout(1),
+            entries: [
+              {
+                binding: 0,
+                resource: {
+                  buffer: offsetBuffer,
+                  offset: iterOffset,
+                  size: offsetAlignment,
+                },
+              },
+            ],
+          }),
+        );
+      }
 
       // Dispatch all iterations
       const filteredPasses = passes.filter(({ grid }) => prod(grid) > 0);
 
       for (let iter = 0; iter < length; iter++) {
         const storageBindGroup = iter % 2 === 0 ? pingBindGroup : pongBindGroup;
-        const dynamicOffset = iter * offsetAlignment;
 
         for (const { grid } of filteredPasses) {
           const passEncoder = commandEncoder.beginComputePass();
           passEncoder.setPipeline(pipeline);
           passEncoder.setBindGroup(0, storageBindGroup);
-          passEncoder.setBindGroup(1, uniformBindGroup, [dynamicOffset]);
+          passEncoder.setBindGroup(1, uniformBindGroups[iter]);
           passEncoder.dispatchWorkgroups(grid[0], grid[1]);
           passEncoder.end();
+        }
+
+        // Copy carry → ys for this iteration (passthrough pattern)
+        // The routine wrote to writeCarry, which is carryPong (even iter) or carryPing (odd iter)
+        const currentCarryBuffers = iter % 2 === 0 ? carryPong : carryPing;
+        for (let c = 0; c < numCarry; c++) {
+          const yOffset = iter * carrySizes[c]; // Offset in ysStackedBuffers
+          commandEncoder.copyBufferToBuffer(
+            currentCarryBuffers[c],
+            0,
+            ysStackedBuffers[c],
+            yOffset,
+            carrySizes[c],
+          );
         }
       }
     }

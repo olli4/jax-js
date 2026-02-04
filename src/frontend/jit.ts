@@ -1753,6 +1753,9 @@ function tryPrepareBatchedScan(
     numY,
     numConsts,
     reverse,
+    // Include the actual routine input/output mappings for correct binding detection
+    routineInputJitIds: execStep.inputs,
+    routineOutputJitIds: execStep.outputs,
   };
 
   try {

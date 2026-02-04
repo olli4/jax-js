@@ -143,18 +143,21 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
       const scanInfo: ScanBindingInfo = {
         numConsts: 0,
         numCarry: 1, // carry_in is carry
-        numX: 1, // x is xs
-        numY: 1, // y is ys (carry_out is carry)
-        numInputs: 2,
-        numOutputs: 2,
+        // Routine inputs: [carry_in=0, x=1] - JitIds in body jaxpr order
+        // With numConsts=0, numCarry=1: JitId 0 is carry, JitId 1 is xs
+        routineInputJitIds: [0, 1], // binding 0 → carry, binding 1 → xs
+        // Routine outputs: [carry_out=0, y=1] - output indices
+        // With numCarry=1: output 0 is carry, output 1 is ys
+        routineOutputJitIds: [0, 1], // binding 0 → carry, binding 1 → ys
       };
 
       const result = wrapRoutineForScan(shaderInfo, scanInfo);
 
-      // Should add struct with ONLY x and y offsets (not carry)
+      // Should add struct with ONLY x offset (not carry or y)
+      // ys are handled via copy-after-iteration, not offset-based writes
       expect(result.code).toContain("struct ScanOffsets");
       expect(result.code).toContain("x_offset: u32");
-      expect(result.code).toContain("y_offset: u32");
+      expect(result.code).not.toContain("y_offset");
       expect(result.code).not.toContain("carry_in_offset");
       expect(result.code).not.toContain("carry_out_offset");
 
@@ -163,11 +166,11 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
         "@group(1) @binding(0) var<uniform> scan_offsets: ScanOffsets",
       );
 
-      // Should transform ONLY x and y array accesses
+      // Should transform ONLY x array accesses
       expect(result.code).toContain("x[x_offset + (idx)]");
-      expect(result.code).toContain("y[y_offset + (idx)]");
 
-      // Carry accesses should be UNCHANGED
+      // Y and carry accesses should be UNCHANGED
+      expect(result.code).toContain("y[idx]");
       expect(result.code).toContain("carry_in[idx]");
       expect(result.code).toContain("carry_out[idx]");
 
@@ -195,10 +198,10 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
       const scanInfo: ScanBindingInfo = {
         numConsts: 0,
         numCarry: 1,
-        numX: 0, // No xs
-        numY: 0, // No ys (carry_out is all carry)
-        numInputs: 1,
-        numOutputs: 1,
+        // Routine has 1 input (carry) and 1 output (carry)
+        // JitId 0 = carry input (< numCarry), output 0 = carry output (< numCarry)
+        routineInputJitIds: [0], // binding 0 → carry
+        routineOutputJitIds: [0], // binding 0 → carry
       };
 
       const result = wrapRoutineForScan(shaderInfo, scanInfo);

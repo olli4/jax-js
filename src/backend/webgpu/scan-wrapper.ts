@@ -28,14 +28,25 @@ export interface BufferBinding {
   type: string; // e.g., "f32", "i32", "vec4<f32>"
 }
 
-/** Scan signature metadata - which bindings need offsets */
+/**
+ * Mapping from routine binding index to scan buffer classification.
+ *
+ * For inputs: a JitId in [0, numConsts) is const, [numConsts, numConsts+numCarry) is carry, rest is xs.
+ * For outputs: a JitId in [0, numCarry) is carry, rest is ys.
+ */
 export interface ScanBindingInfo {
   numConsts: number;
   numCarry: number;
-  numX: number;
-  numY: number;
-  numInputs: number; // total inputs
-  numOutputs: number; // total outputs
+  /**
+   * For each routine input binding i, routineInputJitIds[i] gives the body jaxpr JitId.
+   * This allows determining if binding i is const/carry/xs.
+   */
+  routineInputJitIds: number[];
+  /**
+   * For each routine output binding i, routineOutputJitIds[i] gives the body output index.
+   * This allows determining if binding i is carry/ys.
+   */
+  routineOutputJitIds: number[];
 }
 
 /**
@@ -60,28 +71,43 @@ export function parseBufferBindings(code: string): BufferBinding[] {
 }
 
 /**
- * Identify which bindings need offsets based on scan signature.
+ * Identify which bindings need offsets based on routine-to-scan mapping.
+ *
+ * Uses the routineInputJitIds and routineOutputJitIds to determine which
+ * routine bindings correspond to xs/ys (need offsets) vs const/carry (no offset).
  */
 function getOffsetBindings(
   bindings: BufferBinding[],
   scanInfo: ScanBindingInfo,
 ): { xsBindings: BufferBinding[]; ysBindings: BufferBinding[] } {
-  // Sort by binding number
+  // Sort by binding number to get ordered list
   const sorted = [...bindings].sort((a, b) => a.binding - b.binding);
 
   // Separate inputs (read) and outputs (read_write)
   const inputs = sorted.filter((b) => b.access === "read");
-  const outputs = sorted.filter((b) => b.access === "read_write");
+  // Note: outputs not used - ys are filled via copy-after-iteration, not offset-based writes
+  const _outputs = sorted.filter((b) => b.access === "read_write");
 
-  // XS bindings are inputs after consts and carry
+  const xsBindings: BufferBinding[] = [];
+  const ysBindings: BufferBinding[] = [];
+
   const xsStart = scanInfo.numConsts + scanInfo.numCarry;
-  const xsBindings = inputs.slice(xsStart, xsStart + scanInfo.numX);
 
-  // YS bindings are outputs after carry
-  const ysBindings = outputs.slice(
-    scanInfo.numCarry,
-    scanInfo.numCarry + scanInfo.numY,
-  );
+  // Check each input binding - if its JitId >= xsStart, it's an xs input (needs offset)
+  for (let i = 0; i < inputs.length; i++) {
+    if (i < scanInfo.routineInputJitIds.length) {
+      const jitId = scanInfo.routineInputJitIds[i];
+      if (jitId >= xsStart) {
+        xsBindings.push(inputs[i]);
+      }
+    }
+  }
+
+  // For compiled-body scan with passthrough pattern:
+  // - Routine outputs go to ping-pong carry buffers (no offset needed)
+  // - ys are filled by copying from carry after each iteration
+  // So we never add output offsets here.
+  // The ysBindings array stays empty.
 
   return { xsBindings, ysBindings };
 }
@@ -167,12 +193,13 @@ export function transformArrayAccesses(
 
 /**
  * Find the start of the main() function body.
- * Handles various WGSL main function signatures.
+ * Handles various WGSL main function signatures, including multi-line.
  */
 function findMainBodyStart(code: string): number {
   // Match fn main with various parameter patterns, ending with {
-  // Use .* to handle nested parens in @builtin(global_invocation_id) etc.
-  const mainMatch = code.match(/fn\s+main\s*\(.*\)\s*(?:->[\s\S]*?)?\{/);
+  // Use [\s\S]*? to handle newlines in multi-line function signatures
+  // E.g.: fn main(\n  @builtin(workgroup_id) ...,\n  ...\n) {
+  const mainMatch = code.match(/fn\s+main\s*\([\s\S]*?\)\s*(?:->[\s\S]*?)?\{/);
   if (!mainMatch || mainMatch.index === undefined) {
     throw new Error("Could not find main() function in shader");
   }
