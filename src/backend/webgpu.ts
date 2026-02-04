@@ -870,6 +870,91 @@ export class WebGPUBackend implements Backend {
   }
 }
 
+// ============================================================================
+// Shared WGSL codegen helpers
+// ============================================================================
+
+/**
+ * Translate a binary/unary AluOp to WGSL code.
+ *
+ * This is a shared helper used by both regular kernel codegen and scan codegen.
+ * Returns the WGSL expression string, or undefined if the op is not handled.
+ *
+ * @param op The AluOp to translate
+ * @param srcs Source expression strings (already generated)
+ * @param dtype The result dtype
+ * @param srcDtype The dtype of the first source operand (for comparisons)
+ */
+function translateAluOpToWgsl(
+  op: AluOp,
+  srcs: string[],
+  dtype: DType,
+  srcDtype?: DType,
+): string | undefined {
+  const [a, b, c] = srcs;
+
+  // Binary ops
+  if (op === AluOp.Add) {
+    if (dtype === DType.Bool) return `(${a} || ${b})`;
+    return `(${a} + ${b})`;
+  }
+  if (op === AluOp.Sub) return `(${a} - ${b})`;
+  if (op === AluOp.Mul) {
+    if (dtype === DType.Bool) return `(${a} && ${b})`;
+    return `(${a} * ${b})`;
+  }
+  if (op === AluOp.Idiv) {
+    return isFloatDtype(dtype) ? `trunc(${a} / ${b})` : `(${a} / ${b})`;
+  }
+  if (op === AluOp.Mod) return `(${a} % ${b})`;
+  if (op === AluOp.Min) {
+    if (dtype === DType.Bool) return `(${a} && ${b})`;
+    return `min(${strip1(a)}, ${strip1(b)})`;
+  }
+  if (op === AluOp.Max) {
+    if (dtype === DType.Bool) return `(${a} || ${b})`;
+    return `max(${strip1(a)}, ${strip1(b)})`;
+  }
+
+  // Comparison ops
+  if (op === AluOp.Cmplt) return `(${a} < ${b})`;
+  // Note: Cmpne has special NaN handling in the regular path, not here
+
+  // Unary ops
+  if (op === AluOp.Sin) return `sin(${strip1(a)})`;
+  if (op === AluOp.Cos) return `cos(${strip1(a)})`;
+  if (op === AluOp.Asin) return `asin(${strip1(a)})`;
+  if (op === AluOp.Atan) return `atan(${strip1(a)})`;
+  if (op === AluOp.Exp) return `exp(${strip1(a)})`;
+  if (op === AluOp.Log) return `log(${strip1(a)})`;
+  if (op === AluOp.Sqrt) return `sqrt(${strip1(a)})`;
+  if (op === AluOp.Reciprocal) return `(1.0 / ${a})`;
+  if (op === AluOp.Floor) return `floor(${strip1(a)})`;
+  if (op === AluOp.Ceil) return `ceil(${strip1(a)})`;
+  if (op === AluOp.Cast) return `${dtypeToWgsl(dtype)}(${strip1(a)})`;
+  if (op === AluOp.Bitcast) return `bitcast<${dtypeToWgsl(dtype)}>(${strip1(a)})`;
+
+  // Ternary
+  if (op === AluOp.Where) {
+    // select(f, t, cond) -> cond ? t : f
+    return `select(${strip1(c)}, ${strip1(b)}, ${strip1(a)})`;
+  }
+
+  return undefined;
+}
+
+/**
+ * Translate Erf/Erfc with f32 precision wrapper.
+ */
+function translateErfToWgsl(op: AluOp, a: string, dtype: DType): string {
+  const funcName = op === AluOp.Erf ? "erf" : "erfc";
+  if (dtype !== DType.Float32) {
+    // Always compute special functions in f32 for precision.
+    return `${dtypeToWgsl(dtype)}(${funcName}(f32(${strip1(a)})))`;
+  }
+  return `${funcName}(${strip1(a)})`;
+}
+
 /**
  * Compiles an expression into WebGPU shader source code.
  *
@@ -1002,80 +1087,9 @@ function pipelineSource(device: GPUDevice, kernel: Kernel): ShaderInfo {
 
     // Some of these cases early `return` to force-inline them.
     let source = "";
-    if (AluGroup.Binary.has(op) || AluGroup.Compare.has(op)) {
-      const a = gen(src[0]);
-      const b = gen(src[1]);
-      if (op === AluOp.Add) {
-        if (dtype === DType.Bool) source = `(${a} || ${b})`;
-        else source = `(${a} + ${b})`;
-      } else if (op === AluOp.Sub) source = `(${a} - ${b})`;
-      else if (op === AluOp.Mul) {
-        if (dtype === DType.Bool) source = `(${a} && ${b})`;
-        else source = `(${a} * ${b})`;
-      } else if (op === AluOp.Idiv)
-        source = isFloatDtype(dtype) ? `trunc(${a} / ${b})` : `(${a} / ${b})`;
-      else if (op === AluOp.Mod) source = `(${a} % ${b})`;
-      else if (op === AluOp.Min) {
-        if (dtype === DType.Bool) source = `(${a} && ${b})`;
-        else source = `min(${strip1(a)}, ${strip1(b)})`;
-      } else if (op === AluOp.Max) {
-        if (dtype === DType.Bool) source = `(${a} || ${b})`;
-        else source = `max(${strip1(a)}, ${strip1(b)})`;
-      } else if (op === AluOp.Cmplt) source = `(${a} < ${b})`;
-      else if (op === AluOp.Cmpne) {
-        // Edge case: WebGPU doesn't handle NaN correctly, it's unspecified.
-        // This is a reliable way I found to detect NaNs, since the spec says
-        // for `max()`: if one operand is a NaN, the other is returned.
-        if (isFloatDtype(src[0].dtype)) {
-          const x = isGensym(a) ? a : gensym();
-          if (x !== a) emit(`let ${x} = ${a};`);
-          source = `(${x} != ${b} || min(${x}, ${dtypeToWgsl(src[0].dtype)}(inf())) != ${x})`;
-        } else {
-          source = `(${a} != ${b})`;
-        }
-      }
-    } else if (AluGroup.Unary.has(op)) {
-      if (op === AluOp.Reciprocal && src[0].op === AluOp.Sqrt) {
-        // Special case: 1/sqrt(x) is optimized as rsqrt(x)
-        const a = gen(src[0].src[0]);
-        source = `inverseSqrt(${a})`;
-      } else {
-        const a = gen(src[0]);
-        if (op === AluOp.Sin) source = `sin(${strip1(a)})`;
-        else if (op === AluOp.Cos) source = `cos(${strip1(a)})`;
-        else if (op === AluOp.Asin) source = `asin(${strip1(a)})`;
-        else if (op === AluOp.Atan) source = `atan(${strip1(a)})`;
-        else if (op === AluOp.Exp) source = `exp(${strip1(a)})`;
-        else if (op === AluOp.Log) source = `log(${strip1(a)})`;
-        else if (op === AluOp.Erf || op === AluOp.Erfc) {
-          const funcName = op === AluOp.Erf ? "erf" : "erfc";
-          if (dtype !== DType.Float32) {
-            // Always compute special functions in f32 for precision.
-            source = `${dtypeToWgsl(dtype)}(${funcName}(f32(${strip1(a)})))`;
-          } else {
-            source = `${funcName}(${strip1(a)})`;
-          }
-        } else if (op === AluOp.Sqrt) source = `sqrt(${strip1(a)})`;
-        else if (op === AluOp.Reciprocal) source = `(1.0 / ${a})`;
-        else if (op === AluOp.Floor) source = `floor(${strip1(a)})`;
-        else if (op === AluOp.Ceil) source = `ceil(${strip1(a)})`;
-        else if (op === AluOp.Cast)
-          source = `${dtypeToWgsl(dtype)}(${strip1(a)})`;
-        else if (op === AluOp.Bitcast)
-          source = `bitcast<${dtypeToWgsl(dtype)}>(${strip1(a)})`;
-      }
-    } else if (op === AluOp.Where) {
-      // select(f, t, cond) -> cond ? t : f
-      source = `select(${strip1(gen(src[2]))}, ${strip1(gen(src[1]))}, ${strip1(gen(src[0]))})`;
-    } else if (op === AluOp.Threefry2x32) {
-      const x = gensym(); // temporary to hold the `vec2<u32>(x0, x1)`
-      const [k0, k1, c0, c1] = src.map((x) => strip1(gen(x)));
-      emit(`let ${x} = threefry2x32(vec2(${k0}, ${k1}), vec2(${c0}, ${c1}));`);
-      if (arg === "xor") source = `(${x}.x ^ ${x}.y)`;
-      else if (arg === 0) source = `${x}.x`;
-      else if (arg === 1) source = `${x}.y`;
-      else throw new UnsupportedOpError(op, dtype, "webgpu", arg);
-    } else if (op === AluOp.Const) {
+
+    // Handle special cases first
+    if (op === AluOp.Const) {
       return constToWgsl(dtype, arg);
     } else if (op === AluOp.Special) {
       return arg[0] as string;
@@ -1084,6 +1098,42 @@ function pipelineSource(device: GPUDevice, kernel: Kernel): ShaderInfo {
     } else if (op === AluOp.GlobalIndex) {
       source = `${args[arg[0]]}[${strip1(gen(src[0]))}]`;
       if (dtype === DType.Bool) source = `(${source} != 0)`; // bool is represented as i32
+    } else if (op === AluOp.Threefry2x32) {
+      // PRNG: Threefry2x32 requires special emission
+      const x = gensym();
+      const [k0, k1, c0, c1] = src.map((x) => strip1(gen(x)));
+      emit(`let ${x} = threefry2x32(vec2(${k0}, ${k1}), vec2(${c0}, ${c1}));`);
+      if (arg === "xor") source = `(${x}.x ^ ${x}.y)`;
+      else if (arg === 0) source = `${x}.x`;
+      else if (arg === 1) source = `${x}.y`;
+      else throw new UnsupportedOpError(op, dtype, "webgpu", arg);
+    } else if (op === AluOp.Reciprocal && src[0].op === AluOp.Sqrt) {
+      // Special case: 1/sqrt(x) is optimized as rsqrt(x)
+      const a = gen(src[0].src[0]);
+      source = `inverseSqrt(${a})`;
+    } else if (op === AluOp.Cmpne) {
+      // Special NaN handling for float comparisons
+      const a = gen(src[0]);
+      const b = gen(src[1]);
+      if (isFloatDtype(src[0].dtype)) {
+        const x = isGensym(a) ? a : gensym();
+        if (x !== a) emit(`let ${x} = ${a};`);
+        source = `(${x} != ${b} || min(${x}, ${dtypeToWgsl(src[0].dtype)}(inf())) != ${x})`;
+      } else {
+        source = `(${a} != ${b})`;
+      }
+    } else if (op === AluOp.Erf || op === AluOp.Erfc) {
+      const a = gen(src[0]);
+      source = translateErfToWgsl(op, a, dtype);
+    } else if (AluGroup.Binary.has(op) || AluGroup.Compare.has(op)) {
+      const a = gen(src[0]);
+      const b = gen(src[1]);
+      source = translateAluOpToWgsl(op, [a, b], dtype, src[0].dtype) ?? "";
+    } else if (AluGroup.Unary.has(op)) {
+      const a = gen(src[0]);
+      source = translateAluOpToWgsl(op, [a], dtype) ?? "";
+    } else if (op === AluOp.Where) {
+      source = translateAluOpToWgsl(op, [gen(src[0]), gen(src[1]), gen(src[2])], dtype) ?? "";
     }
 
     if (!source) throw new UnsupportedOpError(op, dtype, "webgpu", arg);
@@ -1466,6 +1516,7 @@ function genScanExpressionWithRidx(
   const gen = (e: AluExp): string => {
     const { op, src, dtype: eDtype, arg } = e;
 
+    // Handle scan-specific GlobalIndex classification
     if (op === AluOp.GlobalIndex) {
       // arg[0] = buffer index (gid), src[0] = element index expression
       const gid = arg[0] as number;
@@ -1505,61 +1556,25 @@ function genScanExpressionWithRidx(
       return arg as string;
     }
 
-    if (op === AluOp.Add) {
-      if (eDtype === DType.Bool) return `(${gen(src[0])} || ${gen(src[1])})`;
-      return `(${gen(src[0])} + ${gen(src[1])})`;
+    // Erf/Erfc with f32 precision wrapper (not in shared helper)
+    if (op === AluOp.Erf || op === AluOp.Erfc) {
+      return translateErfToWgsl(op, gen(src[0]), eDtype);
     }
-    if (op === AluOp.Sub) {
-      return `(${gen(src[0])} - ${gen(src[1])})`;
+
+    // Try shared helper for binary, unary, and ternary ops
+    if (AluGroup.Binary.has(op) || AluGroup.Compare.has(op)) {
+      const result = translateAluOpToWgsl(op, [gen(src[0]), gen(src[1])], eDtype, src[0].dtype);
+      if (result) return result;
     }
-    if (op === AluOp.Mul) {
-      if (eDtype === DType.Bool) return `(${gen(src[0])} && ${gen(src[1])})`;
-      return `(${gen(src[0])} * ${gen(src[1])})`;
+
+    if (AluGroup.Unary.has(op)) {
+      const result = translateAluOpToWgsl(op, [gen(src[0])], eDtype);
+      if (result) return result;
     }
-    if (op === AluOp.Min) {
-      if (eDtype === DType.Bool) return `(${gen(src[0])} && ${gen(src[1])})`;
-      return `min(${strip1(gen(src[0]))}, ${strip1(gen(src[1]))})`;
-    }
-    if (op === AluOp.Max) {
-      if (eDtype === DType.Bool) return `(${gen(src[0])} || ${gen(src[1])})`;
-      return `max(${strip1(gen(src[0]))}, ${strip1(gen(src[1]))})`;
-    }
-    if (op === AluOp.Reciprocal) {
-      return `(1.0 / ${gen(src[0])})`;
-    }
-    if (op === AluOp.Sqrt) {
-      return `sqrt(${gen(src[0])})`;
-    }
-    if (op === AluOp.Cast) {
-      return `${dtypeToWgsl(eDtype)}(${strip1(gen(src[0]))})`;
-    }
+
     if (op === AluOp.Where) {
-      return `select(${strip1(gen(src[2]))}, ${strip1(gen(src[1]))}, ${strip1(gen(src[0]))})`;
-    }
-    if (op === AluOp.Cmplt) {
-      return `(${gen(src[0])} < ${gen(src[1])})`;
-    }
-    if (op === AluOp.Cmpne) {
-      return `(${gen(src[0])} != ${gen(src[1])})`;
-    }
-    if (op === AluOp.Idiv) {
-      return isFloatDtype(eDtype)
-        ? `trunc(${gen(src[0])} / ${gen(src[1])})`
-        : `(${gen(src[0])} / ${gen(src[1])})`;
-    }
-    if (op === AluOp.Mod) {
-      return `(${gen(src[0])} % ${gen(src[1])})`;
-    }
-    if (op === AluOp.Sin) return `sin(${strip1(gen(src[0]))})`;
-    if (op === AluOp.Cos) return `cos(${strip1(gen(src[0]))})`;
-    if (op === AluOp.Asin) return `asin(${strip1(gen(src[0]))})`;
-    if (op === AluOp.Atan) return `atan(${strip1(gen(src[0]))})`;
-    if (op === AluOp.Exp) return `exp(${strip1(gen(src[0]))})`;
-    if (op === AluOp.Log) return `log(${strip1(gen(src[0]))})`;
-    if (op === AluOp.Floor) return `floor(${strip1(gen(src[0]))})`;
-    if (op === AluOp.Ceil) return `ceil(${strip1(gen(src[0]))})`;
-    if (op === AluOp.Bitcast) {
-      return `bitcast<${dtypeToWgsl(eDtype)}>(${strip1(gen(src[0]))})`;
+      const result = translateAluOpToWgsl(op, [gen(src[0]), gen(src[1]), gen(src[2])], eDtype);
+      if (result) return result;
     }
 
     throw new Error(`genScanExpressionWithRidx: unsupported op ${AluOp[op]}`);

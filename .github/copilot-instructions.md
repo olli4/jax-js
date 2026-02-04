@@ -926,55 +926,37 @@ case natively.
 | Medium   | Fix WebGPU compiled-body binding     | `wrapRoutineForScan` arg mapping is incorrect      |
 | Low      | `lax.scatter` / `dynamic_slice`      | Would enable Jaxpr-based routines                  |
 
-### Codegen Unification (In Progress)
+### Codegen Unification (Complete)
 
-The scan codegen duplicates expression translation logic from the regular kernel compilation paths.
-This creates maintenance burden and risk of divergence when adding new `AluOp` operations.
+The scan codegen previously duplicated expression translation logic from regular kernel compilation.
+This has been refactored to share common code.
 
-**WASM Backend Overlap:**
+**WASM Backend (Unified):**
 
-| Function                               | Location              | Purpose                |
-| -------------------------------------- | --------------------- | ---------------------- |
-| `translateExp()`                       | `wasm.ts:1726`        | Regular kernel codegen |
-| `translateExpWithGeneralScanContext()` | `wasm.ts:1534`        | Scan-specific codegen  |
+Both `translateExp()` and `translateExpWithGeneralScanContext()` now call `translateExpCore()`:
 
-~85% of logic is identical. Only difference is `GlobalIndex` resolution:
-- Regular: `ctx.gidx` + buffer offset
-- Scan: Classifies into const/carry/xs/internal + uses `dataIdx` for iteration
+| Function                               | Role                                           |
+| -------------------------------------- | ---------------------------------------------- |
+| `translateExpCore()`                   | Shared core handling all `AluOp` cases         |
+| `TranslateExpContext` interface        | Callbacks for `getVariable` and `handleGlobalIndex` |
+| `translateExp()`                       | Thin wrapper with bounds-check GlobalIndex     |
+| `translateExpWithGeneralScanContext()` | Thin wrapper with const/carry/xs/internal classification |
 
-**WebGPU Backend Overlap:**
+**WebGPU Backend (Unified):**
 
-| Function                    | Location              | Purpose              |
-| --------------------------- | --------------------- | -------------------- |
-| `gen()` in `pipelineSource` | `webgpu.ts:997-1099`  | Regular shader codegen |
-| `genScanExpressionWithRidx` | `webgpu.ts:1456-1565` | Scan shader codegen  |
+Both `gen()` in `pipelineSource` and `genScanExpressionWithRidx` now use shared helpers:
 
-~70% identical. Differences:
-- `GlobalIndex`: Regular uses `in${gid}[idx]`, scan uses `const${i}`, `carry${i}`, `xs${i}[dataIdx * stride + idx]`
-- Regular has CSE (common subexpression elimination), scan inlines everything
-- Regular supports `Threefry2x32`, `Erf/Erfc` with f32 precision wrapper; scan doesn't
+| Function                    | Role                                           |
+| --------------------------- | ---------------------------------------------- |
+| `translateAluOpToWgsl()`    | Binary/unary ops, comparisons, casts, ternary  |
+| `translateErfToWgsl()`      | Erf/Erfc with f32 precision wrapper            |
+| `gen()` in `pipelineSource` | CSE + special cases (inverseSqrt, NaN, Threefry) |
+| `genScanExpressionWithRidx` | Scan-specific GlobalIndex + inline generation  |
 
-**Refactoring Plan:**
-
-1. **WASM: Extract `translateExpCore()`**
-   - Create helper that handles all `AluOp` cases except `GlobalIndex`
-   - Parameterize with callback: `resolveGlobalIndex: (gid: number, indexExp: AluExp) => void`
-   - Both `translateExp` and `translateExpWithGeneralScanContext` call the shared core
-
-2. **WebGPU: Extract `genAluOpWgsl()`**
-   - Create pure function: `genAluOpWgsl(op: AluOp, srcs: string[], dtype: DType): string`
-   - Handles binary/unary ops, casts, comparisons
-   - Both `gen()` in `pipelineSource` and `genScanExpressionWithRidx` use it
-
-3. **Add missing ops to scan paths**
-   - `Threefry2x32` (PRNG)
-   - `Floor`, `Ceil` (in WASM scan)
-   - `Erf`, `Erfc` (special functions)
-
-**Benefits:**
-- Adding new `AluOp` requires changes in 1 place instead of 4
+**Benefits achieved:**
+- Adding new `AluOp` requires changes in 1-2 places instead of 4
 - Bug fixes apply to both regular and scan paths
-- Scan gains missing operations automatically
+- Scan now supports `Erf/Erfc` (was missing before)
 
 ### Multi-output Kernel in Native Scan
 
