@@ -290,6 +290,24 @@ const [finalCarry, stackedOutputs] = await lax.scan(f, initCarry, xs, options);
 
 Use `requirePath: "fused"` in tests to ensure native compilation doesn't regress.
 
+**xs=null and Y=null (jax-js extensions):**
+
+Unlike Python JAX, jax-js supports null inputs and outputs for efficiency:
+
+- **xs=null:** When xs is null, you must provide `length` option. Body receives null as x.
+- **Y=null:** Body can return `[newCarry, null]` to skip output stacking entirely.
+
+```ts
+// xs=null: carry-only scan with no input arrays
+const [carry, ys] = await lax.scan(f, init, null, { length: 100 });
+// f: (carry, null) => [newCarry, y]
+
+// Y=null: skip output stacking (saves memory)
+const [carry, nullYs] = await lax.scan(f, init, xs);
+// f: (carry, x) => [newCarry, null]
+// nullYs is null, not an empty array
+```
+
 **Use cases:**
 
 - Cumulative sum/product
@@ -529,6 +547,16 @@ const [carry, ys] = lax.scan(f, init, null, { length: 100 });
 // Body receives null as second argument: f(carry, null) => [newCarry, y]
 ```
 
+**Y=null to skip output stacking:**
+
+```ts
+// Return null as Y to avoid allocating stacked outputs
+const [carry, nullYs] = lax.scan(f, init, xs);
+// f: (carry, x) => [newCarry, null]
+// nullYs is null, not an empty array - no memory allocated for outputs
+// Useful when you only need the final carry (e.g., Mandelbrot iteration count)
+```
+
 **Body function — borrowed references:**
 
 ```ts
@@ -546,18 +574,19 @@ const f = (carry, x) => {
 const [finalCarry, stackedYs] = lax.scan(f, init, xs);
 // Caller owns these — dispose when done:
 finalCarry.dispose();
-stackedYs.dispose();
+stackedYs.dispose(); // or skip if Y=null
 ```
 
 **Common patterns:**
 
-| Pattern      | Code                                   | Notes                           |
-| ------------ | -------------------------------------- | ------------------------------- |
-| Simple body  | `return [newCarry, y]`                 | Two distinct arrays             |
-| Passthrough  | `return [newCarry.ref, newCarry]`      | Same array in both              |
-| Pytree carry | `return [{ a: a.ref, b }, { out: a }]` | Mix of refs                     |
-| Keep inputs  | `scan(f, init.ref, xs.ref)`            | Don't consume inputs            |
-| Carry-only   | `scan(f, init, null, { length: N })`   | No xs allocation (saves memory) |
+| Pattern      | Code                                   | Notes                            |
+| ------------ | -------------------------------------- | -------------------------------- |
+| Simple body  | `return [newCarry, y]`                 | Two distinct arrays              |
+| Passthrough  | `return [newCarry.ref, newCarry]`      | Same array in both               |
+| Pytree carry | `return [{ a: a.ref, b }, { out: a }]` | Mix of refs                      |
+| Keep inputs  | `scan(f, init.ref, xs.ref)`            | Don't consume inputs             |
+| Carry-only   | `scan(f, init, null, { length: N })`   | No xs allocation (saves memory)  |
+| No Y output  | `return [newCarry, null]`              | No ys allocation (saves memory)  |
 
 ---
 

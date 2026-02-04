@@ -10,6 +10,7 @@ export enum NodeType {
   Array = "Array",
   Object = "Object",
   Leaf = "Leaf",
+  None = "None",
 }
 
 /** Analog to the JAX "pytree" object, but for JavaScript. */
@@ -37,6 +38,7 @@ export type MapJsTree<T, A, B> =
 /** Represents the structure of a JsTree. */
 export class JsTreeDef {
   static leaf = new JsTreeDef(NodeType.Leaf, null, []);
+  static none = new JsTreeDef(NodeType.None, null, []);
 
   constructor(
     readonly nodeType: NodeType,
@@ -46,9 +48,9 @@ export class JsTreeDef {
 
   /** Get the total number of leaves in the tree. */
   get size(): number {
-    return this.nodeType === NodeType.Leaf
-      ? 1
-      : this.childTreedefs.reduce((a, b) => a + b.size, 0);
+    if (this.nodeType === NodeType.Leaf) return 1;
+    if (this.nodeType === NodeType.None) return 0;
+    return this.childTreedefs.reduce((a, b) => a + b.size, 0);
   }
 
   /** Returns a string representation of this tree definition. */
@@ -57,6 +59,8 @@ export class JsTreeDef {
       return "JsTreeDef(" + this.toString(false) + ")";
     }
     switch (this.nodeType) {
+      case NodeType.None:
+        return "null";
       case NodeType.Leaf:
         return "*";
       case NodeType.Array:
@@ -100,6 +104,10 @@ export function flatten<T>(tree: JsTree<T>): [T[], JsTreeDef] {
 }
 
 function _flatten<T>(tree: JsTree<T>, leaves: T[]): JsTreeDef {
+  // Handle null/undefined as empty node (like JAX's None)
+  if (tree === null || tree === undefined) {
+    return JsTreeDef.none;
+  }
   if (JsArray.isArray(tree)) {
     const childTrees = tree.map((c) => _flatten(c, leaves));
     return new JsTreeDef(NodeType.Array, null, childTrees);
@@ -137,6 +145,9 @@ export function unflatten<T>(
 
 function _unflatten<T>(treedef: JsTreeDef, leaves: Iterator<T>): JsTree<T> {
   switch (treedef.nodeType) {
+    case NodeType.None:
+      // None node type represents null/undefined - return null
+      return null as unknown as JsTree<T>;
     case NodeType.Leaf: {
       const { value, done } = leaves.next();
       if (done) {

@@ -1141,6 +1141,82 @@ suite.each(devices)("lax.scan device:%s", (device) => {
       expect(Array.from(outputData)).toEqual([0, 1, 3, 6, 10]);
     });
   });
+
+  describe("scan with Y=null (no output stacking)", () => {
+    // Y=null is a jax-js extension - returns null instead of stacked outputs
+    // Useful when you only need final carry and want to avoid allocation
+
+    test("basic carry-only with Y=null", async () => {
+      const step = (carry: np.Array, _x: null): [np.Array, null] => {
+        const newCarry = np.add(carry.ref, np.array([1.0]));
+        carry.dispose();
+        return [newCarry, null];
+      };
+
+      const init = np.array([0.0]);
+      const [finalCarry, ys] = await lax.scan(step, init, null, { length: 5 });
+
+      const data = await finalCarry.data();
+      expect(data[0]).toBeCloseTo(5.0);
+      expect(ys).toBeNull();
+    });
+
+    test("Y=null with jit", async () => {
+      const scanFn = (init: np.Array) => {
+        const step = (carry: np.Array, _x: null): [np.Array, null] => {
+          const newCarry = np.add(carry.ref, np.array([1.0]));
+          carry.dispose();
+          return [newCarry, null];
+        };
+        return lax.scan(step, init, null, { length: 5 });
+      };
+
+      // Cast needed because jit's type doesn't know about null in pytrees
+      const f = jit(scanFn as any);
+      const [finalCarry, ys] = f(np.array([0.0])) as [np.Array, null];
+
+      const data = await finalCarry.data();
+      expect(data[0]).toBeCloseTo(5.0);
+      expect(ys).toBeNull();
+      f.dispose();
+    });
+
+    test("Y=null with xs array (not null)", async () => {
+      // Y=null works with regular xs too
+      const step = (carry: np.Array, x: np.Array): [np.Array, null] => {
+        const newCarry = np.add(carry, x);
+        return [newCarry, null];
+      };
+
+      const init = np.array([0.0]);
+      const xs = np.array([[1.0], [2.0], [3.0], [4.0], [5.0]]);
+      const [finalCarry, ys] = await lax.scan(step, init, xs);
+
+      const data = await finalCarry.data();
+      expect(data[0]).toBeCloseTo(15.0);
+      expect(ys).toBeNull();
+    });
+
+    test("Y=null with pytree carry", async () => {
+      type Carry = { sum: np.Array; count: np.Array };
+
+      const step = (carry: Carry, _x: null): [Carry, null] => {
+        const newSum = np.add(carry.sum.ref, np.array([10.0]));
+        const newCount = np.add(carry.count, np.array([1.0]));
+        carry.sum.dispose();
+        return [{ sum: newSum, count: newCount }, null];
+      };
+
+      const init = { sum: np.array([0.0]), count: np.array([0.0]) };
+      const [finalCarry, ys] = await lax.scan(step, init, null, { length: 5 });
+
+      const sumData = await finalCarry.sum.data();
+      const countData = await finalCarry.count.data();
+      expect(sumData[0]).toBeCloseTo(50.0);
+      expect(countData[0]).toBeCloseTo(5.0);
+      expect(ys).toBeNull();
+    });
+  });
 });
 
 describe("scan autodiff", () => {

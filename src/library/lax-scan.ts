@@ -269,7 +269,7 @@ export interface ScanOptions {
 export function scan<
   Carry extends JsTree<Array>,
   X extends JsTree<Array> | null | undefined,
-  Y extends JsTree<Array>,
+  Y extends JsTree<Array> | null,
 >(
   f: (carry: Carry, x: X) => [Carry, Y],
   init: Carry,
@@ -319,7 +319,8 @@ export function scan<
       : (tree.unflatten(xsTreedef!, xSliceFlat) as X);
     const [newCarry, y] = f(carry, xSlice as X);
     const [newCarryFlat] = tree.flatten(newCarry);
-    const [yFlat, yTreedef] = tree.flatten(y);
+    // tree.flatten handles null as empty node with no leaves (NodeType.None)
+    const [yFlat, yTreedef] = tree.flatten(y as JsTree<Array>);
     // Store yTreedef for later reconstruction
     (flatF as any)._yTreedef = yTreedef;
     return [newCarryFlat, yFlat];
@@ -375,6 +376,7 @@ export function scan<
   const ysFlat = results.slice(numCarry) as Array[];
 
   // Reconstruct pytrees
+  // tree.unflatten handles None treedef -> returns null
   const finalCarry = tree.unflatten(initTreedef, carryOut) as Carry;
   const yTreedef = (flatF as any)._yTreedef;
   const ys = tree.unflatten(yTreedef, ysFlat) as Y;
