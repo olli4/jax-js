@@ -929,34 +929,57 @@ case natively.
 ### Codegen Unification (Complete)
 
 The scan codegen previously duplicated expression translation logic from regular kernel compilation.
-This has been refactored to share common code.
+This has been refactored to share common code across multiple layers.
 
-**WASM Backend (Unified):**
+**WASM Backend — Expression Translation (Unified):**
 
 Both `translateExp()` and `translateExpWithGeneralScanContext()` now call `translateExpCore()`:
 
-| Function                               | Role                                           |
-| -------------------------------------- | ---------------------------------------------- |
-| `translateExpCore()`                   | Shared core handling all `AluOp` cases         |
-| `TranslateExpContext` interface        | Callbacks for `getVariable` and `handleGlobalIndex` |
-| `translateExp()`                       | Thin wrapper with bounds-check GlobalIndex     |
+| Function                               | Role                                                     |
+| -------------------------------------- | -------------------------------------------------------- |
+| `translateExpCore()`                   | Shared core handling all `AluOp` cases                   |
+| `TranslateExpContext` interface        | Callbacks for `getVariable` and `handleGlobalIndex`      |
+| `translateExp()`                       | Thin wrapper with bounds-check GlobalIndex               |
 | `translateExpWithGeneralScanContext()` | Thin wrapper with const/carry/xs/internal classification |
 
-**WebGPU Backend (Unified):**
+**WASM Backend — Kernel Codegen (Unified):**
+
+Single and multi-output kernel paths share a unified entry point:
+
+| Function               | Role                                          |
+| ---------------------- | --------------------------------------------- |
+| `codegenWasmKernel()`  | Entry point, dispatches based on isMultiOutput|
+| `codegenWasmSinglePath()` | Single-output kernel (supports reduction)  |
+| `codegenWasmMultiPath()` | Multi-output kernel (no reduction)          |
+
+**WebGPU Backend — Expression Translation (Unified):**
 
 Both `gen()` in `pipelineSource` and `genScanExpressionWithRidx` now use shared helpers:
 
-| Function                    | Role                                           |
-| --------------------------- | ---------------------------------------------- |
-| `translateAluOpToWgsl()`    | Binary/unary ops, comparisons, casts, ternary  |
-| `translateErfToWgsl()`      | Erf/Erfc with f32 precision wrapper            |
-| `gen()` in `pipelineSource` | CSE + special cases (inverseSqrt, NaN, Threefry) |
-| `genScanExpressionWithRidx` | Scan-specific GlobalIndex + inline generation  |
+| Function                    | Role                                                    |
+| --------------------------- | ------------------------------------------------------- |
+| `translateAluOpToWgsl()`    | Binary/unary ops, comparisons, casts, ternary           |
+| `translateErfToWgsl()`      | Erf/Erfc with f32 precision wrapper                     |
+| `gen()` in `pipelineSource` | CSE + special cases (inverseSqrt, NaN, Threefry)        |
+| `genScanExpressionWithRidx` | Scan-specific GlobalIndex + inline generation           |
+
+**WebGPU Backend — Shader Emission (Unified):**
+
+Shader generation uses a shared emitter pattern:
+
+| Function                       | Role                                                    |
+| ------------------------------ | ------------------------------------------------------- |
+| `createShaderEmitter()`        | Returns `{emit, pushIndent, popIndent, getCode}` helper |
+| `PUSH_INDENT` / `POP_INDENT`   | Module-level symbols for indent control                 |
+| `nativeScanShaderSource()`     | Thin wrapper delegating to multi version                |
+| `nativeScanMultiShaderSource()`| Full implementation using shared emitter                |
 
 **Benefits achieved:**
 - Adding new `AluOp` requires changes in 1-2 places instead of 4
 - Bug fixes apply to both regular and scan paths
 - Scan now supports `Erf/Erfc` (was missing before)
+- Shader indent logic shared across 3 generation sites
+- Single/multi kernel paths share validation and setup
 
 ### Multi-output Kernel in Native Scan
 
