@@ -909,15 +909,6 @@ other (e.g., Mandelbrot: `Asq = A*A` then `newA = Asq - Bsq + X`), WebGPU falls 
 because its shader codegen doesn't support intermediate buffers between steps. WASM handles this
 case natively.
 
-**Resolved:**
-
-- WebGPU kernel-only bodies now use native scan via `tryPrepareWebGPUNativeScan()`.
-- **Scan body multi-output fusion** now works via `Kernel.multi()`. Body compilation produces fused
-  multi-output kernels, and WASM native scan supports multi-output kernel codegen.
-- **WASM scan cast operations** now support Bool→Float32, Bool→Int32, Bool→Float64, Int32→Float64,
-  and Float64→Int32 in `translateExpWithGeneralScanContext()`. Previously, patterns like
-  `.less(100).astype(np.float32)` in scan bodies would throw "Cast bool -> float32 not supported".
-
 ### Future work
 
 | Priority | Feature                              | Notes                                              |
@@ -926,88 +917,46 @@ case natively.
 | Medium   | Fix WebGPU compiled-body binding     | `wrapRoutineForScan` arg mapping is incorrect      |
 | Low      | `lax.scatter` / `dynamic_slice`      | Would enable Jaxpr-based routines                  |
 
-### Codegen Unification (Complete)
+### Codegen Architecture
 
-The scan codegen previously duplicated expression translation logic from regular kernel compilation.
-This has been refactored to share common code across multiple layers.
+Expression translation and shader generation share common code between regular kernels and scan.
 
-**WASM Backend — Expression Translation (Unified):**
-
-Both `translateExp()` and `translateExpWithGeneralScanContext()` now call `translateExpCore()`:
+**WASM Backend:**
 
 | Function                               | Role                                                     |
 | -------------------------------------- | -------------------------------------------------------- |
 | `translateExpCore()`                   | Shared core handling all `AluOp` cases                   |
 | `TranslateExpContext` interface        | Callbacks for `getVariable` and `handleGlobalIndex`      |
-| `translateExp()`                       | Thin wrapper with bounds-check GlobalIndex               |
-| `translateExpWithGeneralScanContext()` | Thin wrapper with const/carry/xs/internal classification |
+| `translateExp()`                       | Wrapper with bounds-check GlobalIndex                    |
+| `translateExpWithGeneralScanContext()` | Wrapper with const/carry/xs/internal classification      |
+| `codegenWasmKernel()`                  | Entry point, dispatches based on `isMultiOutput`         |
+| `codegenWasmSinglePath()`              | Single-output kernel (supports reduction)                |
+| `codegenWasmMultiPath()`               | Multi-output kernel (no reduction)                       |
 
-**WASM Backend — Kernel Codegen (Unified):**
-
-Single and multi-output kernel paths share a unified entry point:
-
-| Function               | Role                                          |
-| ---------------------- | --------------------------------------------- |
-| `codegenWasmKernel()`  | Entry point, dispatches based on isMultiOutput|
-| `codegenWasmSinglePath()` | Single-output kernel (supports reduction)  |
-| `codegenWasmMultiPath()` | Multi-output kernel (no reduction)          |
-
-**WebGPU Backend — Expression Translation (Unified):**
-
-Both `gen()` in `pipelineSource` and `genScanExpressionWithRidx` now use shared helpers:
-
-| Function                    | Role                                                    |
-| --------------------------- | ------------------------------------------------------- |
-| `translateAluOpToWgsl()`    | Binary/unary ops, comparisons, casts, ternary           |
-| `translateErfToWgsl()`      | Erf/Erfc with f32 precision wrapper                     |
-| `gen()` in `pipelineSource` | CSE + special cases (inverseSqrt, NaN, Threefry)        |
-| `genScanExpressionWithRidx` | Scan-specific GlobalIndex + inline generation           |
-
-**WebGPU Backend — Shader Emission (Unified):**
-
-Shader generation uses a shared emitter pattern:
+**WebGPU Backend:**
 
 | Function                       | Role                                                    |
 | ------------------------------ | ------------------------------------------------------- |
+| `translateAluOpToWgsl()`       | Binary/unary ops, comparisons, casts, ternary           |
+| `translateErfToWgsl()`         | Erf/Erfc with f32 precision wrapper                     |
+| `gen()` in `pipelineSource`    | CSE + special cases (inverseSqrt, NaN, Threefry)        |
+| `genScanExpressionWithRidx`    | Scan-specific GlobalIndex + inline generation           |
 | `createShaderEmitter()`        | Returns `{emit, pushIndent, popIndent, getCode}` helper |
-| `PUSH_INDENT` / `POP_INDENT`   | Module-level symbols for indent control                 |
-| `nativeScanShaderSource()`     | Thin wrapper delegating to multi version                |
-| `nativeScanMultiShaderSource()`| Full implementation using shared emitter                |
+| `nativeScanShaderSource()`     | Wrapper delegating to multi version                     |
+| `nativeScanMultiShaderSource()`| Full scan shader implementation                         |
 
-**Benefits achieved:**
-- Adding new `AluOp` requires changes in 1-2 places instead of 4
-- Bug fixes apply to both regular and scan paths
-- Scan now supports `Erf/Erfc` (was missing before)
-- Shader indent logic shared across 3 generation sites
-- Single/multi kernel paths share validation and setup
+**Backend Interface:**
 
-**Backend API Unification:**
-
-The `Backend` interface previously had separate methods for single vs multi-output kernels:
-
-| Before                                            | After                           |
-| ------------------------------------------------- | ------------------------------- |
-| `prepareKernel()` + `prepareMultiKernel()`        | `prepareKernel()` only          |
-| `prepareKernelSync()` + `prepareMultiKernelSync()`| `prepareKernelSync()` only      |
-
-Each backend now checks `kernel.isMultiOutput` internally:
-- **WASM/CPU**: Were already identical, just removed duplicates
-- **WebGPU**: Merged multi-output expansion logic into `prepareKernel`
-- **WebGL**: Added `isMultiOutput` check that throws
-
-Call sites in `array.ts` no longer branch on `isMultiOutput`.
+The `Backend` interface uses unified methods for single and multi-output kernels:
+- `prepareKernel()` / `prepareKernelSync()` — each backend checks `kernel.isMultiOutput` internally
+- WebGPU expands multi-output kernels into separate shader dispatches
+- WebGL throws on multi-output (not supported)
 
 ### Multi-output Kernel in Native Scan
 
-The `Kernel` class supports fusing multiple outputs into a single kernel dispatch via `Kernel.multi()`.
-This is used in regular `jitCompile()` for functions with multiple same-size outputs.
-
-**Current status:**
-
-- Regular JIT: ✅ Uses multi-output Kernel for multi-output functions
-- Scan body compilation: ✅ Produces multi-output Kernel
-- Native scan (WASM): ✅ Supports multi-output kernel codegen in `codegenNativeScanGeneral()`
-- Native scan (WebGPU): ✅ Supports multi-output via `prepareNativeScanMulti()` expansion
+The `Kernel` class supports fusing multiple outputs via `Kernel.multi()`. Both regular JIT and
+scan body compilation produce multi-output kernels when beneficial. Native scan on both WASM
+and WebGPU supports multi-output kernel codegen.
 
 **Example:** Mandelbrot body with 3 carry outputs compiles to 2-3 multi-output kernel steps instead of 6
 separate kernel steps, and runs via the fused native scan path on both WASM and WebGPU.
