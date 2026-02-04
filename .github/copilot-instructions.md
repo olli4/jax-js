@@ -186,14 +186,15 @@ The JIT system lives in `src/frontend/jit.ts` and `src/frontend/jaxpr.ts`.
 1. **Tracing** – `makeJaxpr(f)` traces a function to produce a `Jaxpr` (IR in ANF form)
 2. **Simplification** – `jaxpr.flatten().simplify()` canonicalizes the graph
 3. **Graph splitting** – `splitGraphDataflow()` identifies "black nodes" vs fusable ops
-4. **Kernel fusion** – Consecutive elementwise ops merge into a single `Kernel` (multi-output if needed)
+4. **Kernel fusion** – Consecutive elementwise ops merge into a single `Kernel` (multi-output if
+   needed)
 5. **Compilation** – `jitCompile(backend, jaxpr)` emits a `JitProgram` (list of `JitStep`s)
 6. **Execution** – `JitProgram.execute(slots)` runs steps, managing memory lifetime
 
 **Multi-output kernel fusion:**
 
-When multiple black nodes have the same size and no reductions, they are batched into a
-multi-output `Kernel`. This reduces kernel dispatch overhead for functions with multiple outputs.
+When multiple black nodes have the same size and no reductions, they are batched into a multi-output
+`Kernel`. This reduces kernel dispatch overhead for functions with multiple outputs.
 
 - Inputs are unioned across all outputs, and expressions are reindexed accordingly
 - Example: `(a + b, a - b, a * b)` becomes one Kernel with 3 outputs and 2 inputs
@@ -251,8 +252,8 @@ The `Kernel` class uses an `outputs: KernelOutput[]` array to support 1..N outpu
 > pnpm run test:deno  # Runs each file separately (RECOMMENDED)
 > ```
 >
-> Do NOT run `deno test test/deno/` directly - use the script instead.
-> All test files use `withLeakCheck` from harness.ts for memory leak detection.
+> Do NOT run `deno test test/deno/` directly - use the script instead. All test files use
+> `withLeakCheck` from harness.ts for memory leak detection.
 
 ## Commit checklist
 
@@ -923,45 +924,47 @@ Expression translation and shader generation share common code between regular k
 
 **WASM Backend:**
 
-| Function                               | Role                                                     |
-| -------------------------------------- | -------------------------------------------------------- |
-| `translateExpCore()`                   | Shared core handling all `AluOp` cases                   |
-| `TranslateExpContext` interface        | Callbacks for `getVariable` and `handleGlobalIndex`      |
-| `translateExp()`                       | Wrapper with bounds-check GlobalIndex                    |
-| `translateExpWithGeneralScanContext()` | Wrapper with const/carry/xs/internal classification      |
-| `codegenWasmKernel()`                  | Entry point, dispatches based on `isMultiOutput`         |
-| `codegenWasmSinglePath()`              | Single-output kernel (supports reduction)                |
-| `codegenWasmMultiPath()`               | Multi-output kernel (no reduction)                       |
+| Function                               | Role                                                |
+| -------------------------------------- | --------------------------------------------------- |
+| `translateExpCore()`                   | Shared core handling all `AluOp` cases              |
+| `TranslateExpContext` interface        | Callbacks for `getVariable` and `handleGlobalIndex` |
+| `translateExp()`                       | Wrapper with bounds-check GlobalIndex               |
+| `translateExpWithGeneralScanContext()` | Wrapper with const/carry/xs/internal classification |
+| `codegenWasmKernel()`                  | Entry point, dispatches based on `isMultiOutput`    |
+| `codegenWasmSinglePath()`              | Single-output kernel (supports reduction)           |
+| `codegenWasmMultiPath()`               | Multi-output kernel (no reduction)                  |
 
 **WebGPU Backend:**
 
-| Function                       | Role                                                    |
-| ------------------------------ | ------------------------------------------------------- |
-| `translateAluOpToWgsl()`       | Binary/unary ops, comparisons, casts, ternary           |
-| `translateErfToWgsl()`         | Erf/Erfc with f32 precision wrapper                     |
-| `gen()` in `pipelineSource`    | CSE + special cases (inverseSqrt, NaN, Threefry)        |
-| `genScanExpressionWithRidx`    | Scan-specific GlobalIndex + inline generation           |
-| `createShaderEmitter()`        | Returns `{emit, pushIndent, popIndent, getCode}` helper |
-| `nativeScanShaderSource()`     | Wrapper delegating to multi version                     |
-| `nativeScanMultiShaderSource()`| Full scan shader implementation                         |
+| Function                        | Role                                                    |
+| ------------------------------- | ------------------------------------------------------- |
+| `translateAluOpToWgsl()`        | Binary/unary ops, comparisons, casts, ternary           |
+| `translateErfToWgsl()`          | Erf/Erfc with f32 precision wrapper                     |
+| `gen()` in `pipelineSource`     | CSE + special cases (inverseSqrt, NaN, Threefry)        |
+| `genScanExpressionWithRidx`     | Scan-specific GlobalIndex + inline generation           |
+| `createShaderEmitter()`         | Returns `{emit, pushIndent, popIndent, getCode}` helper |
+| `nativeScanShaderSource()`      | Wrapper delegating to multi version                     |
+| `nativeScanMultiShaderSource()` | Full scan shader implementation                         |
 
 **Backend Interface:**
 
 The `Backend` interface uses unified methods for single and multi-output kernels:
+
 - `prepareKernel()` / `prepareKernelSync()` — each backend checks `kernel.isMultiOutput` internally
 - WebGPU expands multi-output kernels into separate shader dispatches
 - WebGL throws on multi-output (not supported)
 
 ### Multi-output Kernel in Native Scan
 
-The `Kernel` class supports fusing multiple outputs via `Kernel.multi()`. Both regular JIT and
-scan body compilation produce multi-output kernels when beneficial. Native scan on both WASM
-and WebGPU supports multi-output kernel codegen.
+The `Kernel` class supports fusing multiple outputs via `Kernel.multi()`. Both regular JIT and scan
+body compilation produce multi-output kernels when beneficial. Native scan on both WASM and WebGPU
+supports multi-output kernel codegen.
 
-**Example:** Mandelbrot body with 3 carry outputs compiles to 2-3 multi-output kernel steps instead of 6
-separate kernel steps, and runs via the fused native scan path on both WASM and WebGPU.
+**Example:** Mandelbrot body with 3 carry outputs compiles to 2-3 multi-output kernel steps instead
+of 6 separate kernel steps, and runs via the fused native scan path on both WASM and WebGPU.
 
-See test: `test/lax-scan.test.ts` → "Scan body multi-output: uses native scan with multi-output kernel"
+See test: `test/lax-scan.test.ts` → "Scan body multi-output: uses native scan with multi-output
+kernel"
 
 ### Fix Compiled-Body Binding Detection
 

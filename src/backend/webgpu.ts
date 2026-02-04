@@ -912,13 +912,13 @@ function createShaderEmitter(): {
  * @param op The AluOp to translate
  * @param srcs Source expression strings (already generated)
  * @param dtype The result dtype
- * @param srcDtype The dtype of the first source operand (for comparisons)
+ * @param _srcDtype The dtype of the first source operand (for comparisons)
  */
 function translateAluOpToWgsl(
   op: AluOp,
   srcs: string[],
   dtype: DType,
-  srcDtype?: DType,
+  _srcDtype?: DType,
 ): string | undefined {
   const [a, b, c] = srcs;
 
@@ -961,7 +961,8 @@ function translateAluOpToWgsl(
   if (op === AluOp.Floor) return `floor(${strip1(a)})`;
   if (op === AluOp.Ceil) return `ceil(${strip1(a)})`;
   if (op === AluOp.Cast) return `${dtypeToWgsl(dtype)}(${strip1(a)})`;
-  if (op === AluOp.Bitcast) return `bitcast<${dtypeToWgsl(dtype)}>(${strip1(a)})`;
+  if (op === AluOp.Bitcast)
+    return `bitcast<${dtypeToWgsl(dtype)}>(${strip1(a)})`;
 
   // Ternary
   if (op === AluOp.Where) {
@@ -1152,7 +1153,12 @@ function pipelineSource(device: GPUDevice, kernel: Kernel): ShaderInfo {
       const a = gen(src[0]);
       source = translateAluOpToWgsl(op, [a], dtype) ?? "";
     } else if (op === AluOp.Where) {
-      source = translateAluOpToWgsl(op, [gen(src[0]), gen(src[1]), gen(src[2])], dtype) ?? "";
+      source =
+        translateAluOpToWgsl(
+          op,
+          [gen(src[0]), gen(src[1]), gen(src[2])],
+          dtype,
+        ) ?? "";
     }
 
     if (!source) throw new UnsupportedOpError(op, dtype, "webgpu", arg);
@@ -1403,7 +1409,12 @@ function genScanExpressionWithRidx(
 
     // Try shared helper for binary, unary, and ternary ops
     if (AluGroup.Binary.has(op) || AluGroup.Compare.has(op)) {
-      const result = translateAluOpToWgsl(op, [gen(src[0]), gen(src[1])], eDtype, src[0].dtype);
+      const result = translateAluOpToWgsl(
+        op,
+        [gen(src[0]), gen(src[1])],
+        eDtype,
+        src[0].dtype,
+      );
       if (result) return result;
     }
 
@@ -1413,7 +1424,11 @@ function genScanExpressionWithRidx(
     }
 
     if (op === AluOp.Where) {
-      const result = translateAluOpToWgsl(op, [gen(src[0]), gen(src[1]), gen(src[2])], eDtype);
+      const result = translateAluOpToWgsl(
+        op,
+        [gen(src[0]), gen(src[1]), gen(src[2])],
+        eDtype,
+      );
       if (result) return result;
     }
 

@@ -1,11 +1,4 @@
-import {
-  AluExp,
-  AluGroup,
-  AluOp,
-  DType,
-  isFloatDtype,
-  Kernel,
-} from "../alu";
+import { AluExp, AluGroup, AluOp, DType, isFloatDtype, Kernel } from "../alu";
 import {
   Backend,
   Device,
