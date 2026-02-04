@@ -874,6 +874,39 @@ export class WebGPUBackend implements Backend {
 // Shared WGSL codegen helpers
 // ============================================================================
 
+/** Unique symbols for indent control in shader emitter. */
+const PUSH_INDENT = Symbol("pushIndent");
+const POP_INDENT = Symbol("popIndent");
+
+type EmitFn = (...lines: (string | symbol)[]) => void;
+
+/**
+ * Create a shader code emitter with indentation support.
+ * Returns emit function, indent control symbols, and a function to get final code.
+ */
+function createShaderEmitter(): {
+  emit: EmitFn;
+  pushIndent: symbol;
+  popIndent: symbol;
+  getCode: () => string;
+} {
+  const shader: string[] = [];
+  let indent = "";
+  const emit: EmitFn = (...lines) => {
+    for (const line of lines) {
+      if (line === PUSH_INDENT) indent += "  ";
+      else if (line === POP_INDENT) indent = indent.slice(0, -2);
+      else shader.push(line ? indent + (line as string) : line);
+    }
+  };
+  return {
+    emit,
+    pushIndent: PUSH_INDENT,
+    popIndent: POP_INDENT,
+    getCode: () => shader.join("\n"),
+  };
+}
+
 /**
  * Translate a binary/unary AluOp to WGSL code.
  *
@@ -973,17 +1006,7 @@ function pipelineSource(device: GPUDevice, kernel: Kernel): ShaderInfo {
   // binding(0..n-1): input buffers
   // binding(n): output buffer
 
-  const shader: string[] = []; // line-separated
-  let indent = "";
-  const pushIndent = Symbol("pushIndent");
-  const popIndent = Symbol("popIndent");
-  const emit = (...lines: (string | symbol)[]) => {
-    for (const line of lines) {
-      if (line === pushIndent) indent += "  ";
-      else if (line === popIndent) indent = indent.slice(0, -2);
-      else shader.push(line ? indent + (line as string) : line);
-    }
-  };
+  const { emit, pushIndent, popIndent, getCode } = createShaderEmitter();
 
   if (
     tune.exp.some((exp) => exp.dtype === DType.Float16) ||
@@ -1255,7 +1278,7 @@ function pipelineSource(device: GPUDevice, kernel: Kernel): ShaderInfo {
 
   emit(popIndent, "}");
   return {
-    code: shader.join("\n"),
+    code: getCode(),
     numInputs: nargs,
     numOutputs: 1,
     hasUniform: false,
@@ -1274,11 +1297,7 @@ function pipelineSource(device: GPUDevice, kernel: Kernel): ShaderInfo {
  * Without this invariant, the lack of global barriers between iterations would cause
  * data races. WGSL barriers are workgroup-scoped only, not global across all threads.
  *
- * Buffer layout:
- *   - binding 0..numCarry-1: initCarry buffers (read)
- *   - binding numCarry..numCarry+numX-1: xs buffers (read)
- *   - binding numCarry+numX..numCarry+numX+numCarry-1: carryOut buffers (read_write)
- *   - binding numCarry+numX+numCarry..: ysStacked buffers (write)
+ * This is a convenience wrapper around nativeScanMultiShaderSource for single-kernel scans.
  */
 function nativeScanShaderSource(
   device: GPUDevice,
@@ -1287,8 +1306,8 @@ function nativeScanShaderSource(
   const {
     length,
     numConsts,
-    constSizes: _constSizes,
-    carrySizes: _carrySizes,
+    constSizes,
+    carrySizes,
     xsStrides,
     ysStrides,
     bodyKernel,
@@ -1296,208 +1315,33 @@ function nativeScanShaderSource(
     reverse,
   } = params;
 
-  const re = bodyKernel.reduction;
-  const tune = tuneNullopt(bodyKernel);
-
-  const numX = xsStrides.length;
-  const numY = ysStrides.length;
-  const dtype = bodyKernel.dtype;
-  const resultTy = dtypeToWgsl(dtype, true);
-
   // For MVP, we support single carry/output with matching sizes
-  if (numCarry !== 1 || numY !== 1) {
+  if (numCarry !== 1 || ysStrides.length !== 1) {
     throw new Error("Native scan: only single carry/output supported for now");
   }
 
-  // kernelSize = number of output elements per iteration
-  const kernelSize = bodyKernel.size;
-
-  const shader: string[] = [];
-  let indent = "";
-  const pushIndent = Symbol("pushIndent");
-  const popIndent = Symbol("popIndent");
-  const emit = (...lines: (string | symbol)[]) => {
-    for (const line of lines) {
-      if (line === pushIndent) indent += "  ";
-      else if (line === popIndent) indent = indent.slice(0, -2);
-      else shader.push(line ? indent + (line as string) : line);
-    }
+  // Convert to multi-step format: single step writing to carry0
+  const step: NativeScanMultiStep = {
+    kernel: bodyKernel,
+    inputs: [], // Not used by codegen, we rely on GlobalIndex in expressions
+    outputCarryIdx: 0,
+    outputSize: bodyKernel.size,
   };
 
-  // Check for f16 requirement
-  if (dtype === DType.Float16) {
-    if (!device.features.has("shader-f16")) {
-      throw new Error("WebGPU device does not support shader-f16 feature");
-    }
-    emit("enable f16;");
-  }
-
-  emit(headerWgsl);
-
-  // Global functions needed by body kernel (include epilogue ops)
-  const distinctOps = mapSetUnion(
-    tune.exp.distinctOps(),
-    tune.epilogue?.distinctOps(),
-  );
-  if (distinctOps.has(AluOp.Threefry2x32)) emit(threefrySrc);
-  if (distinctOps.has(AluOp.Erf) || distinctOps.has(AluOp.Erfc)) emit(erfSrc);
-
-  emit("");
-
-  // Buffer declarations
-  // Buffer layout: [consts..., initCarry..., xs..., carryOut..., ysStacked...]
-  let bindingIdx = 0;
-
-  // const buffers (read only)
-  for (let i = 0; i < numConsts; i++) {
-    emit(
-      `@group(0) @binding(${bindingIdx++}) var<storage, read> const${i}: array<${resultTy}>;`,
-    );
-  }
-  // initCarry buffers (read only)
-  for (let i = 0; i < numCarry; i++) {
-    emit(
-      `@group(0) @binding(${bindingIdx++}) var<storage, read> initCarry${i}: array<${resultTy}>;`,
-    );
-  }
-  // xs buffers (read only)
-  for (let i = 0; i < numX; i++) {
-    emit(
-      `@group(0) @binding(${bindingIdx++}) var<storage, read> xs${i}: array<${resultTy}>;`,
-    );
-  }
-  // carryOut buffers (read_write - used as working buffer)
-  for (let i = 0; i < numCarry; i++) {
-    emit(
-      `@group(0) @binding(${bindingIdx++}) var<storage, read_write> carry${i}: array<${resultTy}>;`,
-    );
-  }
-  // ysStacked buffers (write)
-  for (let i = 0; i < numY; i++) {
-    emit(
-      `@group(0) @binding(${bindingIdx++}) var<storage, read_write> ys${i}: array<${resultTy}>;`,
-    );
-  }
-
-  // Workgroup size: use kernel size clamped to 256
-  const workgroupSize = Math.min(Math.max(kernelSize, 1), 256);
-  const [gridX, gridY] = calculateGrid(
-    Math.ceil(Math.max(kernelSize, 1) / workgroupSize),
-  );
-
-  emit(
-    "",
-    `@compute @workgroup_size(${workgroupSize})`,
-    "fn main(@builtin(global_invocation_id) id: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {",
-    pushIndent,
-  );
-
-  emit(`let gidx = i32(id.x);`);
-  emit(`let inBounds = gidx < ${kernelSize};`);
-  emit("");
-
-  // Step 1: Copy initCarry to carryOut (working buffer)
-  emit("// Initialize carry from initCarry");
-  emit("if (inBounds) {");
-  emit(pushIndent);
-  for (let i = 0; i < numCarry; i++) {
-    emit(`carry${i}[gidx] = initCarry${i}[gidx];`);
-  }
-  emit(popIndent, "}");
-  emit("");
-
-  // Step 2: Main scan loop
-  emit(`// Main scan loop over ${length} iterations`);
-  emit(`for (var iter: u32 = 0u; iter < ${length}u; iter++) {`, pushIndent);
-  // Compute dataIdx = reverse ? (length - 1 - iter) : iter
-  if (reverse) {
-    emit(`let dataIdx = ${length - 1}u - iter;`);
-  } else {
-    emit(`let dataIdx = iter;`);
-  }
-  emit("if (inBounds) {");
-  emit(pushIndent);
-
-  const ysElemStride = ysStrides[0] / byteWidth(dtype);
-
-  if (re) {
-    // Reduction kernel: inner ridx loop + epilogue
-    const accTy = dtypeToWgsl(re.dtype, true);
-    emit(`// Reduction: accumulate over ${re.size} elements`);
-    emit(`var acc: ${accTy} = ${constToWgsl(re.dtype, re.identity)};`);
-    emit(
-      `for (var ridx: i32 = 0; ridx < ${tune.size.reduce}; ridx++) {`,
-      pushIndent,
-    );
-
-    // Generate the expression that produces values to reduce
-    const expCode = genScanExpressionWithRidx(
-      tune.exp,
-      dtype,
-      numConsts,
-      numCarry,
-    );
-    emit(`let val = ${expCode};`);
-
-    // Accumulate based on reduction op
-    if (re.op === AluOp.Add) {
-      emit(`acc = acc + val;`);
-    } else if (re.op === AluOp.Mul) {
-      emit(`acc = acc * val;`);
-    } else if (re.op === AluOp.Min) {
-      emit(`acc = min(acc, val);`);
-    } else if (re.op === AluOp.Max) {
-      emit(`acc = max(acc, val);`);
-    } else {
-      throw new Error(`Unsupported reduction op: ${re.op}`);
-    }
-
-    emit(popIndent, "}");
-
-    // Apply epilogue (transforms acc into result)
-    const epilogueCode = genScanExpressionWithRidx(
-      tune.epilogue!,
-      dtype,
-      numConsts,
-      numCarry,
-    );
-    emit(`let result_val: ${resultTy} = ${epilogueCode};`);
-  } else {
-    // Elementwise kernel: no reduction
-    emit("// Compute body expression");
-    const expCode = genScanExpressionWithRidx(
-      tune.exp,
-      dtype,
-      numConsts,
-      numCarry,
-    );
-    emit(`let result_val: ${resultTy} = ${expCode};`);
-  }
-
-  // Write to ysStacked at dataIdx * stride + gidx
-  emit(`ys0[i32(dataIdx) * ${ysElemStride} + gidx] = result_val;`);
-
-  // Update carry for next iteration
-  emit(`carry0[gidx] = result_val;`);
-
-  emit(popIndent, "}");
-  emit(popIndent, "}");
-
-  emit(popIndent, "}");
-
-  // Buffer layout: [consts..., initCarry..., xs..., carryOut..., ysStacked...]
-  // Read-only: consts + initCarry + xs
-  // Read-write: carryOut + ysStacked
-  const numReadOnlyInputs = numConsts + numCarry + numX;
-  const numReadWriteOutputs = numCarry + numY;
-
-  return {
-    code: shader.join("\n"),
-    numInputs: numReadOnlyInputs,
-    numOutputs: numReadWriteOutputs,
-    hasUniform: false,
-    passes: [{ grid: [gridX, gridY] }],
-  };
+  // Delegate to the multi-kernel version
+  return nativeScanMultiShaderSource(device, {
+    length,
+    numConsts,
+    constSizes,
+    numCarry,
+    carrySizes,
+    numX: xsStrides.length,
+    xsStrides,
+    numY: ysStrides.length,
+    ysStrides,
+    steps: [step],
+    reverse,
+  });
 }
 
 /**
@@ -1623,17 +1467,7 @@ function nativeScanMultiShaderSource(
   // Find the maximum kernel size across all steps
   const maxKernelSize = Math.max(...steps.map((s) => s.kernel.size), 1);
 
-  const shader: string[] = [];
-  let indent = "";
-  const pushIndent = Symbol("pushIndent");
-  const popIndent = Symbol("popIndent");
-  const emit = (...lines: (string | symbol)[]) => {
-    for (const line of lines) {
-      if (line === pushIndent) indent += "  ";
-      else if (line === popIndent) indent = indent.slice(0, -2);
-      else shader.push(line ? indent + (line as string) : line);
-    }
-  };
+  const { emit, pushIndent, popIndent, getCode } = createShaderEmitter();
 
   // Check for f16 requirement
   if (dtype === DType.Float16) {
@@ -1820,7 +1654,7 @@ function nativeScanMultiShaderSource(
   const numReadWriteOutputs = numCarry + numY;
 
   return {
-    code: shader.join("\n"),
+    code: getCode(),
     numInputs: numReadOnlyInputs,
     numOutputs: numReadWriteOutputs,
     hasUniform: false,

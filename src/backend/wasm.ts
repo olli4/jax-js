@@ -235,7 +235,7 @@ export class WasmBackend implements Backend {
   prepareKernelSync(kernel: Kernel): Executable<WasmProgram> {
     const kernelHash = FpHash.hash(kernel);
     const module = runWithCache(moduleCache, kernelHash.toString(), () => {
-      const bytes = codegenWasm(kernel);
+      const bytes = codegenWasmKernel(kernel);
       return new WebAssembly.Module(bytes);
     });
     return new Executable(kernel, { module });
@@ -248,7 +248,7 @@ export class WasmBackend implements Backend {
   prepareMultiKernelSync(kernel: Kernel): Executable<WasmProgram> {
     const kernelHash = FpHash.hash(kernel);
     const module = runWithCache(moduleCache, kernelHash.toString(), () => {
-      const bytes = codegenWasmMulti(kernel);
+      const bytes = codegenWasmKernel(kernel);
       return new WebAssembly.Module(bytes);
     });
     return new Executable(kernel, { module });
@@ -975,7 +975,26 @@ function codegenReductionAccumulate(
   cg.local.set(acc);
 }
 
-function codegenWasm(kernel: Kernel): Uint8Array<ArrayBuffer> {
+/**
+ * Generate WASM bytecode for a kernel (single or multi-output).
+ *
+ * For single-output kernels with reduction, generates a ridx loop.
+ * For multi-output kernels (no reduction), generates one store per output.
+ */
+function codegenWasmKernel(kernel: Kernel): Uint8Array<ArrayBuffer> {
+  const isMultiOutput = kernel.isMultiOutput;
+
+  if (isMultiOutput) {
+    // Multi-output path: no reduction, process all outputs per gidx
+    return codegenWasmMultiPath(kernel);
+  } else {
+    // Single-output path: supports reduction
+    return codegenWasmSinglePath(kernel);
+  }
+}
+
+/** Single-output kernel codegen (supports reduction). */
+function codegenWasmSinglePath(kernel: Kernel): Uint8Array<ArrayBuffer> {
   const tune = tuneNullopt(kernel);
   const re = kernel.reduction;
 
@@ -1089,7 +1108,7 @@ function tuneNulloptExp(exp: AluExp, size: number): AluExp {
  * Memory layout for function arguments:
  * [...inputs (nargs), ...outputs (numOutputs)]
  */
-function codegenWasmMulti(kernel: Kernel): Uint8Array<ArrayBuffer> {
+function codegenWasmMultiPath(kernel: Kernel): Uint8Array<ArrayBuffer> {
   const cg = new CodeGenerator();
   cg.memory.import("env", "memory");
 
