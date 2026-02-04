@@ -192,12 +192,6 @@ export interface Backend {
   /** Prepare an expression to be executed later, blocking variant. */
   prepareKernelSync(kernel: Kernel): Executable;
 
-  /** Prepare a multi-output kernel to be executed later. */
-  prepareMultiKernel(kernel: Kernel): Promise<Executable>;
-
-  /** Prepare a multi-output kernel to be executed later, blocking variant. */
-  prepareMultiKernelSync(kernel: Kernel): Executable;
-
   /** Prepare an advanced routine to be executed later. */
   prepareRoutine(routine: Routine): Promise<Executable>;
 

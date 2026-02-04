@@ -305,53 +305,49 @@ export class WebGPUBackend implements Backend {
   }
 
   async prepareKernel(kernel: Kernel): Promise<Executable<ShaderDispatch[]>> {
+    if (kernel.isMultiOutput) {
+      // WebGPU expands multi-output Kernel into individual single-output dispatches
+      // Each output becomes a separate shader dispatch
+      const dispatches: ShaderDispatch[] = [];
+      for (const output of kernel.outputs) {
+        const singleKernel = Kernel.single(
+          kernel.nargs,
+          output.size,
+          output.exp,
+          output.reduction,
+        );
+        const shader = this.#cachedShader(singleKernel);
+        const pipeline = await this.pipelines.prepare(shader);
+        dispatches.push({ ...shader, pipeline });
+      }
+      return new Executable(kernel, dispatches);
+    }
     const shader = this.#cachedShader(kernel);
     const pipeline = await this.pipelines.prepare(shader);
     return new Executable(kernel, [{ ...shader, pipeline }]);
   }
 
   prepareKernelSync(kernel: Kernel): Executable<ShaderDispatch[]> {
+    if (kernel.isMultiOutput) {
+      // WebGPU expands multi-output Kernel into individual single-output dispatches
+      // Each output becomes a separate shader dispatch
+      const dispatches: ShaderDispatch[] = [];
+      for (const output of kernel.outputs) {
+        const singleKernel = Kernel.single(
+          kernel.nargs,
+          output.size,
+          output.exp,
+          output.reduction,
+        );
+        const shader = this.#cachedShader(singleKernel);
+        const pipeline = this.pipelines.prepareSync(shader);
+        dispatches.push({ ...shader, pipeline });
+      }
+      return new Executable(kernel, dispatches);
+    }
     const shader = this.#cachedShader(kernel);
     const pipeline = this.pipelines.prepareSync(shader);
     return new Executable(kernel, [{ ...shader, pipeline }]);
-  }
-
-  async prepareMultiKernel(
-    kernel: Kernel,
-  ): Promise<Executable<ShaderDispatch[]>> {
-    // WebGPU expands multi-output Kernel into individual single-output dispatches
-    // Each output becomes a separate shader dispatch
-    const dispatches: ShaderDispatch[] = [];
-    for (const output of kernel.outputs) {
-      const singleKernel = Kernel.single(
-        kernel.nargs,
-        output.size,
-        output.exp,
-        output.reduction,
-      );
-      const shader = this.#cachedShader(singleKernel);
-      const pipeline = await this.pipelines.prepare(shader);
-      dispatches.push({ ...shader, pipeline });
-    }
-    return new Executable(kernel, dispatches);
-  }
-
-  prepareMultiKernelSync(kernel: Kernel): Executable<ShaderDispatch[]> {
-    // WebGPU expands multi-output Kernel into individual single-output dispatches
-    // Each output becomes a separate shader dispatch
-    const dispatches: ShaderDispatch[] = [];
-    for (const output of kernel.outputs) {
-      const singleKernel = Kernel.single(
-        kernel.nargs,
-        output.size,
-        output.exp,
-        output.reduction,
-      );
-      const shader = this.#cachedShader(singleKernel);
-      const pipeline = this.pipelines.prepareSync(shader);
-      dispatches.push({ ...shader, pipeline });
-    }
-    return new Executable(kernel, dispatches);
   }
 
   async prepareRoutine(

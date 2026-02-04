@@ -272,27 +272,17 @@ export class WebGLBackend implements Backend {
   }
 
   prepareKernelSync(kernel: Kernel): Executable<ShaderDispatch> {
+    if (kernel.isMultiOutput) {
+      throw new Error(
+        "Multi-output kernel not supported for WebGL - should fall back to single kernels",
+      );
+    }
     const shader = generateShader(kernel);
     const cached = this.#programCache.get(shader.code);
     if (cached) return new Executable(kernel, cached);
     const dispatch = compileShader(this.gl, shader);
     this.#programCache.set(shader.code, dispatch);
     return new Executable(kernel, dispatch);
-  }
-
-  async prepareMultiKernel(
-    _kernel: Kernel,
-  ): Promise<Executable<ShaderDispatch>> {
-    // WebGL does not support multi-output rendering in this context
-    throw new Error(
-      "Multi-output kernel not supported for WebGL - should fall back to single kernels",
-    );
-  }
-
-  prepareMultiKernelSync(_kernel: Kernel): Executable<ShaderDispatch> {
-    throw new Error(
-      "Multi-output kernel not supported for WebGL - should fall back to single kernels",
-    );
   }
 
   prepareRoutine(routine: Routine): Promise<Executable> {

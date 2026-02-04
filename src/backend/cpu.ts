@@ -76,14 +76,6 @@ export class CpuBackend implements Backend {
     return new Executable(kernel, undefined);
   }
 
-  async prepareMultiKernel(kernel: Kernel): Promise<Executable<void>> {
-    return this.prepareMultiKernelSync(kernel);
-  }
-
-  prepareMultiKernelSync(kernel: Kernel): Executable<void> {
-    return new Executable(kernel, undefined);
-  }
-
   async prepareRoutine(routine: Routine): Promise<Executable> {
     return this.prepareRoutineSync(routine);
   }

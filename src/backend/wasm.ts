@@ -241,19 +241,6 @@ export class WasmBackend implements Backend {
     return new Executable(kernel, { module });
   }
 
-  async prepareMultiKernel(kernel: Kernel): Promise<Executable<WasmProgram>> {
-    return this.prepareMultiKernelSync(kernel);
-  }
-
-  prepareMultiKernelSync(kernel: Kernel): Executable<WasmProgram> {
-    const kernelHash = FpHash.hash(kernel);
-    const module = runWithCache(moduleCache, kernelHash.toString(), () => {
-      const bytes = codegenWasmKernel(kernel);
-      return new WebAssembly.Module(bytes);
-    });
-    return new Executable(kernel, { module });
-  }
-
   async prepareRoutine(routine: Routine): Promise<Executable<WasmProgram>> {
     return this.prepareRoutineSync(routine);
   }

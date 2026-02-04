@@ -110,8 +110,6 @@ export class PendingExecute {
     this.#promise = (async () => {
       if (this.source instanceof Routine) {
         this.prepared = await this.backend.prepareRoutine(this.source);
-      } else if (this.source.isMultiOutput) {
-        this.prepared = await this.backend.prepareMultiKernel(this.source);
       } else {
         this.prepared = await this.backend.prepareKernel(this.source);
       }
@@ -123,8 +121,6 @@ export class PendingExecute {
     if (this.prepared) return;
     if (this.source instanceof Routine) {
       this.prepared = this.backend.prepareRoutineSync(this.source);
-    } else if (this.source.isMultiOutput) {
-      this.prepared = this.backend.prepareMultiKernelSync(this.source);
     } else {
       this.prepared = this.backend.prepareKernelSync(this.source);
     }
