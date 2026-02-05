@@ -1,12 +1,5 @@
 <script lang="ts">
-  import {
-    defaultDevice,
-    init,
-    jit,
-    lax,
-    numpy as np,
-    setDebug,
-  } from "@jax-js/jax";
+  import { defaultDevice, init, jit, lax, numpy as np } from "@jax-js/jax";
   import { onMount } from "svelte";
 
   const width = 1000;
@@ -56,7 +49,6 @@
     let B = np.zeros(Y.shape);
     let V = np.zeros(X.shape);
     for (let i = 0; i < iters; i++) {
-      console.log(`Iteration ${i + 1}/${iters}`);
       [A, B, V] = f(A, B, V, X.ref, Y.ref);
     }
     X.dispose();
@@ -157,9 +149,7 @@
 <main class="p-4">
   <h1 class="text-2xl mb-2">mandelbrot in jax-js</h1>
 
-  <p class="mb-4">
-    NumPy + GPU + JIT, in JavaScript! Open the browser console to see more.
-  </p>
+  <p class="mb-4">NumPy + GPU + JIT, in JavaScript!</p>
 
   <div class="flex flex-wrap gap-2 mb-4">
     <button
@@ -167,7 +157,6 @@
         const start = performance.now();
         const result = (await calculateMandelbrot(100).data()) as Int32Array;
         milliseconds = performance.now() - start;
-        console.log(`Mandelbrot calculated in ${milliseconds} ms`);
         renderMandelbrot(result);
       }}
     >
@@ -176,14 +165,11 @@
 
     <button
       onmousedown={async () => {
-        setDebug(1);
         const start = performance.now();
         const result = (await calculateMandelbrotJitLoop(
           100,
         ).data()) as Int32Array;
         milliseconds = performance.now() - start;
-        console.log(`Mandelbrot (jit loop) calculated in ${milliseconds} ms`);
-        setDebug(0);
         renderMandelbrot(result);
       }}
     >
@@ -192,14 +178,11 @@
 
     <button
       onmousedown={async () => {
-        setDebug(1);
         const start = performance.now();
         const result = (await calculateMandelbrotScan(
           100,
         ).data()) as Int32Array;
         milliseconds = performance.now() - start;
-        console.log(`Mandelbrot (scan) calculated in ${milliseconds} ms`);
-        setDebug(0);
         renderMandelbrot(result);
       }}
     >
