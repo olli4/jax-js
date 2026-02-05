@@ -335,13 +335,48 @@ function _unflatten(treedef, leaves$1) {
 		}
 	}
 }
-/** Maps a multi-input function over pytree args to produce a new pytree. */
 function map(fn, tree, ...rest) {
-	const [leaves$1, treedef] = flatten(tree);
-	const restLeaves = rest.map((x) => flatten(x)[0]);
+	let options;
+	let restTrees;
+	const last = rest[rest.length - 1];
+	if (rest.length > 0 && typeof last === "object" && last !== null && !JsArray$2.isArray(last) && "isLeaf" in last) {
+		options = last;
+		restTrees = rest.slice(0, -1);
+	} else restTrees = rest;
+	const isLeaf = options?.isLeaf;
+	const [leaves$1, treedef] = isLeaf ? flattenWithIsLeaf(tree, isLeaf) : flatten(tree);
+	const restFlattened = restTrees.map((t, i) => {
+		const [l, td] = isLeaf ? flattenWithIsLeaf(t, isLeaf) : flatten(t);
+		if (!td.equals(treedef)) throw new TypeError(`tree.map: tree structure mismatch at argument ${i + 2}. Expected ${treedef.toString()}, got ${td.toString()}`);
+		return l;
+	});
 	const resultLeaves = [];
-	for (let i = 0; i < leaves$1.length; i++) resultLeaves.push(fn(leaves$1[i], ...restLeaves.map((x) => x[i])));
+	for (let i = 0; i < leaves$1.length; i++) resultLeaves.push(fn(leaves$1[i], ...restFlattened.map((x) => x[i])));
 	return unflatten(treedef, resultLeaves);
+}
+/** Flatten with custom isLeaf predicate. */
+function flattenWithIsLeaf(tree, isLeaf) {
+	const leaves$1 = [];
+	const treedef = _flattenWithIsLeaf(tree, leaves$1, isLeaf);
+	return [leaves$1, treedef];
+}
+function _flattenWithIsLeaf(tree, leaves$1, isLeaf) {
+	if (tree === null || tree === void 0) return JsTreeDef.none;
+	if (isLeaf(tree)) {
+		leaves$1.push(tree);
+		return JsTreeDef.leaf;
+	}
+	if (JsArray$2.isArray(tree)) {
+		const childTrees = tree.map((c) => _flattenWithIsLeaf(c, leaves$1, isLeaf));
+		return new JsTreeDef(NodeType.Array, null, childTrees);
+	} else if (typeof tree === "object" && tree !== null && tree.constructor === Object) {
+		const [keys, values] = require_backend.unzip2(Object.entries(tree));
+		const childTrees = values.map((c) => _flattenWithIsLeaf(c, leaves$1, isLeaf));
+		return new JsTreeDef(NodeType.Object, keys, childTrees);
+	} else {
+		leaves$1.push(tree);
+		return JsTreeDef.leaf;
+	}
 }
 /** Take a reference of every array in a tree. */
 function ref(tree) {
@@ -8790,52 +8825,6 @@ function scan(f, init$1, xs, options) {
 	const ys = unflatten(yTreedef, ysFlat);
 	return [finalCarry, ys];
 }
-/**
-* Stack a list of pytrees along a new leading axis.
-*
-* Each pytree in the list must have the same structure (same keys, same nesting).
-* The corresponding leaves are stacked using {@link numpy.stack}.
-*
-* This is useful for manually accumulating scan-like results when you need
-* more control than {@link scan} provides.
-*
-* @param trees - Array of pytrees to stack. All must have identical structure.
-* @returns A single pytree with the same structure, where each leaf is the
-*   stack of corresponding leaves from input trees (new axis at position 0).
-* @throws If `trees` is empty or pytrees have mismatched structures.
-*
-* @example Single arrays
-* ```ts
-* const a = np.array([1, 2]);
-* const b = np.array([3, 4]);
-* const c = np.array([5, 6]);
-* const stacked = stackPyTree([a, b, c]);
-* // stacked.shape = [3, 2], values = [[1,2], [3,4], [5,6]]
-* ```
-*
-* @example Pytrees (objects)
-* ```ts
-* const trees = [
-*   { x: np.array([1]), y: np.array([2]) },
-*   { x: np.array([3]), y: np.array([4]) },
-* ];
-* const stacked = stackPyTree(trees);
-* // stacked.x.shape = [2, 1], stacked.y.shape = [2, 1]
-* ```
-*/
-function stackPyTree(trees) {
-	if (trees.length === 0) throw new Error("stackPyTree: empty list");
-	const [firstLeaves, treedef] = flatten(trees[0]);
-	const allLeaves = trees.map((t) => leaves(t));
-	const numLeaves = firstLeaves.length;
-	const stackedLeaves = [];
-	for (let leafIdx = 0; leafIdx < numLeaves; leafIdx++) {
-		const toStack = allLeaves.map((leaves$1) => leaves$1[leafIdx].ref);
-		const stacked = stack(toStack, 0);
-		stackedLeaves.push(stacked);
-	}
-	return unflatten(treedef, stackedLeaves);
-}
 
 //#endregion
 //#region src/library/lax.ts
@@ -8851,7 +8840,6 @@ __export(lax_exports, {
 	linalg: () => lax_linalg_exports,
 	reduceWindow: () => reduceWindow,
 	scan: () => scan,
-	stackPyTree: () => stackPyTree,
 	stopGradient: () => stopGradient$1
 });
 const JsArray = globalThis.Array;

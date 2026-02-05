@@ -28,10 +28,10 @@ type MappedJsTree<T, A, B> = T extends A
     : T extends globalThis.Array<infer U>
       ? number extends T["length"]
         ? MapJsTree<U, A, B>[] // plain array
-        : { [K in keyof T]: MapJsTree<T[K], A, B> } // tuple: map each slot, keep tuple shape
-      : { [K in keyof T]: MapJsTree<T[K], A, B> }; // object: map each slot, keep object shape
+        : { [K in keyof T]: MapJsTree<T[K], A, B> } // tuple: map each slot
+      : { [K in keyof T]: MapJsTree<T[K], A, B> }; // object: map each slot
 
-/** @ignore Convert a subtype of JsTree<A> into a JsTree<B>, with the same structure. */
+/** Convert a subtype of JsTree<A> into JsTree<B>, preserving structure. Used by jit/grad/vjp types. */
 export type MapJsTree<T, A, B> =
   Same<A, B> extends true ? T : MappedJsTree<T, A, B>;
 
@@ -170,19 +170,132 @@ function _unflatten<T>(treedef: JsTreeDef, leaves: Iterator<T>): JsTree<T> {
   }
 }
 
-/** Maps a multi-input function over pytree args to produce a new pytree. */
+/** Options for {@link map}. */
+export interface MapOptions<T> {
+  /** Returns true if value should be treated as a leaf (not recursed into). */
+  isLeaf?: (x: T) => boolean;
+}
+
+/**
+ * Maps a function over pytree leaves. Equivalent to `jax.tree.map`.
+ *
+ * @param fn - Function to apply to corresponding leaves.
+ * @param tree - First pytree (determines output structure).
+ * @param rest - Additional trees (must match structure), optionally ending with `{ isLeaf }`.
+ * @throws {TypeError} If trees have different structures.
+ *
+ * @example
+ * ```ts
+ * tree.map((x, y) => x + y, { a: 1 }, { a: 10 });  // { a: 11 }
+ * tree.map((...v) => sum(v), ...trees);  // JAX: tree.map(fn, *trees)
+ * tree.map(fn, tree, { isLeaf: (x) => Array.isArray(x) });  // custom leaves
+ * ```
+ */
+// Overload: single tree with options
+export function map<T, U, Tree extends JsTree<T>>(
+  fn: (arg: T) => U,
+  tree: Tree,
+  options: MapOptions<T>,
+): MapJsTree<Tree, T, U>;
+// Overload: two trees with options
+export function map<T, U, Tree extends JsTree<T>>(
+  fn: (a: T, b: T) => U,
+  tree: Tree,
+  tree2: Tree,
+  options: MapOptions<T>,
+): MapJsTree<Tree, T, U>;
+// Overload: multiple trees (no options) - main signature
 export function map<T, U, Tree extends JsTree<T>>(
   fn: (...args: T[]) => U,
   tree: Tree,
   ...rest: Tree[]
+): MapJsTree<Tree, T, U>;
+// Implementation
+export function map<T, U, Tree extends JsTree<T>>(
+  fn: (...args: T[]) => U,
+  tree: Tree,
+  ...rest: unknown[]
 ): MapJsTree<Tree, T, U> {
-  const [leaves, treedef] = flatten<T>(tree);
-  const restLeaves = rest.map((x) => flatten<T>(x)[0]);
+  // Extract options if last argument has isLeaf
+  let options: MapOptions<T> | undefined;
+  let restTrees: Tree[];
+  const last = rest[rest.length - 1];
+  if (
+    rest.length > 0 &&
+    typeof last === "object" &&
+    last !== null &&
+    !JsArray.isArray(last) &&
+    "isLeaf" in last
+  ) {
+    options = last as MapOptions<T>;
+    restTrees = rest.slice(0, -1) as Tree[];
+  } else {
+    restTrees = rest as Tree[];
+  }
+
+  const isLeaf = options?.isLeaf;
+  const [leaves, treedef] = isLeaf
+    ? flattenWithIsLeaf(tree, isLeaf)
+    : flatten<T>(tree);
+
+  // Flatten rest trees and validate structure
+  const restFlattened = restTrees.map((t, i) => {
+    const [l, td] = isLeaf ? flattenWithIsLeaf(t, isLeaf) : flatten<T>(t);
+    if (!td.equals(treedef)) {
+      throw new TypeError(
+        `tree.map: tree structure mismatch at argument ${i + 2}. ` +
+          `Expected ${treedef.toString()}, got ${td.toString()}`,
+      );
+    }
+    return l;
+  });
+
   const resultLeaves: U[] = [];
   for (let i = 0; i < leaves.length; i++) {
-    resultLeaves.push(fn(leaves[i], ...restLeaves.map((x) => x[i])));
+    resultLeaves.push(fn(leaves[i], ...restFlattened.map((x) => x[i])));
   }
   return unflatten(treedef, resultLeaves) as MapJsTree<Tree, T, U>;
+}
+
+/** Flatten with custom isLeaf predicate. */
+function flattenWithIsLeaf<T>(
+  tree: JsTree<T>,
+  isLeaf: (x: T) => boolean,
+): [T[], JsTreeDef] {
+  const leaves: T[] = [];
+  const treedef = _flattenWithIsLeaf(tree, leaves, isLeaf);
+  return [leaves, treedef];
+}
+
+function _flattenWithIsLeaf<T>(
+  tree: JsTree<T>,
+  leaves: T[],
+  isLeaf: (x: T) => boolean,
+): JsTreeDef {
+  // Handle null/undefined as empty node (like JAX's None)
+  if (tree === null || tree === undefined) {
+    return JsTreeDef.none;
+  }
+  // Check custom isLeaf predicate first
+  if (isLeaf(tree as T)) {
+    leaves.push(tree as T);
+    return JsTreeDef.leaf;
+  }
+  if (JsArray.isArray(tree)) {
+    const childTrees = tree.map((c) => _flattenWithIsLeaf(c, leaves, isLeaf));
+    return new JsTreeDef(NodeType.Array, null, childTrees);
+  } else if (
+    typeof tree === "object" &&
+    tree !== null &&
+    tree.constructor === Object
+  ) {
+    const [keys, values] = unzip2(Object.entries(tree));
+    const childTrees = values.map((c) => _flattenWithIsLeaf(c, leaves, isLeaf));
+    return new JsTreeDef(NodeType.Object, keys, childTrees);
+  } else {
+    leaves.push(tree as T);
+    return JsTreeDef.leaf;
+  }
 }
 
 /** Take a reference of every array in a tree. */

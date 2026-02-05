@@ -23,6 +23,7 @@ import {
   numpy as np,
   setScanBodyStepsCallback,
   setScanPathCallback,
+  tree,
   vmap,
 } from "../src";
 
@@ -36,13 +37,24 @@ describe("lax.scan", () => {
     }
   });
 
-  describe("stackPyTree", () => {
+  describe("tree.map for stacking pytrees (JAX tree_stack pattern)", () => {
     it("stacks list of pytrees", async () => {
-      const tree1 = { a: np.array([1.0]), b: np.array([2.0]) };
-      const tree2 = { a: np.array([3.0]), b: np.array([4.0]) };
-      const tree3 = { a: np.array([5.0]), b: np.array([6.0]) };
+      type Tree = { a: np.Array; b: np.Array };
+      const trees: [Tree, Tree, Tree] = [
+        { a: np.array([1.0]), b: np.array([2.0]) },
+        { a: np.array([3.0]), b: np.array([4.0]) },
+        { a: np.array([5.0]), b: np.array([6.0]) },
+      ];
 
-      const stacked = lax.stackPyTree([tree1, tree2, tree3]);
+      // JAX equivalent: jax.tree.map(lambda *v: jnp.stack(v), *trees)
+      const stacked = tree.map(
+        (...v: np.Array[]) =>
+          np.stack(
+            v.map((a) => a.ref),
+            0,
+          ),
+        ...trees,
+      );
 
       const aData = await (stacked as { a: np.Array; b: np.Array }).a.data();
       const bData = await (stacked as { a: np.Array; b: np.Array }).b.data();

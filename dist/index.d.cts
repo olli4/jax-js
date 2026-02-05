@@ -655,7 +655,7 @@ declare class Executable<T = any> {
   data: T);
 }
 declare namespace tree_d_exports {
-  export { JsTree, JsTreeDef, MapJsTree, NodeType, dispose, flatten, leaves, map, ref, structure, unflatten };
+  export { JsTree, JsTreeDef, MapJsTree, MapOptions, NodeType, dispose, flatten, leaves, map, ref, structure, unflatten };
 }
 declare enum NodeType {
   Array = "Array",
@@ -669,7 +669,7 @@ type JsTree<T> = T | JsTree<T>[] | {
 };
 type Same<X, Y> = (<T>() => T extends X ? 1 : 2) extends (<T>() => T extends Y ? 1 : 2) ? true : false;
 type MappedJsTree<T, A, B> = T extends A ? B : T extends Array ? T : T extends globalThis.Array<infer U> ? number extends T["length"] ? MapJsTree<U, A, B>[] : { [K in keyof T]: MapJsTree<T[K], A, B> } : { [K in keyof T]: MapJsTree<T[K], A, B> };
-/** @ignore Convert a subtype of JsTree<A> into a JsTree<B>, with the same structure. */
+/** Convert a subtype of JsTree<A> into JsTree<B>, preserving structure. Used by jit/grad/vjp types. */
 type MapJsTree<T, A, B> = Same<A, B> extends true ? T : MappedJsTree<T, A, B>;
 /** Represents the structure of a JsTree. */
 declare class JsTreeDef {
@@ -696,7 +696,28 @@ declare function leaves<T>(tree: JsTree<T>): T[];
 declare function structure<T>(tree: JsTree<T>): JsTreeDef;
 /** Reconstruct a structured object from the flattened representation. */
 declare function unflatten<T>(treedef: JsTreeDef, leaves: Iterable<T>): JsTree<T>;
-/** Maps a multi-input function over pytree args to produce a new pytree. */
+/** Options for {@link map}. */
+interface MapOptions<T> {
+  /** Returns true if value should be treated as a leaf (not recursed into). */
+  isLeaf?: (x: T) => boolean;
+}
+/**
+ * Maps a function over pytree leaves. Equivalent to `jax.tree.map`.
+ *
+ * @param fn - Function to apply to corresponding leaves.
+ * @param tree - First pytree (determines output structure).
+ * @param rest - Additional trees (must match structure), optionally ending with `{ isLeaf }`.
+ * @throws {TypeError} If trees have different structures.
+ *
+ * @example
+ * ```ts
+ * tree.map((x, y) => x + y, { a: 1 }, { a: 10 });  // { a: 11 }
+ * tree.map((...v) => sum(v), ...trees);  // JAX: tree.map(fn, *trees)
+ * tree.map(fn, tree, { isLeaf: (x) => Array.isArray(x) });  // custom leaves
+ * ```
+ */
+declare function map<T, U, Tree extends JsTree<T>>(fn: (arg: T) => U, tree: Tree, options: MapOptions<T>): MapJsTree<Tree, T, U>;
+declare function map<T, U, Tree extends JsTree<T>>(fn: (a: T, b: T) => U, tree: Tree, tree2: Tree, options: MapOptions<T>): MapJsTree<Tree, T, U>;
 declare function map<T, U, Tree extends JsTree<T>>(fn: (...args: T[]) => U, tree: Tree, ...rest: Tree[]): MapJsTree<Tree, T, U>;
 /** Take a reference of every array in a tree. */
 declare function ref<Tree extends JsTree<any>>(tree: Tree): Tree;
@@ -1838,42 +1859,8 @@ interface ScanOptions {
  * @see {@link https://docs.jax.dev/en/latest/_autosummary/jax.lax.scan.html | JAX lax.scan}
  */
 declare function scan<Carry extends JsTree<Array>, X extends JsTree<Array> | null, Y extends JsTree<Array> | null>(f: (carry: Carry, x: X) => [Carry, Y], init: Carry, xs: X, options?: ScanOptions): [Carry, Y];
-/**
- * Stack a list of pytrees along a new leading axis.
- *
- * Each pytree in the list must have the same structure (same keys, same nesting).
- * The corresponding leaves are stacked using {@link numpy.stack}.
- *
- * This is useful for manually accumulating scan-like results when you need
- * more control than {@link scan} provides.
- *
- * @param trees - Array of pytrees to stack. All must have identical structure.
- * @returns A single pytree with the same structure, where each leaf is the
- *   stack of corresponding leaves from input trees (new axis at position 0).
- * @throws If `trees` is empty or pytrees have mismatched structures.
- *
- * @example Single arrays
- * ```ts
- * const a = np.array([1, 2]);
- * const b = np.array([3, 4]);
- * const c = np.array([5, 6]);
- * const stacked = stackPyTree([a, b, c]);
- * // stacked.shape = [3, 2], values = [[1,2], [3,4], [5,6]]
- * ```
- *
- * @example Pytrees (objects)
- * ```ts
- * const trees = [
- *   { x: np.array([1]), y: np.array([2]) },
- *   { x: np.array([3]), y: np.array([4]) },
- * ];
- * const stacked = stackPyTree(trees);
- * // stacked.x.shape = [2, 1], stacked.y.shape = [2, 1]
- * ```
- */
-declare function stackPyTree<T extends JsTree<Array>>(trees: T[]): T;
 declare namespace lax_d_exports {
-  export { DotDimensionNumbers, PaddingType, conv, convGeneralDilated, convTranspose, convWithGeneralPadding, dot$1 as dot, erf, erfc, lax_linalg_d_exports as linalg, reduceWindow, scan, stackPyTree, stopGradient };
+  export { DotDimensionNumbers, PaddingType, conv, convGeneralDilated, convTranspose, convWithGeneralPadding, dot$1 as dot, erf, erfc, lax_linalg_d_exports as linalg, reduceWindow, scan, stopGradient };
 }
 /**
  * Dimension numbers for general `dot()` primitive.

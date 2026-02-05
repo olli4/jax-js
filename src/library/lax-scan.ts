@@ -5,7 +5,6 @@
 //
 // This version uses the Scan primitive for efficient execution.
 
-import * as numpy from "./numpy";
 import type { Array } from "../frontend/array";
 import { bind, getAval, Primitive, ShapedArray } from "../frontend/core";
 import { makeJaxpr } from "../frontend/jaxpr";
@@ -420,61 +419,4 @@ export function scan<
   const ys = tree.unflatten(yTreedef, ysFlat) as Y;
 
   return [finalCarry, ys];
-}
-
-/**
- * Stack a list of pytrees along a new leading axis.
- *
- * Each pytree in the list must have the same structure (same keys, same nesting).
- * The corresponding leaves are stacked using {@link numpy.stack}.
- *
- * This is useful for manually accumulating scan-like results when you need
- * more control than {@link scan} provides.
- *
- * @param trees - Array of pytrees to stack. All must have identical structure.
- * @returns A single pytree with the same structure, where each leaf is the
- *   stack of corresponding leaves from input trees (new axis at position 0).
- * @throws If `trees` is empty or pytrees have mismatched structures.
- *
- * @example Single arrays
- * ```ts
- * const a = np.array([1, 2]);
- * const b = np.array([3, 4]);
- * const c = np.array([5, 6]);
- * const stacked = stackPyTree([a, b, c]);
- * // stacked.shape = [3, 2], values = [[1,2], [3,4], [5,6]]
- * ```
- *
- * @example Pytrees (objects)
- * ```ts
- * const trees = [
- *   { x: np.array([1]), y: np.array([2]) },
- *   { x: np.array([3]), y: np.array([4]) },
- * ];
- * const stacked = stackPyTree(trees);
- * // stacked.x.shape = [2, 1], stacked.y.shape = [2, 1]
- * ```
- */
-export function stackPyTree<T extends JsTree<Array>>(trees: T[]): T {
-  if (trees.length === 0) {
-    throw new Error("stackPyTree: empty list");
-  }
-
-  const [firstLeaves, treedef] = tree.flatten(trees[0]);
-  const allLeaves = trees.map((t) => tree.leaves(t));
-
-  // Number of leaves per tree
-  const numLeaves = firstLeaves.length;
-
-  // Stack each leaf position across all trees
-  const stackedLeaves: Array[] = [];
-  for (let leafIdx = 0; leafIdx < numLeaves; leafIdx++) {
-    const toStack = allLeaves.map((leaves) => leaves[leafIdx].ref);
-    // Use np.stack to combine along new axis 0
-    const stacked = numpy.stack(toStack, 0);
-    stackedLeaves.push(stacked);
-  }
-
-  // Reconstruct pytree with stacked leaves
-  return tree.unflatten(treedef, stackedLeaves) as T;
 }
