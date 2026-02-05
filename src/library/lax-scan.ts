@@ -199,28 +199,38 @@ export interface ScanOptions {
  * const [final, ys] = await lax.scan(step, init, xs, { reverse: true });
  * ```
  *
- * @example Carry-only scan (xs=null)
+ * ## jax-js Extensions
+ *
+ * These features extend JAX's scan API for TypeScript/JavaScript ergonomics:
+ *
+ * ### xs=null (carry-only scan)
+ *
+ * Pass `null` as `xs` with `{ length }` to iterate without input arrays.
+ * Useful for generators, RNG sequences, Fibonacci, or any state-only iteration.
+ * The body receives `null` as the second argument.
+ *
+ * ### Y=null (skip output stacking)
+ *
+ * Return `[newCarry, null]` from the body to skip allocating stacked outputs.
+ * Useful when you only need the final carry (e.g., Mandelbrot iteration counts).
+ * The returned `ys` will be `null`, saving memory for large iteration counts.
+ *
+ * @example xs=null: Carry-only scan
  * ```ts
- * // Generate a sequence without allocating input arrays.
- * // Useful for RNG, counters, Fibonacci, or any state-only iteration.
+ * // Generate a sequence without allocating input arrays
  * const step = (carry, _x) => {
  *   const next = np.add(carry.ref, np.array([1.0]));
  *   return [next, carry];  // output is old carry value
  * };
  *
  * const init = np.array([0.0]);
- * // Must provide length when xs is null
  * const [final, ys] = await lax.scan(step, init, null, { length: 5 });
- *
- * console.log(await ys.data());  // [0, 1, 2, 3, 4]
- * console.log(await final.data());  // [5]
+ * // ys = [[0], [1], [2], [3], [4]], final = [5]
  * ```
  *
- * @example Skip output stacking (Y=null)
+ * @example Y=null: Skip output stacking
  * ```ts
- * // When you only need the final carry and don't need intermediate outputs,
- * // return null as the second element to skip allocating stacked outputs.
- * // This saves memory for large iteration counts.
+ * // Only need final carry, not intermediate outputs (saves memory)
  * const step = (carry, x) => {
  *   const Asq = carry.A.ref.mul(carry.A);
  *   const newA = Asq.add(x);
@@ -231,7 +241,6 @@ export interface ScanOptions {
  * const init = { A: np.zeros([100]), count: np.zeros([100], np.int32) };
  * const [final, ys] = await lax.scan(step, init, xs);
  * // ys is null — no memory allocated for intermediate outputs
- * // final.count contains the iteration count per element
  * ```
  *
  * @example jit(scan) - Compile the entire scan loop
@@ -287,20 +296,6 @@ export interface ScanOptions {
  *
  * const gradLoss = grad(loss);
  * const [dInit, dXs] = await gradLoss(init, xs);
- * ```
- *
- * @example Carry-only scan (no input xs)
- * ```ts
- * // Generate sequence without input arrays (saves memory)
- * const step = (carry, _) => {
- *   const next = np.add(carry, np.array([1]));
- *   return [next, carry.ref];
- * };
- *
- * const init = np.array([0]);
- * // Must provide length when xs is null
- * const [final, ys] = await lax.scan(step, init, null, { length: 5 });
- * // ys = [[0], [1], [2], [3], [4]], final = [5]
  * ```
  *
  * @see {@link https://docs.jax.dev/en/latest/_autosummary/jax.lax.scan.html | JAX lax.scan}
