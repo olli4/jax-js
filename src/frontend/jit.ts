@@ -2307,58 +2307,95 @@ function tryPrepareWasmNativeScan(
     };
   };
 
-  // Build routineInfos array for WASM imports
+  // Build routineInfos array for WASM imports (size-specialized)
+  // Note: ScanRoutineInfo is defined in wasm.ts with dtype, sizeParams, unitDiagonal, lower
   type ScanRoutineInfo = {
     routine: Routines;
     exportName: string;
     numParams: number;
+    dtype: "f32" | "f64";
+    sizeParams: number[];
+    unitDiagonal?: boolean;
+    lower?: boolean;
   };
   const routineInfos: ScanRoutineInfo[] = [];
-  const routineToInfoIdx = new Map<Routines, number>();
+  // Map from step index to routine info index (for steps that are routines)
+  const stepToRoutineInfoIdx = new Map<number, number>();
 
-  for (const r of usedRoutines) {
-    const idx = routineInfos.length;
-    routineToInfoIdx.set(r, idx);
+  // First pass: collect routine infos from all routine steps
+  for (let i = 0; i < executeSteps.length; i++) {
+    const step = executeSteps[i];
+    if (step.source instanceof Routine) {
+      const routine = step.source;
+      const routineName = routine.name as Routines;
+      const isF64 = routine.type.inputDtypes[0] === DType.Float64;
+      const dtype: "f32" | "f64" = isF64 ? "f64" : "f32";
 
-    // Determine export name and param count based on routine type
-    // For scan, we use non-batched versions since we process one element at a time
-    const dtype = executeSteps.find(
-      (s) => s.source instanceof Routine && (s.source as Routine).name === r,
-    )?.source;
-    const isF64 =
-      dtype instanceof Routine && dtype.type.inputDtypes[0] === DType.Float64;
-    const suffix = isF64 ? "f64" : "f32";
+      const routineInfoIdx = routineInfos.length;
+      stepToRoutineInfoIdx.set(i, routineInfoIdx);
 
-    if (r === Routines.Cholesky) {
-      routineInfos.push({
-        routine: r,
-        exportName: `cholesky_${suffix}`,
-        numParams: 3, // (inPtr, outPtr, n)
-      });
-    } else if (r === Routines.Sort) {
-      routineInfos.push({
-        routine: r,
-        exportName: `sort_${suffix}`,
-        numParams: 3, // (dataPtr, auxPtr, n)
-      });
-    } else if (r === Routines.TriangularSolve) {
-      routineInfos.push({
-        routine: r,
-        exportName: `triangular_solve_batched_${suffix}`,
-        numParams: 8, // (aPtr, bPtr, xPtr, n, batchRows, numBatches, unitDiagonal, lower)
-      });
-    } else if (r === Routines.LU) {
-      routineInfos.push({
-        routine: r,
-        exportName: `lu_${suffix}`,
-        numParams: 6, // (aPtr, luPtr, pivPtr, permPtr, m, n)
-      });
-    } else if (r === Routines.Argsort) {
-      routineInfos.push({
-        routine: r,
-        exportName: `argsort_${suffix}`,
-        numParams: 5, // (dataPtr, outPtr, idxPtr, auxPtr, n)
-      });
+      // Build routine info with size params for size-specialized modules
+      if (routineName === Routines.Cholesky) {
+        const inputShape = routine.type.inputShapes[0];
+        const n = inputShape[inputShape.length - 1];
+        routineInfos.push({
+          routine: routineName,
+          exportName: "cholesky", // size-specialized module exports simple name
+          numParams: 2, // (inPtr, outPtr) - no n param for size-specialized
+          dtype,
+          sizeParams: [n],
+        });
+      } else if (routineName === Routines.Sort) {
+        const inputShape = routine.type.inputShapes[0];
+        const n = inputShape[inputShape.length - 1];
+        routineInfos.push({
+          routine: routineName,
+          exportName: "sort", // (dataPtr, auxPtr)
+          numParams: 2,
+          dtype,
+          sizeParams: [n],
+        });
+      } else if (routineName === Routines.TriangularSolve) {
+        const aShape = routine.type.inputShapes[0];
+        const bShape = routine.type.inputShapes[1];
+        const n = aShape[aShape.length - 1];
+        // batchRows is the number of columns in B (number of RHS vectors)
+        const batchRows = bShape[bShape.length - 1];
+        const unitDiagonal = routine.params?.unitDiagonal ?? false;
+        // Primitive.TriangularSolve is always upper triangular
+        // (lower=true case is handled by flipping matrices in core.ts)
+        const lower = false;
+        routineInfos.push({
+          routine: routineName,
+          exportName: "triangular_solve", // (aPtr, bPtr, xPtr)
+          numParams: 3,
+          dtype,
+          sizeParams: [n, batchRows],
+          unitDiagonal,
+          lower,
+        });
+      } else if (routineName === Routines.LU) {
+        const inputShape = routine.type.inputShapes[0];
+        const m = inputShape[inputShape.length - 2];
+        const n = inputShape[inputShape.length - 1];
+        routineInfos.push({
+          routine: routineName,
+          exportName: "lu", // (aPtr, luPtr, pivPtr, permPtr)
+          numParams: 4,
+          dtype,
+          sizeParams: [m, n],
+        });
+      } else if (routineName === Routines.Argsort) {
+        const inputShape = routine.type.inputShapes[0];
+        const n = inputShape[inputShape.length - 1];
+        routineInfos.push({
+          routine: routineName,
+          exportName: "argsort", // (dataPtr, outPtr, idxPtr, auxPtr)
+          numParams: 4,
+          dtype,
+          sizeParams: [n],
+        });
+      }
     }
   }
 
@@ -2426,7 +2463,7 @@ function tryPrepareWasmNativeScan(
       // Routine: build routineCallInfo with static params
       const routine = source as Routine;
       const routineName = routine.name as Routines;
-      const routineInfoIdx = routineToInfoIdx.get(routineName)!;
+      const routineInfoIdx = stepToRoutineInfoIdx.get(i)!;
 
       // Get internal buffer indices for all outputs
       const internalBase = stepToInternalBase.get(i)!;
@@ -2437,35 +2474,34 @@ function tryPrepareWasmNativeScan(
       }
 
       // Build static params based on routine type
+      // With size-specialized modules, these are NO LONGER passed at runtime
+      // They're only used here for legacy compatibility in codegenNativeScanGeneral
       let staticParams: number[] = [];
       if (routineName === Routines.Cholesky) {
-        // cholesky_f32(inPtr, outPtr, n) - n is the matrix dimension
         const inputShape = routine.type.inputShapes[0];
-        const n = inputShape[inputShape.length - 1]; // last dimension is matrix size
+        const n = inputShape[inputShape.length - 1];
         staticParams = [n];
       } else if (routineName === Routines.Sort) {
-        // sort_f32(dataPtr, auxPtr, n) - n is array length
         const inputShape = routine.type.inputShapes[0];
         const n = inputShape[inputShape.length - 1];
         staticParams = [n];
       } else if (routineName === Routines.TriangularSolve) {
-        // triangular_solve_batched_f32(aPtr, bPtr, xPtr, n, batchRows, numBatches, unitDiag, lower)
         const aShape = routine.type.inputShapes[0];
         const bShape = routine.type.inputShapes[1];
         const n = aShape[aShape.length - 1];
-        const batchRows = bShape[bShape.length - 2];
-        const numBatches = 1; // In scan, we process one batch at a time
+        // batchRows is the number of columns in B (number of RHS vectors)
+        const batchRows = bShape[bShape.length - 1];
+        const numBatches = 1;
         const unitDiagonal = routine.params?.unitDiagonal ? 1 : 0;
-        const lower = routine.params?.lower ? 1 : 0;
+        // Primitive.TriangularSolve is always upper triangular (lower=0)
+        const lower = 0;
         staticParams = [n, batchRows, numBatches, unitDiagonal, lower];
       } else if (routineName === Routines.LU) {
-        // lu_f32(aPtr, luPtr, pivPtr, permPtr, m, n)
         const inputShape = routine.type.inputShapes[0];
         const m = inputShape[inputShape.length - 2];
         const n = inputShape[inputShape.length - 1];
         staticParams = [m, n];
       } else if (routineName === Routines.Argsort) {
-        // argsort_f32(dataPtr, outPtr, idxPtr, auxPtr, n)
         const inputShape = routine.type.inputShapes[0];
         const n = inputShape[inputShape.length - 1];
         staticParams = [n];

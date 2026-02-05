@@ -391,7 +391,9 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
       throw new Error("carry_out access should NOT be transformed");
     }
 
-    console.log("✓ Shader wrapping correctly identifies xs vs carry (ys use copy-after-iteration)");
+    console.log(
+      "✓ Shader wrapping correctly identifies xs vs carry (ys use copy-after-iteration)",
+    );
   }),
 });
 

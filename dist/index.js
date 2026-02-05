@@ -1,5 +1,5 @@
 import { __export } from "./chunk-Cl8Af3a2.js";
-import { AluExp, AluGroup, AluOp, AluVar, DEBUG, DType, FpHash, Kernel, PPrint, Reduction, Routine, Routines, ShapeTracker, accessorAluExp, accessorGlobal, assertNonNull, byteWidth, checkAxis, checkInts, deepEqual, defaultDevice, devices, dtypedArray, dtypedJsArray, generalBroadcast, getBackend, init, invertPermutation, isFloatDtype, isNumberPair, isPermutation, normalizeAxis, partitionList, prod, promoteTypes, range, recursiveFlatten, rep, reportScanBodySteps, reportScanPath, runWithCache, setDebug, setScanBodyStepsCallback, setScanPathCallback, toposort, unravelAlu, unzip2, zip, zipn } from "./backend-B_dcnT6z.js";
+import { AluExp, AluGroup, AluOp, AluVar, DEBUG, DType, FpHash, Kernel, PPrint, Reduction, Routine, Routines, ShapeTracker, accessorAluExp, accessorGlobal, assertNonNull, byteWidth, checkAxis, checkInts, deepEqual, defaultDevice, devices, dtypedArray, dtypedJsArray, generalBroadcast, getBackend, init, invertPermutation, isFloatDtype, isNumberPair, isPermutation, normalizeAxis, partitionList, prod, promoteTypes, range, recursiveFlatten, rep, reportScanBodySteps, reportScanPath, runWithCache, setDebug, setScanBodyStepsCallback, setScanPathCallback, toposort, unravelAlu, unzip2, zip, zipn } from "./backend-BcW93MQX.js";
 import { createAllIterationsOffsetsBuffer, wrapRoutineForScan } from "./scan-wrapper-TpkqHRRF.js";
 
 //#region src/frontend/convolution.ts
@@ -3038,38 +3038,75 @@ function tryPrepareWasmNativeScan(backend, bodyProgram, bodyJaxpr, executeSteps,
 		}
 	}
 	const routineInfos = [];
-	const routineToInfoIdx = /* @__PURE__ */ new Map();
-	for (const r of usedRoutines) {
-		const idx = routineInfos.length;
-		routineToInfoIdx.set(r, idx);
-		const dtype = executeSteps.find((s) => s.source instanceof Routine && s.source.name === r)?.source;
-		const isF64 = dtype instanceof Routine && dtype.type.inputDtypes[0] === DType.Float64;
-		const suffix = isF64 ? "f64" : "f32";
-		if (r === Routines.Cholesky) routineInfos.push({
-			routine: r,
-			exportName: `cholesky_${suffix}`,
-			numParams: 3
-		});
-		else if (r === Routines.Sort) routineInfos.push({
-			routine: r,
-			exportName: `sort_${suffix}`,
-			numParams: 3
-		});
-		else if (r === Routines.TriangularSolve) routineInfos.push({
-			routine: r,
-			exportName: `triangular_solve_batched_${suffix}`,
-			numParams: 8
-		});
-		else if (r === Routines.LU) routineInfos.push({
-			routine: r,
-			exportName: `lu_${suffix}`,
-			numParams: 6
-		});
-		else if (r === Routines.Argsort) routineInfos.push({
-			routine: r,
-			exportName: `argsort_${suffix}`,
-			numParams: 5
-		});
+	const stepToRoutineInfoIdx = /* @__PURE__ */ new Map();
+	for (let i = 0; i < executeSteps.length; i++) {
+		const step = executeSteps[i];
+		if (step.source instanceof Routine) {
+			const routine = step.source;
+			const routineName = routine.name;
+			const isF64 = routine.type.inputDtypes[0] === DType.Float64;
+			const dtype = isF64 ? "f64" : "f32";
+			const routineInfoIdx = routineInfos.length;
+			stepToRoutineInfoIdx.set(i, routineInfoIdx);
+			if (routineName === Routines.Cholesky) {
+				const inputShape = routine.type.inputShapes[0];
+				const n = inputShape[inputShape.length - 1];
+				routineInfos.push({
+					routine: routineName,
+					exportName: "cholesky",
+					numParams: 2,
+					dtype,
+					sizeParams: [n]
+				});
+			} else if (routineName === Routines.Sort) {
+				const inputShape = routine.type.inputShapes[0];
+				const n = inputShape[inputShape.length - 1];
+				routineInfos.push({
+					routine: routineName,
+					exportName: "sort",
+					numParams: 2,
+					dtype,
+					sizeParams: [n]
+				});
+			} else if (routineName === Routines.TriangularSolve) {
+				const aShape = routine.type.inputShapes[0];
+				const bShape = routine.type.inputShapes[1];
+				const n = aShape[aShape.length - 1];
+				const batchRows = bShape[bShape.length - 1];
+				const unitDiagonal = routine.params?.unitDiagonal ?? false;
+				const lower = false;
+				routineInfos.push({
+					routine: routineName,
+					exportName: "triangular_solve",
+					numParams: 3,
+					dtype,
+					sizeParams: [n, batchRows],
+					unitDiagonal,
+					lower
+				});
+			} else if (routineName === Routines.LU) {
+				const inputShape = routine.type.inputShapes[0];
+				const m = inputShape[inputShape.length - 2];
+				const n = inputShape[inputShape.length - 1];
+				routineInfos.push({
+					routine: routineName,
+					exportName: "lu",
+					numParams: 4,
+					dtype,
+					sizeParams: [m, n]
+				});
+			} else if (routineName === Routines.Argsort) {
+				const inputShape = routine.type.inputShapes[0];
+				const n = inputShape[inputShape.length - 1];
+				routineInfos.push({
+					routine: routineName,
+					exportName: "argsort",
+					numParams: 4,
+					dtype,
+					sizeParams: [n]
+				});
+			}
+		}
 	}
 	const steps = [];
 	for (let i = 0; i < executeSteps.length; i++) {
@@ -3111,7 +3148,7 @@ function tryPrepareWasmNativeScan(backend, bodyProgram, bodyJaxpr, executeSteps,
 		} else {
 			const routine = source;
 			const routineName = routine.name;
-			const routineInfoIdx = routineToInfoIdx.get(routineName);
+			const routineInfoIdx = stepToRoutineInfoIdx.get(i);
 			const internalBase = stepToInternalBase.get(i);
 			const numOutputs = routine.type.outputShapes.length;
 			const outputInternalIndices = [];
@@ -3129,10 +3166,10 @@ function tryPrepareWasmNativeScan(backend, bodyProgram, bodyJaxpr, executeSteps,
 				const aShape = routine.type.inputShapes[0];
 				const bShape = routine.type.inputShapes[1];
 				const n = aShape[aShape.length - 1];
-				const batchRows = bShape[bShape.length - 2];
+				const batchRows = bShape[bShape.length - 1];
 				const numBatches = 1;
 				const unitDiagonal = routine.params?.unitDiagonal ? 1 : 0;
-				const lower = routine.params?.lower ? 1 : 0;
+				const lower = 0;
 				staticParams = [
 					n,
 					batchRows,

@@ -30,7 +30,7 @@ var __toESM = (mod$1, isNodeMode, target) => (target = mod$1 != null ? __create(
 }) : target, mod$1));
 
 //#endregion
-const require_backend = require('./backend-BE92BzLv.cjs');
+const require_backend = require('./backend-B7YhKfJO.cjs');
 const require_scan_wrapper = require('./scan-wrapper-BeVQahyp.cjs');
 
 //#region src/frontend/convolution.ts
@@ -3073,38 +3073,75 @@ function tryPrepareWasmNativeScan(backend, bodyProgram, bodyJaxpr, executeSteps,
 		}
 	}
 	const routineInfos = [];
-	const routineToInfoIdx = /* @__PURE__ */ new Map();
-	for (const r of usedRoutines) {
-		const idx = routineInfos.length;
-		routineToInfoIdx.set(r, idx);
-		const dtype = executeSteps.find((s) => s.source instanceof require_backend.Routine && s.source.name === r)?.source;
-		const isF64 = dtype instanceof require_backend.Routine && dtype.type.inputDtypes[0] === require_backend.DType.Float64;
-		const suffix = isF64 ? "f64" : "f32";
-		if (r === require_backend.Routines.Cholesky) routineInfos.push({
-			routine: r,
-			exportName: `cholesky_${suffix}`,
-			numParams: 3
-		});
-		else if (r === require_backend.Routines.Sort) routineInfos.push({
-			routine: r,
-			exportName: `sort_${suffix}`,
-			numParams: 3
-		});
-		else if (r === require_backend.Routines.TriangularSolve) routineInfos.push({
-			routine: r,
-			exportName: `triangular_solve_batched_${suffix}`,
-			numParams: 8
-		});
-		else if (r === require_backend.Routines.LU) routineInfos.push({
-			routine: r,
-			exportName: `lu_${suffix}`,
-			numParams: 6
-		});
-		else if (r === require_backend.Routines.Argsort) routineInfos.push({
-			routine: r,
-			exportName: `argsort_${suffix}`,
-			numParams: 5
-		});
+	const stepToRoutineInfoIdx = /* @__PURE__ */ new Map();
+	for (let i = 0; i < executeSteps.length; i++) {
+		const step = executeSteps[i];
+		if (step.source instanceof require_backend.Routine) {
+			const routine = step.source;
+			const routineName = routine.name;
+			const isF64 = routine.type.inputDtypes[0] === require_backend.DType.Float64;
+			const dtype = isF64 ? "f64" : "f32";
+			const routineInfoIdx = routineInfos.length;
+			stepToRoutineInfoIdx.set(i, routineInfoIdx);
+			if (routineName === require_backend.Routines.Cholesky) {
+				const inputShape = routine.type.inputShapes[0];
+				const n = inputShape[inputShape.length - 1];
+				routineInfos.push({
+					routine: routineName,
+					exportName: "cholesky",
+					numParams: 2,
+					dtype,
+					sizeParams: [n]
+				});
+			} else if (routineName === require_backend.Routines.Sort) {
+				const inputShape = routine.type.inputShapes[0];
+				const n = inputShape[inputShape.length - 1];
+				routineInfos.push({
+					routine: routineName,
+					exportName: "sort",
+					numParams: 2,
+					dtype,
+					sizeParams: [n]
+				});
+			} else if (routineName === require_backend.Routines.TriangularSolve) {
+				const aShape = routine.type.inputShapes[0];
+				const bShape = routine.type.inputShapes[1];
+				const n = aShape[aShape.length - 1];
+				const batchRows = bShape[bShape.length - 1];
+				const unitDiagonal = routine.params?.unitDiagonal ?? false;
+				const lower = false;
+				routineInfos.push({
+					routine: routineName,
+					exportName: "triangular_solve",
+					numParams: 3,
+					dtype,
+					sizeParams: [n, batchRows],
+					unitDiagonal,
+					lower
+				});
+			} else if (routineName === require_backend.Routines.LU) {
+				const inputShape = routine.type.inputShapes[0];
+				const m = inputShape[inputShape.length - 2];
+				const n = inputShape[inputShape.length - 1];
+				routineInfos.push({
+					routine: routineName,
+					exportName: "lu",
+					numParams: 4,
+					dtype,
+					sizeParams: [m, n]
+				});
+			} else if (routineName === require_backend.Routines.Argsort) {
+				const inputShape = routine.type.inputShapes[0];
+				const n = inputShape[inputShape.length - 1];
+				routineInfos.push({
+					routine: routineName,
+					exportName: "argsort",
+					numParams: 4,
+					dtype,
+					sizeParams: [n]
+				});
+			}
+		}
 	}
 	const steps = [];
 	for (let i = 0; i < executeSteps.length; i++) {
@@ -3146,7 +3183,7 @@ function tryPrepareWasmNativeScan(backend, bodyProgram, bodyJaxpr, executeSteps,
 		} else {
 			const routine = source;
 			const routineName = routine.name;
-			const routineInfoIdx = routineToInfoIdx.get(routineName);
+			const routineInfoIdx = stepToRoutineInfoIdx.get(i);
 			const internalBase = stepToInternalBase.get(i);
 			const numOutputs = routine.type.outputShapes.length;
 			const outputInternalIndices = [];
@@ -3164,10 +3201,10 @@ function tryPrepareWasmNativeScan(backend, bodyProgram, bodyJaxpr, executeSteps,
 				const aShape = routine.type.inputShapes[0];
 				const bShape = routine.type.inputShapes[1];
 				const n = aShape[aShape.length - 1];
-				const batchRows = bShape[bShape.length - 2];
+				const batchRows = bShape[bShape.length - 1];
 				const numBatches = 1;
 				const unitDiagonal = routine.params?.unitDiagonal ? 1 : 0;
-				const lower = routine.params?.lower ? 1 : 0;
+				const lower = 0;
 				staticParams = [
 					n,
 					batchRows,

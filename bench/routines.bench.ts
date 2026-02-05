@@ -1,36 +1,37 @@
 /**
- * Benchmark AssemblyScript-compiled routines.
+ * Benchmark wasmblr-compiled routines (size-specialized).
  *
- * This validates that the AS-compiled WASM is performant compared
- * to hand-written codegen. Run with: pnpm vitest bench bench/routines.bench.ts
+ * This validates that the wasmblr-compiled WASM is performant.
+ * Run with: pnpm vitest bench bench/routines.bench.ts
  */
 
 import { bench, describe } from "vitest";
 
-import { getRoutineModuleSync } from "../src/backend/wasm/generated/routines";
+import {
+  getArgsortModule,
+  getCholeskyModule,
+  getLUModule,
+  getSortModule,
+  getTriangularSolveModule,
+} from "../src/backend/wasm/routine-provider";
 
-describe("AssemblyScript routines", () => {
+describe("wasmblr routines (size-specialized)", () => {
   // Shared memory for all tests
   const memory = new WebAssembly.Memory({ initial: 16 }); // 1MB
 
   describe("cholesky", () => {
-    const module = getRoutineModuleSync("cholesky");
+    const n = 32;
+    const batch = 100;
+
+    const module = getCholeskyModule({ n, dtype: "f32" });
     const instance = new WebAssembly.Instance(module, {
       env: { memory },
     });
     const exports = instance.exports as {
-      cholesky_f32: (inPtr: number, outPtr: number, n: number) => void;
-      cholesky_batched_f32: (
-        inPtr: number,
-        outPtr: number,
-        n: number,
-        batch: number,
-      ) => void;
+      cholesky: (inPtr: number, outPtr: number) => void;
+      cholesky_batched: (inPtr: number, outPtr: number, batch: number) => void;
     };
 
-    // Create positive-definite test matrices
-    const n = 32;
-    const batch = 100;
     const view = new Float32Array(memory.buffer);
 
     // Generate random positive-definite matrices: A = B @ B^T + I
@@ -53,35 +54,38 @@ describe("AssemblyScript routines", () => {
     const outPtr = batch * n * n * 4;
 
     bench(`cholesky ${n}x${n} single`, () => {
-      exports.cholesky_f32(inPtr, outPtr, n);
+      exports.cholesky(inPtr, outPtr);
     });
 
     bench(`cholesky ${n}x${n} x${batch} batched`, () => {
-      exports.cholesky_batched_f32(inPtr, outPtr, n, batch);
+      exports.cholesky_batched(inPtr, outPtr, batch);
     });
   });
 
   describe("triangular-solve", () => {
-    const module = getRoutineModuleSync("triangular-solve");
+    const n = 32;
+    const batchRows = 100;
+
+    const module = getTriangularSolveModule({
+      n,
+      batchRows,
+      dtype: "f32",
+      unitDiagonal: false,
+      lower: false,
+    });
     const instance = new WebAssembly.Instance(module, {
       env: { memory },
     });
     const exports = instance.exports as {
-      triangular_solve_batched_f32: (
+      triangular_solve: (aPtr: number, bPtr: number, xPtr: number) => void;
+      triangular_solve_batched: (
         aPtr: number,
         bPtr: number,
         xPtr: number,
-        n: number,
-        batchRows: number,
         numBatches: number,
-        unitDiagonal: number,
-        lower: number,
       ) => void;
     };
 
-    const n = 32;
-    const batchRows = 100;
-    const numBatches = 1;
     const view = new Float32Array(memory.buffer);
 
     // Create upper-triangular matrix
@@ -101,51 +105,54 @@ describe("AssemblyScript routines", () => {
       }
     }
 
+    // Also build a single-row version for single-bench
+    const singleModule = getTriangularSolveModule({
+      n,
+      batchRows: 1,
+      dtype: "f32",
+      unitDiagonal: false,
+      lower: false,
+    });
+    const singleInstance = new WebAssembly.Instance(singleModule, {
+      env: { memory },
+    });
+    const singleExports = singleInstance.exports as {
+      triangular_solve: (aPtr: number, bPtr: number, xPtr: number) => void;
+    };
+
     bench(`triangular-solve ${n}x${n} single`, () => {
-      exports.triangular_solve_batched_f32(aPtr, bPtr, xPtr, n, 1, 1, 0, 0);
+      singleExports.triangular_solve(aPtr, bPtr, xPtr);
     });
 
     bench(`triangular-solve ${n}x${n} x${batchRows} batched`, () => {
-      exports.triangular_solve_batched_f32(
-        aPtr,
-        bPtr,
-        xPtr,
-        n,
-        batchRows,
-        numBatches,
-        0,
-        0,
-      );
+      exports.triangular_solve_batched(aPtr, bPtr, xPtr, 1);
     });
   });
 
   describe("lu", () => {
-    const module = getRoutineModuleSync("lu");
+    const n = 32;
+    const batch = 100;
+
+    const module = getLUModule({ m: n, n, dtype: "f32" });
     const instance = new WebAssembly.Instance(module, {
       env: { memory },
     });
     const exports = instance.exports as {
-      lu_f32: (
+      lu: (
         aPtr: number,
         luPtr: number,
         pivPtr: number,
         permPtr: number,
-        m: number,
-        n: number,
       ) => void;
-      lu_batched_f32: (
+      lu_batched: (
         aPtr: number,
         luPtr: number,
         pivPtr: number,
         permPtr: number,
-        m: number,
-        n: number,
         batch: number,
       ) => void;
     };
 
-    const n = 32;
-    const batch = 100;
     const view = new Float32Array(memory.buffer);
 
     // Fill with random data
@@ -159,31 +166,27 @@ describe("AssemblyScript routines", () => {
     const permPtr = pivPtr + batch * n * 4;
 
     bench(`lu ${n}x${n} single`, () => {
-      exports.lu_f32(aPtr, luPtr, pivPtr, permPtr, n, n);
+      exports.lu(aPtr, luPtr, pivPtr, permPtr);
     });
 
     bench(`lu ${n}x${n} x${batch} batched`, () => {
-      exports.lu_batched_f32(aPtr, luPtr, pivPtr, permPtr, n, n, batch);
+      exports.lu_batched(aPtr, luPtr, pivPtr, permPtr, batch);
     });
   });
 
   describe("sort", () => {
-    const module = getRoutineModuleSync("sort");
+    const n = 1024;
+    const batch = 32; // Reduced from 100 to avoid memory pressure
+
+    const module = getSortModule({ n, dtype: "f32" });
     const instance = new WebAssembly.Instance(module, {
       env: { memory },
     });
     const exports = instance.exports as {
-      sort_f32: (dataPtr: number, auxPtr: number, n: number) => void;
-      sort_batched_f32: (
-        dataPtr: number,
-        auxPtr: number,
-        n: number,
-        batch: number,
-      ) => void;
+      sort: (dataPtr: number, auxPtr: number) => void;
+      sort_batched: (dataPtr: number, auxPtr: number, batch: number) => void;
     };
 
-    const n = 1024;
-    const batch = 32; // Reduced from 100 to avoid memory pressure
     const view = new Float32Array(memory.buffer);
 
     const dataPtr = 0;
@@ -199,7 +202,7 @@ describe("AssemblyScript routines", () => {
       for (let i = 0; i < n; i++) {
         view[i] = Math.random();
       }
-      exports.sort_f32(dataPtr, auxPtr, n);
+      exports.sort(dataPtr, auxPtr);
     });
 
     bench(`sort n=${n} x${batch} batched`, () => {
@@ -207,35 +210,34 @@ describe("AssemblyScript routines", () => {
       for (let i = 0; i < batch * n; i++) {
         view[i] = Math.random();
       }
-      exports.sort_batched_f32(dataPtr, auxPtr, n, batch);
+      exports.sort_batched(dataPtr, auxPtr, batch);
     });
   });
 
   describe("argsort", () => {
-    const module = getRoutineModuleSync("argsort");
+    const n = 1024;
+    const batch = 32; // Reduced from 100
+
+    const module = getArgsortModule({ n, dtype: "f32" });
     const instance = new WebAssembly.Instance(module, {
       env: { memory },
     });
     const exports = instance.exports as {
-      argsort_f32: (
+      argsort: (
         dataPtr: number,
         outPtr: number,
         idxPtr: number,
         auxPtr: number,
-        n: number,
       ) => void;
-      argsort_batched_f32: (
+      argsort_batched: (
         dataPtr: number,
         outPtr: number,
         idxPtr: number,
         auxPtr: number,
-        n: number,
         batch: number,
       ) => void;
     };
 
-    const n = 1024;
-    const batch = 32; // Reduced from 100
     const view = new Float32Array(memory.buffer);
 
     const dataPtr = 0;
@@ -249,11 +251,11 @@ describe("AssemblyScript routines", () => {
     }
 
     bench(`argsort n=${n} single`, () => {
-      exports.argsort_f32(dataPtr, outPtr, idxPtr, auxPtr, n);
+      exports.argsort(dataPtr, outPtr, idxPtr, auxPtr);
     });
 
     bench(`argsort n=${n} x${batch} batched`, () => {
-      exports.argsort_batched_f32(dataPtr, outPtr, idxPtr, auxPtr, n, batch);
+      exports.argsort_batched(dataPtr, outPtr, idxPtr, auxPtr, batch);
     });
   });
 });

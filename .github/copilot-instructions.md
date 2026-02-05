@@ -44,7 +44,6 @@ pnpm -C website dev                # local dev server for demos
 **Before any commit**, run the full CI validation:
 
 ```bash
-pnpm build:routines                # Rebuild AssemblyScript routines (if src/routines/ changed)
 pnpm build                         # Build the project
 pnpm check                         # TypeScript type checking
 pnpm lint --max-warnings 0         # ESLint with zero warnings tolerance
@@ -484,31 +483,41 @@ identically. To verify manually, run website demos in a WebGL-capable browser.
 2. Enables compiler optimizations across iterations
 3. Single WASM module instantiation vs N calls
 
-Batched-scan is used for WebGPU routines that can't be inlined into a shader. It transforms
-routine shaders to accept per-iteration offsets via uniforms, enabling fused dispatch.
+Batched-scan is used for WebGPU routines that can't be inlined into a shader. It transforms routine
+shaders to accept per-iteration offsets via uniforms, enabling fused dispatch.
 
-### Why AssemblyScript for WASM routines?
+### Why wasmblr for WASM routines?
 
 **Problem:** Hand-writing WASM bytecode is error-prone and unmaintainable.
 
-**Solution:** AssemblyScript — a TypeScript-like language that compiles to WASM.
+**Solution:** wasmblr — a custom WASM bytecode assembler with a high-level helper layer (WasmHl).
 
 **Benefits:**
 
-- Readable, maintainable source code
-- TypeScript-like syntax familiar to contributors
+- Runtime compilation (no separate build step)
+- Single TypeScript syntax throughout the codebase
+- Ergonomic helpers for control flow (`forLoop`, `whileLoop`, `ifElse`) and memory access
+- SIMD-ready (v128, i32x4, f32x4 types available)
 - Small output (~1KB per routine)
-- Easy to debug via source inspection
+- **Size specialization**: Matrix dimensions baked at compile time enable loop unrolling and
+  constant propagation
+- **LRU caching**: 64-entry cache in `routine-provider.ts` amortizes compilation cost across calls
 
-**Alternative considered:** Emscripten (C/C++) — rejected due to larger runtime overhead and less
-familiar syntax for JS developers.
+**Key files:**
+
+| File                                   | Purpose                                              |
+| -------------------------------------- | ---------------------------------------------------- |
+| `src/backend/wasm/wasmblr.ts`          | Low-level WASM bytecode assembler                    |
+| `src/backend/wasm/wasmblr-hl.ts`       | High-level helper layer (WasmHl class)               |
+| `src/backend/wasm/routines/*.ts`       | Size-specialized routine implementations             |
+| `src/backend/wasm/routine-provider.ts` | Module caching with 64-entry LRU cache (by size key) |
 
 ### Why 3 routine implementations (CPU/WASM/WebGPU)?
 
 | Backend    | Implementation          | Location                         | Algorithm Style            |
 | ---------- | ----------------------- | -------------------------------- | -------------------------- |
 | **CPU**    | JavaScript (TypedArray) | `src/routine.ts`                 | Sequential (for debugging) |
-| **WASM**   | AssemblyScript → WASM   | `src/routines/*.ts`              | Sequential (optimized)     |
+| **WASM**   | wasmblr (runtime gen)   | `src/backend/wasm/routines/*.ts` | Sequential (optimized)     |
 | **WebGPU** | Hand-written WGSL       | `src/backend/webgpu/routines.ts` | Parallel (GPU-optimized)   |
 
 **Why 3 routine implementations (CPU/WASM/WebGPU)?**
@@ -518,11 +527,6 @@ familiar syntax for JS developers.
    approaches:
    - Sort: Bitonic sort (parallel) vs merge sort (sequential)
    - Cholesky: Column-parallel Cholesky-Crout vs row-by-row Cholesky-Banachiewicz
-
-**Future unification options:**
-
-- JS → AS codegen: Auto-generate AssemblyScript from JS (unifies CPU + WASM)
-- Jaxpr-based routines: Express as traced functions (blocked by missing `scatter`/`dynamic_slice`)
 
 ### Why WASM imports for routines in scan?
 
@@ -650,15 +654,15 @@ Body jaxpr input: [...consts, ...carry, ...x_slice]
 
 The documentation uses descriptive terms that map to code constructs:
 
-| Doc Term          | Code Step Type | Backend      | Description                                   |
-| ----------------- | -------------- | ------------ | --------------------------------------------- |
-| **compiled-loop** | `native-scan`  | WASM, WebGPU | Entire scan loop compiled to native code      |
-| **batched-scan**  | `batched-scan` | WebGPU       | Routine body with uniform offsets per iter    |
-| **fallback**      | `scan`         | All          | JS loop calling body program per iteration    |
+| Doc Term          | Code Step Type | Backend      | Description                                |
+| ----------------- | -------------- | ------------ | ------------------------------------------ |
+| **compiled-loop** | `native-scan`  | WASM, WebGPU | Entire scan loop compiled to native code   |
+| **batched-scan**  | `batched-scan` | WebGPU       | Routine body with uniform offsets per iter |
+| **fallback**      | `scan`         | All          | JS loop calling body program per iteration |
 
-Note: `batched-scan` transforms routine shaders to use uniform-based offsets for xs buffers,
-then dispatches all iterations with pre-encoded commands. Both `native-scan` and `batched-scan`
-implement the "fused" scan path.
+Note: `batched-scan` transforms routine shaders to use uniform-based offsets for xs buffers, then
+dispatches all iterations with pre-encoded commands. Both `native-scan` and `batched-scan` implement
+the "fused" scan path.
 
 ### Native scan routing
 
@@ -755,6 +759,7 @@ For routine bodies, the approach uses pre-encoded dispatches with uniform-based 
 **Implementation:**
 
 The `wrapRoutineForScan` function transforms routine shaders to add offset uniforms:
+
 1. Parse buffer bindings from WGSL source
 2. Identify which bindings need offsets using `ScanBindingInfo` mapping:
    - `routineInputJitIds` maps routine input bindings → body jaxpr JitIds
@@ -764,6 +769,7 @@ The `wrapRoutineForScan` function transforms routine shaders to add offset unifo
 4. Transform array accesses to add offset (e.g., `x[idx]` → `x[x_offset + idx]`)
 
 **Dispatch architecture:**
+
 - Ping-pong buffers for carry (iteration n reads from one, writes to other)
 - Stacked ys buffers are filled by `copyBufferToBuffer` after each iteration
 - Separate uniform bind groups per iteration (dynamic offsets not supported with auto layout)
@@ -842,49 +848,123 @@ grad-wrapped function instead.
 
 ### Implementation status
 
-| Routine             | Status         | Source                             | Notes                                          |
-| ------------------- | -------------- | ---------------------------------- | ---------------------------------------------- |
-| **Cholesky**        | ✅ Implemented | `src/routines/cholesky.ts`         | f32/f64, single/batched, 740 bytes compiled    |
-| **TriangularSolve** | ✅ Implemented | `src/routines/triangular-solve.ts` | Upper/lower triangular, unit/non-unit diagonal |
-| **LU**              | ✅ Implemented | `src/routines/lu.ts`               | Partial pivoting, 1,308 bytes compiled         |
-| **Sort**            | ✅ Implemented | `src/routines/sort.ts`             | Bottom-up merge sort, NaN-aware, 930 bytes     |
-| **Argsort**         | ✅ Implemented | `src/routines/argsort.ts`          | Stable merge sort on indices, 1,215 bytes      |
+| Routine             | Status         | Source                                          | Notes                                          |
+| ------------------- | -------------- | ----------------------------------------------- | ---------------------------------------------- |
+| **Cholesky**        | ✅ Implemented | `src/backend/wasm/routines/cholesky.ts`         | f32/f64, single/batched                        |
+| **TriangularSolve** | ✅ Implemented | `src/backend/wasm/routines/triangular-solve.ts` | Upper/lower triangular, unit/non-unit diagonal |
+| **LU**              | ✅ Implemented | `src/backend/wasm/routines/lu.ts`               | Partial pivoting                               |
+| **Sort**            | ✅ Implemented | `src/backend/wasm/routines/sort.ts`             | Bottom-up merge sort, NaN-aware                |
+| **Argsort**         | ✅ Implemented | `src/backend/wasm/routines/argsort.ts`          | Stable merge sort on indices                   |
 
-**Build command:** `pnpm build:routines` compiles `src/routines/*.ts` →
-`src/backend/wasm/generated/routines.ts`
+Routines are compiled at runtime using wasmblr — no separate build step required.
 
 ### Adding a new routine (checklist)
 
-| Step | File                        | What to add                                                |
-| ---- | --------------------------- | ---------------------------------------------------------- |
-| 1    | `src/routines/<name>.ts`    | AssemblyScript implementation                              |
-| 2    | `src/routine.ts`            | Add to `Routines` enum                                     |
-| 3    | `src/frontend/core.ts`      | Add to `routinePrimitives` map                             |
-| 4    | `src/backend/wasm.ts`       | Add to `routineModuleNames`, add dispatch case             |
-| 5    | `src/frontend/jit.ts`       | Add to `supportedRoutines` in `tryPrepareWasmNativeScan()` |
-| 6    | `src/backend/wasm.ts`       | Add codegen case in `codegenNativeScanGeneral()`           |
-| opt  | `src/routine.ts`            | Add CPU fallback in `runCpuRoutine()`                      |
-| opt  | `src/frontend/jvp.ts`       | Add JVP rule if autodiff needed                            |
-| opt  | `src/frontend/linearize.ts` | Add transpose rule if grad needed                          |
+| Step | File                                   | What to add                                                          |
+| ---- | -------------------------------------- | -------------------------------------------------------------------- |
+| 1    | `src/backend/wasm/routines/<name>.ts`  | Size-specialized wasmblr implementation (sizes as compile-time args) |
+| 2    | `src/backend/wasm/routines/index.ts`   | Export the build function                                            |
+| 3    | `src/backend/wasm/routine-provider.ts` | Add builder to `routineBuilders` map with size key generation        |
+| 4    | `src/routine.ts`                       | Add to `Routines` enum                                               |
+| 5    | `src/frontend/core.ts`                 | Add to `routinePrimitives` map                                       |
+| 6    | `src/backend/wasm.ts`                  | Add dispatch case with size params from `ScanRoutineInfo`            |
+| 7    | `src/frontend/jit.ts`                  | Add to `supportedRoutines`, populate `ScanRoutineInfo.sizeParams`    |
+| 8    | `src/backend/wasm.ts`                  | Add codegen case in `codegenNativeScanGeneral()`                     |
+| opt  | `src/routine.ts`                       | Add CPU fallback in `runCpuRoutine()`                                |
+| opt  | `src/frontend/jvp.ts`                  | Add JVP rule if autodiff needed                                      |
+| opt  | `src/frontend/linearize.ts`            | Add transpose rule if grad needed                                    |
 
-### AssemblyScript patterns
+**Size key convention:** Cache keys include dtype and all size dimensions, e.g., `cholesky_f32_4` or
+`triangular_solve_f64_8_16_lower_unit`.
+
+### wasmblr routine patterns
+
+Routines are **size-specialized**: matrix dimensions are compile-time constants, enabling loop
+unrolling and constant propagation. The `routine-provider.ts` caches compiled modules by a size key
+(dtype + dimensions).
 
 ```typescript
-export function example_f32(inPtr: usize, outPtr: usize, n: i32): void {
-  const elemSize: i32 = 4;
-  for (let i: i32 = 0; i < n; i++) {
-    const val: f32 = load<f32>(inPtr + <usize>(i * elemSize));
-    store<f32>(outPtr + <usize>(i * elemSize), val * 2.0);
-  }
+import { CodeGenerator } from "../wasmblr";
+import { WasmHl } from "../wasmblr-hl";
+
+// Size-specialized: n is a compile-time constant, not a runtime parameter
+function genRoutine(cg: CodeGenerator, hl: WasmHl, dtype: "f32" | "f64", n: number): number {
+  const ty = dtype === "f32" ? cg.f32 : cg.f64;
+
+  // Function signature: (inPtr: i32, outPtr: i32) - no size params at runtime
+  return cg.function([cg.i32, cg.i32], [], () => {
+    const inPtr = 0; // Function param indices
+    const outPtr = 1;
+
+    const i = cg.local.declare(cg.i32);
+    const val = cg.local.declare(ty);
+
+    // n is a compile-time constant - WASM compiler can unroll/optimize
+    hl.forLoop(i, 0, n, () => {
+      hl.load(dtype, inPtr, hl.getExpr(i));
+      cg.local.set(val);
+
+      hl.store(dtype, outPtr, hl.getExpr(i), () => {
+        cg.local.get(val);
+        hl.const(dtype, 2);
+        hl.binOp(dtype, "mul");
+      });
+    });
+  });
+}
+
+// Builder function called by routine-provider.ts with specific sizes
+export function buildRoutineModule(dtype: "f32" | "f64", n: number): Uint8Array<ArrayBuffer> {
+  const cg = new CodeGenerator();
+  const hl = new WasmHl(cg);
+  cg.memory.import("env", "memory");
+
+  const func = genRoutine(cg, hl, dtype, n);
+  cg.export(func, "routine"); // Single export, no dtype suffix
+
+  return cg.finish();
 }
 ```
 
-**Key differences from TypeScript:**
+**Key WasmHl helpers:**
 
-- Use `usize` for pointers, `i32` for integers, `f32`/`f64` for floats
-- Use `load<T>(ptr)` and `store<T>(ptr, val)` for memory access
-- Cast offsets: `<usize>(i * elemSize)`
-- Use `sqrt<f32>(x)` not `Math.sqrt(x)`
+- `forLoop(i, start, end, body)` — for loop with expression start/end
+- `forLoopDown(i, start, end, body)` — downward for loop
+- `forLoopUnrolled(n, body, threshold?)` — fully unrolls small fixed-size loops (default ≤8
+  iterations)
+- `whileLoop(cond, body)` — while loop with condition callback
+- `ifElse(resultType, then, else?)` — conditional with optional else
+- `load(dtype, base, indexExpr)` — load from base + index \* elemSize
+- `store(dtype, base, indexExpr, valueExpr)` — store to memory
+- `index2D(row, cols, col)` — compute row \* cols + col
+- `binOp(dtype, op)` — binary operation (add, sub, mul, div)
+- `const(dtype, value)` — push constant onto stack
+
+**SIMD helpers (f32x4/f64x2):**
+
+- `loadF32x4(base, indexExpr)` — load 4 floats as v128
+- `storeF32x4(base, indexExpr, valueExpr)` — store v128 as 4 floats
+- `f32x4Hsum()` — horizontal sum v128 → f32
+- `f64x2Hsum()` — horizontal sum v128 → f64
+- `simdReductionF32(acc, k, end, rowABase, rowBBase, op)` — SIMD dot product with automatic tail
+  handling
+- `simdReductionF64(acc, k, end, rowABase, rowBBase, op)` — same for f64x2
+
+The `simdReductionF32`/`F64` helpers take base pointers (locals containing byte addresses) and
+handle both the SIMD main loop and scalar tail automatically. The `k` local is used as the loop
+counter (element index, not byte offset).
+
+**When to use SIMD:**
+
+| Matrix Size | f32x4 Speedup | f64x2 Speedup |
+| ----------- | ------------- | ------------- |
+| n < 32      | ~0.8x (skip)  | ~0.9x (skip)  |
+| n = 32      | ~1.1x         | ~1.0x         |
+| n = 64      | ~1.7x         | ~1.3x         |
+| n = 128     | ~3.0x         | ~1.8x         |
+| n = 256     | ~3.8x         | ~1.9x         |
+
+SIMD is automatically selected for Cholesky when `dtype === "f32" && n >= 32`.
 
 ### Autodiff of routines (example: Cholesky)
 
@@ -1077,14 +1157,14 @@ function trackScanPaths() {
 
 ### Test coverage by category
 
-| Category                      | Backend | Path     | Purpose                     |
-| ----------------------------- | ------- | -------- | --------------------------- |
-| `scan basic`                  | CPU     | fallback | Core correctness            |
-| `compiled-loop scan`          | WASM    | fused    | Verify fusion works         |
-| `compiled-loop > with consts` | WASM    | fused    | Constants in body           |
-| `matmul in body (routine)`    | WASM    | fused    | Routine bodies              |
-| `Cholesky in body`            | WebGPU  | fused    | Batched-scan with routines  |
-| `KNOWN LIMITATIONS`           | WebGPU  | fallback | Verify graceful fallback    |
+| Category                      | Backend | Path     | Purpose                    |
+| ----------------------------- | ------- | -------- | -------------------------- |
+| `scan basic`                  | CPU     | fallback | Core correctness           |
+| `compiled-loop scan`          | WASM    | fused    | Verify fusion works        |
+| `compiled-loop > with consts` | WASM    | fused    | Constants in body          |
+| `matmul in body (routine)`    | WASM    | fused    | Routine bodies             |
+| `Cholesky in body`            | WebGPU  | fused    | Batched-scan with routines |
+| `KNOWN LIMITATIONS`           | WebGPU  | fallback | Verify graceful fallback   |
 
 Tests under "KNOWN LIMITATIONS" PASS when the limitation exists. If you fix a limitation, the test
 will FAIL with instructions to update this documentation.

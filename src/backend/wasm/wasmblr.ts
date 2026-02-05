@@ -169,6 +169,7 @@ export class CodeGenerator {
   v128: V128;
   i32x4: I32x4;
   f32x4: F32x4;
+  f64x2: F64x2;
   memory: Memory;
   void: Type = { typeId: 0x40, name: "void" };
 
@@ -188,6 +189,7 @@ export class CodeGenerator {
     this.v128 = new V128(this);
     this.i32x4 = new I32x4(this);
     this.f32x4 = new F32x4(this);
+    this.f64x2 = new F64x2(this);
     this.memory = new Memory(this);
   }
 
@@ -975,4 +977,34 @@ class F32x4 extends V128 {
   max = VECTOR_OP("max", 0xe9, ["v128", "v128"], "v128");
   pmin = VECTOR_OP("pmin", 0xea, ["v128", "v128"], "v128");
   pmax = VECTOR_OP("pmax", 0xeb, ["v128", "v128"], "v128");
+}
+
+class F64x2 extends V128 {
+  splat = VECTOR_OP("splat", 0x14, ["f64"], "v128");
+  extract_lane = VECTOR_OPL("extract_lane", 0x21, ["v128"], "f64");
+  replace_lane = VECTOR_OPL("replace_lane", 0x22, ["v128", "f64"], "v128");
+
+  eq = VECTOR_OP("eq", 0x47, ["v128", "v128"], "v128");
+  ne = VECTOR_OP("ne", 0x48, ["v128", "v128"], "v128");
+  lt = VECTOR_OP("lt", 0x49, ["v128", "v128"], "v128");
+  gt = VECTOR_OP("gt", 0x4a, ["v128", "v128"], "v128");
+  le = VECTOR_OP("le", 0x4b, ["v128", "v128"], "v128");
+  ge = VECTOR_OP("ge", 0x4c, ["v128", "v128"], "v128");
+
+  ceil = VECTOR_OP("ceil", 0x74, ["v128"], "v128");
+  floor = VECTOR_OP("floor", 0x75, ["v128"], "v128");
+  trunc = VECTOR_OP("trunc", 0x7a, ["v128"], "v128");
+  nearest = VECTOR_OP("nearest", 0x94, ["v128"], "v128");
+
+  abs = VECTOR_OP("abs", 0xec, ["v128"], "v128");
+  neg = VECTOR_OP("neg", 0xed, ["v128"], "v128");
+  sqrt = VECTOR_OP("sqrt", 0xef, ["v128"], "v128");
+  add = VECTOR_OP("add", 0xf0, ["v128", "v128"], "v128");
+  sub = VECTOR_OP("sub", 0xf1, ["v128", "v128"], "v128");
+  mul = VECTOR_OP("mul", 0xf2, ["v128", "v128"], "v128");
+  div = VECTOR_OP("div", 0xf3, ["v128", "v128"], "v128");
+  min = VECTOR_OP("min", 0xf4, ["v128", "v128"], "v128");
+  max = VECTOR_OP("max", 0xf5, ["v128", "v128"], "v128");
+  pmin = VECTOR_OP("pmin", 0xf6, ["v128", "v128"], "v128");
+  pmax = VECTOR_OP("pmax", 0xf7, ["v128", "v128"], "v128");
 }

@@ -30,7 +30,13 @@ import {
   wasm_sin,
   wasm_threefry2x32,
 } from "./wasm/builtins";
-import { getRoutineModuleSync } from "./wasm/generated/routines";
+import {
+  getArgsortModule,
+  getCholeskyModule,
+  getLUModule,
+  getSortModule,
+  getTriangularSolveModule,
+} from "./wasm/routine-provider";
 import { CodeGenerator } from "./wasm/wasmblr";
 
 interface WasmBuffer {
@@ -88,10 +94,18 @@ export interface YOutputSource {
 export interface ScanRoutineInfo {
   /** The routine enum value (e.g., Routines.Cholesky). */
   routine: Routines;
-  /** The WASM export name to call (e.g., "cholesky_f32"). */
+  /** The WASM export name to call (e.g., "cholesky" for single, "cholesky_batched" for batched). */
   exportName: string;
-  /** Number of i32 parameters the routine takes. */
+  /** Number of i32 parameters the routine takes (after size specialization, just pointer args). */
   numParams: number;
+  /** dtype for the routine ("f32" or "f64"). */
+  dtype: "f32" | "f64";
+  /** Routine-specific size parameters for module specialization. */
+  sizeParams: number[];
+  /** For TriangularSolve: unitDiagonal flag. */
+  unitDiagonal?: boolean;
+  /** For TriangularSolve: lower triangular flag. */
+  lower?: boolean;
 }
 
 export interface NativeScanGeneralParams {
@@ -144,15 +158,6 @@ export interface CarryOutputSource {
 
 const moduleCache = new Map<string, WebAssembly.Module>();
 
-/** Map routine enum to AS module name. */
-const routineModuleNames: Record<Routines, string> = {
-  [Routines.Cholesky]: "cholesky",
-  [Routines.TriangularSolve]: "triangular-solve",
-  [Routines.LU]: "lu",
-  [Routines.Sort]: "sort",
-  [Routines.Argsort]: "argsort",
-};
-
 /** Backend that compiles into WebAssembly bytecode for immediate execution. */
 export class WasmBackend implements Backend {
   readonly type: Device = "wasm";
@@ -164,8 +169,6 @@ export class WasmBackend implements Backend {
   #buffers: Map<Slot, WasmBuffer>;
   /** Cache WebAssembly instances keyed by module for reuse in dispatch. */
   #instanceCache: WeakMap<WebAssembly.Module, WebAssembly.Instance>;
-  /** Cached WASM routine instances, keyed by "routine:elementSize". */
-  #routineInstances: Map<string, WebAssembly.Instance> = new Map();
 
   constructor() {
     this.#memory = new WebAssembly.Memory({ initial: 0 });
@@ -310,18 +313,54 @@ export class WasmBackend implements Backend {
     func(...ptrs);
   }
 
-  /** Get or create a WASM instance for a routine. */
-  #getRoutineInstance(name: Routines): WebAssembly.Instance {
-    const moduleName = routineModuleNames[name];
-    let instance = this.#routineInstances.get(moduleName);
+  /** Get or create a WASM instance for a size-specialized routine module. */
+  #getRoutineInstanceForModule(
+    module: WebAssembly.Module,
+  ): WebAssembly.Instance {
+    let instance = this.#instanceCache.get(module);
     if (!instance) {
-      const module = getRoutineModuleSync(moduleName);
       instance = new WebAssembly.Instance(module, {
         env: { memory: this.#memory },
       });
-      this.#routineInstances.set(moduleName, instance);
+      this.#instanceCache.set(module, instance);
     }
     return instance;
+  }
+
+  /** Get the size-specialized routine module for a scan routine info. */
+  #getRoutineModuleForScan(info: ScanRoutineInfo): WebAssembly.Module {
+    const { routine, dtype, sizeParams, unitDiagonal, lower } = info;
+
+    switch (routine) {
+      case Routines.Cholesky: {
+        const [n] = sizeParams;
+        return getCholeskyModule({ n, dtype });
+      }
+      case Routines.Sort: {
+        const [n] = sizeParams;
+        return getSortModule({ n, dtype });
+      }
+      case Routines.Argsort: {
+        const [n] = sizeParams;
+        return getArgsortModule({ n, dtype });
+      }
+      case Routines.TriangularSolve: {
+        const [n, batchRows] = sizeParams;
+        return getTriangularSolveModule({
+          n,
+          batchRows,
+          dtype,
+          unitDiagonal: unitDiagonal ?? false,
+          lower: lower ?? true,
+        });
+      }
+      case Routines.LU: {
+        const [m, n] = sizeParams;
+        return getLUModule({ m, n, dtype });
+      }
+      default:
+        throw new Error(`Unsupported routine for scan: ${Routines[routine]}`);
+    }
   }
 
   #dispatchCholesky(
@@ -330,21 +369,22 @@ export class WasmBackend implements Backend {
     outputs: Slot[],
     elementSize: 4 | 8,
   ): void {
-    const instance = this.#getRoutineInstance(Routines.Cholesky);
-    const exportName =
-      elementSize === 4 ? "cholesky_batched_f32" : "cholesky_batched_f64";
-    const func = instance.exports[exportName] as (
+    const shape = routine.type.inputShapes[0];
+    const n = shape[shape.length - 1];
+    const batchSize = shape.slice(0, -2).reduce((a, b) => a * b, 1);
+    const dtype = elementSize === 4 ? "f32" : "f64";
+
+    const module = getCholeskyModule({ n, dtype });
+    const instance = this.#getRoutineInstanceForModule(module);
+    const func = instance.exports.cholesky_batched as (
       i: number,
       o: number,
-      n: number,
       b: number,
     ) => void;
-    const shape = routine.type.inputShapes[0];
     func(
       this.#buffers.get(inputs[0])!.ptr,
       this.#buffers.get(outputs[0])!.ptr,
-      shape[shape.length - 1],
-      shape.slice(0, -2).reduce((a, b) => a * b, 1),
+      batchSize,
     );
   }
 
@@ -354,35 +394,34 @@ export class WasmBackend implements Backend {
     outputs: Slot[],
     elementSize: 4 | 8,
   ): void {
-    const instance = this.#getRoutineInstance(Routines.TriangularSolve);
-    const exportName =
-      elementSize === 4
-        ? "triangular_solve_batched_f32"
-        : "triangular_solve_batched_f64";
-    const func = instance.exports[exportName] as (
-      a: number,
-      b: number,
-      x: number,
-      n: number,
-      batchRows: number,
-      numBatches: number,
-      unitDiagonal: number,
-      lower: number,
-    ) => void;
     const aShape = routine.type.inputShapes[0];
     const bShape = routine.type.inputShapes[1];
     const n = aShape[aShape.length - 1];
     const batchRows = bShape[bShape.length - 2]; // number of rows in B
     const numBatches = aShape.slice(0, -2).reduce((a, b) => a * b, 1);
+    const dtype = elementSize === 4 ? "f32" : "f64";
+    const unitDiagonal = routine.params?.unitDiagonal ?? false;
+    const lower = routine.params?.lower ?? false;
+
+    const module = getTriangularSolveModule({
+      n,
+      batchRows,
+      dtype,
+      unitDiagonal,
+      lower,
+    });
+    const instance = this.#getRoutineInstanceForModule(module);
+    const func = instance.exports.triangular_solve_batched as (
+      a: number,
+      b: number,
+      x: number,
+      numBatches: number,
+    ) => void;
     func(
       this.#buffers.get(inputs[0])!.ptr,
       this.#buffers.get(inputs[1])!.ptr,
       this.#buffers.get(outputs[0])!.ptr,
-      n,
-      batchRows,
       numBatches,
-      routine.params?.unitDiagonal ? 1 : 0,
-      routine.params?.lower ? 1 : 0,
     );
   }
 
@@ -392,26 +431,27 @@ export class WasmBackend implements Backend {
     outputs: Slot[],
     elementSize: 4 | 8,
   ): void {
-    const instance = this.#getRoutineInstance(Routines.LU);
-    const exportName = elementSize === 4 ? "lu_batched_f32" : "lu_batched_f64";
-    const func = instance.exports[exportName] as (
+    const shape = routine.type.inputShapes[0];
+    const m = shape[shape.length - 2];
+    const n = shape[shape.length - 1];
+    const batchSize = shape.slice(0, -2).reduce((a, b) => a * b, 1);
+    const dtype = elementSize === 4 ? "f32" : "f64";
+
+    const module = getLUModule({ m, n, dtype });
+    const instance = this.#getRoutineInstanceForModule(module);
+    const func = instance.exports.lu_batched as (
       a: number,
       lu: number,
       piv: number,
       perm: number,
-      m: number,
-      n: number,
       batchSize: number,
     ) => void;
-    const shape = routine.type.inputShapes[0];
     func(
       this.#buffers.get(inputs[0])!.ptr,
       this.#buffers.get(outputs[0])!.ptr,
       this.#buffers.get(outputs[1])!.ptr,
       this.#buffers.get(outputs[2])!.ptr,
-      shape[shape.length - 2],
-      shape[shape.length - 1],
-      shape.slice(0, -2).reduce((a, b) => a * b, 1),
+      batchSize,
     );
   }
 
@@ -425,8 +465,9 @@ export class WasmBackend implements Backend {
     const n = shape[shape.length - 1];
     const batchSize = shape.slice(0, -1).reduce((a, b) => a * b, 1);
     const totalSize = n * batchSize * elementSize;
+    const dtype = elementSize === 4 ? "f32" : "f64";
 
-    // Copy input to output (AS sort is in-place)
+    // Copy input to output (sort is in-place)
     const inBuf = this.#buffers.get(inputs[0])!;
     const outBuf = this.#buffers.get(outputs[0])!;
     new Uint8Array(this.#memory.buffer, outBuf.ptr, totalSize).set(
@@ -437,16 +478,14 @@ export class WasmBackend implements Backend {
     const auxPtr = this.#allocator.malloc(n * elementSize);
 
     // Call in-place sort on output buffer
-    const instance = this.#getRoutineInstance(Routines.Sort);
-    const exportName =
-      elementSize === 4 ? "sort_batched_f32" : "sort_batched_f64";
-    const func = instance.exports[exportName] as (
+    const module = getSortModule({ n, dtype });
+    const instance = this.#getRoutineInstanceForModule(module);
+    const func = instance.exports.sort_batched as (
       data: number,
       aux: number,
-      n: number,
       batchSize: number,
     ) => void;
-    func(outBuf.ptr, auxPtr, n, batchSize);
+    func(outBuf.ptr, auxPtr, batchSize);
 
     this.#allocator.free(auxPtr);
   }
@@ -460,19 +499,18 @@ export class WasmBackend implements Backend {
     const shape = routine.type.inputShapes[0];
     const n = shape[shape.length - 1];
     const batchSize = shape.slice(0, -1).reduce((a, b) => a * b, 1);
+    const dtype = elementSize === 4 ? "f32" : "f64";
 
     // Allocate auxiliary buffers (aux uses 4 bytes for indices)
     const auxPtr = this.#allocator.malloc(n * 4);
 
-    const instance = this.#getRoutineInstance(Routines.Argsort);
-    const exportName =
-      elementSize === 4 ? "argsort_batched_f32" : "argsort_batched_f64";
-    const func = instance.exports[exportName] as (
+    const module = getArgsortModule({ n, dtype });
+    const instance = this.#getRoutineInstanceForModule(module);
+    const func = instance.exports.argsort_batched as (
       data: number,
       out: number,
       idx: number,
       aux: number,
-      n: number,
       batchSize: number,
     ) => void;
     func(
@@ -480,7 +518,6 @@ export class WasmBackend implements Backend {
       this.#buffers.get(outputs[0])!.ptr,
       this.#buffers.get(outputs[1])!.ptr,
       auxPtr,
-      n,
       batchSize,
     );
 
@@ -586,11 +623,13 @@ export class WasmBackend implements Backend {
           env: { memory: this.#memory },
         };
 
-        // Add routine function imports if needed
+        // Add routine function imports if needed (using size-specialized modules)
         if (params.routineInfos && params.routineInfos.length > 0) {
           const routineImports: Record<string, WebAssembly.ExportValue> = {};
           for (const info of params.routineInfos) {
-            const routineInstance = this.#getRoutineInstance(info.routine);
+            const routineModule = this.#getRoutineModuleForScan(info);
+            const routineInstance =
+              this.#getRoutineInstanceForModule(routineModule);
             routineImports[info.exportName] = routineInstance.exports[
               info.exportName
             ] as WebAssembly.ExportValue;
@@ -1390,17 +1429,12 @@ function codegenNativeScanGeneral(
           };
 
           if (routineType === Routines.Cholesky) {
-            // cholesky_f32(inPtr, outPtr, n)
+            // cholesky(inPtr, outPtr) - size-specialized, no n param
             pushSlotPtr(step.inputSlots[0]); // inPtr
             cg.local.get(internalsBase + internalIdx); // outPtr
-            for (const param of callInfo.staticParams) {
-              cg.i32.const(param); // n
-            }
           } else if (routineType === Routines.Sort) {
-            // sort_f32(dataPtr, auxPtr, n) - in-place, needs aux buffer
+            // sort(dataPtr, auxPtr) - in-place, size-specialized
             // First, copy input to output (internal buffer), then sort in place
-            // For now, push: internal buffer as dataPtr, aux buffer, n
-            // The input needs to be copied to internal buffer first
 
             // Copy input to internal buffer first
             const inputSlotIdx = step.inputSlots[0];
@@ -1444,41 +1478,29 @@ function codegenNativeScanGeneral(
             // Now call sort with internal buffer as dataPtr
             cg.local.get(internalsBase + internalIdx); // dataPtr (in-place)
             cg.local.get(auxArgIdx); // auxPtr
-            cg.i32.const(sortSize); // n
           } else if (routineType === Routines.TriangularSolve) {
-            // triangular_solve_batched_f32(aPtr, bPtr, xPtr, n, batchRows, numBatches, unitDiag, lower)
+            // triangular_solve(aPtr, bPtr, xPtr) - size-specialized
             pushSlotPtr(step.inputSlots[0]); // aPtr
             pushSlotPtr(step.inputSlots[1]); // bPtr
             cg.local.get(internalsBase + internalIdx); // xPtr (output)
-            for (const param of callInfo.staticParams) {
-              cg.i32.const(param); // n, batchRows, numBatches, unitDiag, lower
-            }
           } else if (routineType === Routines.LU) {
-            // lu_f32(aPtr, luPtr, pivPtr, permPtr, m, n)
+            // lu(aPtr, luPtr, pivPtr, permPtr) - size-specialized
             const outIndices = step.outputInternalIndices!;
             pushSlotPtr(step.inputSlots[0]); // aPtr
             cg.local.get(internalsBase + outIndices[0]); // luPtr (first output)
             cg.local.get(internalsBase + outIndices[1]); // pivPtr (second output)
             cg.local.get(internalsBase + outIndices[2]); // permPtr (third output)
-            for (const param of callInfo.staticParams) {
-              cg.i32.const(param); // m, n
-            }
           } else if (routineType === Routines.Argsort) {
-            // argsort_f32(dataPtr, outPtr, idxPtr, auxPtr, n)
+            // argsort(dataPtr, outPtr, idxPtr, auxPtr) - size-specialized
             const outIndices = step.outputInternalIndices!;
-            const sortSize = callInfo.staticParams[0]; // n
             pushSlotPtr(step.inputSlots[0]); // dataPtr (input)
             cg.local.get(internalsBase + outIndices[0]); // outPtr (sorted values)
             cg.local.get(internalsBase + outIndices[1]); // idxPtr (indices)
             cg.local.get(auxArgIdx); // auxPtr
-            cg.i32.const(sortSize); // n
           } else {
             // Generic fallback (shouldn't happen for supported routines)
             pushSlotPtr(step.inputSlots[0]);
             cg.local.get(internalsBase + internalIdx);
-            for (const param of callInfo.staticParams) {
-              cg.i32.const(param);
-            }
           }
 
           // Call the routine
