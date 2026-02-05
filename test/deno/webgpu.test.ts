@@ -56,11 +56,13 @@ function trackScanPaths() {
     paths,
     clear: () => (paths.length = 0),
     cleanup: () => setScanPathCallback(null),
-    expectPath: (expected: ScanPath) => {
-      const found = paths.some((p) => p.path === expected);
+    /** Check that at least one of the expected paths was used. */
+    expectPath: (expected: ScanPath | ScanPath[]) => {
+      const allowed = Array.isArray(expected) ? expected : [expected];
+      const found = paths.some((p) => allowed.includes(p.path));
       if (!found) {
         throw new Error(
-          `Expected scan path "${expected}" but got: ${paths.map((p) => p.path).join(", ") || "(none)"}`,
+          `Expected scan path ${JSON.stringify(allowed)} but got: ${paths.map((p) => p.path).join(", ") || "(none)"}`,
         );
       }
     },
@@ -275,8 +277,8 @@ Deno.test({
     );
     const [finalCarry, outputs] = await jitScan(initCarry, xs);
 
-    // Verify fused path was used
-    tracker.expectPath("fused");
+    // Verify native path was used (compiled-loop for kernel-only body)
+    tracker.expectPath(["compiled-loop", "preencoded-routine"]);
     tracker.cleanup();
 
     const finalData = await finalCarry.data();
@@ -318,8 +320,8 @@ Deno.test({
     );
     const [finalCarry, outputs] = await jitScan(initCarry, xs);
 
-    // Verify fused path was used
-    tracker.expectPath("fused");
+    // Verify native path was used (compiled-loop for kernel-only body)
+    tracker.expectPath(["compiled-loop", "preencoded-routine"]);
     tracker.cleanup();
 
     const finalData = await finalCarry.data();
@@ -413,8 +415,8 @@ Deno.test({
     // So output array should be [15, 14, 12, 9, 5] (outputs[0] = result at xs[4], etc.)
     const [finalCarry, outputs] = await scanFn(initCarry, xs);
 
-    // Verify fused was used (WebGPU native-scan supports reverse via dataIdx)
-    tracker.expectPath("fused");
+    // Verify native path was used (WebGPU native-scan supports reverse via dataIdx)
+    tracker.expectPath(["compiled-loop", "preencoded-routine"]);
     tracker.cleanup();
 
     const finalData = await finalCarry.data();
@@ -464,8 +466,8 @@ Deno.test({
 
       const [finalCarry, outputs] = await scanFn(initCarry, xs);
 
-      // Verify fused was used (with constants support)
-      tracker.expectPath("fused");
+      // Verify native path was used (with constants support)
+      tracker.expectPath(["compiled-loop", "preencoded-routine"]);
       tracker.cleanup();
 
       // Iteration 1: 0 + (1*2 + 1) = 3
@@ -531,12 +533,8 @@ Deno.test({
       const [finalCarry, outputs] = await scanFn(initCarry, xs);
 
       // Verify the path used (small matmul fuses to kernel with reduction)
-      // Accept "fused" (native-scan) or "fallback" (JS loop for routine bodies)
-      const pathObj = tracker.paths[0];
-      const path = pathObj?.path;
-      if (path !== "fused" && path !== "fallback") {
-        throw new Error(`Expected fused or fallback, got: ${path || "none"}`);
-      }
+      // Accept any path - native-scan or fallback for routine bodies
+      tracker.expectPath(["compiled-loop", "preencoded-routine", "fallback"]);
       tracker.cleanup();
 
       // I * [[2,0],[0,2]] = [[2,0],[0,2]]

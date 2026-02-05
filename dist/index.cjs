@@ -30,7 +30,7 @@ var __toESM = (mod$1, isNodeMode, target) => (target = mod$1 != null ? __create(
 }) : target, mod$1));
 
 //#endregion
-const require_backend = require('./backend-CjNydALo.cjs');
+const require_backend = require('./backend-C8HSUSf-.cjs');
 const require_scan_wrapper = require('./scan-wrapper-BeVQahyp.cjs');
 
 //#region src/frontend/convolution.ts
@@ -2245,13 +2245,12 @@ function jitCompile(backend, jaxpr) {
 			const nativeScanResult = tryPrepareNativeScan(backend, bodyProgram, bodyJaxpr, length, numCarry, numConsts, numX, numY, reverse);
 			const nativeScanExe = nativeScanResult?.executable ?? null;
 			if (nativeScanExe) {
-				const pathError$1 = checkRequiredPath("fused", requirePath);
+				const pathError$1 = checkRequiredPath("compiled-loop", requirePath);
 				if (pathError$1) throw new Error(pathError$1);
-				require_backend.reportScanPath("fused", backend.type, {
+				require_backend.reportScanPath("compiled-loop", backend.type, {
 					numConsts,
 					numCarry,
-					length,
-					pathDetail: "compiled-loop"
+					length
 				});
 				builder.steps.push({
 					type: "compiled-loop",
@@ -2271,13 +2270,12 @@ function jitCompile(backend, jaxpr) {
 			}
 			const batchedParams = tryPrepareBatchedScan(backend, bodyProgram, bodyJaxpr, length, numCarry, numConsts, numX, numY, eqn, reverse);
 			if (batchedParams) {
-				const pathError$1 = checkRequiredPath("fused", requirePath);
+				const pathError$1 = checkRequiredPath("preencoded-routine", requirePath);
 				if (pathError$1) throw new Error(pathError$1);
-				require_backend.reportScanPath("fused", backend.type, {
+				require_backend.reportScanPath("preencoded-routine", backend.type, {
 					numConsts,
 					numCarry,
-					length,
-					pathDetail: "preencoded-routine"
+					length
 				});
 				builder.steps.push({
 					type: "preencoded-routine",
@@ -2300,8 +2298,7 @@ function jitCompile(backend, jaxpr) {
 			require_backend.reportScanPath("fallback", backend.type, {
 				numConsts,
 				numCarry,
-				length,
-				pathDetail: "fallback"
+				length
 			});
 			builder.steps.push({
 				type: "scan",

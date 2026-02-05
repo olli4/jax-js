@@ -1,5 +1,5 @@
 import { __export } from "./chunk-Cl8Af3a2.js";
-import { AluExp, AluGroup, AluOp, AluVar, DEBUG, DType, FpHash, Kernel, PPrint, Reduction, Routine, Routines, ShapeTracker, accessorAluExp, accessorGlobal, assertNonNull, byteWidth, checkAxis, checkInts, deepEqual, defaultDevice, devices, dtypedArray, dtypedJsArray, generalBroadcast, getBackend, init, invertPermutation, isFloatDtype, isNumberPair, isPermutation, normalizeAxis, partitionList, prod, promoteTypes, range, recursiveFlatten, rep, reportScanBodySteps, reportScanPath, runWithCache, setDebug, setScanBodyStepsCallback, setScanPathCallback, toposort, unravelAlu, unzip2, zip, zipn } from "./backend-DGe3Ta8T.js";
+import { AluExp, AluGroup, AluOp, AluVar, DEBUG, DType, FpHash, Kernel, PPrint, Reduction, Routine, Routines, ShapeTracker, accessorAluExp, accessorGlobal, assertNonNull, byteWidth, checkAxis, checkInts, deepEqual, defaultDevice, devices, dtypedArray, dtypedJsArray, generalBroadcast, getBackend, init, invertPermutation, isFloatDtype, isNumberPair, isPermutation, normalizeAxis, partitionList, prod, promoteTypes, range, recursiveFlatten, rep, reportScanBodySteps, reportScanPath, runWithCache, setDebug, setScanBodyStepsCallback, setScanPathCallback, toposort, unravelAlu, unzip2, zip, zipn } from "./backend-Cjbb2Nzw.js";
 import { createAllIterationsOffsetsBuffer, wrapRoutineForScan } from "./scan-wrapper-TpkqHRRF.js";
 
 //#region src/frontend/convolution.ts
@@ -2210,13 +2210,12 @@ function jitCompile(backend, jaxpr) {
 			const nativeScanResult = tryPrepareNativeScan(backend, bodyProgram, bodyJaxpr, length, numCarry, numConsts, numX, numY, reverse);
 			const nativeScanExe = nativeScanResult?.executable ?? null;
 			if (nativeScanExe) {
-				const pathError$1 = checkRequiredPath("fused", requirePath);
+				const pathError$1 = checkRequiredPath("compiled-loop", requirePath);
 				if (pathError$1) throw new Error(pathError$1);
-				reportScanPath("fused", backend.type, {
+				reportScanPath("compiled-loop", backend.type, {
 					numConsts,
 					numCarry,
-					length,
-					pathDetail: "compiled-loop"
+					length
 				});
 				builder.steps.push({
 					type: "compiled-loop",
@@ -2236,13 +2235,12 @@ function jitCompile(backend, jaxpr) {
 			}
 			const batchedParams = tryPrepareBatchedScan(backend, bodyProgram, bodyJaxpr, length, numCarry, numConsts, numX, numY, eqn, reverse);
 			if (batchedParams) {
-				const pathError$1 = checkRequiredPath("fused", requirePath);
+				const pathError$1 = checkRequiredPath("preencoded-routine", requirePath);
 				if (pathError$1) throw new Error(pathError$1);
-				reportScanPath("fused", backend.type, {
+				reportScanPath("preencoded-routine", backend.type, {
 					numConsts,
 					numCarry,
-					length,
-					pathDetail: "preencoded-routine"
+					length
 				});
 				builder.steps.push({
 					type: "preencoded-routine",
@@ -2265,8 +2263,7 @@ function jitCompile(backend, jaxpr) {
 			reportScanPath("fallback", backend.type, {
 				numConsts,
 				numCarry,
-				length,
-				pathDetail: "fallback"
+				length
 			});
 			builder.steps.push({
 				type: "scan",

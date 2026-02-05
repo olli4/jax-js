@@ -37,11 +37,11 @@ export interface ScanOptions {
    *
    * @example
    * ```ts
-   * // Require the fused (native) scan path
-   * lax.scan(f, init, xs, { requirePath: "fused" });
+   * // Require the compiled-loop path (entire loop in native code)
+   * lax.scan(f, init, xs, { requirePath: "compiled-loop" });
    *
-   * // Allow either fused or fallback
-   * lax.scan(f, init, xs, { requirePath: ["fused", "fallback"] });
+   * // Allow any native path (compiled-loop or preencoded-routine)
+   * lax.scan(f, init, xs, { requirePath: ["compiled-loop", "preencoded-routine"] });
    * ```
    */
   requirePath?: ScanPath | ScanPath[];

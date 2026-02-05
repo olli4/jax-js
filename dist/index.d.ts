@@ -138,24 +138,16 @@ declare class ShapeTracker {
 declare function setDebug(level: number): void;
 /**
  * Scan path types for diagnostic tracking.
- * - "fused": Loop fused into native code (WASM module or WebGPU shader)
- * - "fallback": JS loop fallback (body executed per iteration)
- */
-type ScanPath = "fused" | "fallback";
-/**
- * Detailed scan path types that expose the internal implementation.
  * - "compiled-loop": Entire scan loop compiled to native code (WASM module or WebGPU shader)
- * - "preencoded-routine": Pre-encoded GPU command dispatches with uniform offsets per iteration
- * - "fallback": JS loop calling compiled body program per iteration
+ * - "preencoded-routine": Pre-encoded GPU command dispatches with uniform offsets per iteration (WebGPU only)
+ * - "fallback": JS loop calling body program per iteration (one or more JS↔backend boundary crossings)
  */
-type ScanPathDetail = "compiled-loop" | "preencoded-routine" | "fallback";
+type ScanPath = "compiled-loop" | "preencoded-routine" | "fallback";
 /** Callback for tracking which scan implementation paths are taken. */
 type ScanPathCallback = (path: ScanPath, backend: string, details?: {
   numConsts?: number;
   numCarry?: number;
   length?: number;
-  /** Detailed path type exposing the internal step type. */
-  pathDetail?: ScanPathDetail;
 }) => void;
 /** Callback for tracking scan body execute steps (for testing fusion). */
 type ScanBodyStepsCallback = (executeSteps: number, backend: string, details?: {
@@ -199,13 +191,13 @@ declare function setScanBodyStepsCallback(callback: ScanBodyStepsCallback | null
  * @example
  * ```ts
  * // Option 1: Use requirePath (recommended for tests)
- * lax.scan(f, init, xs, { requirePath: "fused" }); // throws if not fused
+ * lax.scan(f, init, xs, { requirePath: "compiled-loop" }); // throws if not compiled-loop
  *
  * // Option 2: Use callback to observe without throwing
  * let usedPath: ScanPath | null = null;
  * setScanPathCallback((path, backend) => { usedPath = path; });
  * await jitScan(init, xs);
- * expect(usedPath).toBe("fused");
+ * expect(usedPath).toBe("compiled-loop");
  * setScanPathCallback(null); // cleanup
  * ```
  */
@@ -1597,11 +1589,11 @@ interface ScanOptions {
    *
    * @example
    * ```ts
-   * // Require the fused (native) scan path
-   * lax.scan(f, init, xs, { requirePath: "fused" });
+   * // Require the compiled-loop path (entire loop in native code)
+   * lax.scan(f, init, xs, { requirePath: "compiled-loop" });
    *
-   * // Allow either fused or fallback
-   * lax.scan(f, init, xs, { requirePath: ["fused", "fallback"] });
+   * // Allow any native path (compiled-loop or preencoded-routine)
+   * lax.scan(f, init, xs, { requirePath: ["compiled-loop", "preencoded-routine"] });
    * ```
    */
   requirePath?: ScanPath | ScanPath[];
@@ -3328,4 +3320,4 @@ declare function blockUntilReady<T extends JsTree<any>>(x: T): Promise<T>;
  */
 declare function devicePut<T extends JsTree<any>>(x: T, device?: Device): Promise<MapJsTree<T, number | boolean, Array>>;
 //#endregion
-export { Array, ClosedJaxpr, DType, type Device, Jaxpr, type JsTree, type JsTreeDef, type OwnedFunction, type ScanPath, type ScanPathDetail, blockUntilReady, createAllIterationsOffsetsBuffer, defaultDevice, devicePut, devices, getBackend, grad, hessian, init, jacfwd, jacrev as jacobian, jacrev, jit, jvp, lax_d_exports as lax, linearize, makeJaxpr, nn_d_exports as nn, numpy_d_exports as numpy, random_d_exports as random, scipy_special_d_exports as scipySpecial, setDebug, setScanBodyStepsCallback, setScanPathCallback, tree_d_exports as tree, valueAndGrad, vjp, vmap, wrapRoutineForScan };
+export { Array, ClosedJaxpr, DType, type Device, Jaxpr, type JsTree, type JsTreeDef, type OwnedFunction, type ScanPath, blockUntilReady, createAllIterationsOffsetsBuffer, defaultDevice, devicePut, devices, getBackend, grad, hessian, init, jacfwd, jacrev as jacobian, jacrev, jit, jvp, lax_d_exports as lax, linearize, makeJaxpr, nn_d_exports as nn, numpy_d_exports as numpy, random_d_exports as random, scipy_special_d_exports as scipySpecial, setDebug, setScanBodyStepsCallback, setScanPathCallback, tree_d_exports as tree, valueAndGrad, vjp, vmap, wrapRoutineForScan };
