@@ -627,26 +627,27 @@ The WebGPU backend keeps data on GPU between iterations. Supports **compiled-loo
 kernels, **multi-kernel scan** for bodies with multiple independent kernels, and
 **preencoded-routine** for single-routine bodies meeting specific requirements (currently Cholesky).
 
-| Feature / Test                      | Status                           | Notes                                    |
-| ----------------------------------- | -------------------------------- | ---------------------------------------- |
-| `scan basic`                        | [✅ Pass](test/lax-scan.test.ts) | uses native scan on WebGPU               |
-| `scan with pytree carry`            | [✅ Pass](test/lax-scan.test.ts) |                                          |
-| `reverse scan`                      | [✅ Pass](test/lax-scan.test.ts) | uses native scan with dataIdx            |
-| `jit + scan`                        | [✅ Pass](test/lax-scan.test.ts) |                                          |
-| `JVP (forward-mode)`                | [✅ Pass](test/lax-scan.test.ts) |                                          |
-| `VJP (reverse-mode)`                | [✅ Pass](test/lax-scan.test.ts) |                                          |
-| `vmap`                              | [✅ Pass](test/lax-scan.test.ts) |                                          |
-| `vmap` > `jit(vmap(scan))`          | [✅ Pass](test/lax-scan.test.ts) |                                          |
-| `vmap` > `vmap(jit(scan))`          | [✅ Pass](test/lax-scan.test.ts) |                                          |
-| `scan over views`                   | [✅ Pass](test/lax-scan.test.ts) | sliced/transposed xs                     |
-| `native scan`                       | [✅ Pass](test/lax-scan.test.ts) | kernel gids reindexed to scan layout     |
-| `native scan` > `with reduction`    | [✅ Pass](test/lax-scan.test.ts) | e.g., `carry += sum(x)` or matmul        |
-| `native scan` > `with reverse`      | [✅ Pass](test/lax-scan.test.ts) | uses dataIdx like WASM                   |
-| `native scan` > `with constants`    | [✅ Pass](test/lax-scan.test.ts) | captured constants bound as storage      |
-| `multi-kernel scan`                 | ✅ Pass                          | derives output mapping from body outputs |
-| `preencoded-routine` (Cholesky)     | ✅ Pass                          | uses uniform offsets                     |
-| `preencoded-routine` (LU, TriSolve) | ⚠️ Fallback                      | multi-output or mixed kernel+routine     |
-| `preencoded-routine` (Sort)         | ⚠️ Fallback                      | Sort already uses uniforms (conflict)    |
+| Feature / Test                   | Status                           | Notes                                        |
+| -------------------------------- | -------------------------------- | -------------------------------------------- |
+| `scan basic`                     | [✅ Pass](test/lax-scan.test.ts) | uses native scan on WebGPU                   |
+| `scan with pytree carry`         | [✅ Pass](test/lax-scan.test.ts) |                                              |
+| `reverse scan`                   | [✅ Pass](test/lax-scan.test.ts) | uses native scan with dataIdx                |
+| `jit + scan`                     | [✅ Pass](test/lax-scan.test.ts) |                                              |
+| `JVP (forward-mode)`             | [✅ Pass](test/lax-scan.test.ts) |                                              |
+| `VJP (reverse-mode)`             | [✅ Pass](test/lax-scan.test.ts) |                                              |
+| `vmap`                           | [✅ Pass](test/lax-scan.test.ts) |                                              |
+| `vmap` > `jit(vmap(scan))`       | [✅ Pass](test/lax-scan.test.ts) |                                              |
+| `vmap` > `vmap(jit(scan))`       | [✅ Pass](test/lax-scan.test.ts) |                                              |
+| `scan over views`                | [✅ Pass](test/lax-scan.test.ts) | sliced/transposed xs                         |
+| `native scan`                    | [✅ Pass](test/lax-scan.test.ts) | kernel gids reindexed to scan layout         |
+| `native scan` > `with reduction` | [✅ Pass](test/lax-scan.test.ts) | e.g., `carry += sum(x)` or matmul            |
+| `native scan` > `with reverse`   | [✅ Pass](test/lax-scan.test.ts) | uses dataIdx like WASM                       |
+| `native scan` > `with constants` | [✅ Pass](test/lax-scan.test.ts) | captured constants bound as storage          |
+| `multi-kernel scan`              | ✅ Pass                          | derives output mapping from body outputs     |
+| `preencoded-routine` (Cholesky)  | ✅ Pass                          | requires passthrough pattern (numCarry=numY) |
+| Mixed kernel+routine bodies      | ⚠️ Fallback                      | e.g., Kalman filter, lstsq                   |
+| Multi-routine bodies             | ⚠️ Fallback                      | e.g., Cholesky→TriSolve→TriSolve             |
+| Sort in scan body                | ⚠️ Fallback                      | Sort already uses uniforms (conflict)        |
 
 **Note on numCarry ≠ numY:** WebGPU native scan requires `numCarry === numY`. When they differ,
 WebGPU falls back to JS loop. WASM's general scan handles this case.
@@ -1045,12 +1046,28 @@ Scan bodies are classified by what operations they contain:
 | kernel-only (simple)     | compiled-loop | compiled-loop                     |
 | kernel-only (with deps¹) | compiled-loop | **fallback**                      |
 | routine body (single)    | compiled-loop | preencoded-routine (or fallback²) |
-| mixed kernel+routine     | compiled-loop | **fallback**                      |
-| multiple routines        | compiled-loop | **fallback**                      |
+| mixed kernel+routine     | compiled-loop | **fallback** (common in practice) |
+| multiple routines        | compiled-loop | **fallback** (e.g., lstsq)        |
 
 ¹ "With deps" = internal buffer dependencies between steps, or carry passthrough pattern. ² Sort
 uses fallback due to uniform buffer conflict; LU uses fallback due to multi-output (numCarry ≠
 numY).
+
+**Why `lax.linalg.triangularSolve` creates a mixed body:**
+
+The high-level `triangularSolve` API handles `leftSide` and `lower` parameters by adding
+transpose/flip operations around the primitive routine:
+
+```ts
+// What lax.linalg.triangularSolve(L, b, { leftSide: true, lower: true }) compiles to:
+b_transposed = moveaxis(b, -2, -1); // Kernel step 1
+L_flipped = flip(L, [-2, -1]); // Kernel step 2 (for lower=true)
+x = Primitive.TriangularSolve(L_flipped, b_transposed); // Routine step
+result = flip(moveaxis(x, -2, -1), [-1]); // Kernel step 3
+```
+
+This creates a mixed kernel+routine body with 3+ steps, so WebGPU falls back. WASM handles it
+natively. If performance is critical, consider using WASM backend for linalg-heavy scan bodies.
 
 **Definition: Internal buffer dependencies**
 
@@ -1486,21 +1503,46 @@ kernel"
 
 ### Current limitations
 
-| Limitation                          | Workaround                | Backend |
-| ----------------------------------- | ------------------------- | ------- |
-| `numCarry ≠ numY` on WebGPU         | Falls back to JS loop     | WebGPU  |
-| WebGPU internal buffer deps in scan | Falls back to JS loop     | WebGPU  |
-| `grad(scan)` memory O(N)            | None (stores all carries) | All     |
-| Sort in scan body on WebGPU         | Uses JS loop (uniforms)   | WebGPU  |
+| Limitation                            | Workaround                | Backend |
+| ------------------------------------- | ------------------------- | ------- |
+| `numCarry ≠ numY` on WebGPU           | Falls back to JS loop     | WebGPU  |
+| WebGPU internal buffer deps in scan   | Falls back to JS loop     | WebGPU  |
+| Mixed kernel+routine bodies on WebGPU | Falls back to JS loop     | WebGPU  |
+| `grad(scan)` memory O(N)              | None (stores all carries) | All     |
+| Sort in scan body on WebGPU           | Uses JS loop (uniforms)   | WebGPU  |
 
-**Note on WebGPU internal buffer dependencies:** When a scan body has steps that depend on each
-other (e.g., Mandelbrot: `Asq = A*A` then `newA = Asq - Bsq + X`), WebGPU falls back to JS loop
-because its shader codegen doesn't support intermediate buffers between steps. WASM handles this
-case natively.
+**WebGPU preencoded-routine requirements:** WebGPU can only use `preencoded-routine` for scan bodies
+that are:
+
+1. **Exactly one routine** (no kernels before or after)
+2. **numCarry === numY** (passthrough pattern)
+3. **Routine doesn't use uniforms** (excludes Sort)
+
+In practice, this means only simple Cholesky-passthrough patterns like:
+
+```ts
+const step = (carry, x) => {
+  const L = lax.linalg.cholesky(x);
+  return [L.ref, L]; // L is both carry and y
+};
+```
+
+**Why most linalg patterns fall back on WebGPU:**
+
+- **TriangularSolve**: The `lax.linalg.triangularSolve` API handles `leftSide`/`lower` via transpose
+  operations (kernels), so the body has multiple steps.
+- **LU**: Returns `[lu, pivots, permutation]` — three outputs, so numCarry ≠ numY.
+- **lstsq/solve**: Combines Cholesky + TriangularSolve + TriangularSolve — multiple routines.
+- **Kalman filters**: Mix matmul (kernel) + routines in one body.
+
+**This is a minor limitation** because:
+
+1. WASM `compiled-loop` handles all these cases natively via imports
+2. Complex linalg patterns (Kalman, Newton, etc.) fall back regardless
+3. WebGPU fallback still keeps data on GPU — the overhead is command encoding, not data transfer
 
 **Note on Sort in scan body:** Sort already uses a uniform buffer for its configuration, which
-conflicts with the scan offset uniform. This causes Sort-in-scan to fall back to JS loop on WebGPU.
-Cholesky uses preencoded-routine when the body is a single Cholesky routine with matching carry/Y.
+conflicts with the scan offset uniform.
 
 ### Future work
 

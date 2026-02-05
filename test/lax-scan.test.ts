@@ -2404,9 +2404,11 @@ describe("scan autodiff", () => {
       f.dispose();
     });
 
-    it("WebGPU: TriangularSolve in scan body uses fallback instead of compiled-loop", async () => {
-      // Limitation test: uses fallback. If this test fails with "scan used X but acceptPath
-      // requires fallback", the limitation has been fixed! Update copilot-instructions.md.
+    it("WebGPU: Mixed kernel+routine body (triangularSolve) uses fallback", async () => {
+      // This is EXPECTED behavior, not a limitation:
+      // lax.linalg.triangularSolve adds transpose operations (kernels) around the routine,
+      // creating a mixed kernel+routine body which WebGPU doesn't support natively.
+      // WASM handles this via compiled-loop with routine imports.
       const availableDevices = await init();
       if (!availableDevices.includes("webgpu")) {
         return;
@@ -2450,9 +2452,10 @@ describe("scan autodiff", () => {
       f.dispose();
     });
 
-    it("WebGPU: LU in scan body uses fallback instead of compiled-loop", async () => {
-      // Limitation test: uses fallback. If this test fails with "scan used X but acceptPath
-      // requires fallback", the limitation has been fixed! Update copilot-instructions.md.
+    it("WebGPU: Multi-output routine (LU) uses fallback due to numCarry≠numY", async () => {
+      // LU returns [lu, pivots, permutation] - 3 outputs but body consumes 1 carry.
+      // This means numCarry≠numY which WebGPU preencoded-routine doesn't support.
+      // WASM handles this via compiled-loop.
       const availableDevices = await init();
       if (!availableDevices.includes("webgpu")) {
         return;
