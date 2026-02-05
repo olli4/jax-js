@@ -937,6 +937,13 @@ interface PrimitiveParamsImpl extends Record<Primitive, Record<string, any>> {
     reverse: boolean;
     /** Accepted scan path(s). Throws if actual path is not in this list. */
     acceptPath?: string | string[];
+    /**
+     * Enable gradient checkpointing to reduce memory from O(N) to O(√N).
+     * - `true`: use segment size of ceil(√N)
+     * - A positive integer: use that as the segment size
+     * - `undefined` (default): store all intermediate carries (O(N) memory)
+     */
+    checkpoint?: boolean | number;
   };
 }
 /** Type of parameters taken by each primitive. */
@@ -1569,6 +1576,30 @@ interface ScanOptions {
    * ```
    */
   acceptPath?: ScanPath | ScanPath[];
+  /**
+   * Enable gradient checkpointing to reduce memory during reverse-mode autodiff.
+   *
+   * When differentiating through scan with `grad()` or `vjp()`, all N intermediate
+   * carry values are stored by default, using O(N) memory. With checkpointing enabled,
+   * only O(√N) checkpoints are stored, and intermediate values are recomputed from
+   * the nearest checkpoint during the backward pass. This trades ~2× computation
+   * for significantly reduced memory usage.
+   *
+   * - `true`: use segment size of `ceil(√N)`
+   * - A positive integer: use that as the segment size (larger = more memory, less recompute)
+   * - `undefined` (default): store all intermediate carries (O(N) memory)
+   *
+   * @example
+   * ```ts
+   * // Enable automatic √N checkpointing
+   * const loss = (xs) => {
+   *   const [carry, _] = lax.scan(step, init, xs, { checkpoint: true });
+   *   return carry.sum();
+   * };
+   * const dxs = grad(loss)(xs); // Uses O(√N) memory instead of O(N)
+   * ```
+   */
+  checkpoint?: boolean | number;
 }
 /**
  * Scan a function over leading array axes while carrying along state.

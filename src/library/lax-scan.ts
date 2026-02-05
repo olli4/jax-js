@@ -50,6 +50,34 @@ export interface ScanOptions {
    * ```
    */
   acceptPath?: ScanPath | ScanPath[];
+
+  /**
+   * Control gradient checkpointing during reverse-mode autodiff.
+   *
+   * By default, `grad(scan)` uses √N checkpointing: only O(√N) intermediate carry
+   * values are stored, and the rest are recomputed from the nearest checkpoint
+   * during the backward pass. This trades ~2× computation for O(√N) memory.
+   *
+   * - `undefined` or `true` (default): use segment size of `ceil(√N)`
+   * - A positive integer: use that as the segment size (larger = more memory, less recompute)
+   * - `false`: store all N intermediate carries (O(N) memory, no recomputation)
+   *
+   * @example
+   * ```ts
+   * // Default: √N checkpointing is used automatically
+   * const dxs = grad((xs) => {
+   *   const [carry, _] = lax.scan(step, init, xs);
+   *   return carry.sum();
+   * })(xs);
+   *
+   * // Opt out: store all carries (faster, more memory)
+   * const dxs2 = grad((xs) => {
+   *   const [carry, _] = lax.scan(step, init, xs, { checkpoint: false });
+   *   return carry.sum();
+   * })(xs);
+   * ```
+   */
+  checkpoint?: boolean | number;
 }
 
 /**
@@ -316,7 +344,7 @@ export function scan<
   options?: ScanOptions,
 ): [Carry, Y] {
   const opts: ScanOptions = options ?? {};
-  const { length: lengthOpt, reverse = false, acceptPath } = opts;
+  const { length: lengthOpt, reverse = false, acceptPath, checkpoint } = opts;
 
   // Handle xs=null case (carry-only scan with no input arrays)
   const xsIsNull = xs === null;
@@ -401,6 +429,7 @@ export function scan<
     length: n,
     reverse,
     acceptPath,
+    checkpoint,
   });
 
   // Dispose original inputs

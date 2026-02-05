@@ -411,7 +411,7 @@ const jvpRules: { [P in Primitive]: JvpRule<P> } = {
   [Primitive.Scan](
     primals,
     tangents,
-    { jaxpr, numCarry, numConsts, length, reverse },
+    { jaxpr, numCarry, numConsts, length, reverse, checkpoint },
   ) {
     // JVP of scan: run a combined scan that processes both primals and tangents.
     //
@@ -586,6 +586,7 @@ const jvpRules: { [P in Primitive]: JvpRule<P> } = {
       numConsts: wrapperJaxpr.consts.length + numConsts * 2,
       length,
       reverse,
+      checkpoint,
     });
 
     // Dispose the wrapper jaxpr (not cached)

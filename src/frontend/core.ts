@@ -131,6 +131,13 @@ interface PrimitiveParamsImpl extends Record<Primitive, Record<string, any>> {
     reverse: boolean;
     /** Accepted scan path(s). Throws if actual path is not in this list. */
     acceptPath?: string | string[];
+    /**
+     * Control gradient checkpointing for the backward pass.
+     * - `undefined` or `true` (default): use √N checkpointing with segment size ceil(√N)
+     * - A positive integer: use that as the segment size
+     * - `false`: store all intermediate carries (O(N) memory, no recomputation)
+     */
+    checkpoint?: boolean | number;
   };
 }
 

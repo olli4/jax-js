@@ -139,6 +139,9 @@ const step = (carry, x) => {
 - `acceptPath?: ScanPath | ScanPath[]` — accept only these paths: `"compiled-loop"` (native code),
   `"preencoded-routine"` (GPU routines), or `"fallback"` (JS loop). Throws if actual path is not in
   the list.
+- `checkpoint?: boolean | number` — control gradient checkpointing for `grad(scan)`. Default
+  (undefined/true) uses √N checkpointing (O(√N) memory, ~2× compute). A number specifies the segment
+  size. `false` stores all carries (O(N) memory, no recomputation).
 
 ---
 

@@ -5337,7 +5337,7 @@ const jvpRules = {
 		const [primalsOut, tangentsOut] = [outs.slice(0, n), outs.slice(n)];
 		return [primalsOut, tangentsOut];
 	},
-	[Primitive.Scan](primals, tangents, { jaxpr, numCarry, numConsts, length, reverse }) {
+	[Primitive.Scan](primals, tangents, { jaxpr, numCarry, numConsts, length, reverse, checkpoint }) {
 		const numX = primals.length - numConsts - numCarry;
 		const numY = jaxpr.outs.length - numCarry;
 		const jvpBody = jvpJaxpr(jaxpr);
@@ -5409,7 +5409,8 @@ const jvpRules = {
 			numCarry: numCarry * 2,
 			numConsts: wrapperJaxpr.consts.length + numConsts * 2,
 			length,
-			reverse
+			reverse,
+			checkpoint
 		});
 		wrapperJaxpr.dispose();
 		const carryOutP = results.slice(0, numCarry);
@@ -6132,7 +6133,7 @@ const transposeRules = {
 		let i = 0;
 		return undefPrimals.map((isUndef) => isUndef ? outs[i++] : null);
 	},
-	[Primitive.Scan](cts, args, { jaxpr, numCarry, numConsts, length, reverse }) {
+	[Primitive.Scan](cts, args, { jaxpr, numCarry, numConsts, length, reverse, checkpoint }) {
 		const numX = args.length - numConsts - numCarry;
 		const numY = cts.length - numCarry;
 		const isJvpScan = numCarry % 2 === 0 && numY % 2 === 0 && numX % 2 === 0;
@@ -6186,10 +6187,7 @@ const transposeRules = {
 			for (let i = numCarry + Math.floor(numY / 2); i < outs.length; i++) outs[i].dispose();
 			return [...primalCarryOuts, ...primalYOuts];
 		})(...forwardInTypes);
-		const allCarries = [];
-		let currentCarry = carryResiduals.map((c) => c.ref);
-		allCarries.push(currentCarry.map((c) => c.ref));
-		for (let iter = 0; iter < length; iter++) {
+		const runOneForwardStep = (iter, carry) => {
 			const dataIdx = reverse ? length - 1 - iter : iter;
 			const xSlices = [];
 			for (const xs of xsResiduals) {
@@ -6198,17 +6196,31 @@ const transposeRules = {
 			}
 			const forwardInputs = [
 				...constResiduals.map((c) => c.ref),
-				...currentCarry.map((c) => c.ref),
+				...carry.map((c) => c.ref),
 				...xSlices
 			];
 			const forwardOuts = evalJaxpr(primalForwardJaxpr.jaxpr, [...primalForwardJaxpr.consts.map((c) => c.ref), ...forwardInputs]);
 			const newCarry = forwardOuts.slice(0, numPrimalCarry);
 			for (let i = numPrimalCarry; i < forwardOuts.length; i++) forwardOuts[i].dispose();
+			return newCarry;
+		};
+		const useCheckpointing = checkpoint != null;
+		const segmentSize = useCheckpointing ? typeof checkpoint === "number" ? checkpoint : Math.max(1, Math.ceil(Math.sqrt(length))) : length;
+		const allCarries = useCheckpointing ? null : [];
+		const checkpointCarries = useCheckpointing ? /* @__PURE__ */ new Map() : null;
+		{
+			let currentCarry = carryResiduals.map((c) => c.ref);
+			if (allCarries) allCarries.push(currentCarry.map((c) => c.ref));
+			else checkpointCarries.set(0, currentCarry.map((c) => c.ref));
+			for (let iter = 0; iter < length; iter++) {
+				const newCarry = runOneForwardStep(iter, currentCarry);
+				for (const c of currentCarry) c.dispose();
+				currentCarry = newCarry;
+				if (allCarries) allCarries.push(currentCarry.map((c) => c.ref));
+				else if ((iter + 1) % segmentSize === 0) checkpointCarries.set(iter + 1, currentCarry.map((c) => c.ref));
+			}
 			for (const c of currentCarry) c.dispose();
-			currentCarry = newCarry;
-			allCarries.push(currentCarry.map((c) => c.ref));
 		}
-		for (const c of currentCarry) c.dispose();
 		const numTangentConsts = numConsts - constResiduals.length;
 		const numTangentCarry = numCarry - numPrimalCarry;
 		const numTangentX = numX - numPrimalX;
@@ -6240,16 +6252,14 @@ const transposeRules = {
 		const ctXsAccum = [];
 		for (let i = 0; i < numTangentX; i++) ctXsAccum.push([]);
 		let ctConstsAccum = null;
-		for (let iter = length - 1; iter >= 0; iter--) {
+		const runOneBackwardStep = (iter, primalCarry) => {
 			const dataIdx = reverse ? length - 1 - iter : iter;
-			const primalCarry = allCarries[iter];
 			const xSlices = [];
 			for (const xs of xsResiduals) {
 				const slice = shrink(xs.ref, [[dataIdx, dataIdx + 1], ...xs.shape.slice(1).map((_, i) => [0, xs.shape[i + 1]])]);
 				xSlices.push(reshape$1(slice, xs.shape.slice(1)));
 			}
 			const ctYSlices = [];
-			ctYsAll.length - Math.floor(numY / 2);
 			for (let i = Math.floor(numY / 2); i < ctYsAll.length; i++) {
 				const ctY = ctYsAll[i];
 				const slice = shrink(ctY.ref, [[dataIdx, dataIdx + 1], ...ctY.shape.slice(1).map((_, j) => [0, ctY.shape[j + 1]])]);
@@ -6270,8 +6280,8 @@ const transposeRules = {
 			const ctConstsIter = [];
 			for (let i = 0; i < numTangentConsts; i++) ctConstsIter.push(transposedOuts[outIdx++]);
 			const ctCarryNew = [];
-			const numTangentCarry$1 = numCarry - numPrimalCarry;
-			for (let i = 0; i < numTangentCarry$1; i++) ctCarryNew.push(transposedOuts[outIdx++]);
+			const numTangentCarryLocal = numCarry - numPrimalCarry;
+			for (let i = 0; i < numTangentCarryLocal; i++) ctCarryNew.push(transposedOuts[outIdx++]);
 			const ctXIter = [];
 			for (let i = 0; i < numTangentX; i++) ctXIter.push(transposedOuts[outIdx++]);
 			if (ctConstsAccum === null) ctConstsAccum = ctConstsIter;
@@ -6279,9 +6289,38 @@ const transposeRules = {
 			for (let i = 0; i < numTangentX; i++) ctXsAccum[i].push(ctXIter[i]);
 			for (const c of ctCarryRunning) c.dispose();
 			ctCarryRunning = ctCarryNew;
-			for (const c of primalCarry) c.dispose();
+		};
+		if (useCheckpointing) {
+			const numSegments = Math.ceil(length / segmentSize);
+			for (let seg = numSegments - 1; seg >= 0; seg--) {
+				const segStart = seg * segmentSize;
+				const segEnd = Math.min(segStart + segmentSize, length);
+				const segCarries = [];
+				let carry = checkpointCarries.get(segStart).map((c) => c.ref);
+				segCarries.push(carry.map((c) => c.ref));
+				for (let iter = segStart; iter < segEnd - 1; iter++) {
+					const newCarry = runOneForwardStep(iter, carry);
+					for (const c of carry) c.dispose();
+					carry = newCarry;
+					segCarries.push(carry.map((c) => c.ref));
+				}
+				for (const c of carry) c.dispose();
+				for (let iter = segEnd - 1; iter >= segStart; iter--) {
+					const localIdx = iter - segStart;
+					runOneBackwardStep(iter, segCarries[localIdx]);
+					for (const c of segCarries[localIdx]) c.dispose();
+				}
+				for (const c of checkpointCarries.get(segStart)) c.dispose();
+				checkpointCarries.delete(segStart);
+			}
+			for (const [, carries] of checkpointCarries) for (const c of carries) c.dispose();
+		} else {
+			for (let iter = length - 1; iter >= 0; iter--) {
+				runOneBackwardStep(iter, allCarries[iter]);
+				for (const c of allCarries[iter]) c.dispose();
+			}
+			for (const c of allCarries[length]) c.dispose();
 		}
-		for (const c of allCarries[length]) c.dispose();
 		for (let i = Math.floor(numY / 2); i < ctYsAll.length; i++) ctYsAll[i].dispose();
 		for (let i = 0; i < Math.floor(numY / 2); i++) ctYsAll[i].dispose();
 		const ctXsStacked = [];
@@ -8736,7 +8775,7 @@ function triangularSolve(a, b, { leftSide = false, lower = false, transposeA = f
 */
 function scan(f, init$1, xs, options) {
 	const opts = options ?? {};
-	const { length: lengthOpt, reverse = false, acceptPath } = opts;
+	const { length: lengthOpt, reverse = false, acceptPath, checkpoint } = opts;
 	const xsIsNull = xs === null;
 	const [initFlat, initTreedef] = flatten(init$1);
 	const [xsFlat, xsTreedef] = xsIsNull ? [[], null] : flatten(xs);
@@ -8780,7 +8819,8 @@ function scan(f, init$1, xs, options) {
 		numConsts,
 		length: n,
 		reverse,
-		acceptPath
+		acceptPath,
+		checkpoint
 	});
 	initFlat.forEach((arr) => arr.dispose());
 	xsFlat.forEach((arr) => arr.dispose());

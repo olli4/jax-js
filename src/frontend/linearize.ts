@@ -1149,14 +1149,21 @@ const transposeRules: Partial<{ [P in Primitive]: TransposeRule<P> }> = {
     let i = 0;
     return undefPrimals.map((isUndef) => (isUndef ? outs[i++] : null));
   },
-  [Primitive.Scan](cts, args, { jaxpr, numCarry, numConsts, length, reverse }) {
-    // Scan transpose rule with "store all" approach.
+  [Primitive.Scan](
+    cts,
+    args,
+    { jaxpr, numCarry, numConsts, length, reverse, checkpoint },
+  ) {
+    // Scan transpose rule for backward pass through scan.
+    //
+    // Supports two strategies controlled by the `checkpoint` option:
+    // - Default: Store only √N checkpoints, recompute intermediate carries
+    //   from the nearest checkpoint during the backward pass — O(√N) memory, ~2× compute.
+    // - checkpoint=false: Store all N intermediate carries — O(N) memory.
+    //   See: Griewank & Walther, "Algorithm 799: Revolve"
     //
     // Forward scan: (consts, init_carry, xs) -> (final_carry, ys)
     // body: (consts, carry, x) -> (new_carry, y)
-    //
-    // The transpose runs the body transposed in reverse order, accumulating
-    // cotangents. This requires O(n) memory to store intermediate carries.
     //
     // For a JVP-transformed scan, the layout is:
     // args: [jvpConsts..., constsP..., constsT..., carryP..., carryT..., xsP..., xsT...]
@@ -1327,24 +1334,13 @@ const transposeRules: Partial<{ [P in Primitive]: TransposeRule<P> }> = {
       },
     )(...forwardInTypes);
 
-    // Run primal forward scan to get all intermediate carries.
-    // We need to collect carries at each iteration for the backward pass.
-    //
-    // TODO: This stores all N carries, using O(N) memory. For long scans, consider
-    // implementing binomial checkpointing to reduce memory to O(√N) with 2× recompute.
-    // See: Griewank & Walther, "Algorithm 799: Revolve"
-    const allCarries: Tracer[][] = [];
-    let currentCarry = carryResiduals.map((c) => c.ref);
-    allCarries.push(currentCarry.map((c) => c.ref)); // carries[0] = init
-
-    // For each iteration, run forward body and save carry
-    for (let iter = 0; iter < length; iter++) {
+    // ── Helper: run one forward step ──────────────────────────────────────
+    // Computes new carry from current carry at a given iteration.
+    // Used by both the checkpoint-forward pass and segment recomputation.
+    const runOneForwardStep = (iter: number, carry: Tracer[]): Tracer[] => {
       const dataIdx = reverse ? length - 1 - iter : iter;
-
-      // Slice xs for this iteration
       const xSlices: Tracer[] = [];
       for (const xs of xsResiduals) {
-        // xs has shape [length, ...]
         const slice = shrink(xs.ref, [
           [dataIdx, dataIdx + 1],
           ...xs.shape
@@ -1353,36 +1349,71 @@ const transposeRules: Partial<{ [P in Primitive]: TransposeRule<P> }> = {
         ]);
         xSlices.push(reshape(slice, xs.shape.slice(1)));
       }
-
-      // Build forward body inputs: [constsP, carryP, xP]
       const forwardInputs = [
         ...constResiduals.map((c) => c.ref),
-        ...currentCarry.map((c) => c.ref),
+        ...carry.map((c) => c.ref),
         ...xSlices,
       ];
-
-      // Run forward body
       const forwardOuts = evalJaxpr(primalForwardJaxpr.jaxpr, [
         ...primalForwardJaxpr.consts.map((c) => c.ref),
         ...forwardInputs,
       ]);
-
-      // Extract new carry (first numPrimalCarry outputs)
       const newCarry = forwardOuts.slice(0, numPrimalCarry);
-      // Dispose y outputs (we don't need them for backward)
       for (let i = numPrimalCarry; i < forwardOuts.length; i++) {
         forwardOuts[i].dispose();
       }
+      return newCarry;
+    };
 
-      // Dispose old carry
+    // ── Forward pass: collect carries for backward pass ──────────────────
+    //
+    // Default: √N checkpointing — store ceil(N/k)+1 checkpoints — O(√N) memory
+    //   where k = segmentSize = ceil(√N)
+    // checkpoint=false: store all N+1 carries — O(N) memory
+
+    const useCheckpointing = checkpoint !== false;
+    const segmentSize = useCheckpointing
+      ? typeof checkpoint === "number"
+        ? checkpoint
+        : Math.max(1, Math.ceil(Math.sqrt(length)))
+      : length; // Without checkpointing, treat entire scan as one "segment"
+
+    // allCarries[i] = carry BEFORE iteration i (only if !useCheckpointing)
+    const allCarries: Tracer[][] | null = useCheckpointing ? null : [];
+    // checkpointCarries[i] = carry at iteration boundary i (only if useCheckpointing)
+    const checkpointCarries: Map<number, Tracer[]> | null = useCheckpointing
+      ? new Map()
+      : null;
+
+    {
+      let currentCarry = carryResiduals.map((c) => c.ref);
+      if (allCarries) {
+        allCarries.push(currentCarry.map((c) => c.ref));
+      } else {
+        checkpointCarries!.set(
+          0,
+          currentCarry.map((c) => c.ref),
+        );
+      }
+
+      for (let iter = 0; iter < length; iter++) {
+        const newCarry = runOneForwardStep(iter, currentCarry);
+        for (const c of currentCarry) c.dispose();
+        currentCarry = newCarry;
+
+        if (allCarries) {
+          // Store every carry
+          allCarries.push(currentCarry.map((c) => c.ref));
+        } else if ((iter + 1) % segmentSize === 0) {
+          // Store checkpoint at segment boundaries
+          checkpointCarries!.set(
+            iter + 1,
+            currentCarry.map((c) => c.ref),
+          );
+        }
+      }
       for (const c of currentCarry) c.dispose();
-
-      currentCarry = newCarry;
-      allCarries.push(currentCarry.map((c) => c.ref));
     }
-
-    // Dispose final carry (we have a ref in allCarries)
-    for (const c of currentCarry) c.dispose();
 
     // Step 2: Create a tangent-only body for transposition
     //
@@ -1502,12 +1533,10 @@ const transposeRules: Partial<{ [P in Primitive]: TransposeRule<P> }> = {
 
     let ctConstsAccum: Tracer[] | null = null;
 
-    // Run backward iterations in reverse order
-    for (let iter = length - 1; iter >= 0; iter--) {
+    // ── Helper: run one backward step ──────────────────────────────────
+    // Runs the transposed body for one iteration, updating running cotangents.
+    const runOneBackwardStep = (iter: number, primalCarry: Tracer[]) => {
       const dataIdx = reverse ? length - 1 - iter : iter;
-
-      // Get primal carry for this iteration from allCarries
-      const primalCarry = allCarries[iter];
 
       // Slice primal xs for this iteration
       const xSlices: Tracer[] = [];
@@ -1523,7 +1552,6 @@ const transposeRules: Partial<{ [P in Primitive]: TransposeRule<P> }> = {
 
       // Slice cotangent of y for this iteration
       const ctYSlices: Tracer[] = [];
-      const _numTangentY = ctYsAll.length - Math.floor(numY / 2);
       for (let i = Math.floor(numY / 2); i < ctYsAll.length; i++) {
         const ctY = ctYsAll[i];
         const slice = shrink(ctY.ref, [
@@ -1534,29 +1562,13 @@ const transposeRules: Partial<{ [P in Primitive]: TransposeRule<P> }> = {
         ]);
         ctYSlices.push(reshape(slice, ctY.shape.slice(1)));
       }
-      // Dispose primal Y cotangent slices (they should be zero)
-      // Actually we should skip these entirely - don't slice them
-
-      // Build transposed body inputs
-      // Transposed body takes: [residuals..., cotangents_out...]
-      // residuals = [constsP, carryP, xP] (primals that were known)
-      // cotangents_out = [ct_carry_out, ct_y] (for tangent outputs)
-
-      // The transposed body jaxpr expects:
-      // inputs: [forwardIn (primals), cotangents]
-      // where forwardIn = residuals, cotangents = [ct_carryT, ct_yT]
 
       // Build cotangents for tangentBody outputs
-      // tangentBody outputs are ONLY the tangent outputs: [carryT..., yT...]
-      // So we pass: [ctCarryRunning..., ctYSlices...]
       const bodyOutCotangents: Tracer[] = [];
-      // Tangent carry cotangents
       bodyOutCotangents.push(...ctCarryRunning.map((c) => c.ref));
-      // Tangent Y cotangents
       bodyOutCotangents.push(...ctYSlices);
 
       // Run transposed body
-      // transposedBody.jaxpr expects: [transposedBody.consts, forwardIn (primals), cotangents]
       const transposedInputs = [
         ...transposedBody.consts.map((c) => c.ref),
         ...constResiduals.map((c) => c.ref),
@@ -1567,24 +1579,19 @@ const transposeRules: Partial<{ [P in Primitive]: TransposeRule<P> }> = {
 
       const transposedOuts = evalJaxpr(transposedBody.jaxpr, transposedInputs);
 
-      // Transposed body outputs: cotangents for UndefPrimal inputs
-      // Layout: [ct_constsT, ct_carryT_in, ct_xT]
+      // Extract cotangents
       let outIdx = 0;
-
-      // Cotangents for tangent consts
       const ctConstsIter: Tracer[] = [];
       for (let i = 0; i < numTangentConsts; i++) {
         ctConstsIter.push(transposedOuts[outIdx++]);
       }
 
-      // Cotangents for tangent carry input (this becomes next iteration's running ct)
       const ctCarryNew: Tracer[] = [];
-      const numTangentCarry = numCarry - numPrimalCarry;
-      for (let i = 0; i < numTangentCarry; i++) {
+      const numTangentCarryLocal = numCarry - numPrimalCarry;
+      for (let i = 0; i < numTangentCarryLocal; i++) {
         ctCarryNew.push(transposedOuts[outIdx++]);
       }
 
-      // Cotangents for tangent x
       const ctXIter: Tracer[] = [];
       for (let i = 0; i < numTangentX; i++) {
         ctXIter.push(transposedOuts[outIdx++]);
@@ -1605,15 +1612,58 @@ const transposeRules: Partial<{ [P in Primitive]: TransposeRule<P> }> = {
       // Update running carry cotangent
       for (const c of ctCarryRunning) c.dispose();
       ctCarryRunning = ctCarryNew;
+    };
 
-      // Dispose primal carry refs from allCarries[iter]
-      for (const c of primalCarry) c.dispose();
-      // Note: xSlices were consumed by evalJaxpr, no need to dispose
-      // Note: bodyOutCotangents were consumed by evalJaxpr, no need to dispose
+    // ── Execute backward pass ────────────────────────────────────────────
+
+    if (useCheckpointing) {
+      // Checkpointed backward: process segments in reverse order.
+      // For each segment, recompute forward from the nearest checkpoint to
+      // recover intermediate carries, then run backward through the segment.
+      const numSegments = Math.ceil(length / segmentSize);
+
+      for (let seg = numSegments - 1; seg >= 0; seg--) {
+        const segStart = seg * segmentSize;
+        const segEnd = Math.min(segStart + segmentSize, length);
+
+        // Recompute carries for this segment from checkpoint
+        const segCarries: Tracer[][] = [];
+        let carry = checkpointCarries!.get(segStart)!.map((c) => c.ref);
+        segCarries.push(carry.map((c) => c.ref)); // carry before segStart
+
+        for (let iter = segStart; iter < segEnd - 1; iter++) {
+          const newCarry = runOneForwardStep(iter, carry);
+          for (const c of carry) c.dispose();
+          carry = newCarry;
+          segCarries.push(carry.map((c) => c.ref)); // carry before iter+1
+        }
+        for (const c of carry) c.dispose();
+
+        // Process segment backward
+        for (let iter = segEnd - 1; iter >= segStart; iter--) {
+          const localIdx = iter - segStart;
+          runOneBackwardStep(iter, segCarries[localIdx]);
+          for (const c of segCarries[localIdx]) c.dispose();
+        }
+
+        // Dispose checkpoint (no longer needed)
+        for (const c of checkpointCarries!.get(segStart)!) c.dispose();
+        checkpointCarries!.delete(segStart);
+      }
+
+      // Dispose any remaining checkpoints (e.g., at length boundary)
+      for (const [, carries] of checkpointCarries!) {
+        for (const c of carries) c.dispose();
+      }
+    } else {
+      // Standard backward: use allCarries directly (O(N) memory, already stored)
+      for (let iter = length - 1; iter >= 0; iter--) {
+        runOneBackwardStep(iter, allCarries![iter]);
+        for (const c of allCarries![iter]) c.dispose();
+      }
+      // Dispose the last allCarries entry (carry after final iteration)
+      for (const c of allCarries![length]) c.dispose();
     }
-
-    // Dispose the last allCarries entry
-    for (const c of allCarries[length]) c.dispose();
 
     // Dispose remaining cotangents
     for (let i = Math.floor(numY / 2); i < ctYsAll.length; i++)

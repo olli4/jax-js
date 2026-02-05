@@ -1451,6 +1451,192 @@ describe("scan autodiff", () => {
     });
   });
 
+  describe("gradient checkpointing", () => {
+    it("default (√N) produces same gradient as checkpoint: false (sum of final carry)", async () => {
+      const step = (carry: np.Array, x: np.Array): [np.Array, np.Array] => {
+        const newCarry = np.add(carry.ref, x);
+        return [newCarry, newCarry.ref];
+      };
+
+      // Without checkpointing (reference)
+      const cumsumScanNoCheckpoint = (xs: np.Array) => {
+        const init = np.zeros([1]);
+        const [finalCarry, _] = lax.scan(step, init, xs, {
+          checkpoint: false,
+        });
+        return finalCarry.sum();
+      };
+
+      // Default (√N checkpointing)
+      const cumsumScanDefault = (xs: np.Array) => {
+        const init = np.zeros([1]);
+        const [finalCarry, _] = lax.scan(step, init, xs);
+        return finalCarry.sum();
+      };
+
+      const xs = np.array([[1.0], [2.0], [3.0], [4.0], [5.0]]);
+      const dxsRef = grad(cumsumScanNoCheckpoint)(xs.ref);
+      const dxsDefault = grad(cumsumScanDefault)(xs);
+
+      expect(await dxsDefault.data()).toEqual(await dxsRef.data());
+    });
+
+    it("default checkpointing produces correct gradient (sum of all outputs)", async () => {
+      // Loss = sum of all cumsum values → gradient depends on position
+      const step = (carry: np.Array, x: np.Array): [np.Array, np.Array] => {
+        const newCarry = np.add(carry.ref, x);
+        return [newCarry, newCarry.ref];
+      };
+
+      const sumOfCumsum = (xs: np.Array) => {
+        const init = np.zeros([1]);
+        const [_, ys] = lax.scan(step, init, xs);
+        return ys.sum();
+      };
+
+      const xs = np.array([[1.0], [2.0], [3.0], [4.0], [5.0]]);
+      const dxs = grad(sumOfCumsum)(xs);
+      expect(dxs.shape).toEqual([5, 1]);
+      // xs[0] contributes 5 times, xs[1] 4 times, ..., xs[4] once
+      expect(await dxs.data()).toEqual(new Float32Array([5, 4, 3, 2, 1]));
+    });
+
+    it("checkpoint: number uses custom segment size", async () => {
+      const step = (carry: np.Array, x: np.Array): [np.Array, np.Array] => {
+        const newCarry = np.add(carry.ref, x);
+        return [newCarry, newCarry.ref];
+      };
+
+      // Use segment size 2 for a 6-element scan
+      const cumsumScan = (xs: np.Array) => {
+        const init = np.zeros([1]);
+        const [finalCarry, _] = lax.scan(step, init, xs, { checkpoint: 2 });
+        return finalCarry.sum();
+      };
+
+      const xs = np.array([[1.0], [2.0], [3.0], [4.0], [5.0], [6.0]]);
+      const dxs = grad(cumsumScan)(xs);
+      expect(dxs.shape).toEqual([6, 1]);
+      expect(await dxs.data()).toEqual(new Float32Array([1, 1, 1, 1, 1, 1]));
+    });
+
+    it("checkpoint works with reverse scan", async () => {
+      const step = (carry: np.Array, x: np.Array): [np.Array, np.Array] => {
+        const newCarry = np.add(carry.ref, x);
+        return [newCarry, newCarry.ref];
+      };
+
+      const reverseScan = (xs: np.Array) => {
+        const init = np.zeros([1]);
+        const [finalCarry, _] = lax.scan(step, init, xs, {
+          reverse: true,
+        });
+        return finalCarry.sum();
+      };
+
+      const xs = np.array([[1.0], [2.0], [3.0]]);
+      const dxs = grad(reverseScan)(xs);
+      expect(dxs.shape).toEqual([3, 1]);
+      expect(await dxs.data()).toEqual(new Float32Array([1, 1, 1]));
+    });
+
+    it("checkpoint works with larger iteration count", async () => {
+      // Test with 100 iterations — sqrt(100) = 10, so 10 checkpoints
+      const step = (carry: np.Array, x: np.Array): [np.Array, np.Array] => {
+        const newCarry = np.add(carry.ref, x);
+        return [newCarry, newCarry.ref];
+      };
+
+      const cumsumScan = (xs: np.Array) => {
+        const init = np.zeros([1]);
+        const [finalCarry, _] = lax.scan(step, init, xs);
+        return finalCarry.sum();
+      };
+
+      // Create xs = [[1], [1], ..., [1]] (100 elements)
+      const data = new Float32Array(100).fill(1.0);
+      const xs = np.array(data).reshape([100, 1]);
+
+      const dxs = grad(cumsumScan)(xs);
+      expect(dxs.shape).toEqual([100, 1]);
+
+      // All gradients should be 1.0 (each contributes equally to the sum)
+      const gradData = await dxs.data();
+      for (let i = 0; i < 100; i++) {
+        expect(gradData[i]).toBeCloseTo(1.0);
+      }
+    });
+
+    it("checkpoint works with nonlinear body (multiplicative)", async () => {
+      // Test a body where carry is multiplied, not added
+      // f(carry, x) = carry * x, x_i = 2 for all i
+      // After 3 iters: carry = init * 2 * 2 * 2 = 8*init
+      // d(carry)/d(xs[0]) = carry/xs[0] = 4 (product of remaining xs)
+      const mulScan = (xs: np.Array) => {
+        const step = (carry: np.Array, x: np.Array): [np.Array, np.Array] => {
+          const newCarry = np.multiply(carry.ref, x);
+          return [newCarry, carry]; // output old carry
+        };
+        const init = np.array([1.0]);
+        const [finalCarry, _] = lax.scan(step, init, xs);
+        return finalCarry.sum();
+      };
+
+      const xs = np.array([[2.0], [3.0], [4.0]]);
+      const dxsRef = grad((xs: np.Array) => {
+        const step = (carry: np.Array, x: np.Array): [np.Array, np.Array] => {
+          const newCarry = np.multiply(carry.ref, x);
+          return [newCarry, carry];
+        };
+        const init = np.array([1.0]);
+        const [finalCarry, _] = lax.scan(step, init, xs, {
+          checkpoint: false,
+        });
+        return finalCarry.sum();
+      })(xs.ref);
+      const dxsDefault = grad(mulScan)(xs);
+
+      expect(await dxsDefault.data()).toEqual(await dxsRef.data());
+    });
+
+    it("checkpoint: 1 recomputes every carry (max recompute, min memory)", async () => {
+      // Segment size 1 = store only the initial carry, recompute everything
+      const step = (carry: np.Array, x: np.Array): [np.Array, np.Array] => {
+        const newCarry = np.add(carry.ref, x);
+        return [newCarry, newCarry.ref];
+      };
+
+      const cumsumScan = (xs: np.Array) => {
+        const init = np.zeros([1]);
+        const [finalCarry, _] = lax.scan(step, init, xs, { checkpoint: 1 });
+        return finalCarry.sum();
+      };
+
+      const xs = np.array([[1.0], [2.0], [3.0], [4.0]]);
+      const dxs = grad(cumsumScan)(xs);
+      expect(await dxs.data()).toEqual(new Float32Array([1, 1, 1, 1]));
+    });
+
+    it("jit(grad(scan)) works with default checkpointing", async () => {
+      const step = (carry: np.Array, x: np.Array): [np.Array, np.Array] => {
+        const newCarry = np.add(carry.ref, x);
+        return [newCarry, newCarry.ref];
+      };
+
+      const cumsumScan = (xs: np.Array) => {
+        const init = np.zeros([1]);
+        const [finalCarry, _] = lax.scan(step, init, xs);
+        return finalCarry.sum();
+      };
+
+      const jitGrad = jit(grad(cumsumScan));
+      const xs = np.array([[1.0], [2.0], [3.0]]);
+      const dxs = jitGrad(xs);
+      expect(await dxs.data()).toEqual(new Float32Array([1, 1, 1]));
+      jitGrad.dispose();
+    });
+  });
+
   describe("makeJaxpr of scan with JVP", () => {
     it("traces scan jvp correctly", async () => {
       const cumsumScan = (xs: np.Array) => {

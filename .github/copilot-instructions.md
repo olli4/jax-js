@@ -504,6 +504,9 @@ const [finalCarry, stackedOutputs] = await lax.scan(f, initCarry, xs, options);
 - `length?: number` — Number of iterations (inferred from xs if not provided)
 - `reverse?: boolean` — Process xs in reverse order (default: false)
 - `acceptPath?: ScanPath | ScanPath[]` — Accept only these paths; throws if actual path not in list
+- `checkpoint?: boolean | number` — Control gradient checkpointing for `grad(scan)`. Default
+  (undefined/true) uses √N checkpointing. A number specifies the segment size. `false` stores all
+  carries (O(N) memory).
 
 **Scan paths (`ScanPath` type):**
 
@@ -1249,9 +1252,39 @@ grad(f)(xs)
 
 **Key insights:**
 
-1. Forward pass stores all intermediate carries in `allCarries`
-2. Backward pass iterates from `length-1` to `0`
+1. Forward pass stores √N checkpoint carries by default (or all N if `checkpoint: false`)
+2. Backward pass iterates from `length-1` to `0`, recomputing from checkpoints as needed
 3. `evalJaxprTransposed` propagates "known" status for residuals
+
+**Gradient checkpointing (`checkpoint` option):**
+
+By default, the backward pass uses √N checkpointing: only O(√N) intermediate carries are stored, and
+the rest are recomputed from the nearest checkpoint during the backward pass. This trades ~2×
+compute for dramatically reduced memory. Set `checkpoint: false` to store all N carries (O(N)
+memory, no recomputation).
+
+```ts
+// Default: √N checkpointing is automatic
+const loss = (xs) => {
+  const [carry, _] = lax.scan(step, init, xs);
+  return carry.sum();
+};
+const dxs = grad(loss)(xs); // O(√N) memory
+
+// Opt out: store all carries
+const dxs2 = grad((xs) => {
+  const [carry, _] = lax.scan(step, init, xs, { checkpoint: false });
+  return carry.sum();
+})(xs); // O(N) memory, no recomputation
+```
+
+Implementation (in `linearize.ts` transpose rule):
+
+1. **Checkpoint forward pass**: Run forward, save carries every `segmentSize` iterations
+2. **Segment-based backward**: For each segment (reverse order):
+   - Recompute forward from the segment's checkpoint to recover all segment carries
+   - Run transposed body backward through the segment
+3. Helper functions `runOneForwardStep` and `runOneBackwardStep` eliminate code duplication
 
 ### Vmap (Vectorized Scan)
 
@@ -1485,13 +1518,13 @@ kernel"
 
 ### Current limitations
 
-| Limitation                            | Workaround                | Backend |
-| ------------------------------------- | ------------------------- | ------- |
-| `numCarry ≠ numY` on WebGPU           | Falls back to JS loop     | WebGPU  |
-| WebGPU internal buffer deps in scan   | Falls back to JS loop     | WebGPU  |
-| Mixed kernel+routine bodies on WebGPU | Falls back to JS loop     | WebGPU  |
-| `grad(scan)` memory O(N)              | None (stores all carries) | All     |
-| Sort in scan body on WebGPU           | Uses JS loop (uniforms)   | WebGPU  |
+| Limitation                            | Workaround                           | Backend |
+| ------------------------------------- | ------------------------------------ | ------- |
+| `numCarry ≠ numY` on WebGPU           | Falls back to JS loop                | WebGPU  |
+| WebGPU internal buffer deps in scan   | Falls back to JS loop                | WebGPU  |
+| Mixed kernel+routine bodies on WebGPU | Falls back to JS loop                | WebGPU  |
+| `grad(scan)` ~2× compute overhead     | Use `{ checkpoint: false }` for O(N) | All     |
+| Sort in scan body on WebGPU           | Uses JS loop (uniforms)              | WebGPU  |
 
 **WebGPU preencoded-routine requirements:** WebGPU can only use `preencoded-routine` for scan bodies
 that are:
@@ -1528,10 +1561,9 @@ conflicts with the scan offset uniform.
 
 ### Future work
 
-| Priority | Feature                              | Notes                                              |
-| -------- | ------------------------------------ | -------------------------------------------------- |
-| High     | Sqrt(N) checkpointing for grad(scan) | Reduce memory from O(N) to O(√N) with 2× recompute |
-| Low      | `lax.scatter` / `dynamic_slice`      | Would enable Jaxpr-based routines                  |
+| Priority | Feature                         | Notes                             |
+| -------- | ------------------------------- | --------------------------------- |
+| Low      | `lax.scatter` / `dynamic_slice` | Would enable Jaxpr-based routines |
 
 ---
 
@@ -1541,7 +1573,7 @@ conflicts with the scan offset uniform.
 
 | File                                         | Purpose                            |
 | -------------------------------------------- | ---------------------------------- |
-| `test/lax-scan.test.ts`                      | Main scan test suite (~2000 lines) |
+| `test/lax-scan.test.ts`                      | Main scan test suite (~2800 lines) |
 | `test/jit-scan-dlm.test.ts`                  | Kalman filter integration tests    |
 | `test/deno/webgpu.test.ts`                   | Headless WebGPU tests via Deno     |
 | `test/deno/batched-scan.test.ts`             | Batched scan integration           |
