@@ -15,7 +15,6 @@ import * as tree from "./tree";
 import type { JsTree, JsTreeDef, MapJsTree } from "./tree";
 import {
   type ScanPath,
-  type ScanPathDetail,
   setDebug,
   setScanBodyStepsCallback,
   setScanPathCallback,
@@ -41,7 +40,6 @@ export {
   type OwnedFunction,
   random,
   type ScanPath,
-  type ScanPathDetail,
   setDebug,
   setScanBodyStepsCallback,
   setScanPathCallback,

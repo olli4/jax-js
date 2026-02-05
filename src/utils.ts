@@ -20,21 +20,11 @@ export function setDebug(level: number) {
 
 /**
  * Scan path types for diagnostic tracking.
- * - "fused": Loop fused into native code (WASM module or WebGPU shader)
- * - "fallback": JS loop fallback (body executed per iteration)
- */
-export type ScanPath = "fused" | "fallback";
-
-/**
- * Detailed scan path types that expose the internal implementation.
  * - "compiled-loop": Entire scan loop compiled to native code (WASM module or WebGPU shader)
- * - "preencoded-routine": Pre-encoded GPU command dispatches with uniform offsets per iteration
- * - "fallback": JS loop calling compiled body program per iteration
+ * - "preencoded-routine": Pre-encoded GPU command dispatches with uniform offsets per iteration (WebGPU only)
+ * - "fallback": JS loop calling body program per iteration (one or more JS↔backend boundary crossings)
  */
-export type ScanPathDetail =
-  | "compiled-loop"
-  | "preencoded-routine"
-  | "fallback";
+export type ScanPath = "compiled-loop" | "preencoded-routine" | "fallback";
 
 /** Callback for tracking which scan implementation paths are taken. */
 export type ScanPathCallback = (
@@ -44,8 +34,6 @@ export type ScanPathCallback = (
     numConsts?: number;
     numCarry?: number;
     length?: number;
-    /** Detailed path type exposing the internal step type. */
-    pathDetail?: ScanPathDetail;
   },
 ) => void;
 
@@ -111,13 +99,13 @@ export function reportScanBodySteps(
  * @example
  * ```ts
  * // Option 1: Use requirePath (recommended for tests)
- * lax.scan(f, init, xs, { requirePath: "fused" }); // throws if not fused
+ * lax.scan(f, init, xs, { requirePath: "compiled-loop" }); // throws if not compiled-loop
  *
  * // Option 2: Use callback to observe without throwing
  * let usedPath: ScanPath | null = null;
  * setScanPathCallback((path, backend) => { usedPath = path; });
  * await jitScan(init, xs);
- * expect(usedPath).toBe("fused");
+ * expect(usedPath).toBe("compiled-loop");
  * setScanPathCallback(null); // cleanup
  * ```
  */
@@ -133,7 +121,6 @@ export function reportScanPath(
     numConsts?: number;
     numCarry?: number;
     length?: number;
-    pathDetail?: ScanPathDetail;
   },
 ): void {
   if (scanPathCallback) {

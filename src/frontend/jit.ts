@@ -784,14 +784,13 @@ export function jitCompile(backend: Backend, jaxpr: Jaxpr): JitProgram {
       const nativeScanExe = nativeScanResult?.executable ?? null;
 
       if (nativeScanExe) {
-        // Report fused path (loop runs in native code)
-        const pathError = checkRequiredPath("fused", requirePath);
+        // Report compiled-loop path (loop runs in native code)
+        const pathError = checkRequiredPath("compiled-loop", requirePath);
         if (pathError) throw new Error(pathError);
-        reportScanPath("fused", backend.type, {
+        reportScanPath("compiled-loop", backend.type, {
           numConsts,
           numCarry,
           length,
-          pathDetail: "compiled-loop",
         });
 
         // Use compiled loop (entire scan loop in native code)
@@ -827,14 +826,13 @@ export function jitCompile(backend: Backend, jaxpr: Jaxpr): JitProgram {
       );
 
       if (batchedParams) {
-        // Use pre-encoded routine dispatches (fused, but dispatches pre-encoded per iteration)
-        const pathError = checkRequiredPath("fused", requirePath);
+        // Use pre-encoded routine dispatches (preencoded-routine path)
+        const pathError = checkRequiredPath("preencoded-routine", requirePath);
         if (pathError) throw new Error(pathError);
-        reportScanPath("fused", backend.type, {
+        reportScanPath("preencoded-routine", backend.type, {
           numConsts,
           numCarry,
           length,
-          pathDetail: "preencoded-routine",
         });
         builder.steps.push({
           type: "preencoded-routine",
@@ -860,7 +858,6 @@ export function jitCompile(backend: Backend, jaxpr: Jaxpr): JitProgram {
         numConsts,
         numCarry,
         length,
-        pathDetail: "fallback",
       });
       builder.steps.push({
         type: "scan",

@@ -21,7 +21,6 @@ import {
   jvp,
   lax,
   numpy as np,
-  type ScanPathDetail,
   setScanBodyStepsCallback,
   setScanPathCallback,
   tree,
@@ -281,9 +280,9 @@ suite.each(devices)("lax.scan device:%s", (device) => {
       const initCarry = np.zeros([size]);
       const xs = np.ones([10, size]); // 10 iterations
 
-      // requirePath: "fused" ensures this doesn't silently regress to fallback
+      // requirePath: ["compiled-loop", "preencoded-routine"] ensures this doesn't silently regress to fallback
       const [finalCarry, _outputs] = await lax.scan(step, initCarry, xs, {
-        requirePath: "fused",
+        requirePath: ["compiled-loop", "preencoded-routine"],
       });
 
       const finalData = await finalCarry.data();
@@ -305,9 +304,9 @@ suite.each(devices)("lax.scan device:%s", (device) => {
       const initCarry = np.zeros([size]);
       const xs = np.ones([5, size]); // 5 iterations
 
-      // requirePath: "fused" ensures this doesn't silently regress to fallback
+      // requirePath: ["compiled-loop", "preencoded-routine"] ensures this doesn't silently regress to fallback
       const [finalCarry, _outputs] = await lax.scan(step, initCarry, xs, {
-        requirePath: "fused",
+        requirePath: ["compiled-loop", "preencoded-routine"],
       });
 
       const finalData = await finalCarry.data();
@@ -334,9 +333,9 @@ suite.each(devices)("lax.scan device:%s", (device) => {
       const initCarry = np.array([0.0]);
       const xs = np.array([[1.0], [2.0], [3.0]]); // 3 iterations
 
-      // requirePath: "fused" ensures constant handling works in fused path
+      // requirePath: ["compiled-loop", "preencoded-routine"] ensures constant handling works in native scan path
       const [finalCarry, outputs] = await lax.scan(step, initCarry, xs, {
-        requirePath: "fused",
+        requirePath: ["compiled-loop", "preencoded-routine"],
       });
 
       // Iteration 1: 0 + (1*2 + 1) = 3
@@ -357,7 +356,7 @@ suite.each(devices)("lax.scan device:%s", (device) => {
       // Test scan body with a reduction (sum) - correctness test only
       // NOTE: This currently falls back to JS loop because the JIT creates 2 execute
       // steps (reduction, then add) instead of fusing them. This is a known limitation.
-      // When epilogue fusion is improved, this could use fused path.
+      // When epilogue fusion is improved, this could use compiled-loop path.
       // We do NOT use requirePath here because this is testing correctness, not fusion.
 
       const step = (carry: np.Array, x: np.Array): [np.Array, np.Array] => {
@@ -602,10 +601,10 @@ suite.each(devices)("lax.scan device:%s", (device) => {
           return [carry, L];
         };
 
-        // JIT should use native routine scan (fused path)
+        // JIT should use native routine scan (compiled-loop path)
         const jitScan = jit((matrices: np.Array) => {
           return lax.scan(step, initCarry.ref, matrices, {
-            requirePath: "fused",
+            requirePath: ["compiled-loop", "preencoded-routine"],
           });
         });
 
@@ -663,7 +662,7 @@ suite.each(devices)("lax.scan device:%s", (device) => {
         const jitScanRev = jit((matrices: np.Array) => {
           return lax.scan(step, initCarry.ref, matrices, {
             reverse: true,
-            requirePath: "fused",
+            requirePath: ["compiled-loop", "preencoded-routine"],
           });
         });
 
@@ -721,7 +720,7 @@ suite.each(devices)("lax.scan device:%s", (device) => {
         const jitScan = jit((matrices: np.Array) => {
           // Uses native scan with both Kernel (multiply) and Routine (cholesky)
           return lax.scan(step, initCarry.ref, matrices, {
-            requirePath: "fused",
+            requirePath: ["compiled-loop", "preencoded-routine"],
           });
         });
 
@@ -774,7 +773,7 @@ suite.each(devices)("lax.scan device:%s", (device) => {
         const jitScan = jit((matrices: np.Array) => {
           // Uses native scan with Sort routine (requires aux buffer)
           return lax.scan(step, initCarry.ref, matrices, {
-            requirePath: "fused",
+            requirePath: ["compiled-loop", "preencoded-routine"],
           });
         });
 
@@ -859,7 +858,7 @@ suite.each(devices)("lax.scan device:%s", (device) => {
 
         const jitScan = jit((inputs: np.Array[]) => {
           return lax.scan(step, initCarry.ref, inputs, {
-            requirePath: "fused",
+            requirePath: ["compiled-loop", "preencoded-routine"],
           });
         });
 
@@ -911,7 +910,7 @@ suite.each(devices)("lax.scan device:%s", (device) => {
 
       const jitScan = jit((matrices: np.Array) => {
         return lax.scan(step, initCarry.ref, matrices, {
-          requirePath: "fused",
+          requirePath: ["compiled-loop", "preencoded-routine"],
         });
       });
 
@@ -960,7 +959,7 @@ suite.each(devices)("lax.scan device:%s", (device) => {
 
         const jitScan = jit((arrays: np.Array) => {
           return lax.scan(step, initCarry.ref, arrays, {
-            requirePath: "fused",
+            requirePath: ["compiled-loop", "preencoded-routine"],
           });
         });
 
@@ -2203,8 +2202,12 @@ describe("scan autodiff", () => {
       const init = np.array([0.0]);
       const xs = np.array([[1.0], [2.0]]);
 
-      // Requiring fused on CPU should throw (CPU always uses fallback)
-      const f = jit(() => lax.scan(step, init, xs, { requirePath: "fused" }));
+      // Requiring compiled-loop on CPU should throw (CPU always uses fallback)
+      const f = jit(() =>
+        lax.scan(step, init, xs, {
+          requirePath: ["compiled-loop", "preencoded-routine"],
+        }),
+      );
 
       expect(() => f()).toThrow(/requirePath/);
 
@@ -2214,7 +2217,7 @@ describe("scan autodiff", () => {
     });
 
     it("succeeds when requirePath matches actual path", async () => {
-      // Simple cumsum body that should compile to fused
+      // Simple cumsum body that should compile to compiled-loop
       const step = (carry: np.Array, x: np.Array): [np.Array, np.Array] => {
         const newCarry = np.add(carry, x);
         return [newCarry, newCarry.ref];
@@ -2223,11 +2226,11 @@ describe("scan autodiff", () => {
       const init = np.array([0.0]);
       const xs = np.array([[1.0], [2.0], [3.0]]);
 
-      // On wasm/webgpu, this should use fused; on cpu it's fallback
-      // Use array to allow either fused or fallback
+      // On wasm/webgpu, this should use compiled-loop; on cpu it's fallback
+      // Use array to allow either compiled-loop or preencoded-routine or fallback
       const f = jit(() =>
         lax.scan(step, init, xs, {
-          requirePath: ["fused", "fallback"],
+          requirePath: ["compiled-loop", "preencoded-routine", "fallback"],
         }),
       );
 
@@ -2251,10 +2254,10 @@ describe("scan autodiff", () => {
       const init = np.array([0.0]);
       const xs = np.array([[1.0], [2.0]]);
 
-      // Allow multiple paths (now just fused or fallback)
+      // Allow multiple paths (now just compiled-loop or preencoded-routine or fallback)
       const f = jit(() =>
         lax.scan(step, init, xs, {
-          requirePath: ["fused", "fallback"],
+          requirePath: ["compiled-loop", "preencoded-routine", "fallback"],
         }),
       );
 
@@ -2386,7 +2389,7 @@ describe("scan autodiff", () => {
    * ============================================================================
    */
   describe("KNOWN LIMITATIONS (pass = limitation exists, fail = limitation fixed)", () => {
-    it("WebGPU: Cholesky in scan body uses fused (batched-scan)", async () => {
+    it("WebGPU: Cholesky in scan body uses preencoded-routine", async () => {
       const availableDevices = await init();
       if (!availableDevices.includes("webgpu")) {
         // Skip on non-WebGPU environments
@@ -2425,14 +2428,14 @@ describe("scan autodiff", () => {
         await ys.data();
         f.dispose();
 
-        // Cholesky now uses fused path via batched-scan
-        expect(capturedPath).toBe("fused");
+        // Cholesky now uses preencoded-routine path
+        expect(capturedPath).toBe("preencoded-routine");
       } finally {
         setScanPathCallback(null);
       }
     });
 
-    it("WebGPU: TriangularSolve in scan body uses fallback instead of fused", async () => {
+    it("WebGPU: TriangularSolve in scan body uses fallback instead of compiled-loop", async () => {
       const availableDevices = await init();
       if (!availableDevices.includes("webgpu")) {
         return;
@@ -2479,15 +2482,15 @@ describe("scan autodiff", () => {
 
         expect(
           capturedPath,
-          "🎉 LIMITATION FIXED! TriangularSolve now uses fused. " +
+          "🎉 LIMITATION FIXED! TriangularSolve now uses preencoded-routine. " +
             "Please update .github/copilot-instructions.md and convert this to a normal test.",
-        ).not.toBe("fused");
+        ).toBe("fallback");
       } finally {
         setScanPathCallback(null);
       }
     });
 
-    it("WebGPU: LU in scan body uses fallback instead of fused", async () => {
+    it("WebGPU: LU in scan body uses fallback instead of compiled-loop", async () => {
       const availableDevices = await init();
       if (!availableDevices.includes("webgpu")) {
         return;
@@ -2520,16 +2523,16 @@ describe("scan autodiff", () => {
 
         expect(
           capturedPath,
-          "🎉 LIMITATION FIXED! LU now uses fused. " +
+          "🎉 LIMITATION FIXED! LU now uses preencoded-routine. " +
             "Please update .github/copilot-instructions.md and convert this to a normal test.",
-        ).not.toBe("fused");
+        ).toBe("fallback");
       } finally {
         setScanPathCallback(null);
       }
     });
 
     it("WebGPU: Sort in scan body uses fallback (uniforms conflict)", async () => {
-      // Sort/Argsort use uniforms internally which conflict with fused scan's offset uniforms
+      // Sort/Argsort use uniforms internally which conflict with preencoded-routine's offset uniforms
       const availableDevices = await init();
       if (!availableDevices.includes("webgpu")) {
         return;
@@ -2561,12 +2564,12 @@ describe("scan autodiff", () => {
         await ys.data();
         f.dispose();
 
-        // Sort uses uniforms internally, so fused is not possible
+        // Sort uses uniforms internally, so preencoded-routine is not possible
         expect(
           capturedPath,
-          "🎉 LIMITATION FIXED! Sort now uses fused (uniforms conflict resolved). " +
+          "🎉 LIMITATION FIXED! Sort now uses preencoded-routine (uniforms conflict resolved). " +
             "Please update .github/copilot-instructions.md and convert this to a normal test.",
-        ).not.toBe("fused");
+        ).toBe("fallback");
       } finally {
         setScanPathCallback(null);
       }
@@ -2578,11 +2581,11 @@ describe("scan autodiff", () => {
       // multiple outputs with the same size.
       //
       // Native-scan on WASM supports multi-output kernels, so scans with
-      // multi-output kernel-only bodies use the fused path.
+      // multi-output kernel-only bodies use the compiled-loop path.
       //
       // This test verifies:
       // 1. Body compilation produces fewer execute steps (fusion working)
-      // 2. Native scan uses fused path with multi-output kernel
+      // 2. Native scan uses compiled-loop path with multi-output kernel
       //
       // Testing note: Test each backend separately:
       // - WASM: this test (runs in vitest/node)
@@ -2648,8 +2651,8 @@ describe("scan autodiff", () => {
         "Scan path callback should have fired",
       ).not.toBeNull();
 
-      // Native scan now supports multi-output kernels - should use fused path
-      expect(capturedPath).toBe("fused");
+      // Native scan now supports multi-output kernels - should use compiled-loop path
+      expect(capturedPath).toBe("compiled-loop");
 
       // Body compilation produces fewer execute steps (multi-output kernel fusion working)
       // With multi-output kernel: 2-3 steps (two multi-kernels)
@@ -2666,7 +2669,7 @@ describe("scan autodiff", () => {
       async () => {
         // Multi-output scan bodies now use native scan via prepareNativeScanMulti.
         // Each output in a multi-output Kernel is extracted and converted to a separate
-        // kernel step, enabling the fused path.
+        // kernel step, enabling the compiled-loop path.
 
         defaultDevice("webgpu");
 
@@ -2688,12 +2691,10 @@ describe("scan autodiff", () => {
         const B0 = np.ones([2, 2]);
         const xs = np.zeros([3]); // 3 iterations
 
-        // Capture the scan path with detail
+        // Capture the scan path
         let capturedPath: string | null = null;
-        let capturedDetail: ScanPathDetail | undefined = undefined;
-        setScanPathCallback((path, _backend, details) => {
+        setScanPathCallback((path) => {
           capturedPath = path;
-          capturedDetail = details?.pathDetail;
         });
 
         try {
@@ -2714,14 +2715,12 @@ describe("scan autodiff", () => {
           setScanPathCallback(null);
         }
 
-        // WebGPU should now use fused path for multi-output scan
-        expect(capturedPath).toBe("fused");
-        // Detail should be "compiled-loop" (entire loop compiled to GPU shader)
-        expect(capturedDetail).toBe("compiled-loop");
+        // WebGPU should now use compiled-loop path for multi-output scan
+        expect(capturedPath).toBe("compiled-loop");
       },
     );
 
-    it("WebGPU: numCarry ≠ numY uses fallback instead of fused", async () => {
+    it("WebGPU: numCarry ≠ numY uses fallback instead of compiled-loop", async () => {
       // WebGPU compiled-loop requires numCarry === numY
       // When they differ, falls back to JS loop
       const availableDevices = await init();
@@ -2732,10 +2731,8 @@ describe("scan autodiff", () => {
       defaultDevice("webgpu");
 
       let capturedPath: string | null = null;
-      let capturedDetail: ScanPathDetail | undefined = undefined;
-      setScanPathCallback((path, _backend, details) => {
+      setScanPathCallback((path) => {
         capturedPath = path;
-        capturedDetail = details?.pathDetail;
       });
 
       try {
@@ -2760,15 +2757,13 @@ describe("scan autodiff", () => {
         await ys2.data();
         f.dispose();
 
-        // WebGPU doesn't support numCarry ≠ numY in fused
+        // WebGPU doesn't support numCarry ≠ numY in compiled-loop
         // (WASM's general scan does, but WebGPU falls back)
         expect(
           capturedPath,
-          "🎉 LIMITATION FIXED! WebGPU now supports numCarry ≠ numY in fused. " +
+          "🎉 LIMITATION FIXED! WebGPU now supports numCarry ≠ numY in compiled-loop. " +
             "Please update .github/copilot-instructions.md and convert this to a normal test.",
         ).toBe("fallback");
-        // Detail should be "fallback" (JS loop)
-        expect(capturedDetail).toBe("fallback");
       } finally {
         setScanPathCallback(null);
       }

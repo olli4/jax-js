@@ -504,18 +504,14 @@ const [finalCarry, stackedOutputs] = await lax.scan(f, initCarry, xs, options);
 
 **Scan paths (`ScanPath` type):**
 
-- `"fused"` — Loop runs in native code (`compiled-loop` or `preencoded-routine` step)
-- `"fallback"` — JS loop with per-iteration dispatch (`scan` step)
-
-**Scan path details (`ScanPathDetail` type):**
-
-For finer-grained tracking, the callback's `details.pathDetail` exposes:
-
 - `"compiled-loop"` — Entire scan loop compiled to native code (WASM module or WebGPU shader)
 - `"preencoded-routine"` — Pre-encoded GPU command dispatches with uniform offsets per iteration
-- `"fallback"` — JS loop calling compiled body program per iteration
+  (WebGPU only)
+- `"fallback"` — JS loop calling body program per iteration (one or more JS↔backend boundary
+  crossings)
 
-Use `requirePath: "fused"` in tests to ensure native compilation doesn't regress.
+Use `requirePath: ["compiled-loop", "preencoded-routine"]` in tests to ensure native compilation
+doesn't regress.
 
 **xs=null and Y=null (jax-js extensions):**
 
@@ -645,7 +641,7 @@ kernels, **multi-kernel scan** for bodies with multiple independent kernels, and
 | `native scan` > `with reverse`                | [✅ Pass](test/lax-scan.test.ts) | uses dataIdx like WASM                   |
 | `native scan` > `with constants`              | [✅ Pass](test/lax-scan.test.ts) | captured constants bound as storage      |
 | `multi-kernel scan`                           | ✅ Pass                          | derives output mapping from body outputs |
-| `preencoded-routine` (Cholesky, LU, TriSolve) | ✅ Pass                          | uses fused path with uniform offsets     |
+| `preencoded-routine` (Cholesky, LU, TriSolve) | ✅ Pass                          | uses uniform offsets                     |
 | `preencoded-routine` (Sort)                   | ⚠️ Fallback                      | Sort already uses uniforms (conflict)    |
 
 **Note on numCarry ≠ numY:** WebGPU native scan requires `numCarry === numY`. When they differ,
@@ -887,7 +883,7 @@ Understanding how JIT interacts with scan is crucial for performance:
 1. Trace body function f → bodyJaxpr
 2. JIT-compile bodyJaxpr → bodyProgram (this ALWAYS happens)
 3. Execute via scanRunner callback:
-   - Native path (fused): Single compiled-loop or preencoded-routine step
+   - Native path (compiled-loop or preencoded-routine): Single compiled-loop or preencoded-routine step
    - Fallback path: JS loop calling bodyProgram.execute() per iteration
 ```
 
@@ -1020,10 +1016,10 @@ setDebug(2); // Shows shader/WASM code
 
 ### JIT step types
 
-| ScanPath   | Meaning                              | Internal Step Types                   |
-| ---------- | ------------------------------------ | ------------------------------------- |
-| `fused`    | Loop runs in native code (fast path) | `compiled-loop`, `preencoded-routine` |
-| `fallback` | JS loop with per-iteration dispatch  | `scan`                                |
+| ScanPath | Meaning | Internal Step Types |
+| -------- | ------- | ------------------- |
+
+| `fallback` | JS loop with per-iteration dispatch | `scan` |
 
 ### Body composition types
 
@@ -1092,7 +1088,7 @@ The documentation uses descriptive terms that map to code constructs:
 
 Note: `preencoded-routine` transforms routine shaders to use uniform-based offsets for xs buffers,
 then dispatches all iterations with pre-encoded commands. Both `compiled-loop` and
-`preencoded-routine` implement the "fused" scan path.
+`preencoded-routine` implement the "fast" scan path.
 
 ### Compiled-loop routing
 
@@ -1471,7 +1467,7 @@ body compilation produce multi-output kernels when beneficial. Native scan on bo
 supports multi-output kernel codegen.
 
 **Example:** Mandelbrot body with 3 carry outputs compiles to 2-3 multi-output kernel steps instead
-of 6 separate kernel steps, and runs via the fused native scan path on both WASM and WebGPU.
+of 6 separate kernel steps, and runs via native scan on both WASM and WebGPU.
 
 See test: `test/lax-scan.test.ts` → "Scan body multi-output: uses native scan with multi-output
 kernel"
@@ -1496,7 +1492,7 @@ case natively.
 
 **Note on Sort in scan body:** Sort already uses a uniform buffer for its configuration, which
 conflicts with the scan offset uniform. This causes Sort-in-scan to fall back to JS loop on WebGPU.
-Cholesky, LU, and TriangularSolve now use the fused preencoded-routine path.
+Cholesky, LU, and TriangularSolve now use preencoded-routine.
 
 ### Future work
 
@@ -1588,18 +1584,18 @@ function trackScanPaths() {
 ```
 
 **Why this matters:** Tests named "native scan" may silently fall back to JS loop. Use
-`requirePath: "fused"` to ensure tests fail if fusion regresses.
+`requirePath: ["compiled-loop", "preencoded-routine"]` to ensure tests fail if fusion regresses.
 
 ### Test coverage by category
 
-| Category                    | Backend | Path     | Purpose                          |
-| --------------------------- | ------- | -------- | -------------------------------- |
-| `scan basic`                | CPU     | fallback | Core correctness                 |
-| `native scan`               | WASM    | fused    | Verify fusion works              |
-| `native scan > with consts` | WASM    | fused    | Constants in body                |
-| `matmul in body (routine)`  | WASM    | fused    | Routine bodies                   |
-| `Cholesky in body`          | WebGPU  | fused    | Preencoded-routine with routines |
-| `KNOWN LIMITATIONS`         | WebGPU  | fallback | Verify graceful fallback         |
+| Category                    | Backend | Path               | Purpose                          |
+| --------------------------- | ------- | ------------------ | -------------------------------- |
+| `scan basic`                | CPU     | fallback           | Core correctness                 |
+| `native scan`               | WASM    | compiled-loop      | Verify fusion works              |
+| `native scan > with consts` | WASM    | compiled-loop      | Constants in body                |
+| `matmul in body (routine)`  | WASM    | compiled-loop      | Routine bodies                   |
+| `Cholesky in body`          | WebGPU  | preencoded-routine | Preencoded-routine with routines |
+| `KNOWN LIMITATIONS`         | WebGPU  | fallback           | Verify graceful fallback         |
 
 Tests under "KNOWN LIMITATIONS" PASS when the limitation exists. If you fix a limitation, the test
 will FAIL with instructions to update this documentation.
