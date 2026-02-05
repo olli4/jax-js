@@ -287,7 +287,7 @@ export interface ScanOptions {
  */
 export function scan<
   Carry extends JsTree<Array>,
-  X extends JsTree<Array> | null | undefined,
+  X extends JsTree<Array> | null,
   Y extends JsTree<Array> | null,
 >(
   f: (carry: Carry, x: X) => [Carry, Y],
@@ -299,7 +299,7 @@ export function scan<
   const { length: lengthOpt, reverse = false, requirePath } = opts;
 
   // Handle xs=null case (carry-only scan with no input arrays)
-  const xsIsNull = xs === null || xs === undefined;
+  const xsIsNull = xs === null;
 
   // Flatten inputs for primitive call
   const [initFlat, initTreedef] = tree.flatten(init);

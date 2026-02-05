@@ -1813,7 +1813,7 @@ interface ScanOptions {
  *
  * @see {@link https://docs.jax.dev/en/latest/_autosummary/jax.lax.scan.html | JAX lax.scan}
  */
-declare function scan<Carry extends JsTree<Array>, X extends JsTree<Array> | null | undefined, Y extends JsTree<Array> | null>(f: (carry: Carry, x: X) => [Carry, Y], init: Carry, xs: X, options?: ScanOptions): [Carry, Y];
+declare function scan<Carry extends JsTree<Array>, X extends JsTree<Array> | null, Y extends JsTree<Array> | null>(f: (carry: Carry, x: X) => [Carry, Y], init: Carry, xs: X, options?: ScanOptions): [Carry, Y];
 /**
  * Stack a list of pytrees along a new leading axis.
  *

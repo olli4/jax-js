@@ -8714,7 +8714,7 @@ function triangularSolve(a, b, { leftSide = false, lower = false, transposeA = f
 function scan(f, init$1, xs, options) {
 	const opts = options ?? {};
 	const { length: lengthOpt, reverse = false, requirePath } = opts;
-	const xsIsNull = xs === null || xs === void 0;
+	const xsIsNull = xs === null;
 	const [initFlat, initTreedef] = flatten(init$1);
 	const [xsFlat, xsTreedef] = xsIsNull ? [[], null] : flatten(xs);
 	const n = lengthOpt ?? (xsFlat.length > 0 ? xsFlat[0].shape[0] : 0);
