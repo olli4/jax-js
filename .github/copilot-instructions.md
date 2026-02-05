@@ -232,7 +232,7 @@ linear index.
 The 256-byte `minStorageBufferOffsetAlignment` means you can't bind a buffer at arbitrary offsets.
 For scan with strides like 48 bytes (a 4×3 f32 matrix), buffer offsets fail. jax-js solves this with
 **uniform-based offsets**: bind the entire buffer, pass the element offset as a uniform variable.
-See [WebGPU batched-scan details](#webgpu-batched-scan-details-routine-body) in Part 2.
+See [WebGPU preencoded-routine details](#webgpu-preencoded-routine-details-routine-body) in Part 2.
 
 ### Features exploited
 
@@ -504,8 +504,16 @@ const [finalCarry, stackedOutputs] = await lax.scan(f, initCarry, xs, options);
 
 **Scan paths (`ScanPath` type):**
 
-- `"fused"` — Loop runs in native code (`native-scan` or `batched-scan` step)
+- `"fused"` — Loop runs in native code (`compiled-loop` or `preencoded-routine` step)
 - `"fallback"` — JS loop with per-iteration dispatch (`scan` step)
+
+**Scan path details (`ScanPathDetail` type):**
+
+For finer-grained tracking, the callback's `details.pathDetail` exposes:
+
+- `"compiled-loop"` — Entire scan loop compiled to native code (WASM module or WebGPU shader)
+- `"preencoded-routine"` — Pre-encoded GPU command dispatches with uniform offsets per iteration
+- `"fallback"` — JS loop calling compiled body program per iteration
 
 Use `requirePath: "fused"` in tests to ensure native compilation doesn't regress.
 
@@ -536,18 +544,18 @@ const [carry, nullYs] = await lax.scan(f, init, xs);
 
 **Key files:**
 
-| File                                 | Role                                                  |
-| ------------------------------------ | ----------------------------------------------------- |
-| `src/library/lax-scan.ts`            | Public API                                            |
-| `src/frontend/core.ts`               | `Primitive.Scan` enum + params type                   |
-| `src/frontend/jaxpr.ts`              | Abstract eval rule                                    |
-| `src/frontend/array.ts`              | Scan impl rule with `scanRunner` callback             |
-| `src/frontend/jit.ts`                | JIT step types: `scan`, `native-scan`, `batched-scan` |
-| `src/frontend/linearize.ts`          | JVP + transpose rules for autodiff                    |
-| `src/frontend/vmap.ts`               | Scan vmap rule (batches independent scans)            |
-| `src/backend/wasm.ts`                | Native scan codegen                                   |
-| `src/backend/webgpu.ts`              | Native scan + batched-scan for routines               |
-| `src/backend/webgpu/scan-wrapper.ts` | WGSL shader transformer for uniform offsets           |
+| File                                 | Role                                                          |
+| ------------------------------------ | ------------------------------------------------------------- |
+| `src/library/lax-scan.ts`            | Public API                                                    |
+| `src/frontend/core.ts`               | `Primitive.Scan` enum + params type                           |
+| `src/frontend/jaxpr.ts`              | Abstract eval rule                                            |
+| `src/frontend/array.ts`              | Scan impl rule with `scanRunner` callback                     |
+| `src/frontend/jit.ts`                | JIT step types: `scan`, `compiled-loop`, `preencoded-routine` |
+| `src/frontend/linearize.ts`          | JVP + transpose rules for autodiff                            |
+| `src/frontend/vmap.ts`               | Scan vmap rule (batches independent scans)                    |
+| `src/backend/wasm.ts`                | Compiled-loop codegen                                         |
+| `src/backend/webgpu.ts`              | Compiled-loop + preencoded-routine for routines               |
+| `src/backend/webgpu/scan-wrapper.ts` | WGSL shader transformer for uniform offsets                   |
 
 ---
 
@@ -616,29 +624,29 @@ Native scan compiles the entire loop into one WASM module, avoiding per-iteratio
 
 ### WebGPU Backend
 
-The WebGPU backend keeps data on GPU between iterations. Supports **native scan** for elementwise
-kernels, **multi-kernel scan** for bodies with multiple independent kernels, and **batched-scan**
-for routine bodies (Cholesky, LU, TriangularSolve).
+The WebGPU backend keeps data on GPU between iterations. Supports **compiled-loop** for elementwise
+kernels, **multi-kernel scan** for bodies with multiple independent kernels, and
+**preencoded-routine** for routine bodies (Cholesky, LU, TriangularSolve).
 
-| Feature / Test                          | Status                           | Notes                                    |
-| --------------------------------------- | -------------------------------- | ---------------------------------------- |
-| `scan basic`                            | [✅ Pass](test/lax-scan.test.ts) | uses native scan on WebGPU               |
-| `scan with pytree carry`                | [✅ Pass](test/lax-scan.test.ts) |                                          |
-| `reverse scan`                          | [✅ Pass](test/lax-scan.test.ts) | uses native scan with dataIdx            |
-| `jit + scan`                            | [✅ Pass](test/lax-scan.test.ts) |                                          |
-| `JVP (forward-mode)`                    | [✅ Pass](test/lax-scan.test.ts) |                                          |
-| `VJP (reverse-mode)`                    | [✅ Pass](test/lax-scan.test.ts) |                                          |
-| `vmap`                                  | [✅ Pass](test/lax-scan.test.ts) |                                          |
-| `vmap` > `jit(vmap(scan))`              | [✅ Pass](test/lax-scan.test.ts) |                                          |
-| `vmap` > `vmap(jit(scan))`              | [✅ Pass](test/lax-scan.test.ts) |                                          |
-| `scan over views`                       | [✅ Pass](test/lax-scan.test.ts) | sliced/transposed xs                     |
-| `native scan`                           | [✅ Pass](test/lax-scan.test.ts) | kernel gids reindexed to scan layout     |
-| `native scan` > `with reduction`        | [✅ Pass](test/lax-scan.test.ts) | e.g., `carry += sum(x)` or matmul        |
-| `native scan` > `with reverse`          | [✅ Pass](test/lax-scan.test.ts) | uses dataIdx like WASM                   |
-| `native scan` > `with constants`        | [✅ Pass](test/lax-scan.test.ts) | captured constants bound as storage      |
-| `multi-kernel scan`                     | ✅ Pass                          | derives output mapping from body outputs |
-| `batched-scan` (Cholesky, LU, TriSolve) | ✅ Pass                          | uses fused path with uniform offsets     |
-| `batched-scan` (Sort)                   | ⚠️ Fallback                      | Sort already uses uniforms (conflict)    |
+| Feature / Test                                | Status                           | Notes                                    |
+| --------------------------------------------- | -------------------------------- | ---------------------------------------- |
+| `scan basic`                                  | [✅ Pass](test/lax-scan.test.ts) | uses native scan on WebGPU               |
+| `scan with pytree carry`                      | [✅ Pass](test/lax-scan.test.ts) |                                          |
+| `reverse scan`                                | [✅ Pass](test/lax-scan.test.ts) | uses native scan with dataIdx            |
+| `jit + scan`                                  | [✅ Pass](test/lax-scan.test.ts) |                                          |
+| `JVP (forward-mode)`                          | [✅ Pass](test/lax-scan.test.ts) |                                          |
+| `VJP (reverse-mode)`                          | [✅ Pass](test/lax-scan.test.ts) |                                          |
+| `vmap`                                        | [✅ Pass](test/lax-scan.test.ts) |                                          |
+| `vmap` > `jit(vmap(scan))`                    | [✅ Pass](test/lax-scan.test.ts) |                                          |
+| `vmap` > `vmap(jit(scan))`                    | [✅ Pass](test/lax-scan.test.ts) |                                          |
+| `scan over views`                             | [✅ Pass](test/lax-scan.test.ts) | sliced/transposed xs                     |
+| `native scan`                                 | [✅ Pass](test/lax-scan.test.ts) | kernel gids reindexed to scan layout     |
+| `native scan` > `with reduction`              | [✅ Pass](test/lax-scan.test.ts) | e.g., `carry += sum(x)` or matmul        |
+| `native scan` > `with reverse`                | [✅ Pass](test/lax-scan.test.ts) | uses dataIdx like WASM                   |
+| `native scan` > `with constants`              | [✅ Pass](test/lax-scan.test.ts) | captured constants bound as storage      |
+| `multi-kernel scan`                           | ✅ Pass                          | derives output mapping from body outputs |
+| `preencoded-routine` (Cholesky, LU, TriSolve) | ✅ Pass                          | uses fused path with uniform offsets     |
+| `preencoded-routine` (Sort)                   | ⚠️ Fallback                      | Sort already uses uniforms (conflict)    |
 
 **Note on numCarry ≠ numY:** WebGPU native scan requires `numCarry === numY`. When they differ,
 WebGPU falls back to JS loop. WASM's general scan handles this case.
@@ -668,22 +676,22 @@ identically. To verify manually, run website demos in a WebGL-capable browser.
 
 ## Design Choices & Rationales
 
-### Why native-scan vs batched-scan vs fallback?
+### Why compiled-loop vs preencoded-routine vs fallback?
 
-| Approach         | How it works                                  | When used                                        |
-| ---------------- | --------------------------------------------- | ------------------------------------------------ |
-| **Native-scan**  | Entire scan loop in native code (WASM/shader) | Elementwise kernels (WASM+WebGPU), WASM routines |
-| **Batched-scan** | Pre-encode dispatches with uniform offsets    | WebGPU routines (Cholesky, LU, TriangularSolve)  |
-| **Fallback**     | JS loop calling body program per iteration    | Unsupported patterns, Sort (uniform conflict)    |
+| Approach               | How it works                                  | When used                                        |
+| ---------------------- | --------------------------------------------- | ------------------------------------------------ |
+| **compiled-loop**      | Entire scan loop in native code (WASM/shader) | Elementwise kernels (WASM+WebGPU), WASM routines |
+| **preencoded-routine** | Pre-encode dispatches with uniform offsets    | WebGPU routines (Cholesky, LU, TriangularSolve)  |
+| **fallback**           | JS loop calling body program per iteration    | Unsupported patterns, Sort (uniform conflict)    |
 
-**Rationale:** Native-scan is preferred because:
+**Rationale:** compiled-loop is preferred because:
 
 1. Eliminates JS↔native boundary per iteration (~5000× speedup for WASM)
 2. Enables compiler optimizations across iterations
 3. Single WASM module instantiation vs N calls
 
-Batched-scan is used for WebGPU routines that can't be inlined into a shader. It transforms routine
-shaders to accept per-iteration offsets via uniforms, enabling fused dispatch.
+preencoded-routine is used for WebGPU routines that can't be inlined into a shader. It transforms
+routine shaders to accept per-iteration offsets via uniforms, enabling fused dispatch.
 
 ### Why wasmblr for WASM routines?
 
@@ -879,7 +887,7 @@ Understanding how JIT interacts with scan is crucial for performance:
 1. Trace body function f → bodyJaxpr
 2. JIT-compile bodyJaxpr → bodyProgram (this ALWAYS happens)
 3. Execute via scanRunner callback:
-   - Native path (fused): Single native-scan or batched-scan step
+   - Native path (fused): Single compiled-loop or preencoded-routine step
    - Fallback path: JS loop calling bodyProgram.execute() per iteration
 ```
 
@@ -891,17 +899,17 @@ Understanding how JIT interacts with scan is crucial for performance:
 3. Trace body function f → bodyJaxpr (nested inside scan step compilation)
 4. JIT-compile bodyJaxpr → bodyProgram
 5. Execute outerProgram:
-   - Native path: outerProgram has native-scan step, runs entire loop in native code
+   - Native path: outerProgram has compiled-loop step, runs entire loop in native code
    - Fallback path: outerProgram has scan step, calls scanRunner with bodyProgram
 ```
 
 **Key insight:** The body function is **always** JIT-compiled into a `bodyProgram`. The difference
-is whether the **outer loop** runs natively (native-scan/batched-scan) or via JS (fallback).
+is whether the **outer loop** runs natively (compiled-loop/preencoded-routine) or via JS (fallback).
 
 **Why use `jit()` wrapper:**
 
 - **Enables native loop execution** — Without jit, scan uses `scanRunner` (JS loop). With jit, the
-  compiler can emit `native-scan` or `batched-scan` steps that run entirely in WASM/GPU.
+  compiler can emit `compiled-loop` or `preencoded-routine` steps that run entirely in WASM/GPU.
 - **Caches compilation** — `jit((xs) => scan(...))` compiles once, runs many times.
 - **Captures constants** — Closed-over arrays become constants in the compiled program.
 
@@ -1012,10 +1020,10 @@ setDebug(2); // Shows shader/WASM code
 
 ### JIT step types
 
-| ScanPath   | Meaning                              | Internal Step Types           |
-| ---------- | ------------------------------------ | ----------------------------- |
-| `fused`    | Loop runs in native code (fast path) | `native-scan`, `batched-scan` |
-| `fallback` | JS loop with per-iteration dispatch  | `scan`                        |
+| ScanPath   | Meaning                              | Internal Step Types                   |
+| ---------- | ------------------------------------ | ------------------------------------- |
+| `fused`    | Loop runs in native code (fast path) | `compiled-loop`, `preencoded-routine` |
+| `fallback` | JS loop with per-iteration dispatch  | `scan`                                |
 
 ### Body composition types
 
@@ -1029,13 +1037,13 @@ Scan bodies are classified by what operations they contain:
 
 **Execution path by body type and backend:**
 
-| Body Type                | WASM        | WebGPU                      |
-| ------------------------ | ----------- | --------------------------- |
-| kernel-only (simple)     | native-scan | native-scan                 |
-| kernel-only (with deps¹) | native-scan | **fallback**                |
-| routine body (single)    | native-scan | batched-scan (or fallback²) |
-| mixed kernel+routine     | native-scan | **fallback**                |
-| multiple routines        | native-scan | **fallback**                |
+| Body Type                | WASM          | WebGPU                            |
+| ------------------------ | ------------- | --------------------------------- |
+| kernel-only (simple)     | compiled-loop | compiled-loop                     |
+| kernel-only (with deps¹) | compiled-loop | **fallback**                      |
+| routine body (single)    | compiled-loop | preencoded-routine (or fallback²) |
+| mixed kernel+routine     | compiled-loop | **fallback**                      |
+| multiple routines        | compiled-loop | **fallback**                      |
 
 ¹ "With deps" = internal buffer dependencies between steps, or carry passthrough pattern. ² Sort
 uses fallback due to uniform buffer conflict.
@@ -1076,17 +1084,17 @@ constraints and falls back to JS loop for complex patterns.
 
 The documentation uses descriptive terms that map to code constructs:
 
-| Doc Term         | Code Step Type | Backend      | Description                                |
-| ---------------- | -------------- | ------------ | ------------------------------------------ |
-| **native-scan**  | `native-scan`  | WASM, WebGPU | Entire scan loop compiled to native code   |
-| **batched-scan** | `batched-scan` | WebGPU       | Routine body with uniform offsets per iter |
-| **fallback**     | `scan`         | All          | JS loop calling body program per iteration |
+| Doc Term               | Code Step Type       | Backend      | Description                                |
+| ---------------------- | -------------------- | ------------ | ------------------------------------------ |
+| **compiled-loop**      | `compiled-loop`      | WASM, WebGPU | Entire scan loop compiled to native code   |
+| **preencoded-routine** | `preencoded-routine` | WebGPU       | Routine body with uniform offsets per iter |
+| **fallback**           | `scan`               | All          | JS loop calling body program per iteration |
 
-Note: `batched-scan` transforms routine shaders to use uniform-based offsets for xs buffers, then
-dispatches all iterations with pre-encoded commands. Both `native-scan` and `batched-scan` implement
-the "fused" scan path.
+Note: `preencoded-routine` transforms routine shaders to use uniform-based offsets for xs buffers,
+then dispatches all iterations with pre-encoded commands. Both `compiled-loop` and
+`preencoded-routine` implement the "fused" scan path.
 
-### Native scan routing
+### Compiled-loop routing
 
 The `tryPrepareNativeScan()` dispatcher routes to backend-specific implementations:
 
@@ -1095,9 +1103,9 @@ The `tryPrepareNativeScan()` dispatcher routes to backend-specific implementatio
 - **WebGPU routine body** → `tryPrepareBatchedScan()` → uses `prepareBatchedScan()`
 - **WASM (kernels + routines)** → `tryPrepareWasmNativeScan()` → uses `prepareNativeScanGeneral()`
 
-### Native scan eligibility
+### Compiled-loop eligibility
 
-**WASM native-scan** (via `tryPrepareWasmNativeScan`):
+**WASM compiled-loop** (via `tryPrepareWasmNativeScan`):
 
 - All body steps are Kernels or supported Routines
 - Constants allowed, reductions allowed
@@ -1125,7 +1133,7 @@ The `tryPrepareNativeScan()` dispatcher routes to backend-specific implementatio
 - `numCarry === numY` (passthrough pattern)
 - Routine must not already use uniforms (excludes Sort)
 
-### WASM native-scan details
+### WASM compiled-loop details
 
 All WASM scan variants use `codegenNativeScanGeneral`:
 
@@ -1154,7 +1162,7 @@ All WASM scan variants use `codegenNativeScanGeneral`:
 | `passthrough` | Copy from carry input     | `return [oldC.ref, y]` (carry unchanged) |
 | `internal`    | Copy from internal buffer | `return [computation, y]`                |
 
-### WebGPU native-scan details
+### WebGPU compiled-loop details
 
 Shader codegen in `nativeScanShaderSource()`:
 
@@ -1171,7 +1179,7 @@ for (var iter: u32 = 0; iter < length; iter++) {
 
 Key insight: Thread `i` only reads/writes `carry[i]` and `xs[:,i]`. No `workgroupBarrier()` needed.
 
-### WebGPU batched-scan details (routine body)
+### WebGPU preencoded-routine details (routine body)
 
 For routine bodies, the approach uses pre-encoded dispatches with uniform-based offsets.
 
@@ -1488,7 +1496,7 @@ case natively.
 
 **Note on Sort in scan body:** Sort already uses a uniform buffer for its configuration, which
 conflicts with the scan offset uniform. This causes Sort-in-scan to fall back to JS loop on WebGPU.
-Cholesky, LU, and TriangularSolve now use the fused batched-scan path.
+Cholesky, LU, and TriangularSolve now use the fused preencoded-routine path.
 
 ### Future work
 
@@ -1584,14 +1592,14 @@ function trackScanPaths() {
 
 ### Test coverage by category
 
-| Category                    | Backend | Path     | Purpose                    |
-| --------------------------- | ------- | -------- | -------------------------- |
-| `scan basic`                | CPU     | fallback | Core correctness           |
-| `native scan`               | WASM    | fused    | Verify fusion works        |
-| `native scan > with consts` | WASM    | fused    | Constants in body          |
-| `matmul in body (routine)`  | WASM    | fused    | Routine bodies             |
-| `Cholesky in body`          | WebGPU  | fused    | Batched-scan with routines |
-| `KNOWN LIMITATIONS`         | WebGPU  | fallback | Verify graceful fallback   |
+| Category                    | Backend | Path     | Purpose                          |
+| --------------------------- | ------- | -------- | -------------------------------- |
+| `scan basic`                | CPU     | fallback | Core correctness                 |
+| `native scan`               | WASM    | fused    | Verify fusion works              |
+| `native scan > with consts` | WASM    | fused    | Constants in body                |
+| `matmul in body (routine)`  | WASM    | fused    | Routine bodies                   |
+| `Cholesky in body`          | WebGPU  | fused    | Preencoded-routine with routines |
+| `KNOWN LIMITATIONS`         | WebGPU  | fallback | Verify graceful fallback         |
 
 Tests under "KNOWN LIMITATIONS" PASS when the limitation exists. If you fix a limitation, the test
 will FAIL with instructions to update this documentation.

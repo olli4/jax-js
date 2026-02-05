@@ -1100,7 +1100,7 @@ export class Array extends Tracer {
         // - Creating Array wrappers for slots
         // - ShapeTracker slicing for xs
         // - Object allocation inside the loop
-        // The native paths (native-scan, batched-scan) avoid this overhead entirely
+        // The fused paths (compiled-loop, preencoded-routine) avoid this overhead entirely
         // by running the entire loop in WASM or GPU shader code.
         const scanRunner: ScanRunner = (
           bodyProgram,
@@ -1339,7 +1339,7 @@ export class Array extends Tracer {
         const prevPending = [...new Set(args.flatMap((x) => x.#pending))];
 
         // Submit input pending operations BEFORE executing JIT program
-        // This is necessary because native-scan reads from buffers synchronously
+        // This is necessary because compiled-loop reads from buffers synchronously
         for (const exe of prevPending) {
           exe.prepareSync();
           exe.submit();

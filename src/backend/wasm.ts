@@ -535,7 +535,7 @@ export class WasmBackend implements Backend {
    *
    * Note: This compiles a new WASM module for each distinct set of scan parameters.
    * However, `jit()` caching at the higher level protects against recompilation:
-   * the JitProgram (including the native-scan step) is cached after the first trace,
+   * the JitProgram (including the compiled-loop step) is cached after the first trace,
    * so repeated calls to the same jit'd function reuse the compiled module.
    */
   prepareNativeScanGeneral(

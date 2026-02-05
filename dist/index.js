@@ -1,5 +1,5 @@
 import { __export } from "./chunk-Cl8Af3a2.js";
-import { AluExp, AluGroup, AluOp, AluVar, DEBUG, DType, FpHash, Kernel, PPrint, Reduction, Routine, Routines, ShapeTracker, accessorAluExp, accessorGlobal, assertNonNull, byteWidth, checkAxis, checkInts, deepEqual, defaultDevice, devices, dtypedArray, dtypedJsArray, generalBroadcast, getBackend, init, invertPermutation, isFloatDtype, isNumberPair, isPermutation, normalizeAxis, partitionList, prod, promoteTypes, range, recursiveFlatten, rep, reportScanBodySteps, reportScanPath, runWithCache, setDebug, setScanBodyStepsCallback, setScanPathCallback, toposort, unravelAlu, unzip2, zip, zipn } from "./backend-BcW93MQX.js";
+import { AluExp, AluGroup, AluOp, AluVar, DEBUG, DType, FpHash, Kernel, PPrint, Reduction, Routine, Routines, ShapeTracker, accessorAluExp, accessorGlobal, assertNonNull, byteWidth, checkAxis, checkInts, deepEqual, defaultDevice, devices, dtypedArray, dtypedJsArray, generalBroadcast, getBackend, init, invertPermutation, isFloatDtype, isNumberPair, isPermutation, normalizeAxis, partitionList, prod, promoteTypes, range, recursiveFlatten, rep, reportScanBodySteps, reportScanPath, runWithCache, setDebug, setScanBodyStepsCallback, setScanPathCallback, toposort, unravelAlu, unzip2, zip, zipn } from "./backend-DGe3Ta8T.js";
 import { createAllIterationsOffsetsBuffer, wrapRoutineForScan } from "./scan-wrapper-TpkqHRRF.js";
 
 //#region src/frontend/convolution.ts
@@ -1912,8 +1912,8 @@ var JitProgram = class {
 				case "incref": return PPrint.pp(`incref ${step.input}`);
 				case "free": return PPrint.pp(`free ${step.input}`);
 				case "scan": return PPrint.pp(`scan length=${step.length} numCarry=${step.numCarry} numConsts=${step.numConsts}`).concat(PPrint.pp(`  consts=[${step.consts.join(", ")}] initCarry=[${step.initCarry.join(", ")}] xs=[${step.xs.join(", ")}]`)).concat(PPrint.pp(`  outputs=[${step.outputs.join(", ")}]`)).concat(PPrint.pp("  body=").concat(PPrint.pp(step.bodyJaxpr.toString()).indent(4)));
-				case "native-scan": return PPrint.pp(`native-scan length=${step.length} numCarry=${step.numCarry}`).concat(PPrint.pp(`  initCarry=[${step.initCarry.join(", ")}] xs=[${step.xs.join(", ")}]`)).concat(PPrint.pp(`  outputs=[${step.outputs.join(", ")}]`));
-				case "batched-scan": return PPrint.pp(`batched-scan length=${step.length} numCarry=${step.numCarry} numConsts=${step.numConsts}`).concat(PPrint.pp(`  initCarry=[${step.initCarry.join(", ")}] xs=[${step.xs.join(", ")}]`)).concat(PPrint.pp(`  outputs=[${step.outputs.join(", ")}]`));
+				case "compiled-loop": return PPrint.pp(`compiled-loop length=${step.length} numCarry=${step.numCarry}`).concat(PPrint.pp(`  initCarry=[${step.initCarry.join(", ")}] xs=[${step.xs.join(", ")}]`)).concat(PPrint.pp(`  outputs=[${step.outputs.join(", ")}]`));
+				case "preencoded-routine": return PPrint.pp(`preencoded-routine length=${step.length} numCarry=${step.numCarry} numConsts=${step.numConsts}`).concat(PPrint.pp(`  initCarry=[${step.initCarry.join(", ")}] xs=[${step.xs.join(", ")}]`)).concat(PPrint.pp(`  outputs=[${step.outputs.join(", ")}]`));
 			}
 		});
 		const display = PPrint.prototype.concat(PPrint.pp(`device = ${this.backend.type}`), PPrint.pp("inputs = [" + this.inputs.join(", ") + "]"), PPrint.pp("outputs = [" + this.outputs.join(", ") + "]"), PPrint.pp("steps ="), PPrint.prototype.concat(...steps).indent(2));
@@ -1984,7 +1984,7 @@ var JitProgram = class {
 				pending.push(...result.pending);
 				break;
 			}
-			case "native-scan": {
+			case "compiled-loop": {
 				for (const p of pending) {
 					p.prepareSync();
 					p.submit();
@@ -1997,12 +1997,12 @@ var JitProgram = class {
 				const carryOutSlots = outputSlots.slice(0, step.numCarry);
 				const ysStackedSlots = outputSlots.slice(step.numCarry);
 				if (step.generalParams) if (this.backend.dispatchNativeScanGeneral) this.backend.dispatchNativeScanGeneral(step.executable, step.generalParams, constSlots, initCarrySlots, xsSlots, carryOutSlots, ysStackedSlots);
-				else throw new Error("internal: general native-scan requires backend.dispatchNativeScanGeneral");
+				else throw new Error("internal: compiled-loop requires backend.dispatchNativeScanGeneral");
 				else if (this.backend.dispatchNativeScan) this.backend.dispatchNativeScan(step.executable, constSlots, initCarrySlots, xsSlots, carryOutSlots, ysStackedSlots);
-				else throw new Error("internal: native-scan requires backend.dispatchNativeScan");
+				else throw new Error("internal: compiled-loop requires backend.dispatchNativeScan");
 				break;
 			}
-			case "batched-scan": {
+			case "preencoded-routine": {
 				for (const p of pending) {
 					p.prepareSync();
 					p.submit();
@@ -2015,7 +2015,7 @@ var JitProgram = class {
 				const carryOutSlots = outputSlots.slice(0, step.numCarry);
 				const ysStackedSlots = outputSlots.slice(step.numCarry);
 				if (this.backend.dispatchBatchedScan) this.backend.dispatchBatchedScan(step.batchedParams, constSlots, initCarrySlots, xsSlots, carryOutSlots, ysStackedSlots);
-				else throw new Error("internal: batched-scan requires backend.dispatchBatchedScan");
+				else throw new Error("internal: preencoded-routine requires backend.dispatchBatchedScan");
 				break;
 			}
 			default:
@@ -2087,7 +2087,7 @@ var JitProgramBuilder = class {
 		const ids = this.steps.filter((s) => s.type === "malloc").map((s) => s.output);
 		for (const id of ids) {
 			if (outputIds.includes(id)) continue;
-			const lastUsage = this.steps.findLastIndex((s) => s.type === "execute" && (s.outputs.includes(id) || s.inputs.includes(id)) || s.type === "malloc" && s.output === id || s.type === "scan" && (s.consts.includes(id) || s.initCarry.includes(id) || s.xs.includes(id) || s.outputs.includes(id)) || s.type === "native-scan" && (s.consts.includes(id) || s.initCarry.includes(id) || s.xs.includes(id) || s.outputs.includes(id)) || s.type === "batched-scan" && (s.consts.includes(id) || s.initCarry.includes(id) || s.xs.includes(id) || s.outputs.includes(id)));
+			const lastUsage = this.steps.findLastIndex((s) => s.type === "execute" && (s.outputs.includes(id) || s.inputs.includes(id)) || s.type === "malloc" && s.output === id || s.type === "scan" && (s.consts.includes(id) || s.initCarry.includes(id) || s.xs.includes(id) || s.outputs.includes(id)) || s.type === "compiled-loop" && (s.consts.includes(id) || s.initCarry.includes(id) || s.xs.includes(id) || s.outputs.includes(id)) || s.type === "preencoded-routine" && (s.consts.includes(id) || s.initCarry.includes(id) || s.xs.includes(id) || s.outputs.includes(id)));
 			this.steps.splice(lastUsage + 1, 0, {
 				type: "free",
 				input: id
@@ -2215,10 +2215,11 @@ function jitCompile(backend, jaxpr) {
 				reportScanPath("fused", backend.type, {
 					numConsts,
 					numCarry,
-					length
+					length,
+					pathDetail: "compiled-loop"
 				});
 				builder.steps.push({
-					type: "native-scan",
+					type: "compiled-loop",
 					executable: nativeScanExe,
 					length,
 					numCarry,
@@ -2240,10 +2241,11 @@ function jitCompile(backend, jaxpr) {
 				reportScanPath("fused", backend.type, {
 					numConsts,
 					numCarry,
-					length
+					length,
+					pathDetail: "preencoded-routine"
 				});
 				builder.steps.push({
-					type: "batched-scan",
+					type: "preencoded-routine",
 					batchedParams,
 					length,
 					numCarry,
@@ -2263,7 +2265,8 @@ function jitCompile(backend, jaxpr) {
 			reportScanPath("fallback", backend.type, {
 				numConsts,
 				numCarry,
-				length
+				length,
+				pathDetail: "fallback"
 			});
 			builder.steps.push({
 				type: "scan",
@@ -2982,13 +2985,13 @@ function tryPrepareWebGPUNativeScan(backend, bodyProgram, bodyJaxpr, executeStep
 function tryPrepareNativeScan(backend, bodyProgram, bodyJaxpr, length, numCarry, numConsts, numX, numY, reverse) {
 	const executeSteps = bodyProgram.steps.filter((s) => s.type === "execute");
 	if (executeSteps.length === 0) {
-		if (DEBUG >= 1) console.log("[native-scan] skipped, no execute steps");
+		if (DEBUG >= 1) console.log("[compiled-loop] skipped, no execute steps");
 		return null;
 	}
 	const allKernels = executeSteps.every((s) => s.source instanceof Kernel);
 	if (backend.type === "webgpu" && allKernels) return tryPrepareWebGPUNativeScan(backend, bodyProgram, bodyJaxpr, executeSteps, length, numCarry, numConsts, numX, numY, reverse);
 	if (backend.type === "wasm") return tryPrepareWasmNativeScan(backend, bodyProgram, bodyJaxpr, executeSteps, length, numCarry, numConsts, numX, numY, reverse);
-	if (DEBUG >= 1) console.log(`[native-scan] skipped, backend=${backend.type} not supported`);
+	if (DEBUG >= 1) console.log(`[compiled-loop] skipped, backend=${backend.type} not supported`);
 	return null;
 }
 /**
@@ -8624,28 +8627,38 @@ function triangularSolve(a, b, { leftSide = false, lower = false, transposeA = f
 * const [final, ys] = await lax.scan(step, init, xs, { reverse: true });
 * ```
 *
-* @example Carry-only scan (xs=null)
+* ## jax-js Extensions
+*
+* These features extend JAX's scan API for TypeScript/JavaScript ergonomics:
+*
+* ### xs=null (carry-only scan)
+*
+* Pass `null` as `xs` with `{ length }` to iterate without input arrays.
+* Useful for generators, RNG sequences, Fibonacci, or any state-only iteration.
+* The body receives `null` as the second argument.
+*
+* ### Y=null (skip output stacking)
+*
+* Return `[newCarry, null]` from the body to skip allocating stacked outputs.
+* Useful when you only need the final carry (e.g., Mandelbrot iteration counts).
+* The returned `ys` will be `null`, saving memory for large iteration counts.
+*
+* @example xs=null: Carry-only scan
 * ```ts
-* // Generate a sequence without allocating input arrays.
-* // Useful for RNG, counters, Fibonacci, or any state-only iteration.
+* // Generate a sequence without allocating input arrays
 * const step = (carry, _x) => {
 *   const next = np.add(carry.ref, np.array([1.0]));
 *   return [next, carry];  // output is old carry value
 * };
 *
 * const init = np.array([0.0]);
-* // Must provide length when xs is null
 * const [final, ys] = await lax.scan(step, init, null, { length: 5 });
-*
-* console.log(await ys.data());  // [0, 1, 2, 3, 4]
-* console.log(await final.data());  // [5]
+* // ys = [[0], [1], [2], [3], [4]], final = [5]
 * ```
 *
-* @example Skip output stacking (Y=null)
+* @example Y=null: Skip output stacking
 * ```ts
-* // When you only need the final carry and don't need intermediate outputs,
-* // return null as the second element to skip allocating stacked outputs.
-* // This saves memory for large iteration counts.
+* // Only need final carry, not intermediate outputs (saves memory)
 * const step = (carry, x) => {
 *   const Asq = carry.A.ref.mul(carry.A);
 *   const newA = Asq.add(x);
@@ -8656,7 +8669,6 @@ function triangularSolve(a, b, { leftSide = false, lower = false, transposeA = f
 * const init = { A: np.zeros([100]), count: np.zeros([100], np.int32) };
 * const [final, ys] = await lax.scan(step, init, xs);
 * // ys is null — no memory allocated for intermediate outputs
-* // final.count contains the iteration count per element
 * ```
 *
 * @example jit(scan) - Compile the entire scan loop
@@ -8712,20 +8724,6 @@ function triangularSolve(a, b, { leftSide = false, lower = false, transposeA = f
 *
 * const gradLoss = grad(loss);
 * const [dInit, dXs] = await gradLoss(init, xs);
-* ```
-*
-* @example Carry-only scan (no input xs)
-* ```ts
-* // Generate sequence without input arrays (saves memory)
-* const step = (carry, _) => {
-*   const next = np.add(carry, np.array([1]));
-*   return [next, carry.ref];
-* };
-*
-* const init = np.array([0]);
-* // Must provide length when xs is null
-* const [final, ys] = await lax.scan(step, init, null, { length: 5 });
-* // ys = [[0], [1], [2], [3], [4]], final = [5]
 * ```
 *
 * @see {@link https://docs.jax.dev/en/latest/_autosummary/jax.lax.scan.html | JAX lax.scan}

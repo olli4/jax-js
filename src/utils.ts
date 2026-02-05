@@ -25,11 +25,28 @@ export function setDebug(level: number) {
  */
 export type ScanPath = "fused" | "fallback";
 
+/**
+ * Detailed scan path types that expose the internal implementation.
+ * - "compiled-loop": Entire scan loop compiled to native code (WASM module or WebGPU shader)
+ * - "preencoded-routine": Pre-encoded GPU command dispatches with uniform offsets per iteration
+ * - "fallback": JS loop calling compiled body program per iteration
+ */
+export type ScanPathDetail =
+  | "compiled-loop"
+  | "preencoded-routine"
+  | "fallback";
+
 /** Callback for tracking which scan implementation paths are taken. */
 export type ScanPathCallback = (
   path: ScanPath,
   backend: string,
-  details?: { numConsts?: number; numCarry?: number; length?: number },
+  details?: {
+    numConsts?: number;
+    numCarry?: number;
+    length?: number;
+    /** Detailed path type exposing the internal step type. */
+    pathDetail?: ScanPathDetail;
+  },
 ) => void;
 
 let scanPathCallback: ScanPathCallback | null = null;
@@ -112,7 +129,12 @@ export function setScanPathCallback(callback: ScanPathCallback | null): void {
 export function reportScanPath(
   path: ScanPath,
   backend: string,
-  details?: { numConsts?: number; numCarry?: number; length?: number },
+  details?: {
+    numConsts?: number;
+    numCarry?: number;
+    length?: number;
+    pathDetail?: ScanPathDetail;
+  },
 ): void {
   if (scanPathCallback) {
     scanPathCallback(path, backend, details);

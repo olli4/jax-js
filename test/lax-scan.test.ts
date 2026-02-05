@@ -21,6 +21,7 @@ import {
   jvp,
   lax,
   numpy as np,
+  type ScanPathDetail,
   setScanBodyStepsCallback,
   setScanPathCallback,
   tree,
@@ -2687,10 +2688,12 @@ describe("scan autodiff", () => {
         const B0 = np.ones([2, 2]);
         const xs = np.zeros([3]); // 3 iterations
 
-        // Capture the scan path
+        // Capture the scan path with detail
         let capturedPath: string | null = null;
-        setScanPathCallback((path) => {
+        let capturedDetail: ScanPathDetail | undefined = undefined;
+        setScanPathCallback((path, _backend, details) => {
           capturedPath = path;
+          capturedDetail = details?.pathDetail;
         });
 
         try {
@@ -2713,11 +2716,13 @@ describe("scan autodiff", () => {
 
         // WebGPU should now use fused path for multi-output scan
         expect(capturedPath).toBe("fused");
+        // Detail should be "compiled-loop" (entire loop compiled to GPU shader)
+        expect(capturedDetail).toBe("compiled-loop");
       },
     );
 
     it("WebGPU: numCarry ≠ numY uses fallback instead of fused", async () => {
-      // WebGPU native-scan requires numCarry === numY
+      // WebGPU compiled-loop requires numCarry === numY
       // When they differ, falls back to JS loop
       const availableDevices = await init();
       if (!availableDevices.includes("webgpu")) {
@@ -2727,8 +2732,10 @@ describe("scan autodiff", () => {
       defaultDevice("webgpu");
 
       let capturedPath: string | null = null;
-      setScanPathCallback((path) => {
+      let capturedDetail: ScanPathDetail | undefined = undefined;
+      setScanPathCallback((path, _backend, details) => {
         capturedPath = path;
+        capturedDetail = details?.pathDetail;
       });
 
       try {
@@ -2760,6 +2767,8 @@ describe("scan autodiff", () => {
           "🎉 LIMITATION FIXED! WebGPU now supports numCarry ≠ numY in fused. " +
             "Please update .github/copilot-instructions.md and convert this to a normal test.",
         ).toBe("fallback");
+        // Detail should be "fallback" (JS loop)
+        expect(capturedDetail).toBe("fallback");
       } finally {
         setScanPathCallback(null);
       }

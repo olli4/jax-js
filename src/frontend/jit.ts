@@ -81,7 +81,7 @@ export type JitStep =
       outputs: JitId[]; // [carry_out..., stacked_ys...]
     }
   | {
-      type: "native-scan";
+      type: "compiled-loop";
       executable: Executable;
       length: number;
       numCarry: number;
@@ -96,8 +96,8 @@ export type JitStep =
       generalParams?: NativeScanGeneralParams;
     }
   | {
-      type: "batched-scan";
-      /** Batched scan params (stored for dispatch). */
+      type: "preencoded-routine";
+      /** Pre-encoded routine params (stored for dispatch). */
       batchedParams: any; // BatchedScanParams from webgpu.ts
       length: number;
       numCarry: number;
@@ -201,9 +201,9 @@ export class JitProgram {
                 PPrint.pp(step.bodyJaxpr.toString()).indent(4),
               ),
             );
-        case "native-scan":
+        case "compiled-loop":
           return PPrint.pp(
-            `native-scan length=${step.length} numCarry=${step.numCarry}`,
+            `compiled-loop length=${step.length} numCarry=${step.numCarry}`,
           )
             .concat(
               PPrint.pp(
@@ -211,9 +211,9 @@ export class JitProgram {
               ),
             )
             .concat(PPrint.pp(`  outputs=[${step.outputs.join(", ")}]`));
-        case "batched-scan":
+        case "preencoded-routine":
           return PPrint.pp(
-            `batched-scan length=${step.length} numCarry=${step.numCarry} numConsts=${step.numConsts}`,
+            `preencoded-routine length=${step.length} numCarry=${step.numCarry} numConsts=${step.numConsts}`,
           )
             .concat(
               PPrint.pp(
@@ -365,8 +365,8 @@ export class JitProgram {
           pending.push(...result.pending);
           break;
         }
-        case "native-scan": {
-          // Native scan - dispatch directly to backend
+        case "compiled-loop": {
+          // Compiled loop - dispatch directly to backend
           // IMPORTANT: Submit all pending operations first so input data is computed!
           for (const p of pending) {
             p.prepareSync();
@@ -397,7 +397,7 @@ export class JitProgram {
               );
             } else {
               throw new Error(
-                "internal: general native-scan requires backend.dispatchNativeScanGeneral",
+                "internal: compiled-loop requires backend.dispatchNativeScanGeneral",
               );
             }
           } else if (this.backend.dispatchNativeScan) {
@@ -411,13 +411,13 @@ export class JitProgram {
             );
           } else {
             throw new Error(
-              "internal: native-scan requires backend.dispatchNativeScan",
+              "internal: compiled-loop requires backend.dispatchNativeScan",
             );
           }
           break;
         }
-        case "batched-scan": {
-          // Batched scan for routine bodies (matmul, conv, etc.)
+        case "preencoded-routine": {
+          // Pre-encoded routine dispatches for routine bodies (Cholesky, LU, TriangularSolve)
           // IMPORTANT: Submit all pending operations first so input data is computed!
           for (const p of pending) {
             p.prepareSync();
@@ -445,7 +445,7 @@ export class JitProgram {
             );
           } else {
             throw new Error(
-              "internal: batched-scan requires backend.dispatchBatchedScan",
+              "internal: preencoded-routine requires backend.dispatchBatchedScan",
             );
           }
           break;
@@ -554,12 +554,12 @@ class JitProgramBuilder {
               s.initCarry.includes(id) ||
               s.xs.includes(id) ||
               s.outputs.includes(id))) ||
-          (s.type === "native-scan" &&
+          (s.type === "compiled-loop" &&
             (s.consts.includes(id) ||
               s.initCarry.includes(id) ||
               s.xs.includes(id) ||
               s.outputs.includes(id))) ||
-          (s.type === "batched-scan" &&
+          (s.type === "preencoded-routine" &&
             (s.consts.includes(id) ||
               s.initCarry.includes(id) ||
               s.xs.includes(id) ||
@@ -787,11 +787,16 @@ export function jitCompile(backend: Backend, jaxpr: Jaxpr): JitProgram {
         // Report fused path (loop runs in native code)
         const pathError = checkRequiredPath("fused", requirePath);
         if (pathError) throw new Error(pathError);
-        reportScanPath("fused", backend.type, { numConsts, numCarry, length });
+        reportScanPath("fused", backend.type, {
+          numConsts,
+          numCarry,
+          length,
+          pathDetail: "compiled-loop",
+        });
 
-        // Use native scan
+        // Use compiled loop (entire scan loop in native code)
         builder.steps.push({
-          type: "native-scan",
+          type: "compiled-loop",
           executable: nativeScanExe,
           length,
           numCarry,
@@ -822,16 +827,17 @@ export function jitCompile(backend: Backend, jaxpr: Jaxpr): JitProgram {
       );
 
       if (batchedParams) {
-        // Use batched scan (pre-encoded dispatches, still fused)
+        // Use pre-encoded routine dispatches (fused, but dispatches pre-encoded per iteration)
         const pathError = checkRequiredPath("fused", requirePath);
         if (pathError) throw new Error(pathError);
         reportScanPath("fused", backend.type, {
           numConsts,
           numCarry,
           length,
+          pathDetail: "preencoded-routine",
         });
         builder.steps.push({
-          type: "batched-scan",
+          type: "preencoded-routine",
           batchedParams,
           length,
           numCarry,
@@ -854,6 +860,7 @@ export function jitCompile(backend: Backend, jaxpr: Jaxpr): JitProgram {
         numConsts,
         numCarry,
         length,
+        pathDetail: "fallback",
       });
       builder.steps.push({
         type: "scan",
@@ -2102,7 +2109,7 @@ function tryPrepareNativeScan(
     (s) => s.type === "execute",
   ) as Extract<JitStep, { type: "execute" }>[];
   if (executeSteps.length === 0) {
-    if (DEBUG >= 1) console.log("[native-scan] skipped, no execute steps");
+    if (DEBUG >= 1) console.log("[compiled-loop] skipped, no execute steps");
     return null;
   }
 
@@ -2143,7 +2150,9 @@ function tryPrepareNativeScan(
 
   // Other backends: no native scan support
   if (DEBUG >= 1)
-    console.log(`[native-scan] skipped, backend=${backend.type} not supported`);
+    console.log(
+      `[compiled-loop] skipped, backend=${backend.type} not supported`,
+    );
   return null;
 }
 
