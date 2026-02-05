@@ -702,23 +702,16 @@ routine shaders to accept per-iteration offsets via uniforms, enabling fused dis
 
 **Benefits:**
 
-- Runtime compilation (no separate build step)
+- Runtime JIT compilation (no separate build step, no pre-compiled binaries)
 - Single TypeScript syntax throughout the codebase
 - Ergonomic helpers for control flow (`forLoop`, `whileLoop`, `ifElse`) and memory access
 - SIMD-ready (v128, i32x4, f32x4 types available)
 - Small output (~1KB per routine)
 - **Size specialization**: Matrix dimensions baked at compile time enable loop unrolling and
   constant propagation
-- **LRU caching**: 64-entry cache in `routine-provider.ts` amortizes compilation cost across calls
+- **LRU caching**: 64-entry cache amortizes compilation cost across calls
 
-**Key files:**
-
-| File                                   | Purpose                                              |
-| -------------------------------------- | ---------------------------------------------------- |
-| `src/backend/wasm/wasmblr.ts`          | Low-level WASM bytecode assembler                    |
-| `src/backend/wasm/wasmblr-hl.ts`       | High-level helper layer (WasmHl class)               |
-| `src/backend/wasm/routines/*.ts`       | Size-specialized routine implementations             |
-| `src/backend/wasm/routine-provider.ts` | Module caching with 64-entry LRU cache (by size key) |
+See the [Routine System](#routine-system) section for implementation details and wasmblr patterns.
 
 ### Why 3 routine implementations (CPU/WASM/WebGPU)?
 
@@ -736,29 +729,9 @@ routine shaders to accept per-iteration offsets via uniforms, enabling fused dis
    - Sort: Bitonic sort (parallel) vs merge sort (sequential)
    - Cholesky: Column-parallel Cholesky-Crout vs row-by-row Cholesky-Banachiewicz
 
-### Why WASM imports for routines in scan?
-
-**Problem:** How to call routines (Cholesky, Sort, etc.) from inside a compiled scan loop?
-
-**Options considered:**
-
-1. **Duplicate routine code in scan module** — Rejected: code bloat, maintenance burden
-2. **Call out to JS** — Rejected: defeats purpose of compiled loop
-3. **WASM imports** — Chosen: scan module imports pre-compiled routine functions
-
-**Implementation:**
-
-```typescript
-// At codegen time:
-cg.importFunction("routines", "cholesky_f32", [Type.i32, Type.i32, Type.i32]);
-
-// At instantiation:
-dispatchNativeScanGeneral(module, {
-  routines: { cholesky_f32: routineInstance.exports.cholesky_f32 },
-});
-```
-
-**Result:** Full native performance (~1.5M iter/sec) with zero code duplication.
+**Calling routines from scan loops:** Scan modules use WASM imports to call routines from separate
+wasmblr modules. This avoids code duplication (each routine is 1-3KB) while keeping the entire loop
+in native code (~1.5M iter/sec). See `codegenNativeScanGeneral()` in `src/backend/wasm.ts`.
 
 ---
 
@@ -1311,6 +1284,15 @@ grad-wrapped function instead.
 | **Argsort**         | ✅ Implemented | `src/backend/wasm/routines/argsort.ts`          | Stable merge sort on indices                   |
 
 Routines are compiled at runtime using wasmblr — no separate build step required.
+
+**Key files:**
+
+| File                                   | Purpose                                |
+| -------------------------------------- | -------------------------------------- |
+| `src/backend/wasm/wasmblr.ts`          | Low-level WASM bytecode assembler      |
+| `src/backend/wasm/wasmblr-hl.ts`       | High-level helper layer (WasmHl class) |
+| `src/backend/wasm/routines/*.ts`       | Size-specialized routine codegen       |
+| `src/backend/wasm/routine-provider.ts` | 64-entry LRU module cache (by size)    |
 
 ### Adding a new routine (checklist)
 

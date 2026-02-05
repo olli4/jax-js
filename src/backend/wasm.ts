@@ -1261,7 +1261,7 @@ function codegenNativeScanGeneral(
   cg.memory.import("env", "memory");
 
   // Import routine functions from the "routines" module
-  // These will be provided at instantiation time from the pre-compiled AS modules
+  // These will be provided at instantiation time from size-specialized wasmblr modules
   const routineFuncIndices: number[] = [];
   if (routineInfos) {
     for (const info of routineInfos) {
