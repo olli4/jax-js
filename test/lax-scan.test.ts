@@ -22,7 +22,6 @@ import {
   lax,
   numpy as np,
   setScanBodyStepsCallback,
-  setScanPathCallback,
   tree,
   vmap,
 } from "../src";
@@ -280,9 +279,9 @@ suite.each(devices)("lax.scan device:%s", (device) => {
       const initCarry = np.zeros([size]);
       const xs = np.ones([10, size]); // 10 iterations
 
-      // requirePath: ["compiled-loop", "preencoded-routine"] ensures this doesn't silently regress to fallback
+      // acceptPath: ["compiled-loop", "preencoded-routine"] ensures this doesn't silently regress to fallback
       const [finalCarry, _outputs] = await lax.scan(step, initCarry, xs, {
-        requirePath: ["compiled-loop", "preencoded-routine"],
+        acceptPath: ["compiled-loop", "preencoded-routine"],
       });
 
       const finalData = await finalCarry.data();
@@ -304,9 +303,9 @@ suite.each(devices)("lax.scan device:%s", (device) => {
       const initCarry = np.zeros([size]);
       const xs = np.ones([5, size]); // 5 iterations
 
-      // requirePath: ["compiled-loop", "preencoded-routine"] ensures this doesn't silently regress to fallback
+      // acceptPath: ["compiled-loop", "preencoded-routine"] ensures this doesn't silently regress to fallback
       const [finalCarry, _outputs] = await lax.scan(step, initCarry, xs, {
-        requirePath: ["compiled-loop", "preencoded-routine"],
+        acceptPath: ["compiled-loop", "preencoded-routine"],
       });
 
       const finalData = await finalCarry.data();
@@ -333,9 +332,9 @@ suite.each(devices)("lax.scan device:%s", (device) => {
       const initCarry = np.array([0.0]);
       const xs = np.array([[1.0], [2.0], [3.0]]); // 3 iterations
 
-      // requirePath: ["compiled-loop", "preencoded-routine"] ensures constant handling works in native scan path
+      // acceptPath: ["compiled-loop", "preencoded-routine"] ensures constant handling works in native scan path
       const [finalCarry, outputs] = await lax.scan(step, initCarry, xs, {
-        requirePath: ["compiled-loop", "preencoded-routine"],
+        acceptPath: ["compiled-loop", "preencoded-routine"],
       });
 
       // Iteration 1: 0 + (1*2 + 1) = 3
@@ -357,7 +356,7 @@ suite.each(devices)("lax.scan device:%s", (device) => {
       // NOTE: This currently falls back to JS loop because the JIT creates 2 execute
       // steps (reduction, then add) instead of fusing them. This is a known limitation.
       // When epilogue fusion is improved, this could use compiled-loop path.
-      // We do NOT use requirePath here because this is testing correctness, not fusion.
+      // We do NOT use acceptPath here because this is testing correctness, not fusion.
 
       const step = (carry: np.Array, x: np.Array): [np.Array, np.Array] => {
         // sum the elements of x, then add to carry
@@ -604,7 +603,7 @@ suite.each(devices)("lax.scan device:%s", (device) => {
         // JIT should use native routine scan (compiled-loop path)
         const jitScan = jit((matrices: np.Array) => {
           return lax.scan(step, initCarry.ref, matrices, {
-            requirePath: ["compiled-loop", "preencoded-routine"],
+            acceptPath: ["compiled-loop", "preencoded-routine"],
           });
         });
 
@@ -662,7 +661,7 @@ suite.each(devices)("lax.scan device:%s", (device) => {
         const jitScanRev = jit((matrices: np.Array) => {
           return lax.scan(step, initCarry.ref, matrices, {
             reverse: true,
-            requirePath: ["compiled-loop", "preencoded-routine"],
+            acceptPath: ["compiled-loop", "preencoded-routine"],
           });
         });
 
@@ -720,7 +719,7 @@ suite.each(devices)("lax.scan device:%s", (device) => {
         const jitScan = jit((matrices: np.Array) => {
           // Uses native scan with both Kernel (multiply) and Routine (cholesky)
           return lax.scan(step, initCarry.ref, matrices, {
-            requirePath: ["compiled-loop", "preencoded-routine"],
+            acceptPath: ["compiled-loop", "preencoded-routine"],
           });
         });
 
@@ -773,7 +772,7 @@ suite.each(devices)("lax.scan device:%s", (device) => {
         const jitScan = jit((matrices: np.Array) => {
           // Uses native scan with Sort routine (requires aux buffer)
           return lax.scan(step, initCarry.ref, matrices, {
-            requirePath: ["compiled-loop", "preencoded-routine"],
+            acceptPath: ["compiled-loop", "preencoded-routine"],
           });
         });
 
@@ -858,7 +857,7 @@ suite.each(devices)("lax.scan device:%s", (device) => {
 
         const jitScan = jit((inputs: np.Array[]) => {
           return lax.scan(step, initCarry.ref, inputs, {
-            requirePath: ["compiled-loop", "preencoded-routine"],
+            acceptPath: ["compiled-loop", "preencoded-routine"],
           });
         });
 
@@ -910,7 +909,7 @@ suite.each(devices)("lax.scan device:%s", (device) => {
 
       const jitScan = jit((matrices: np.Array) => {
         return lax.scan(step, initCarry.ref, matrices, {
-          requirePath: ["compiled-loop", "preencoded-routine"],
+          acceptPath: ["compiled-loop", "preencoded-routine"],
         });
       });
 
@@ -959,7 +958,7 @@ suite.each(devices)("lax.scan device:%s", (device) => {
 
         const jitScan = jit((arrays: np.Array) => {
           return lax.scan(step, initCarry.ref, arrays, {
-            requirePath: ["compiled-loop", "preencoded-routine"],
+            acceptPath: ["compiled-loop", "preencoded-routine"],
           });
         });
 
@@ -2189,8 +2188,8 @@ describe("scan autodiff", () => {
     });
   });
 
-  describe("requirePath option", () => {
-    it("throws when requirePath is not satisfied", async () => {
+  describe("acceptPath option", () => {
+    it("throws when acceptPath is not satisfied", async () => {
       // Use CPU backend where scans always use fallback path
       defaultDevice("cpu");
 
@@ -2205,18 +2204,18 @@ describe("scan autodiff", () => {
       // Requiring compiled-loop on CPU should throw (CPU always uses fallback)
       const f = jit(() =>
         lax.scan(step, init, xs, {
-          requirePath: ["compiled-loop", "preencoded-routine"],
+          acceptPath: ["compiled-loop", "preencoded-routine"],
         }),
       );
 
-      expect(() => f()).toThrow(/requirePath/);
+      expect(() => f()).toThrow(/acceptPath/);
 
       f.dispose();
       // Reset to wasm for subsequent tests
       defaultDevice("wasm");
     });
 
-    it("succeeds when requirePath matches actual path", async () => {
+    it("succeeds when acceptPath matches actual path", async () => {
       // Simple cumsum body that should compile to compiled-loop
       const step = (carry: np.Array, x: np.Array): [np.Array, np.Array] => {
         const newCarry = np.add(carry, x);
@@ -2230,7 +2229,7 @@ describe("scan autodiff", () => {
       // Use array to allow either compiled-loop or preencoded-routine or fallback
       const f = jit(() =>
         lax.scan(step, init, xs, {
-          requirePath: ["compiled-loop", "preencoded-routine", "fallback"],
+          acceptPath: ["compiled-loop", "preencoded-routine", "fallback"],
         }),
       );
 
@@ -2257,7 +2256,7 @@ describe("scan autodiff", () => {
       // Allow multiple paths (now just compiled-loop or preencoded-routine or fallback)
       const f = jit(() =>
         lax.scan(step, init, xs, {
-          requirePath: ["compiled-loop", "preencoded-routine", "fallback"],
+          acceptPath: ["compiled-loop", "preencoded-routine", "fallback"],
         }),
       );
 
@@ -2289,39 +2288,30 @@ describe("scan autodiff", () => {
       async () => {
         defaultDevice("webgl");
 
-        let capturedPath: string | null = null;
-        setScanPathCallback((path) => {
-          capturedPath = path;
+        const step = (carry: np.Array, x: np.Array): [np.Array, np.Array] => {
+          const newCarry = np.add(carry.ref, x);
+          return [newCarry, newCarry.ref];
+        };
+
+        const init = np.zeros([1]);
+        const xs = np.array([[1.0], [2.0], [3.0]]);
+
+        // WebGL only supports fallback path (no native scan)
+        const [finalCarry, ys] = lax.scan(step, init, xs, {
+          acceptPath: "fallback",
         });
 
-        try {
-          const step = (carry: np.Array, x: np.Array): [np.Array, np.Array] => {
-            const newCarry = np.add(carry.ref, x);
-            return [newCarry, newCarry.ref];
-          };
+        // Verify results
+        expect(finalCarry.shape).toEqual([1]);
+        expect(ys.shape).toEqual([3, 1]);
 
-          const init = np.zeros([1]);
-          const xs = np.array([[1.0], [2.0], [3.0]]);
+        const carryData = await finalCarry.data();
+        expect(carryData[0]).toBeCloseTo(6.0); // 1 + 2 + 3
 
-          const [finalCarry, ys] = lax.scan(step, init, xs);
-
-          // Verify results
-          expect(finalCarry.shape).toEqual([1]);
-          expect(ys.shape).toEqual([3, 1]);
-
-          const carryData = await finalCarry.data();
-          expect(carryData[0]).toBeCloseTo(6.0); // 1 + 2 + 3
-
-          const ysData = await ys.data();
-          expect(ysData[0]).toBeCloseTo(1.0);
-          expect(ysData[1]).toBeCloseTo(3.0);
-          expect(ysData[2]).toBeCloseTo(6.0);
-
-          // WebGL should use fallback path (no native scan support)
-          expect(capturedPath).toBe("fallback");
-        } finally {
-          setScanPathCallback(null);
-        }
+        const ysData = await ys.data();
+        expect(ysData[0]).toBeCloseTo(1.0);
+        expect(ysData[1]).toBeCloseTo(3.0);
+        expect(ysData[2]).toBeCloseTo(6.0);
       },
     );
 
@@ -2330,43 +2320,31 @@ describe("scan autodiff", () => {
       async () => {
         defaultDevice("webgl");
 
-        let capturedPath: string | null = null;
-        setScanPathCallback((path) => {
-          capturedPath = path;
+        const jitScan = jit((xs: np.Array) => {
+          const step = (carry: np.Array, x: np.Array): [np.Array, np.Array] => {
+            const newCarry = np.add(carry.ref, x);
+            return [newCarry, newCarry.ref];
+          };
+          const init = np.zeros([1]);
+          // WebGL only supports fallback path (no native scan)
+          const [finalCarry, ys] = lax.scan(step, init, xs, {
+            acceptPath: "fallback",
+          });
+          return [finalCarry, ys] as [np.Array, np.Array];
         });
 
-        try {
-          const jitScan = jit((xs: np.Array) => {
-            const step = (
-              carry: np.Array,
-              x: np.Array,
-            ): [np.Array, np.Array] => {
-              const newCarry = np.add(carry.ref, x);
-              return [newCarry, newCarry.ref];
-            };
-            const init = np.zeros([1]);
-            const [finalCarry, ys] = lax.scan(step, init, xs);
-            return [finalCarry, ys] as [np.Array, np.Array];
-          });
+        const xs = np.array([[1.0], [2.0], [3.0]]);
+        const [finalCarry, ys] = jitScan(xs);
 
-          const xs = np.array([[1.0], [2.0], [3.0]]);
-          const [finalCarry, ys] = jitScan(xs);
+        const carryData = await finalCarry.data();
+        expect(carryData[0]).toBeCloseTo(6.0);
 
-          const carryData = await finalCarry.data();
-          expect(carryData[0]).toBeCloseTo(6.0);
+        const ysData = await ys.data();
+        expect(ysData[0]).toBeCloseTo(1.0);
+        expect(ysData[1]).toBeCloseTo(3.0);
+        expect(ysData[2]).toBeCloseTo(6.0);
 
-          const ysData = await ys.data();
-          expect(ysData[0]).toBeCloseTo(1.0);
-          expect(ysData[1]).toBeCloseTo(3.0);
-          expect(ysData[2]).toBeCloseTo(6.0);
-
-          // WebGL should use fallback path
-          expect(capturedPath).toBe("fallback");
-
-          jitScan.dispose();
-        } finally {
-          setScanPathCallback(null);
-        }
+        jitScan.dispose();
       },
     );
   });
@@ -2382,7 +2360,7 @@ describe("scan autodiff", () => {
    * If a test FAILS, it means the limitation has been FIXED! 🎉
    * When that happens:
    * 1. Update .github/copilot-instructions.md to remove/update the limitation
-   * 2. Convert this test to a normal test using requirePath to verify the fix
+   * 2. Convert this test to a normal test using acceptPath to verify the fix
    * 3. Celebrate! 🎊
    *
    * See: .github/copilot-instructions.md "Known Limitations" section
@@ -2398,44 +2376,37 @@ describe("scan autodiff", () => {
 
       defaultDevice("webgpu");
 
-      let capturedPath: string | null = null;
-      setScanPathCallback((path) => {
-        capturedPath = path;
-      });
+      // Simple body with just Cholesky (single routine step)
+      const step = (carry: np.Array, x: np.Array): [np.Array, np.Array] => {
+        const L = lax.linalg.cholesky(x.ref);
+        return [L.ref, L];
+      };
 
-      try {
-        // Simple body with just Cholesky (single routine step)
-        const step = (carry: np.Array, x: np.Array): [np.Array, np.Array] => {
-          const L = lax.linalg.cholesky(x.ref);
-          return [L.ref, L];
-        };
+      const initCarry = np.eye(2);
+      const xs = np.array([
+        [
+          [4.0, 2.0],
+          [2.0, 5.0],
+        ],
+        [
+          [5.0, 3.0],
+          [3.0, 6.0],
+        ],
+      ]);
 
-        const initCarry = np.eye(2);
-        const xs = np.array([
-          [
-            [4.0, 2.0],
-            [2.0, 5.0],
-          ],
-          [
-            [5.0, 3.0],
-            [3.0, 6.0],
-          ],
-        ]);
-
-        const f = jit(() => lax.scan(step, initCarry, xs));
-        const [carry, ys] = f();
-        await carry.data();
-        await ys.data();
-        f.dispose();
-
-        // Cholesky now uses preencoded-routine path
-        expect(capturedPath).toBe("preencoded-routine");
-      } finally {
-        setScanPathCallback(null);
-      }
+      // Cholesky uses preencoded-routine path
+      const f = jit(() =>
+        lax.scan(step, initCarry, xs, { acceptPath: "preencoded-routine" }),
+      );
+      const [carry, ys] = f();
+      await carry.data();
+      await ys.data();
+      f.dispose();
     });
 
     it("WebGPU: TriangularSolve in scan body uses fallback instead of compiled-loop", async () => {
+      // Limitation test: uses fallback. If this test fails with "scan used X but acceptPath
+      // requires fallback", the limitation has been fixed! Update copilot-instructions.md.
       const availableDevices = await init();
       if (!availableDevices.includes("webgpu")) {
         return;
@@ -2443,54 +2414,45 @@ describe("scan autodiff", () => {
 
       defaultDevice("webgpu");
 
-      let capturedPath: string | null = null;
-      setScanPathCallback((path) => {
-        capturedPath = path;
-      });
-
-      try {
-        const step = (carry: np.Array, x: np.Array): [np.Array, np.Array] => {
-          const L = np.array([
-            [2.0, 0.0],
-            [1.0, 3.0],
-          ]);
-          const result = lax.linalg.triangularSolve(L, x, { lower: true });
-          const newCarry = np.add(carry, result);
-          return [newCarry, result];
-        };
-
-        const initCarry = np.array([
-          [0.0, 0.0],
-          [0.0, 0.0],
+      const step = (carry: np.Array, x: np.Array): [np.Array, np.Array] => {
+        const L = np.array([
+          [2.0, 0.0],
+          [1.0, 3.0],
         ]);
-        const xs = np.array([
-          [
-            [2.0, 1.0],
-            [5.0, 2.0],
-          ],
-          [
-            [4.0, 3.0],
-            [7.0, 4.0],
-          ],
-        ]);
+        const result = lax.linalg.triangularSolve(L, x, { lower: true });
+        const newCarry = np.add(carry, result);
+        return [newCarry, result];
+      };
 
-        const f = jit(() => lax.scan(step, initCarry, xs));
-        const [carry, ys] = f();
-        await carry.data();
-        await ys.data();
-        f.dispose();
+      const initCarry = np.array([
+        [0.0, 0.0],
+        [0.0, 0.0],
+      ]);
+      const xs = np.array([
+        [
+          [2.0, 1.0],
+          [5.0, 2.0],
+        ],
+        [
+          [4.0, 3.0],
+          [7.0, 4.0],
+        ],
+      ]);
 
-        expect(
-          capturedPath,
-          "🎉 LIMITATION FIXED! TriangularSolve now uses preencoded-routine. " +
-            "Please update .github/copilot-instructions.md and convert this to a normal test.",
-        ).toBe("fallback");
-      } finally {
-        setScanPathCallback(null);
-      }
+      // This limitation test expects fallback path.
+      // If scan uses a native path, acceptPath will throw (test fails = limitation fixed!)
+      const f = jit(() =>
+        lax.scan(step, initCarry, xs, { acceptPath: "fallback" }),
+      );
+      const [carry, ys] = f();
+      await carry.data();
+      await ys.data();
+      f.dispose();
     });
 
     it("WebGPU: LU in scan body uses fallback instead of compiled-loop", async () => {
+      // Limitation test: uses fallback. If this test fails with "scan used X but acceptPath
+      // requires fallback", the limitation has been fixed! Update copilot-instructions.md.
       const availableDevices = await init();
       if (!availableDevices.includes("webgpu")) {
         return;
@@ -2498,41 +2460,31 @@ describe("scan autodiff", () => {
 
       defaultDevice("webgpu");
 
-      let capturedPath: string | null = null;
-      setScanPathCallback((path) => {
-        capturedPath = path;
-      });
+      const step = (carry: np.Array, _x: np.Array): [np.Array, np.Array] => {
+        const [lu, pivots] = lax.linalg.lu(carry);
+        return [lu, pivots];
+      };
 
-      try {
-        const step = (carry: np.Array, _x: np.Array): [np.Array, np.Array] => {
-          const [lu, pivots] = lax.linalg.lu(carry);
-          return [lu, pivots];
-        };
+      const initCarry = np.array([
+        [4.0, 3.0],
+        [6.0, 3.0],
+      ]);
+      const xs = np.array([[1.0], [1.0]]);
 
-        const initCarry = np.array([
-          [4.0, 3.0],
-          [6.0, 3.0],
-        ]);
-        const xs = np.array([[1.0], [1.0]]);
-
-        const f = jit(() => lax.scan(step, initCarry, xs));
-        const [carry, ys] = f();
-        await carry.data();
-        await ys.data();
-        f.dispose();
-
-        expect(
-          capturedPath,
-          "🎉 LIMITATION FIXED! LU now uses preencoded-routine. " +
-            "Please update .github/copilot-instructions.md and convert this to a normal test.",
-        ).toBe("fallback");
-      } finally {
-        setScanPathCallback(null);
-      }
+      // This limitation test expects fallback path.
+      // If scan uses a native path, acceptPath will throw (test fails = limitation fixed!)
+      const f = jit(() =>
+        lax.scan(step, initCarry, xs, { acceptPath: "fallback" }),
+      );
+      const [carry, ys] = f();
+      await carry.data();
+      await ys.data();
+      f.dispose();
     });
 
     it("WebGPU: Sort in scan body uses fallback (uniforms conflict)", async () => {
       // Sort/Argsort use uniforms internally which conflict with preencoded-routine's offset uniforms
+      // Limitation test: uses fallback. If this test fails, limitation is fixed!
       const availableDevices = await init();
       if (!availableDevices.includes("webgpu")) {
         return;
@@ -2540,39 +2492,27 @@ describe("scan autodiff", () => {
 
       defaultDevice("webgpu");
 
-      let capturedPath: string | null = null;
-      setScanPathCallback((path) => {
-        capturedPath = path;
-      });
+      const step = (carry: np.Array, x: np.Array): [np.Array, np.Array] => {
+        const sorted = np.sort(x);
+        const newCarry = np.add(carry, sorted);
+        return [newCarry, sorted];
+      };
 
-      try {
-        const step = (carry: np.Array, x: np.Array): [np.Array, np.Array] => {
-          const sorted = np.sort(x);
-          const newCarry = np.add(carry, sorted);
-          return [newCarry, sorted];
-        };
+      const initCarry = np.array([0.0, 0.0, 0.0]);
+      const xs = np.array([
+        [3.0, 1.0, 2.0],
+        [6.0, 4.0, 5.0],
+      ]);
 
-        const initCarry = np.array([0.0, 0.0, 0.0]);
-        const xs = np.array([
-          [3.0, 1.0, 2.0],
-          [6.0, 4.0, 5.0],
-        ]);
-
-        const f = jit(() => lax.scan(step, initCarry, xs));
-        const [carry, ys] = f();
-        await carry.data();
-        await ys.data();
-        f.dispose();
-
-        // Sort uses uniforms internally, so preencoded-routine is not possible
-        expect(
-          capturedPath,
-          "🎉 LIMITATION FIXED! Sort now uses preencoded-routine (uniforms conflict resolved). " +
-            "Please update .github/copilot-instructions.md and convert this to a normal test.",
-        ).toBe("fallback");
-      } finally {
-        setScanPathCallback(null);
-      }
+      // This limitation test expects fallback path.
+      // If scan uses a native path, acceptPath will throw (test fails = limitation fixed!)
+      const f = jit(() =>
+        lax.scan(step, initCarry, xs, { acceptPath: "fallback" }),
+      );
+      const [carry, ys] = f();
+      await carry.data();
+      await ys.data();
+      f.dispose();
     });
 
     it("Scan body multi-output: uses native scan with multi-output kernel (WASM)", async () => {
@@ -2624,35 +2564,24 @@ describe("scan autodiff", () => {
       const V0 = np.zeros([2, 2]);
       const xs = np.zeros([5]); // 5 iterations
 
-      // Capture how many execute steps the body has and verify the scan path
+      // Capture how many execute steps the body has
       let bodyExecuteSteps = 0;
-      let capturedPath: string | null = null;
 
       setScanBodyStepsCallback((steps) => {
         bodyExecuteSteps = steps;
       });
-      setScanPathCallback((path) => {
-        capturedPath = path;
-      });
 
       try {
-        const f = jit(() => lax.scan(step, [A0, B0, V0], xs));
+        // Native scan uses compiled-loop path with multi-output kernel
+        const f = jit(() =>
+          lax.scan(step, [A0, B0, V0], xs, { acceptPath: "compiled-loop" }),
+        );
         const [[_A, _B, V], _ys] = f() as [np.Array[], np.Array];
         await V.data();
         f.dispose();
       } finally {
         setScanBodyStepsCallback(null);
-        setScanPathCallback(null);
       }
-
-      // Debug: if path callback didn't fire, something is wrong
-      expect(
-        capturedPath,
-        "Scan path callback should have fired",
-      ).not.toBeNull();
-
-      // Native scan now supports multi-output kernels - should use compiled-loop path
-      expect(capturedPath).toBe("compiled-loop");
 
       // Body compilation produces fewer execute steps (multi-output kernel fusion working)
       // With multi-output kernel: 2-3 steps (two multi-kernels)
@@ -2691,38 +2620,29 @@ describe("scan autodiff", () => {
         const B0 = np.ones([2, 2]);
         const xs = np.zeros([3]); // 3 iterations
 
-        // Capture the scan path
-        let capturedPath: string | null = null;
-        setScanPathCallback((path) => {
-          capturedPath = path;
-        });
+        // WebGPU uses compiled-loop path for multi-output scan
+        const f = jit(() =>
+          lax.scan(step, [A0, B0], xs, { acceptPath: "compiled-loop" }),
+        );
+        const [[A, B], _ys] = f() as [np.Array[], np.Array[]];
 
-        try {
-          const f = jit(() => lax.scan(step, [A0, B0], xs));
-          const [[A, B], _ys] = f() as [np.Array[], np.Array[]];
+        // Verify results
+        const aData = await A.data();
+        const bData = await B.data();
 
-          // Verify results
-          const aData = await A.data();
-          const bData = await B.data();
+        // A: 0 + 1 + 1 + 1 = 3
+        expect(aData[0]).toBe(3);
+        // B: 1 * 2 * 2 * 2 = 8
+        expect(bData[0]).toBe(8);
 
-          // A: 0 + 1 + 1 + 1 = 3
-          expect(aData[0]).toBe(3);
-          // B: 1 * 2 * 2 * 2 = 8
-          expect(bData[0]).toBe(8);
-
-          f.dispose();
-        } finally {
-          setScanPathCallback(null);
-        }
-
-        // WebGPU should now use compiled-loop path for multi-output scan
-        expect(capturedPath).toBe("compiled-loop");
+        f.dispose();
       },
     );
 
     it("WebGPU: numCarry ≠ numY uses fallback instead of compiled-loop", async () => {
       // WebGPU compiled-loop requires numCarry === numY
       // When they differ, falls back to JS loop
+      // Limitation test: uses fallback. If this test fails, limitation is fixed!
       const availableDevices = await init();
       if (!availableDevices.includes("webgpu")) {
         return;
@@ -2730,43 +2650,30 @@ describe("scan autodiff", () => {
 
       defaultDevice("webgpu");
 
-      let capturedPath: string | null = null;
-      setScanPathCallback((path) => {
-        capturedPath = path;
-      });
+      // Body with 1 carry but 2 outputs (numCarry=1, numY=2)
+      const step = (
+        carry: np.Array,
+        x: np.Array,
+      ): [np.Array, [np.Array, np.Array]] => {
+        const newCarry = np.add(carry, x);
+        const y1 = newCarry.ref;
+        const y2 = np.multiply(newCarry.ref, np.array([2.0]));
+        return [newCarry, [y1, y2]];
+      };
 
-      try {
-        // Body with 1 carry but 2 outputs (numCarry=1, numY=2)
-        const step = (
-          carry: np.Array,
-          x: np.Array,
-        ): [np.Array, [np.Array, np.Array]] => {
-          const newCarry = np.add(carry, x);
-          const y1 = newCarry.ref;
-          const y2 = np.multiply(newCarry.ref, np.array([2.0]));
-          return [newCarry, [y1, y2]];
-        };
+      const initCarry = np.array([0.0]);
+      const xs = np.array([[1.0], [2.0], [3.0]]);
 
-        const initCarry = np.array([0.0]);
-        const xs = np.array([[1.0], [2.0], [3.0]]);
-
-        const f = jit(() => lax.scan(step, initCarry, xs));
-        const [carry, [ys1, ys2]] = f() as [np.Array, [np.Array, np.Array]];
-        await carry.data();
-        await ys1.data();
-        await ys2.data();
-        f.dispose();
-
-        // WebGPU doesn't support numCarry ≠ numY in compiled-loop
-        // (WASM's general scan does, but WebGPU falls back)
-        expect(
-          capturedPath,
-          "🎉 LIMITATION FIXED! WebGPU now supports numCarry ≠ numY in compiled-loop. " +
-            "Please update .github/copilot-instructions.md and convert this to a normal test.",
-        ).toBe("fallback");
-      } finally {
-        setScanPathCallback(null);
-      }
+      // This limitation test expects fallback path.
+      // If scan uses a native path, acceptPath will throw (test fails = limitation fixed!)
+      const f = jit(() =>
+        lax.scan(step, initCarry, xs, { acceptPath: "fallback" }),
+      );
+      const [carry, [ys1, ys2]] = f() as [np.Array, [np.Array, np.Array]];
+      await carry.data();
+      await ys1.data();
+      await ys2.data();
+      f.dispose();
     });
   });
 

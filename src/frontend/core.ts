@@ -129,8 +129,8 @@ interface PrimitiveParamsImpl extends Record<Primitive, Record<string, any>> {
     numConsts: number;
     length: number;
     reverse: boolean;
-    /** Required scan path(s). Throws if fallback would be used. */
-    requirePath?: string | string[];
+    /** Accepted scan path(s). Throws if actual path is not in this list. */
+    acceptPath?: string | string[];
   };
 }
 

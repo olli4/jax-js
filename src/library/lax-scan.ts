@@ -30,21 +30,26 @@ export interface ScanOptions {
   reverse?: boolean;
 
   /**
-   * Require a specific scan implementation path. If the JIT cannot use the
-   * required path, it throws an error instead of falling back.
+   * Accept only specific scan implementation paths. Throws an error if the
+   * actual path chosen is not in the list.
    *
    * This is primarily useful for testing to ensure optimized code paths are used.
    *
+   * Valid paths:
+   * - `"compiled-loop"` — entire scan loop compiled to native code (WASM/WebGPU)
+   * - `"preencoded-routine"` — pre-encoded GPU dispatches for routine bodies (WebGPU only)
+   * - `"fallback"` — JS loop calling body program per iteration
+   *
    * @example
    * ```ts
-   * // Require the compiled-loop path (entire loop in native code)
-   * lax.scan(f, init, xs, { requirePath: "compiled-loop" });
+   * // Accept only the compiled-loop (native) scan path
+   * lax.scan(f, init, xs, { acceptPath: "compiled-loop" });
    *
-   * // Allow any native path (compiled-loop or preencoded-routine)
-   * lax.scan(f, init, xs, { requirePath: ["compiled-loop", "preencoded-routine"] });
+   * // Accept any native path (compiled-loop or preencoded-routine)
+   * lax.scan(f, init, xs, { acceptPath: ["compiled-loop", "preencoded-routine"] });
    * ```
    */
-  requirePath?: ScanPath | ScanPath[];
+  acceptPath?: ScanPath | ScanPath[];
 }
 
 /**
@@ -311,7 +316,7 @@ export function scan<
   options?: ScanOptions,
 ): [Carry, Y] {
   const opts: ScanOptions = options ?? {};
-  const { length: lengthOpt, reverse = false, requirePath } = opts;
+  const { length: lengthOpt, reverse = false, acceptPath } = opts;
 
   // Handle xs=null case (carry-only scan with no input arrays)
   const xsIsNull = xs === null;
@@ -395,7 +400,7 @@ export function scan<
     numConsts,
     length: n,
     reverse,
-    requirePath,
+    acceptPath,
   });
 
   // Dispose original inputs

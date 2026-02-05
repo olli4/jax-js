@@ -26,19 +26,6 @@ export function setDebug(level: number) {
  */
 export type ScanPath = "compiled-loop" | "preencoded-routine" | "fallback";
 
-/** Callback for tracking which scan implementation paths are taken. */
-export type ScanPathCallback = (
-  path: ScanPath,
-  backend: string,
-  details?: {
-    numConsts?: number;
-    numCarry?: number;
-    length?: number;
-  },
-) => void;
-
-let scanPathCallback: ScanPathCallback | null = null;
-
 /** Callback for tracking scan body execute steps (for testing fusion). */
 export type ScanBodyStepsCallback = (
   executeSteps: number,
@@ -86,46 +73,19 @@ export function reportScanBodySteps(
 }
 
 /**
- * Set a callback to be notified when scan implementations are chosen.
- * Useful for testing to verify the expected code path is taken.
- *
- * For most use cases, prefer the `requirePath` option on `lax.scan()` which
- * throws an error if the required path cannot be used. Use this callback when
- * you need to observe the path without throwing, or need the backend/details.
- *
- * @param callback - Function called with (path, backend, details) when scan path is chosen.
- *                   Pass null to disable tracking.
- *
- * @example
- * ```ts
- * // Option 1: Use requirePath (recommended for tests)
- * lax.scan(f, init, xs, { requirePath: "compiled-loop" }); // throws if not compiled-loop
- *
- * // Option 2: Use callback to observe without throwing
- * let usedPath: ScanPath | null = null;
- * setScanPathCallback((path, backend) => { usedPath = path; });
- * await jitScan(init, xs);
- * expect(usedPath).toBe("compiled-loop");
- * setScanPathCallback(null); // cleanup
- * ```
+ * Internal: report scan path choice (no-op, kept for compatibility with jit.ts).
+ * Path verification is now done via `acceptPath` option on `lax.scan()`.
  */
-export function setScanPathCallback(callback: ScanPathCallback | null): void {
-  scanPathCallback = callback;
-}
-
-/** Internal: report scan path choice to registered callback. */
 export function reportScanPath(
-  path: ScanPath,
-  backend: string,
-  details?: {
+  _path: ScanPath,
+  _backend: string,
+  _details?: {
     numConsts?: number;
     numCarry?: number;
     length?: number;
   },
 ): void {
-  if (scanPathCallback) {
-    scanPathCallback(path, backend, details);
-  }
+  // No-op. Path verification is handled by checkAcceptedPath in jit.ts.
 }
 
 export function assertNonNull<T>(value: T): asserts value is NonNullable<T> {}

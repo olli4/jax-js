@@ -136,9 +136,9 @@ const step = (carry, x) => {
 
 - `length?: number` — iteration count (required if `xs === null`).
 - `reverse?: boolean` — process `xs` in reverse order (default `false`).
-- `requirePath?: ScanPath | ScanPath[]` — one of `"compiled-loop"`, `"preencoded-routine"`, or
-  `"fallback"`. Use `["compiled-loop", "preencoded-routine"]` to require any native path. Throws if
-  path unavailable.
+- `acceptPath?: ScanPath | ScanPath[]` — accept only these paths: `"compiled-loop"` (native code),
+  `"preencoded-routine"` (GPU routines), or `"fallback"` (JS loop). Throws if actual path is not in
+  the list.
 
 ---
 

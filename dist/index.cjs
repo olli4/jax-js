@@ -30,7 +30,7 @@ var __toESM = (mod$1, isNodeMode, target) => (target = mod$1 != null ? __create(
 }) : target, mod$1));
 
 //#endregion
-const require_backend = require('./backend-C8HSUSf-.cjs');
+const require_backend = require('./backend-DUsm3qC3.cjs');
 const require_scan_wrapper = require('./scan-wrapper-BeVQahyp.cjs');
 
 //#region src/frontend/convolution.ts
@@ -1915,13 +1915,20 @@ function jit$1(f, opts) {
 //#endregion
 //#region src/frontend/jit.ts
 /**
-* Check if a chosen scan path satisfies the requirePath constraint.
+* Check if a chosen scan path satisfies the acceptPath constraint.
 * Returns an error message if the path is not allowed, or null if OK.
+*
+* Special case: an empty array `[]` always rejects, showing the chosen path.
+* This is useful for debugging to discover which path was selected.
+*
+* @param extraInfo Optional extra info to include in the error message (e.g., dispatch count)
 */
-function checkRequiredPath(chosenPath, requirePath) {
-	if (!requirePath) return null;
-	const allowedPaths = Array.isArray(requirePath) ? requirePath : [requirePath];
-	if (!allowedPaths.includes(chosenPath)) return `Scan requirePath constraint not satisfied: got "${chosenPath}" but required one of [${allowedPaths.map((p) => `"${p}"`).join(", ")}]`;
+function checkAcceptedPath(chosenPath, acceptPath, extraInfo) {
+	if (!acceptPath) return null;
+	const allowedPaths = Array.isArray(acceptPath) ? acceptPath : [acceptPath];
+	const suffix = extraInfo ? ` (${extraInfo})` : "";
+	if (allowedPaths.length === 0) return `Scan path debug: chose "${chosenPath}"${suffix}`;
+	if (!allowedPaths.includes(chosenPath)) return `Scan acceptPath constraint not satisfied: got "${chosenPath}" but accepted paths are [${allowedPaths.map((p) => `"${p}"`).join(", ")}]${suffix}`;
 	return null;
 }
 /** Result of compiling a Jaxpr. Can be evaluated on a series of inputs. */
@@ -2216,7 +2223,7 @@ function jitCompile(backend, jaxpr) {
 		if (eqn.primitive === Primitive.Scan) {
 			flushPendingKernels();
 			const params = eqn.params;
-			const { jaxpr: bodyJaxpr, numCarry, numConsts, length, reverse, requirePath } = params;
+			const { jaxpr: bodyJaxpr, numCarry, numConsts, length, reverse, acceptPath } = params;
 			const numX = bodyJaxpr.inBinders.length - numConsts - numCarry;
 			const numY = bodyJaxpr.outs.length - numCarry;
 			const inputs = [];
@@ -2245,7 +2252,7 @@ function jitCompile(backend, jaxpr) {
 			const nativeScanResult = tryPrepareNativeScan(backend, bodyProgram, bodyJaxpr, length, numCarry, numConsts, numX, numY, reverse);
 			const nativeScanExe = nativeScanResult?.executable ?? null;
 			if (nativeScanExe) {
-				const pathError$1 = checkRequiredPath("compiled-loop", requirePath);
+				const pathError$1 = checkAcceptedPath("compiled-loop", acceptPath);
 				if (pathError$1) throw new Error(pathError$1);
 				require_backend.reportScanPath("compiled-loop", backend.type, {
 					numConsts,
@@ -2270,7 +2277,7 @@ function jitCompile(backend, jaxpr) {
 			}
 			const batchedParams = tryPrepareBatchedScan(backend, bodyProgram, bodyJaxpr, length, numCarry, numConsts, numX, numY, eqn, reverse);
 			if (batchedParams) {
-				const pathError$1 = checkRequiredPath("preencoded-routine", requirePath);
+				const pathError$1 = checkAcceptedPath("preencoded-routine", acceptPath);
 				if (pathError$1) throw new Error(pathError$1);
 				require_backend.reportScanPath("preencoded-routine", backend.type, {
 					numConsts,
@@ -2293,7 +2300,9 @@ function jitCompile(backend, jaxpr) {
 				});
 				continue;
 			}
-			const pathError = checkRequiredPath("fallback", requirePath);
+			const dispatchCount = bodyProgram.steps.filter((s) => s.type === "execute").length;
+			const extraInfo = backend.type === "webgpu" ? `${dispatchCount} GPU dispatch${dispatchCount !== 1 ? "es" : ""} per iteration` : void 0;
+			const pathError = checkAcceptedPath("fallback", acceptPath, extraInfo);
 			if (pathError) throw new Error(pathError);
 			require_backend.reportScanPath("fallback", backend.type, {
 				numConsts,
@@ -8764,7 +8773,7 @@ function triangularSolve(a, b, { leftSide = false, lower = false, transposeA = f
 */
 function scan(f, init$1, xs, options) {
 	const opts = options ?? {};
-	const { length: lengthOpt, reverse = false, requirePath } = opts;
+	const { length: lengthOpt, reverse = false, acceptPath } = opts;
 	const xsIsNull = xs === null;
 	const [initFlat, initTreedef] = flatten(init$1);
 	const [xsFlat, xsTreedef] = xsIsNull ? [[], null] : flatten(xs);
@@ -8808,7 +8817,7 @@ function scan(f, init$1, xs, options) {
 		numConsts,
 		length: n,
 		reverse,
-		requirePath
+		acceptPath
 	});
 	initFlat.forEach((arr) => arr.dispose());
 	xsFlat.forEach((arr) => arr.dispose());
@@ -9901,7 +9910,6 @@ Object.defineProperty(exports, 'scipySpecial', {
 });
 exports.setDebug = require_backend.setDebug;
 exports.setScanBodyStepsCallback = require_backend.setScanBodyStepsCallback;
-exports.setScanPathCallback = require_backend.setScanPathCallback;
 Object.defineProperty(exports, 'tree', {
   enumerable: true,
   get: function () {

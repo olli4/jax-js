@@ -33,41 +33,13 @@ import {
   lax,
   jit,
   grad,
-  setScanPathCallback,
-  type ScanPath,
 } from "../../dist/index.js";
 
 // Import leak detection harness
-import { withLeakCheck, getSlotCount, assertNoLeaks } from "./harness.ts";
+import { withLeakCheck } from "./harness.ts";
 
 // Check if WebGPU is available
 const hasWebGPU = typeof navigator !== "undefined" && "gpu" in navigator;
-
-/**
- * Track which scan implementation path is used during a test.
- * @returns Object with `paths` array and `clear()`/`cleanup()` methods.
- */
-function trackScanPaths() {
-  const paths: { path: ScanPath; backend: string }[] = [];
-  setScanPathCallback((path, backend) => {
-    paths.push({ path, backend });
-  });
-  return {
-    paths,
-    clear: () => (paths.length = 0),
-    cleanup: () => setScanPathCallback(null),
-    /** Check that at least one of the expected paths was used. */
-    expectPath: (expected: ScanPath | ScanPath[]) => {
-      const allowed = Array.isArray(expected) ? expected : [expected];
-      const found = paths.some((p) => allowed.includes(p.path));
-      if (!found) {
-        throw new Error(
-          `Expected scan path ${JSON.stringify(allowed)} but got: ${paths.map((p) => p.path).join(", ") || "(none)"}`,
-        );
-      }
-    },
-  };
-}
 
 Deno.test({
   name: "WebGPU adapter available (hardware GPU)",
@@ -260,7 +232,6 @@ Deno.test({
     }
 
     defaultDevice("webgpu");
-    const tracker = trackScanPaths();
 
     // 64 elements - uses native WebGPU scan
     const step = (carry: np.Array, x: np.Array): [np.Array, np.Array] => {
@@ -272,14 +243,13 @@ Deno.test({
     const initCarry = np.zeros([size]);
     const xs = np.ones([10, size]); // 10 iterations
 
+    // acceptPath ensures native path is used (throws if fallback)
     const jitScan = jit((init: np.Array, xs: np.Array) =>
-      lax.scan(step, init, xs),
+      lax.scan(step, init, xs, {
+        acceptPath: ["compiled-loop", "preencoded-routine"],
+      }),
     );
     const [finalCarry, outputs] = await jitScan(initCarry, xs);
-
-    // Verify native path was used (compiled-loop for kernel-only body)
-    tracker.expectPath(["compiled-loop", "preencoded-routine"]);
-    tracker.cleanup();
 
     const finalData = await finalCarry.data();
     // Each element should be 10 (10 iterations of adding 1)
@@ -303,7 +273,6 @@ Deno.test({
     }
 
     defaultDevice("webgpu");
-    const tracker = trackScanPaths();
 
     // 512 elements - uses native WebGPU scan (independent per-element scans)
     const step = (carry: np.Array, x: np.Array): [np.Array, np.Array] => {
@@ -315,14 +284,13 @@ Deno.test({
     const initCarry = np.zeros([size]);
     const xs = np.ones([5, size]); // 5 iterations
 
+    // acceptPath ensures native path is used (throws if fallback)
     const jitScan = jit((init: np.Array, xs: np.Array) =>
-      lax.scan(step, init, xs),
+      lax.scan(step, init, xs, {
+        acceptPath: ["compiled-loop", "preencoded-routine"],
+      }),
     );
     const [finalCarry, outputs] = await jitScan(initCarry, xs);
-
-    // Verify native path was used (compiled-loop for kernel-only body)
-    tracker.expectPath(["compiled-loop", "preencoded-routine"]);
-    tracker.cleanup();
 
     const finalData = await finalCarry.data();
     // Each element should be 5 (5 iterations of adding 1)
@@ -336,7 +304,7 @@ Deno.test({
 });
 
 Deno.test({
-  name: "lax.scan - reduction body (fallback)",
+  name: "lax.scan - reduction body (correctness test)",
   ignore: !hasWebGPU,
   fn: withLeakCheck(async () => {
     const devices = await init();
@@ -346,7 +314,6 @@ Deno.test({
     }
 
     defaultDevice("webgpu");
-    const tracker = trackScanPaths();
 
     // Test scan body with a reduction followed by add.
     // NOTE: This currently falls back to JS loop because the JIT creates 2 execute
@@ -366,11 +333,8 @@ Deno.test({
       [1.0, 1.0, 1.0, 1.0], // sum = 4
     ]);
 
+    // Don't use acceptPath - this test verifies correctness, not path
     const [finalCarry, outputs] = await lax.scan(step, initCarry, xs);
-
-    // Currently uses fallback (JS loop) because reduction+add creates 2 steps
-    // When epilogue fusion is improved, this could use fused
-    tracker.cleanup();
 
     // Iteration 1: 0 + 10 = 10
     // Iteration 2: 10 + 10 = 20
@@ -394,7 +358,6 @@ Deno.test({
     }
 
     defaultDevice("webgpu");
-    const tracker = trackScanPaths();
 
     // Test reverse scan with native-scan path
     // Use jit() to ensure compilation happens
@@ -403,8 +366,12 @@ Deno.test({
       return [newCarry.ref, newCarry];
     };
 
+    // acceptPath ensures native path is used (throws if fallback)
     const scanFn = jit((init: np.Array, xs: np.Array) =>
-      lax.scan(step, init, xs, { reverse: true }),
+      lax.scan(step, init, xs, {
+        reverse: true,
+        acceptPath: ["compiled-loop", "preencoded-routine"],
+      }),
     );
 
     const initCarry = np.array([0.0]);
@@ -414,10 +381,6 @@ Deno.test({
     // Reverse scan: 0+5=5, 5+4=9, 9+3=12, 12+2=14, 14+1=15 → outputs stored at reverse positions
     // So output array should be [15, 14, 12, 9, 5] (outputs[0] = result at xs[4], etc.)
     const [finalCarry, outputs] = await scanFn(initCarry, xs);
-
-    // Verify native path was used (WebGPU native-scan supports reverse via dataIdx)
-    tracker.expectPath(["compiled-loop", "preencoded-routine"]);
-    tracker.cleanup();
 
     const finalData = await finalCarry.data();
     assertAlmostEquals(finalData[0], 15.0, 1e-5);
@@ -441,7 +404,6 @@ Deno.test({
       }
 
       defaultDevice("webgpu");
-      const tracker = trackScanPaths();
 
       // Test that constants captured in the body work correctly
       // This exercises native-scan with constants (WebGPU)
@@ -456,19 +418,17 @@ Deno.test({
         return [newCarry.ref, newCarry];
       };
 
-      // Use jit() to ensure compilation happens
+      // acceptPath ensures native path is used (throws if fallback)
       const scanFn = jit((init: np.Array, xs: np.Array) =>
-        lax.scan(step, init, xs),
+        lax.scan(step, init, xs, {
+          acceptPath: ["compiled-loop", "preencoded-routine"],
+        }),
       );
 
       const initCarry = np.array([0.0]);
       const xs = np.array([[1.0], [2.0], [3.0]]); // 3 iterations
 
       const [finalCarry, outputs] = await scanFn(initCarry, xs);
-
-      // Verify native path was used (with constants support)
-      tracker.expectPath(["compiled-loop", "preencoded-routine"]);
-      tracker.cleanup();
 
       // Iteration 1: 0 + (1*2 + 1) = 3
       // Iteration 2: 3 + (2*2 + 1) = 8
@@ -489,7 +449,7 @@ Deno.test({
 });
 
 Deno.test({
-  name: "lax.scan with matmul - batched-scan (routine)",
+  name: "lax.scan with matmul - routine body",
   ignore: !hasWebGPU,
   fn: withLeakCheck(
     async () => {
@@ -500,7 +460,6 @@ Deno.test({
       }
 
       defaultDevice("webgpu");
-      const tracker = trackScanPaths();
 
       // Matmul (for larger matrices) is a "routine" not a kernel, so uses batched-scan
       // Note: Very small matmuls may fuse into kernels; we use 2x2 which typically uses batched-scan
@@ -509,9 +468,11 @@ Deno.test({
         return [newCarry.ref, newCarry];
       };
 
-      // Use jit() to ensure compilation happens
+      // Accept any path - native-scan or fallback for routine bodies
       const scanFn = jit((init: np.Array, xs: np.Array) =>
-        lax.scan(step, init, xs),
+        lax.scan(step, init, xs, {
+          acceptPath: ["compiled-loop", "preencoded-routine", "fallback"],
+        }),
       );
 
       const initCarry = np.eye(2); // 2x2 identity matrix
@@ -531,11 +492,6 @@ Deno.test({
       ]); // 3 iterations
 
       const [finalCarry, outputs] = await scanFn(initCarry, xs);
-
-      // Verify the path used (small matmul fuses to kernel with reduction)
-      // Accept any path - native-scan or fallback for routine bodies
-      tracker.expectPath(["compiled-loop", "preencoded-routine", "fallback"]);
-      tracker.cleanup();
 
       // I * [[2,0],[0,2]] = [[2,0],[0,2]]
       // [[2,0],[0,2]] * [[1,1],[0,1]] = [[2,2],[0,2]]

@@ -143,12 +143,6 @@ declare function setDebug(level: number): void;
  * - "fallback": JS loop calling body program per iteration (one or more JS↔backend boundary crossings)
  */
 type ScanPath = "compiled-loop" | "preencoded-routine" | "fallback";
-/** Callback for tracking which scan implementation paths are taken. */
-type ScanPathCallback = (path: ScanPath, backend: string, details?: {
-  numConsts?: number;
-  numCarry?: number;
-  length?: number;
-}) => void;
 /** Callback for tracking scan body execute steps (for testing fusion). */
 type ScanBodyStepsCallback = (executeSteps: number, backend: string, details?: {
   numCarry?: number;
@@ -176,33 +170,6 @@ type ScanBodyStepsCallback = (executeSteps: number, backend: string, details?: {
  */
 declare function setScanBodyStepsCallback(callback: ScanBodyStepsCallback | null): void;
 /** Internal: report scan body step count to registered callback. */
-
-/**
- * Set a callback to be notified when scan implementations are chosen.
- * Useful for testing to verify the expected code path is taken.
- *
- * For most use cases, prefer the `requirePath` option on `lax.scan()` which
- * throws an error if the required path cannot be used. Use this callback when
- * you need to observe the path without throwing, or need the backend/details.
- *
- * @param callback - Function called with (path, backend, details) when scan path is chosen.
- *                   Pass null to disable tracking.
- *
- * @example
- * ```ts
- * // Option 1: Use requirePath (recommended for tests)
- * lax.scan(f, init, xs, { requirePath: "compiled-loop" }); // throws if not compiled-loop
- *
- * // Option 2: Use callback to observe without throwing
- * let usedPath: ScanPath | null = null;
- * setScanPathCallback((path, backend) => { usedPath = path; });
- * await jitScan(init, xs);
- * expect(usedPath).toBe("compiled-loop");
- * setScanPathCallback(null); // cleanup
- * ```
- */
-declare function setScanPathCallback(callback: ScanPathCallback | null): void;
-/** Internal: report scan path choice to registered callback. */
 
 /** @inline */
 type RecursiveArray<T> = T | RecursiveArray<T>[];
@@ -968,8 +935,8 @@ interface PrimitiveParamsImpl extends Record<Primitive, Record<string, any>> {
     numConsts: number;
     length: number;
     reverse: boolean;
-    /** Required scan path(s). Throws if fallback would be used. */
-    requirePath?: string | string[];
+    /** Accepted scan path(s). Throws if actual path is not in this list. */
+    acceptPath?: string | string[];
   };
 }
 /** Type of parameters taken by each primitive. */
@@ -1582,21 +1549,26 @@ interface ScanOptions {
    */
   reverse?: boolean;
   /**
-   * Require a specific scan implementation path. If the JIT cannot use the
-   * required path, it throws an error instead of falling back.
+   * Accept only specific scan implementation paths. Throws an error if the
+   * actual path chosen is not in the list.
    *
    * This is primarily useful for testing to ensure optimized code paths are used.
    *
+   * Valid paths:
+   * - `"compiled-loop"` — entire scan loop compiled to native code (WASM/WebGPU)
+   * - `"preencoded-routine"` — pre-encoded GPU dispatches for routine bodies (WebGPU only)
+   * - `"fallback"` — JS loop calling body program per iteration
+   *
    * @example
    * ```ts
-   * // Require the compiled-loop path (entire loop in native code)
-   * lax.scan(f, init, xs, { requirePath: "compiled-loop" });
+   * // Accept only the compiled-loop (native) scan path
+   * lax.scan(f, init, xs, { acceptPath: "compiled-loop" });
    *
-   * // Allow any native path (compiled-loop or preencoded-routine)
-   * lax.scan(f, init, xs, { requirePath: ["compiled-loop", "preencoded-routine"] });
+   * // Accept any native path (compiled-loop or preencoded-routine)
+   * lax.scan(f, init, xs, { acceptPath: ["compiled-loop", "preencoded-routine"] });
    * ```
    */
-  requirePath?: ScanPath | ScanPath[];
+  acceptPath?: ScanPath | ScanPath[];
 }
 /**
  * Scan a function over leading array axes while carrying along state.
@@ -3320,4 +3292,4 @@ declare function blockUntilReady<T extends JsTree<any>>(x: T): Promise<T>;
  */
 declare function devicePut<T extends JsTree<any>>(x: T, device?: Device): Promise<MapJsTree<T, number | boolean, Array>>;
 //#endregion
-export { Array, ClosedJaxpr, DType, type Device, Jaxpr, type JsTree, type JsTreeDef, type OwnedFunction, type ScanPath, blockUntilReady, createAllIterationsOffsetsBuffer, defaultDevice, devicePut, devices, getBackend, grad, hessian, init, jacfwd, jacrev as jacobian, jacrev, jit, jvp, lax_d_exports as lax, linearize, makeJaxpr, nn_d_exports as nn, numpy_d_exports as numpy, random_d_exports as random, scipy_special_d_exports as scipySpecial, setDebug, setScanBodyStepsCallback, setScanPathCallback, tree_d_exports as tree, valueAndGrad, vjp, vmap, wrapRoutineForScan };
+export { Array, ClosedJaxpr, DType, type Device, Jaxpr, type JsTree, type JsTreeDef, type OwnedFunction, type ScanPath, blockUntilReady, createAllIterationsOffsetsBuffer, defaultDevice, devicePut, devices, getBackend, grad, hessian, init, jacfwd, jacrev as jacobian, jacrev, jit, jvp, lax_d_exports as lax, linearize, makeJaxpr, nn_d_exports as nn, numpy_d_exports as numpy, random_d_exports as random, scipy_special_d_exports as scipySpecial, setDebug, setScanBodyStepsCallback, tree_d_exports as tree, valueAndGrad, vjp, vmap, wrapRoutineForScan };

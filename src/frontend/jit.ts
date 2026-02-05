@@ -130,21 +130,34 @@ export type ScanRunner = (
 ) => { outputs: Slot[]; pending: PendingExecute[] };
 
 /**
- * Check if a chosen scan path satisfies the requirePath constraint.
+ * Check if a chosen scan path satisfies the acceptPath constraint.
  * Returns an error message if the path is not allowed, or null if OK.
+ *
+ * Special case: an empty array `[]` always rejects, showing the chosen path.
+ * This is useful for debugging to discover which path was selected.
+ *
+ * @param extraInfo Optional extra info to include in the error message (e.g., dispatch count)
  */
-function checkRequiredPath(
+function checkAcceptedPath(
   chosenPath: ScanPath,
-  requirePath: string | string[] | undefined,
+  acceptPath: string | string[] | undefined,
+  extraInfo?: string,
 ): string | null {
-  if (!requirePath) return null;
+  if (!acceptPath) return null;
 
-  const allowedPaths = Array.isArray(requirePath) ? requirePath : [requirePath];
+  const allowedPaths = Array.isArray(acceptPath) ? acceptPath : [acceptPath];
+
+  const suffix = extraInfo ? ` (${extraInfo})` : "";
+
+  // Empty array = always reject (useful for debugging to see what was chosen)
+  if (allowedPaths.length === 0) {
+    return `Scan path debug: chose "${chosenPath}"${suffix}`;
+  }
 
   if (!allowedPaths.includes(chosenPath)) {
     return (
-      `Scan requirePath constraint not satisfied: ` +
-      `got "${chosenPath}" but required one of [${allowedPaths.map((p) => `"${p}"`).join(", ")}]`
+      `Scan acceptPath constraint not satisfied: ` +
+      `got "${chosenPath}" but accepted paths are [${allowedPaths.map((p) => `"${p}"`).join(", ")}]${suffix}`
     );
   }
   return null;
@@ -721,7 +734,7 @@ export function jitCompile(backend: Backend, jaxpr: Jaxpr): JitProgram {
         numConsts,
         length,
         reverse,
-        requirePath,
+        acceptPath,
       } = params;
       const numX = bodyJaxpr.inBinders.length - numConsts - numCarry;
       const numY = bodyJaxpr.outs.length - numCarry;
@@ -785,7 +798,7 @@ export function jitCompile(backend: Backend, jaxpr: Jaxpr): JitProgram {
 
       if (nativeScanExe) {
         // Report compiled-loop path (loop runs in native code)
-        const pathError = checkRequiredPath("compiled-loop", requirePath);
+        const pathError = checkAcceptedPath("compiled-loop", acceptPath);
         if (pathError) throw new Error(pathError);
         reportScanPath("compiled-loop", backend.type, {
           numConsts,
@@ -827,7 +840,7 @@ export function jitCompile(backend: Backend, jaxpr: Jaxpr): JitProgram {
 
       if (batchedParams) {
         // Use pre-encoded routine dispatches (preencoded-routine path)
-        const pathError = checkRequiredPath("preencoded-routine", requirePath);
+        const pathError = checkAcceptedPath("preencoded-routine", acceptPath);
         if (pathError) throw new Error(pathError);
         reportScanPath("preencoded-routine", backend.type, {
           numConsts,
@@ -852,7 +865,14 @@ export function jitCompile(backend: Backend, jaxpr: Jaxpr): JitProgram {
       }
 
       // Fall back to JS loop scan
-      const pathError = checkRequiredPath("fallback", requirePath);
+      const dispatchCount = bodyProgram.steps.filter(
+        (s) => s.type === "execute",
+      ).length;
+      const extraInfo =
+        backend.type === "webgpu"
+          ? `${dispatchCount} GPU dispatch${dispatchCount !== 1 ? "es" : ""} per iteration`
+          : undefined;
+      const pathError = checkAcceptedPath("fallback", acceptPath, extraInfo);
       if (pathError) throw new Error(pathError);
       reportScanPath("fallback", backend.type, {
         numConsts,
