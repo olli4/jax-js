@@ -197,7 +197,23 @@ const [final, history] = await lax.scan(step, init, xs);
 // final.sum = [60], final.count = [3]
 ```
 
-### Carry-only scan (`xs = null`)
+### Reverse scan
+
+```ts
+// Process sequence from end to beginning
+const [final, ys] = await lax.scan(step, init, xs, { reverse: true });
+```
+
+---
+
+## jax-js Extensions
+
+These features extend JAX's scan API for TypeScript/JavaScript ergonomics:
+
+### `xs = null` (carry-only scan)
+
+Pass `null` as `xs` with `{ length }` to iterate without input arrays. Useful for generators, RNG
+sequences, Fibonacci, or any state-only iteration. The body receives `null` as the second argument.
 
 ```ts
 const step = (carry, _x) => {
@@ -209,17 +225,11 @@ const [final, ys] = await lax.scan(step, init, null, { length: 5 });
 // ys = [0,1,2,3,4], final = [5]
 ```
 
-### Reverse scan
+### `Y = null` (skip output stacking)
 
-```ts
-// Process sequence from end to beginning
-const [final, ys] = await lax.scan(step, init, xs, { reverse: true });
-```
-
-### Skip output stacking (`Y = null`)
-
-Return `null` for the per-iteration output to avoid allocating `ys` when only the final carry is
-needed.
+Return `[newCarry, null]` from the body to skip allocating stacked outputs. Useful when you only
+need the final carry (e.g., Mandelbrot iteration counts). The returned `ys` will be `null`, saving
+memory for large iteration counts.
 
 ```ts
 const step = (carry, x) => {
@@ -233,6 +243,10 @@ const init = { A: np.zeros([100]), count: np.zeros([100], np.int32) };
 const [final, ys] = await lax.scan(step, init, xs);
 // ys is null — no memory allocated for intermediate outputs
 ```
+
+---
+
+## JIT compilation patterns
 
 ### `jit(scan)` — compile whole loop (recommended)
 
