@@ -18,8 +18,6 @@
     "**/dist",
     "website",
     "test/deno",
-    "tmp",
-    "src/routines/*.ts",
-    "!src/routines/*.test.ts"
+    "tmp"
   ]
 }
