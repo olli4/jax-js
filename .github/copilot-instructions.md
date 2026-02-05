@@ -316,7 +316,7 @@ The "no global barrier" limitation creates scan-specific constraints documented 
 | Constraint                        | Why it exists                                                | Consequence                   |
 | --------------------------------- | ------------------------------------------------------------ | ----------------------------- |
 | Per-element independence required | No cross-workgroup sync between iterations                   | Complex bodies → JS fallback  |
-| numCarry ≠ numY unsupported       | Native scan shader assumes 1:1 carry↔output mapping         | Falls back to JS loop         |
+| numCarry ≠ numY unsupported       | compiled-loop shader assumes 1:1 carry↔output mapping       | Falls back to JS loop         |
 | Internal buffer deps unsupported  | Shader can't allocate scratch temporaries between statements | Mandelbrot pattern → fallback |
 | Sort in scan uses fallback        | Sort shader already uses uniforms (offset conflict)          | Uniform buffer contention     |
 
@@ -563,53 +563,53 @@ const [carry, nullYs] = await lax.scan(f, init, xs);
 ### CPU Backend
 
 The CPU backend uses JavaScript-interpreted evaluation. It serves as the reference implementation
-for correctness testing.
+for correctness testing. All scan tests are in [test/lax-scan.test.ts](test/lax-scan.test.ts).
 
-| Feature / Test             | Status                           | Notes                                |
-| -------------------------- | -------------------------------- | ------------------------------------ |
-| `scan basic`               | [✅ Pass](test/lax-scan.test.ts) |                                      |
-| `scan with pytree carry`   | [✅ Pass](test/lax-scan.test.ts) | pytree = nested dict/array structure |
-| `reverse scan`             | [✅ Pass](test/lax-scan.test.ts) |                                      |
-| `jit + scan`               | [✅ Pass](test/lax-scan.test.ts) |                                      |
-| `JVP (forward-mode)`       | [✅ Pass](test/lax-scan.test.ts) |                                      |
-| `VJP (reverse-mode)`       | [✅ Pass](test/lax-scan.test.ts) |                                      |
-| `vmap`                     | [✅ Pass](test/lax-scan.test.ts) |                                      |
-| `vmap` > `jit(vmap(scan))` | [✅ Pass](test/lax-scan.test.ts) |                                      |
-| `vmap` > `vmap(jit(scan))` | [✅ Pass](test/lax-scan.test.ts) |                                      |
-| `scan over views`          | [✅ Pass](test/lax-scan.test.ts) | sliced/transposed xs                 |
+| Feature / Test             | Status  | Notes                                |
+| -------------------------- | ------- | ------------------------------------ |
+| `scan basic`               | ✅ Pass |                                      |
+| `scan with pytree carry`   | ✅ Pass | pytree = nested dict/array structure |
+| `reverse scan`             | ✅ Pass |                                      |
+| `jit + scan`               | ✅ Pass |                                      |
+| `JVP (forward-mode)`       | ✅ Pass |                                      |
+| `VJP (reverse-mode)`       | ✅ Pass |                                      |
+| `vmap`                     | ✅ Pass |                                      |
+| `vmap` > `jit(vmap(scan))` | ✅ Pass |                                      |
+| `vmap` > `vmap(jit(scan))` | ✅ Pass |                                      |
+| `scan over views`          | ✅ Pass | sliced/transposed xs                 |
 
 ### WASM Backend
 
-The WASM backend supports **native scan**: the entire scan loop is compiled into a WebAssembly
+The WASM backend supports **compiled-loop**: the entire scan loop is compiled into a WebAssembly
 module, eliminating JS/WASM boundary overhead per iteration.
 
-| Feature / Test                      | Status                           | Notes                        |
-| ----------------------------------- | -------------------------------- | ---------------------------- |
-| `scan basic`                        | [✅ Pass](test/lax-scan.test.ts) |                              |
-| `scan with pytree carry`            | [✅ Pass](test/lax-scan.test.ts) |                              |
-| `reverse scan`                      | [✅ Pass](test/lax-scan.test.ts) |                              |
-| `jit + scan`                        | [✅ Pass](test/lax-scan.test.ts) |                              |
-| `JVP (forward-mode)`                | [✅ Pass](test/lax-scan.test.ts) |                              |
-| `VJP (reverse-mode)`                | [✅ Pass](test/lax-scan.test.ts) |                              |
-| `vmap`                              | [✅ Pass](test/lax-scan.test.ts) |                              |
-| `vmap` > `jit(vmap(scan))`          | [✅ Pass](test/lax-scan.test.ts) |                              |
-| `vmap` > `vmap(jit(scan))`          | [✅ Pass](test/lax-scan.test.ts) |                              |
-| `scan over views`                   | [✅ Pass](test/lax-scan.test.ts) | sliced/transposed xs         |
-| `native scan`                       | [✅ Pass](test/lax-scan.test.ts) |                              |
-| `native scan` > `with constants`    | [✅ Pass](test/lax-scan.test.ts) |                              |
-| Native scan `reverse=true`          | ✅ Pass                          | all variants support reverse |
-| `scan with routine body`            | [✅ Pass](test/lax-scan.test.ts) |                              |
-| `routine in scan body`              | [✅ Pass](test/lax-scan.test.ts) | uses native scan via imports |
-| `grad` through `scan` with routines | [✅ Pass](test/lax-scan.test.ts) | works via native path        |
+| Feature / Test                      | Status  | Notes                               |
+| ----------------------------------- | ------- | ----------------------------------- |
+| `scan basic`                        | ✅ Pass |                                     |
+| `scan with pytree carry`            | ✅ Pass |                                     |
+| `reverse scan`                      | ✅ Pass |                                     |
+| `jit + scan`                        | ✅ Pass |                                     |
+| `JVP (forward-mode)`                | ✅ Pass |                                     |
+| `VJP (reverse-mode)`                | ✅ Pass |                                     |
+| `vmap`                              | ✅ Pass |                                     |
+| `vmap` > `jit(vmap(scan))`          | ✅ Pass |                                     |
+| `vmap` > `vmap(jit(scan))`          | ✅ Pass |                                     |
+| `scan over views`                   | ✅ Pass | sliced/transposed xs                |
+| `compiled-loop`                     | ✅ Pass |                                     |
+| `compiled-loop` > `with constants`  | ✅ Pass |                                     |
+| `compiled-loop` > `reverse=true`    | ✅ Pass | all variants support reverse        |
+| `scan with routine body`            | ✅ Pass |                                     |
+| `routine in scan body`              | ✅ Pass | uses compiled-loop via WASM imports |
+| `grad` through `scan` with routines | ✅ Pass | works via compiled-loop             |
 
 **Performance benchmarks:**
 
 - Fallback (JS loop): ~500 iter/sec
-- Native scan (fused): ~7-13M iter/sec
+- Compiled-loop: ~7-13M iter/sec
 
 **Scan vs jit(loop) overhead:**
 
-Native scan is consistently faster than manual `jit(loop)` at all tested sizes due to eliminating
+Compiled-loop is consistently faster than manual `jit(loop)` at all tested sizes due to eliminating
 JS↔WASM boundary crossings per iteration:
 
 | Matrix Size | Overhead | Notes                                |
@@ -619,7 +619,7 @@ JS↔WASM boundary crossings per iteration:
 | 64×64       | **-82%** | Scan FASTER                          |
 | 128×128     | **-33%** | Scan FASTER                          |
 
-Native scan compiles the entire loop into one WASM module, avoiding per-iteration overhead.
+Compiled-loop compiles the entire loop into one WASM module, avoiding per-iteration overhead.
 
 ### WebGPU Backend
 
@@ -627,37 +627,37 @@ The WebGPU backend keeps data on GPU between iterations. Supports **compiled-loo
 kernels, **multi-kernel scan** for bodies with multiple independent kernels, and
 **preencoded-routine** for single-routine bodies meeting specific requirements (currently Cholesky).
 
-| Feature / Test                   | Status                           | Notes                                        |
-| -------------------------------- | -------------------------------- | -------------------------------------------- |
-| `scan basic`                     | [✅ Pass](test/lax-scan.test.ts) | uses native scan on WebGPU                   |
-| `scan with pytree carry`         | [✅ Pass](test/lax-scan.test.ts) |                                              |
-| `reverse scan`                   | [✅ Pass](test/lax-scan.test.ts) | uses native scan with dataIdx                |
-| `jit + scan`                     | [✅ Pass](test/lax-scan.test.ts) |                                              |
-| `JVP (forward-mode)`             | [✅ Pass](test/lax-scan.test.ts) |                                              |
-| `VJP (reverse-mode)`             | [✅ Pass](test/lax-scan.test.ts) |                                              |
-| `vmap`                           | [✅ Pass](test/lax-scan.test.ts) |                                              |
-| `vmap` > `jit(vmap(scan))`       | [✅ Pass](test/lax-scan.test.ts) |                                              |
-| `vmap` > `vmap(jit(scan))`       | [✅ Pass](test/lax-scan.test.ts) |                                              |
-| `scan over views`                | [✅ Pass](test/lax-scan.test.ts) | sliced/transposed xs                         |
-| `native scan`                    | [✅ Pass](test/lax-scan.test.ts) | kernel gids reindexed to scan layout         |
-| `native scan` > `with reduction` | [✅ Pass](test/lax-scan.test.ts) | e.g., `carry += sum(x)` or matmul            |
-| `native scan` > `with reverse`   | [✅ Pass](test/lax-scan.test.ts) | uses dataIdx like WASM                       |
-| `native scan` > `with constants` | [✅ Pass](test/lax-scan.test.ts) | captured constants bound as storage          |
-| `multi-kernel scan`              | ✅ Pass                          | derives output mapping from body outputs     |
-| `preencoded-routine` (Cholesky)  | ✅ Pass                          | requires passthrough pattern (numCarry=numY) |
-| Mixed kernel+routine bodies      | ⚠️ Fallback                      | e.g., Kalman filter, lstsq                   |
-| Multi-routine bodies             | ⚠️ Fallback                      | e.g., Cholesky→TriSolve→TriSolve             |
-| Sort in scan body                | ⚠️ Fallback                      | Sort already uses uniforms (conflict)        |
+| Feature / Test                     | Status      | Notes                                        |
+| ---------------------------------- | ----------- | -------------------------------------------- |
+| `scan basic`                       | ✅ Pass     | uses compiled-loop on WebGPU                 |
+| `scan with pytree carry`           | ✅ Pass     |                                              |
+| `reverse scan`                     | ✅ Pass     | uses compiled-loop with dataIdx              |
+| `jit + scan`                       | ✅ Pass     |                                              |
+| `JVP (forward-mode)`               | ✅ Pass     |                                              |
+| `VJP (reverse-mode)`               | ✅ Pass     |                                              |
+| `vmap`                             | ✅ Pass     |                                              |
+| `vmap` > `jit(vmap(scan))`         | ✅ Pass     |                                              |
+| `vmap` > `vmap(jit(scan))`         | ✅ Pass     |                                              |
+| `scan over views`                  | ✅ Pass     | sliced/transposed xs                         |
+| `compiled-loop`                    | ✅ Pass     | kernel gids reindexed to scan layout         |
+| `compiled-loop` > `with reduction` | ✅ Pass     | e.g., `carry += sum(x)` or matmul            |
+| `compiled-loop` > `with reverse`   | ✅ Pass     | uses dataIdx like WASM                       |
+| `compiled-loop` > `with constants` | ✅ Pass     | captured constants bound as storage          |
+| `multi-kernel scan`                | ✅ Pass     | derives output mapping from body outputs     |
+| `preencoded-routine` (Cholesky)    | ✅ Pass     | requires passthrough pattern (numCarry=numY) |
+| Mixed kernel+routine bodies        | ⚠️ Fallback | e.g., Kalman filter, lstsq                   |
+| Multi-routine bodies               | ⚠️ Fallback | e.g., Cholesky→TriSolve→TriSolve             |
+| Sort in scan body                  | ⚠️ Fallback | Sort already uses uniforms (conflict)        |
 
-**Note on numCarry ≠ numY:** WebGPU native scan requires `numCarry === numY`. When they differ,
-WebGPU falls back to JS loop. WASM's general scan handles this case.
+**Note on numCarry ≠ numY:** WebGPU compiled-loop requires `numCarry === numY`. When they differ,
+WebGPU falls back to JS loop. WASM compiled-loop handles this case.
 
 **Tested on:** NVIDIA RTX 4070 Ti SUPER via Deno WebGPU (headless, no X11)
 
 ### WebGL Backend
 
-The WebGL backend has **no native scan support**. All scans use the JS fallback path, which executes
-the body program per iteration. This works correctly but lacks the native scan optimization.
+The WebGL backend has **no compiled-loop support**. All scans use the JS fallback path, which
+executes the body program per iteration. This works correctly but lacks optimization.
 
 | Feature / Test | Status      | Notes                                         |
 | -------------- | ----------- | --------------------------------------------- |
@@ -868,8 +868,8 @@ lax.scan(f, init, xs, { reverse })
 ```
 
 The `scanRunner` is a callback passed from `array.ts` to `JitProgram.execute()`. It implements the
-fallback path — a JS loop that calls `bodyProgram.execute()` per iteration. Native paths bypass
-`scanRunner` entirely by running the loop in WASM/GPU code.
+fallback path — a JS loop that calls `bodyProgram.execute()` per iteration. The compiled-loop and
+preencoded-routine paths bypass `scanRunner` entirely by running the loop in WASM/GPU code.
 
 **Argument layout:**
 
@@ -888,8 +888,8 @@ Understanding how JIT interacts with scan is crucial for performance:
 1. Trace body function f → bodyJaxpr
 2. JIT-compile bodyJaxpr → bodyProgram (this ALWAYS happens)
 3. Execute via scanRunner callback:
-   - Native path (compiled-loop or preencoded-routine): Single compiled-loop or preencoded-routine step
-   - Fallback path: JS loop calling bodyProgram.execute() per iteration
+   - compiled-loop/preencoded-routine: Single step runs entire loop
+   - fallback: JS loop calling bodyProgram.execute() per iteration
 ```
 
 **With JIT wrapper:** `jit(() => lax.scan(f, init, xs))()`
@@ -900,8 +900,8 @@ Understanding how JIT interacts with scan is crucial for performance:
 3. Trace body function f → bodyJaxpr (nested inside scan step compilation)
 4. JIT-compile bodyJaxpr → bodyProgram
 5. Execute outerProgram:
-   - Native path: outerProgram has compiled-loop step, runs entire loop in native code
-   - Fallback path: outerProgram has scan step, calls scanRunner with bodyProgram
+   - compiled-loop/preencoded-routine: outerProgram runs entire loop in WASM/GPU code
+   - fallback: outerProgram has scan step, calls scanRunner with bodyProgram
 ```
 
 **Key insight:** The body function is **always** JIT-compiled into a `bodyProgram`. The difference
@@ -909,8 +909,8 @@ is whether the **outer loop** runs natively (compiled-loop/preencoded-routine) o
 
 **Why use `jit()` wrapper:**
 
-- **Enables native loop execution** — Without jit, scan uses `scanRunner` (JS loop). With jit, the
-  compiler can emit `compiled-loop` or `preencoded-routine` steps that run entirely in WASM/GPU.
+- **Enables compiled-loop/preencoded-routine** — Without jit, scan uses `scanRunner` (JS loop). With
+  jit, the compiler can emit steps that run entirely in WASM/GPU.
 - **Caches compilation** — `jit((xs) => scan(...))` compiles once, runs many times.
 - **Captures constants** — Closed-over arrays become constants in the compiled program.
 
@@ -1066,8 +1066,8 @@ x = Primitive.TriangularSolve(L_flipped, b_transposed); // Routine step
 result = flip(moveaxis(x, -2, -1), [-1]); // Kernel step 3
 ```
 
-This creates a mixed kernel+routine body with 3+ steps, so WebGPU falls back. WASM handles it
-natively. If performance is critical, consider using WASM backend for linalg-heavy scan bodies.
+This creates a mixed kernel+routine body with 3+ steps, so WebGPU falls back. WASM compiled-loop
+handles it. If performance is critical, consider using WASM backend for linalg-heavy scan bodies.
 
 **Definition: Internal buffer dependencies**
 
@@ -1098,7 +1098,7 @@ const body = (carry, x) => {
 
 WebGPU multi-kernel scan requires every carry output to be produced by a kernel step.
 
-WASM's unified `codegenNativeScanGeneral` handles all body types natively. WebGPU has more
+WASM's unified `codegenNativeScanGeneral` handles all body types via compiled-loop. WebGPU has more
 constraints and falls back to JS loop for complex patterns.
 
 ### Terminology glossary
@@ -1135,13 +1135,13 @@ The `tryPrepareNativeScan()` dispatcher routes to backend-specific implementatio
 - Internal buffer dependencies between steps: **supported**
 - Supported routines: Cholesky, Sort, TriangularSolve, LU, Argsort
 
-**WebGPU native-scan (single kernel)** (via `prepareNativeScan`):
+**WebGPU compiled-loop (single kernel)** (via `prepareNativeScan`):
 
 - Exactly 1 Kernel step (single-output)
 - `numCarry === 1` and `numY === 1`
 - Constants supported, reverse supported
 
-**WebGPU native-scan (multi-kernel)** (via `prepareNativeScanMulti`):
+**WebGPU compiled-loop (multi-kernel)** (via `prepareNativeScanMulti`):
 
 - Multiple Kernel steps (kernel-only body)
 - `numCarry === numY` (or `numY === 0`)
@@ -1618,7 +1618,7 @@ Deno.test({
 Use the `acceptPath` option to verify expected scan paths:
 
 ```ts
-// Ensure native path is used (throws if fallback)
+// Ensure compiled-loop or preencoded-routine is used (throws if fallback)
 const [carry, ys] = await lax.scan(f, init, xs, {
   acceptPath: ["compiled-loop", "preencoded-routine"],
 });
@@ -1631,8 +1631,8 @@ await lax.scan(f, init, xs, { acceptPath: [] });
 // Error: Scan path debug: chose "compiled-loop"
 ```
 
-**Why this matters:** Tests named "native scan" may silently fall back to JS loop. Use
-`acceptPath: ["compiled-loop", "preencoded-routine"]` to ensure tests fail if fusion regresses.
+**Why this matters:** Tests may silently fall back to JS loop. Use
+`acceptPath: ["compiled-loop", "preencoded-routine"]` to ensure tests fail if this regresses.
 
 ### Test coverage by category
 
