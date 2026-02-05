@@ -2474,8 +2474,8 @@ function tryPrepareWasmNativeScan(
       }
 
       // Build static params based on routine type
-      // With size-specialized modules, these are NO LONGER passed at runtime
-      // They're only used here for legacy compatibility in codegenNativeScanGeneral
+      // Size params are extracted here for codegenNativeScanGeneral to use when
+      // calling size-specialized routine modules
       let staticParams: number[] = [];
       if (routineName === Routines.Cholesky) {
         const inputShape = routine.type.inputShapes[0];

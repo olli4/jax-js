@@ -114,7 +114,7 @@ export interface ScanOptions {
  * @param xs - Input sequence to scan over, or `null` for carry-only scans.
  *   When an array/pytree, the leading axis is the scan dimension.
  *   When `null`, you must provide `{ length }` in options.
- * @param options - Scan options or legacy `length` number
+ * @param options - Scan options
  * @returns `[finalCarry, ys]` where:
  *   - `finalCarry` has the same structure as `init`
  *   - `ys` has the same structure as `y` from `f`, with each leaf having
@@ -293,11 +293,9 @@ export function scan<
   f: (carry: Carry, x: X) => [Carry, Y],
   init: Carry,
   xs: X,
-  options?: number | ScanOptions,
+  options?: ScanOptions,
 ): [Carry, Y] {
-  // Handle legacy length-only argument
-  const opts: ScanOptions =
-    typeof options === "number" ? { length: options } : (options ?? {});
+  const opts: ScanOptions = options ?? {};
   const { length: lengthOpt, reverse = false, requirePath } = opts;
 
   // Handle xs=null case (carry-only scan with no input arrays)

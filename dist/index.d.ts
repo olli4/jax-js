@@ -1642,7 +1642,7 @@ interface ScanOptions {
  * @param xs - Input sequence to scan over, or `null` for carry-only scans.
  *   When an array/pytree, the leading axis is the scan dimension.
  *   When `null`, you must provide `{ length }` in options.
- * @param options - Scan options or legacy `length` number
+ * @param options - Scan options
  * @returns `[finalCarry, ys]` where:
  *   - `finalCarry` has the same structure as `init`
  *   - `ys` has the same structure as `y` from `f`, with each leaf having
@@ -1813,7 +1813,7 @@ interface ScanOptions {
  *
  * @see {@link https://docs.jax.dev/en/latest/_autosummary/jax.lax.scan.html | JAX lax.scan}
  */
-declare function scan<Carry extends JsTree<Array>, X extends JsTree<Array> | null | undefined, Y extends JsTree<Array> | null>(f: (carry: Carry, x: X) => [Carry, Y], init: Carry, xs: X, options?: number | ScanOptions): [Carry, Y];
+declare function scan<Carry extends JsTree<Array>, X extends JsTree<Array> | null | undefined, Y extends JsTree<Array> | null>(f: (carry: Carry, x: X) => [Carry, Y], init: Carry, xs: X, options?: ScanOptions): [Carry, Y];
 /**
  * Stack a list of pytrees along a new leading axis.
  *

@@ -8503,7 +8503,7 @@ function triangularSolve(a, b, { leftSide = false, lower = false, transposeA = f
 * @param xs - Input sequence to scan over, or `null` for carry-only scans.
 *   When an array/pytree, the leading axis is the scan dimension.
 *   When `null`, you must provide `{ length }` in options.
-* @param options - Scan options or legacy `length` number
+* @param options - Scan options
 * @returns `[finalCarry, ys]` where:
 *   - `finalCarry` has the same structure as `init`
 *   - `ys` has the same structure as `y` from `f`, with each leaf having
@@ -8675,7 +8675,7 @@ function triangularSolve(a, b, { leftSide = false, lower = false, transposeA = f
 * @see {@link https://docs.jax.dev/en/latest/_autosummary/jax.lax.scan.html | JAX lax.scan}
 */
 function scan(f, init$1, xs, options) {
-	const opts = typeof options === "number" ? { length: options } : options ?? {};
+	const opts = options ?? {};
 	const { length: lengthOpt, reverse = false, requirePath } = opts;
 	const xsIsNull = xs === null || xs === void 0;
 	const [initFlat, initTreedef] = flatten(init$1);

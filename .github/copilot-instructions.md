@@ -377,27 +377,27 @@ for correctness testing.
 
 ### WASM Backend
 
-The WASM backend supports **native scan**: the entire scan loop is compiled into a
-WebAssembly module, eliminating JS/WASM boundary overhead per iteration.
+The WASM backend supports **native scan**: the entire scan loop is compiled into a WebAssembly
+module, eliminating JS/WASM boundary overhead per iteration.
 
-| Feature / Test                          | Status                           | Notes                        |
-| --------------------------------------- | -------------------------------- | ---------------------------- |
-| `scan basic`                            | [✅ Pass](test/lax-scan.test.ts) |                              |
-| `scan with pytree carry`                | [✅ Pass](test/lax-scan.test.ts) |                              |
-| `reverse scan`                          | [✅ Pass](test/lax-scan.test.ts) |                              |
-| `jit + scan`                            | [✅ Pass](test/lax-scan.test.ts) |                              |
-| `JVP (forward-mode)`                    | [✅ Pass](test/lax-scan.test.ts) |                              |
-| `VJP (reverse-mode)`                    | [✅ Pass](test/lax-scan.test.ts) |                              |
-| `vmap`                                  | [✅ Pass](test/lax-scan.test.ts) |                              |
-| `vmap` > `jit(vmap(scan))`              | [✅ Pass](test/lax-scan.test.ts) |                              |
-| `vmap` > `vmap(jit(scan))`              | [✅ Pass](test/lax-scan.test.ts) |                              |
-| `scan over views`                       | [✅ Pass](test/lax-scan.test.ts) | sliced/transposed xs         |
-| `native scan`                           | [✅ Pass](test/lax-scan.test.ts) |                              |
-| `native scan` > `with constants`        | [✅ Pass](test/lax-scan.test.ts) |                              |
-| Native scan `reverse=true`              | ✅ Pass                          | all variants support reverse |
-| `scan with routine body`                | [✅ Pass](test/lax-scan.test.ts) |                              |
-| `routine in scan body`                  | [✅ Pass](test/lax-scan.test.ts) | uses native scan via imports |
-| `grad` through `scan` with routines     | [✅ Pass](test/lax-scan.test.ts) | works via native path        |
+| Feature / Test                      | Status                           | Notes                        |
+| ----------------------------------- | -------------------------------- | ---------------------------- |
+| `scan basic`                        | [✅ Pass](test/lax-scan.test.ts) |                              |
+| `scan with pytree carry`            | [✅ Pass](test/lax-scan.test.ts) |                              |
+| `reverse scan`                      | [✅ Pass](test/lax-scan.test.ts) |                              |
+| `jit + scan`                        | [✅ Pass](test/lax-scan.test.ts) |                              |
+| `JVP (forward-mode)`                | [✅ Pass](test/lax-scan.test.ts) |                              |
+| `VJP (reverse-mode)`                | [✅ Pass](test/lax-scan.test.ts) |                              |
+| `vmap`                              | [✅ Pass](test/lax-scan.test.ts) |                              |
+| `vmap` > `jit(vmap(scan))`          | [✅ Pass](test/lax-scan.test.ts) |                              |
+| `vmap` > `vmap(jit(scan))`          | [✅ Pass](test/lax-scan.test.ts) |                              |
+| `scan over views`                   | [✅ Pass](test/lax-scan.test.ts) | sliced/transposed xs         |
+| `native scan`                       | [✅ Pass](test/lax-scan.test.ts) |                              |
+| `native scan` > `with constants`    | [✅ Pass](test/lax-scan.test.ts) |                              |
+| Native scan `reverse=true`          | ✅ Pass                          | all variants support reverse |
+| `scan with routine body`            | [✅ Pass](test/lax-scan.test.ts) |                              |
+| `routine in scan body`              | [✅ Pass](test/lax-scan.test.ts) | uses native scan via imports |
+| `grad` through `scan` with routines | [✅ Pass](test/lax-scan.test.ts) | works via native path        |
 
 **Performance benchmarks:**
 
@@ -417,9 +417,9 @@ Crossover point: ~48×48 matrices.
 
 ### WebGPU Backend
 
-The WebGPU backend keeps data on GPU between iterations. Supports **native scan** for
-elementwise kernels, **multi-kernel scan** for bodies with multiple independent kernels, and
-**batched-scan** for routine bodies (Cholesky, LU, TriangularSolve).
+The WebGPU backend keeps data on GPU between iterations. Supports **native scan** for elementwise
+kernels, **multi-kernel scan** for bodies with multiple independent kernels, and **batched-scan**
+for routine bodies (Cholesky, LU, TriangularSolve).
 
 | Feature / Test                          | Status                           | Notes                                    |
 | --------------------------------------- | -------------------------------- | ---------------------------------------- |
@@ -652,6 +652,7 @@ Body jaxpr input: [...consts, ...carry, ...x_slice]
 Understanding how JIT interacts with scan is crucial for performance:
 
 **Without JIT wrapper:** `lax.scan(f, init, xs)`
+
 ```
 1. Trace body function f → bodyJaxpr
 2. JIT-compile bodyJaxpr → bodyProgram (this ALWAYS happens)
@@ -661,6 +662,7 @@ Understanding how JIT interacts with scan is crucial for performance:
 ```
 
 **With JIT wrapper:** `jit(() => lax.scan(f, init, xs))()`
+
 ```
 1. Trace outer function → outerJaxpr containing Primitive.Scan
 2. JIT-compile outerJaxpr → outerProgram containing scan step
@@ -683,25 +685,25 @@ is whether the **outer loop** runs natively (native-scan/batched-scan) or via JS
 
 **When to use `jit()` wrapper:**
 
-| Pattern | Use case | Notes |
-| ------- | -------- | ----- |
-| `lax.scan(f, init, xs)` | Simple scans, debugging | Body still JIT-compiled |
-| `jit(() => lax.scan(...))()` | Performance-critical | Enables native loop execution |
-| `jit((xs) => lax.scan(f, init, xs))` | Reusable function | Cached compilation, constants captured |
+| Pattern                              | Use case                | Notes                                  |
+| ------------------------------------ | ----------------------- | -------------------------------------- |
+| `lax.scan(f, init, xs)`              | Simple scans, debugging | Body still JIT-compiled                |
+| `jit(() => lax.scan(...))()`         | Performance-critical    | Enables native loop execution          |
+| `jit((xs) => lax.scan(f, init, xs))` | Reusable function       | Cached compilation, constants captured |
 
 **Transform compositions:**
 
-| Composition | Works? | Notes |
-| ----------- | ------ | ----- |
-| `jit(scan(...))` | ✅ | JIT wraps scan, body is JIT-compiled |
-| `scan(jit(...))` | ⚠️ | JIT inside body adds overhead per iteration |
-| `grad(jit(scan))` | ❌ | Not supported — jit captures forward pass |
-| `jit(grad(scan))` | ✅ | Correct pattern for gradients |
-| `vmap(jit(scan))` | ✅ | Each batch element runs JIT-compiled scan |
-| `jit(vmap(scan))` | ✅ | Outer JIT, inner vmap, body compiled once |
+| Composition       | Works? | Notes                                       |
+| ----------------- | ------ | ------------------------------------------- |
+| `jit(scan(...))`  | ✅     | JIT wraps scan, body is JIT-compiled        |
+| `scan(jit(...))`  | ⚠️     | JIT inside body adds overhead per iteration |
+| `grad(jit(scan))` | ❌     | Not supported — jit captures forward pass   |
+| `jit(grad(scan))` | ✅     | Correct pattern for gradients               |
+| `vmap(jit(scan))` | ✅     | Each batch element runs JIT-compiled scan   |
+| `jit(vmap(scan))` | ✅     | Outer JIT, inner vmap, body compiled once   |
 
-**Transform sandwiches:** Compositions like `jit(grad(scan))` where transforms wrap each other.
-The test suite verifies these work correctly by comparing against reference implementations.
+**Transform sandwiches:** Compositions like `jit(grad(scan))` where transforms wrap each other. The
+test suite verifies these work correctly by comparing against reference implementations.
 
 ### Debugging scan paths
 
@@ -730,12 +732,12 @@ setDebug(2); // Shows shader/WASM code
 
 **Common fallback reasons:**
 
-| Reason | Debug message | Fix |
-| ------ | ------------- | --- |
-| Internal buffer deps | "internal buffer dependencies not supported" | Simplify body or use WASM |
-| Carry passthrough | "carry is passthrough, not supported" | Ensure kernel produces carry |
-| numCarry ≠ numY | "numCarry !== numY" | Match carry/output counts |
-| Unsupported routine | "unsupported routine in scan body" | Use supported routine or WASM |
+| Reason               | Debug message                                | Fix                           |
+| -------------------- | -------------------------------------------- | ----------------------------- |
+| Internal buffer deps | "internal buffer dependencies not supported" | Simplify body or use WASM     |
+| Carry passthrough    | "carry is passthrough, not supported"        | Ensure kernel produces carry  |
+| numCarry ≠ numY      | "numCarry !== numY"                          | Match carry/output counts     |
+| Unsupported routine  | "unsupported routine in scan body"           | Use supported routine or WASM |
 
 ### JIT step types
 
@@ -748,24 +750,24 @@ setDebug(2); // Shows shader/WASM code
 
 Scan bodies are classified by what operations they contain:
 
-| Body Type              | Description                                   | Example                          |
-| ---------------------- | --------------------------------------------- | -------------------------------- |
-| **kernel-only**        | Only elementwise/reduction kernels            | `carry + x`, `sum(x)`            |
-| **routine body**       | Single routine operation                      | `cholesky(x)`, `sort(x)`         |
-| **mixed kernel+routine** | Both kernels and routines in one body       | `scale * x` then `cholesky(...)` |
+| Body Type                | Description                           | Example                          |
+| ------------------------ | ------------------------------------- | -------------------------------- |
+| **kernel-only**          | Only elementwise/reduction kernels    | `carry + x`, `sum(x)`            |
+| **routine body**         | Single routine operation              | `cholesky(x)`, `sort(x)`         |
+| **mixed kernel+routine** | Both kernels and routines in one body | `scale * x` then `cholesky(...)` |
 
 **Execution path by body type and backend:**
 
-| Body Type                 | WASM          | WebGPU                        |
-| ------------------------- | ------------- | ----------------------------- |
-| kernel-only (simple)      | native-scan   | native-scan                   |
-| kernel-only (with deps¹)  | native-scan   | **fallback**                  |
-| routine body (single)     | native-scan   | batched-scan (or fallback²)   |
-| mixed kernel+routine      | native-scan   | **fallback**                  |
-| multiple routines         | native-scan   | **fallback**                  |
+| Body Type                | WASM        | WebGPU                      |
+| ------------------------ | ----------- | --------------------------- |
+| kernel-only (simple)     | native-scan | native-scan                 |
+| kernel-only (with deps¹) | native-scan | **fallback**                |
+| routine body (single)    | native-scan | batched-scan (or fallback²) |
+| mixed kernel+routine     | native-scan | **fallback**                |
+| multiple routines        | native-scan | **fallback**                |
 
-¹ "With deps" = internal buffer dependencies between steps, or carry passthrough pattern.
-² Sort uses fallback due to uniform buffer conflict.
+¹ "With deps" = internal buffer dependencies between steps, or carry passthrough pattern. ² Sort
+uses fallback due to uniform buffer conflict.
 
 **Definition: Internal buffer dependencies**
 
@@ -774,8 +776,8 @@ When one kernel step reads from another step's output within the same body:
 ```ts
 // Body with internal deps (WebGPU falls back):
 const body = (carry, x) => {
-  const Asq = carry.A.mul(carry.A);  // Step 1: produces Asq
-  const newA = Asq.sub(carry.B);     // Step 2: reads Asq (internal dep!)
+  const Asq = carry.A.mul(carry.A); // Step 1: produces Asq
+  const newA = Asq.sub(carry.B); // Step 2: reads Asq (internal dep!)
   return [{ A: newA, B: carry.B }, newA];
 };
 ```
@@ -790,7 +792,7 @@ When an output carry slot directly references the input carry without a kernel p
 // Carry passthrough (WebGPU multi-kernel falls back):
 const body = (carry, x) => {
   const newA = carry.A.add(x);
-  return [{ A: newA, B: carry.B.ref }, newA];  // B is passthrough!
+  return [{ A: newA, B: carry.B.ref }, newA]; // B is passthrough!
 };
 ```
 
@@ -1311,14 +1313,14 @@ function trackScanPaths() {
 
 ### Test coverage by category
 
-| Category                      | Backend | Path     | Purpose                    |
-| ----------------------------- | ------- | -------- | -------------------------- |
-| `scan basic`                  | CPU     | fallback | Core correctness           |
-| `native scan`                 | WASM    | fused    | Verify fusion works        |
-| `native scan > with consts`   | WASM    | fused    | Constants in body          |
-| `matmul in body (routine)`    | WASM    | fused    | Routine bodies             |
-| `Cholesky in body`            | WebGPU  | fused    | Batched-scan with routines |
-| `KNOWN LIMITATIONS`           | WebGPU  | fallback | Verify graceful fallback   |
+| Category                    | Backend | Path     | Purpose                    |
+| --------------------------- | ------- | -------- | -------------------------- |
+| `scan basic`                | CPU     | fallback | Core correctness           |
+| `native scan`               | WASM    | fused    | Verify fusion works        |
+| `native scan > with consts` | WASM    | fused    | Constants in body          |
+| `matmul in body (routine)`  | WASM    | fused    | Routine bodies             |
+| `Cholesky in body`          | WebGPU  | fused    | Batched-scan with routines |
+| `KNOWN LIMITATIONS`         | WebGPU  | fallback | Verify graceful fallback   |
 
 Tests under "KNOWN LIMITATIONS" PASS when the limitation exists. If you fix a limitation, the test
 will FAIL with instructions to update this documentation.

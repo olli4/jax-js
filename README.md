@@ -99,13 +99,14 @@ Differences vs a plain JS loop:
 
 - `init` — initial carry (array or pytree)
 - `xs` — input sequence or `null` (when `null`, you must provide `{ length }`)
-- `options` — `number | ScanOptions` (legacy `length` number supported)
+- `options` — `ScanOptions` object (optional)
 
 ### ScanOptions
 
 - `length?: number` — iteration count (required if `xs === null`).
 - `reverse?: boolean` — process `xs` in reverse order (default `false`).
-- `requirePath?: ScanPath | ScanPath[]` — require a specific implementation path (e.g., `"fused"`).
+- `requirePath?: ScanPath | ScanPath[]` — require `"fused"` (native code) or `"fallback"` (JS loop).
+  Throws if path unavailable.
 
 ---
 
@@ -177,6 +178,13 @@ const [final, ys] = await lax.scan(step, init, null, { length: 5 });
 // ys = [0,1,2,3,4], final = [5]
 ```
 
+### Reverse scan
+
+```ts
+// Process sequence from end to beginning
+const [final, ys] = await lax.scan(step, init, xs, { reverse: true });
+```
+
 ### Skip output stacking (`Y = null`)
 
 Return `null` for the per-iteration output to avoid allocating `ys` when only the final carry is
@@ -189,6 +197,10 @@ const step = (carry, x) => {
   const newCount = carry.count.add(Asq.less(100).astype(np.int32));
   return [{ A: newA, count: newCount }, null];
 };
+
+const init = { A: np.zeros([100]), count: np.zeros([100], np.int32) };
+const [final, ys] = await lax.scan(step, init, xs);
+// ys is null — no memory allocated for intermediate outputs
 ```
 
 ### `jit(scan)` — compile whole loop (recommended)
@@ -201,7 +213,31 @@ scanFn.dispose();
 
 ### `scan(jit(body))` — JIT-compile step only (JS loop)
 
-Useful when the step is expensive but the loop control should remain in JS.
+Each iteration calls compiled code, but the loop itself runs in JS. Useful when the step is
+expensive but you want to inspect intermediate values or the scan body is dynamic.
+
+```ts
+const step = jit((carry, x) => {
+  const newCarry = np.add(carry, x);
+  return [newCarry, newCarry.ref];
+});
+
+const [final, ys] = await lax.scan(step, init, xs);
+step.dispose(); // Free compiled step function
+```
+
+### With `grad` for differentiation
+
+```ts
+const loss = (init, xs) => {
+  const [final, ys] = lax.scan(step, init, xs);
+  final.dispose();
+  return np.sum(ys);
+};
+
+const gradLoss = grad(loss);
+const [dInit, dXs] = await gradLoss(init, xs);
+```
 
 ---
 
@@ -216,7 +252,7 @@ Useful when the step is expensive but the loop control should remain in JS.
 ## Implementation notes (where to look in the codebase)
 
 - Frontend / tracing & Jaxpr: `src/library/lax-scan.ts`.
-- Primitive: `Primitive.Scan` and backend lowerings (`native-scan`, `scan`).
+- Primitive: `Primitive.Scan` and backend lowerings (`native-scan`, `batched-scan`, `scan`).
 - WebGPU/WASM codegen and scan-specific helpers: `src/backend/*` (see `scan-wrapper.ts`,
   `webgpu.ts`).
 - Tests: `test/lax-scan.test.ts`, `test/jit-scan-dlm.test.ts`.
