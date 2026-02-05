@@ -255,10 +255,10 @@ suite.each(devices)("lax.scan device:%s", (device) => {
     expect(finalData[0]).toBeLessThan(1);
   });
 
-  describe("compiled-loop scan", () => {
+  describe("native scan", () => {
     test("small array", async () => {
-      // Small carry array (64 elements) - uses compiled-loop on WebGPU/WASM
-      // This test verifies fusion works for elementwise bodies
+      // Small carry array (64 elements) - uses native-scan on WebGPU/WASM
+      // This test verifies fusion works for kernel-only bodies
       const step = (carry: np.Array, x: np.Array): [np.Array, np.Array] => {
         const newCarry = np.add(carry, x);
         return [newCarry, newCarry.ref];
@@ -280,8 +280,8 @@ suite.each(devices)("lax.scan device:%s", (device) => {
     });
 
     test("large array", async () => {
-      // Large carry array (512 elements) - uses compiled-loop on WebGPU/WASM
-      // For elementwise bodies, each element's scan is independent so any size works
+      // Large carry array (512 elements) - uses native-scan on WebGPU/WASM
+      // For kernel-only bodies, each element's scan is independent so any size works
       // This test verifies fusion works for larger arrays
       const step = (carry: np.Array, x: np.Array): [np.Array, np.Array] => {
         const newCarry = np.add(carry, x);
@@ -305,7 +305,7 @@ suite.each(devices)("lax.scan device:%s", (device) => {
 
     test("with constants", async () => {
       // Test that constants captured in the body work correctly
-      // This exercises compiled-loop with constants (WASM/WebGPU)
+      // This exercises native-scan with constants (WASM/WebGPU)
       // A fallback would indicate constant handling is broken
       const scale = np.array([2.0]);
       const offset = np.array([1.0]);
@@ -375,10 +375,10 @@ suite.each(devices)("lax.scan device:%s", (device) => {
     });
   });
 
-  describe("compiled-body scan", () => {
+  describe("scan with routine body", () => {
     test("matmul in body (routine)", async () => {
-      // Matmul is a "routine" (not an elementwise kernel), so compiled-loop is ineligible
-      // This tests compiled-body scan (JS loop or pre-encoded dispatches)
+      // Matmul is a routine (not an elementwise kernel), so requires batched-scan or fallback
+      // Routine body scan: batched-scan on WebGPU, native-scan on WASM, fallback on CPU
       const step = (carry: np.Array, x: np.Array): [np.Array, np.Array] => {
         // carry: [2, 2], x: [2, 2] -> matmul produces [2, 2]
         const newCarry = np.matmul(carry, x);
@@ -416,7 +416,7 @@ suite.each(devices)("lax.scan device:%s", (device) => {
 
     test("matmul in body with reverse", async () => {
       // Matmul routine with reverse=true
-      // This verifies compiled-body scan handles reverse correctly
+      // This verifies routine body scan handles reverse correctly
       const step = (carry: np.Array, x: np.Array): [np.Array, np.Array] => {
         const newCarry = np.matmul(carry, x);
         return [newCarry.ref, newCarry];
@@ -2369,7 +2369,7 @@ describe("scan autodiff", () => {
    * 2. Convert this test to a normal test using requirePath to verify the fix
    * 3. Celebrate! 🎊
    *
-   * See: .github/copilot-instructions.md section "Note on compiled-body (routine bodies)"
+   * See: .github/copilot-instructions.md "Known Limitations" section
    * ============================================================================
    */
   describe("KNOWN LIMITATIONS (pass = limitation exists, fail = limitation fixed)", () => {
@@ -2564,8 +2564,8 @@ describe("scan autodiff", () => {
       // Regular jit() and scan body compilation produce multi-output Kernels for
       // multiple outputs with the same size.
       //
-      // Native scan (WASM compiled-loop) now supports multi-output kernels, so scans
-      // with multi-output bodies use the fused path.
+      // Native-scan on WASM supports multi-output kernels, so scans with
+      // multi-output kernel-only bodies use the fused path.
       //
       // This test verifies:
       // 1. Body compilation produces fewer execute steps (fusion working)
@@ -2705,7 +2705,7 @@ describe("scan autodiff", () => {
     );
 
     it("WebGPU: numCarry ≠ numY uses fallback instead of fused", async () => {
-      // WebGPU compiled-loop requires numCarry === numY
+      // WebGPU native-scan requires numCarry === numY
       // When they differ, falls back to JS loop
       const availableDevices = await init();
       if (!availableDevices.includes("webgpu")) {

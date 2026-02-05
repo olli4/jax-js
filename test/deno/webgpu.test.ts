@@ -394,7 +394,7 @@ Deno.test({
     defaultDevice("webgpu");
     const tracker = trackScanPaths();
 
-    // Test reverse scan with compiled-loop native scan
+    // Test reverse scan with native-scan path
     // Use jit() to ensure compilation happens
     const step = (carry: np.Array, x: np.Array): [np.Array, np.Array] => {
       const newCarry = np.add(carry, x);
@@ -413,7 +413,7 @@ Deno.test({
     // So output array should be [15, 14, 12, 9, 5] (outputs[0] = result at xs[4], etc.)
     const [finalCarry, outputs] = await scanFn(initCarry, xs);
 
-    // Verify fused was used (WebGPU compiled-loop supports reverse via dataIdx)
+    // Verify fused was used (WebGPU native-scan supports reverse via dataIdx)
     tracker.expectPath("fused");
     tracker.cleanup();
 
@@ -442,7 +442,7 @@ Deno.test({
       const tracker = trackScanPaths();
 
       // Test that constants captured in the body work correctly
-      // This exercises compiled-loop with constants (WebGPU)
+      // This exercises native-scan with constants (WebGPU)
       const scale = np.array([2.0]);
       const offset = np.array([1.0]);
 
@@ -531,7 +531,7 @@ Deno.test({
       const [finalCarry, outputs] = await scanFn(initCarry, xs);
 
       // Verify the path used (small matmul fuses to kernel with reduction)
-      // Accept "fused" (compiled-loop) or "fallback" (JS loop for routine bodies)
+      // Accept "fused" (native-scan) or "fallback" (JS loop for routine bodies)
       const pathObj = tracker.paths[0];
       const path = pathObj?.path;
       if (path !== "fused" && path !== "fallback") {

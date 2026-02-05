@@ -103,7 +103,7 @@ function getOffsetBindings(
     }
   }
 
-  // For compiled-body scan with passthrough pattern:
+  // For batched-scan with passthrough pattern:
   // - Routine outputs go to ping-pong carry buffers (no offset needed)
   // - ys are filled by copying from carry after each iteration
   // So we never add output offsets here.
