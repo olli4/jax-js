@@ -68,15 +68,15 @@ pnpm -C website dev                # local dev server for demos
 
 ### Pre-commit CI checks
 
-**Before any commit**, run the full CI validation:
+Husky runs `lint-staged` on commit, which auto-fixes ESLint and Prettier issues on staged files.
+
+**Before any commit**, also run these checks (not enforced by husky):
 
 ```bash
 pnpm build                         # Build the project
 pnpm check                         # TypeScript type checking
-pnpm lint --max-warnings 0         # ESLint with zero warnings tolerance
 pnpm exec playwright install chromium-headless-shell  # (if not already installed)
 pnpm test                          # Run all tests
-pnpm format:check                  # Verify Prettier formatting (or `pnpm format` to fix)
 ```
 
 These match the checks in `.github/workflows/ci.yaml`.
