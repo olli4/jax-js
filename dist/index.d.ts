@@ -1626,9 +1626,30 @@ interface ScanOptions {
  * - Use `.ref` if you need to keep inputs alive: `scan(f, init.ref, xs.ref)`
  *
  * **Body function:**
- * - `carry` and `x` are **borrowed** — do NOT dispose them
+ * - `carry` and `x` are **managed** by scan — do NOT manually dispose them
+ * - Standard consumption rules apply inside the body (same as regular functions):
+ *   - **Single use:** `np.add(carry, x)` — no `.ref` needed
+ *   - **Multiple uses:** Use `.ref` to keep alive for additional uses
  * - Return **new** arrays for `newCarry` and `y`
  * - For passthrough (same array in both), use `.ref`: `[result.ref, result]`
+ *
+ * **Example — multiple uses of carry:**
+ * ```ts
+ * // ✓ Works: .ref keeps carry alive, then bare carry consumed in return
+ * const step = (carry, x) => {
+ *   const newCarry = np.add(carry.ref, x);  // .ref: we'll use carry again
+ *   return [newCarry, carry];               // carry consumed here
+ * };
+ *
+ * // ✗ Fails: can't use carry in TWO separate operations after .ref
+ * const step = (carry, x) => {
+ *   const a = np.add(carry.ref, x);  // first operation
+ *   const b = np.add(a, carry);      // ERROR: second operation on carry
+ *   return [b, a.ref];
+ * };
+ * ```
+ *
+ * **Workaround:** Use pytree carries so each field can be `.ref`'d independently.
  *
  * **Outputs (caller owns):**
  * - `finalCarry` and `ys` are owned by caller — dispose when done

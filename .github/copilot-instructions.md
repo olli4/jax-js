@@ -9,6 +9,33 @@ These notes help AI coding agents be immediately productive. The document has tw
 
 # Part 1: Repository Overview
 
+## What is jax-js?
+
+jax-js is a JavaScript/TypeScript port of [JAX](https://github.com/google/jax), Google's library for
+high-performance numerical computing. It enables:
+
+- **NumPy-like array operations** in the browser or Node.js
+- **Automatic differentiation** — compute gradients of arbitrary functions for ML training
+- **JIT compilation** — trace functions once, compile to optimized GPU/WASM code
+- **Transformations** — `grad`, `vmap`, `jit` compose to build complex ML pipelines
+
+### Key concepts
+
+**Tracing:** When you call a jit-wrapped function, jax-js executes it with "tracer" objects instead
+of real arrays. This records what operations happen, producing an intermediate representation
+(Jaxpr) that can be compiled to efficient native code. The function runs once for tracing, then the
+compiled version runs for all subsequent calls.
+
+**Kernels:** A "kernel" is a compiled computation unit. On GPU, this is a WGSL shader program; on
+WASM, it's a WebAssembly module. jax-js _fuses_ multiple elementwise operations into single kernels
+to minimize dispatch overhead — instead of launching one GPU dispatch per `add`, `mul`, `exp`, it
+combines them into one.
+
+**Autodiff intuition:** `grad(f)` returns a new function that computes `f`'s gradient. Internally,
+jax-js traces `f` to build a computation graph, then applies the chain rule automatically. The `jvp`
+(forward-mode) and `vjp` (reverse-mode) primitives enable efficient gradient computation for
+different use cases.
+
 ## Architecture overview
 
 - **Core library** (`@jax-js/jax`, root `src/`): array API, autodiff (`grad`, `jvp`, `vjp`), JIT
@@ -68,14 +95,14 @@ import { setDebug } from "@jax-js/jax";
 setDebug(1); // Enable debug logging BEFORE any jit compilation
 ```
 
-| Level | Output                                    |
-| ----- | ----------------------------------------- |
-| 0     | No debug output (default)                 |
-| 1     | JIT compile logs, scan path selection     |
-| 2     | Shader code (WGSL/WASM), detailed tracing |
-| 3     | Expressions and metadata                  |
-| 4     | JIT programs, tuning details              |
-| 5     | Most verbose operation traces             |
+| Level | Output                                           |
+| ----- | ------------------------------------------------ |
+| 0     | No debug output (default)                        |
+| 1     | JIT compile logs, scan path selection            |
+| 2     | Shader code (WGSL/WebAssembly), detailed tracing |
+| 3     | Expressions and metadata                         |
+| 4     | JIT programs, tuning details                     |
+| 5     | Most verbose operation traces                    |
 
 ### WebGPU testing on headless servers
 
@@ -125,12 +152,15 @@ Canonical examples: `test/refcount.test.ts`, `test/conv.test.ts`, `test/deno/web
 
 ### Memory lifecycle
 
+A **Slot** is jax-js's internal handle to a backend memory allocation (WASM pointer or GPU buffer).
+
 1. **Array creation** — `np.array(...)` allocates a backend `Slot` with refcount = 1.
 2. **`.ref` accessor** — increments the Array object's `#rc`; same underlying Slot.
 3. **Function call** — passing an Array decrements `#rc` by 1 (ownership transfer).
 4. **`.data()` / `.dataSync()`** — reads buffer, then calls `dispose()` internally.
 5. **`.dispose()`** — decrements `#rc`; when 0, calls `backend.decRef(slot)`.
-6. **Pending ops** — `PendingExecute` holds refs on Slots until `submit()`.
+6. **Pending ops** — `PendingExecute` (batched GPU commands awaiting submission) holds refs on Slots
+   until `submit()`.
 
 ### Backend memory comparison
 
@@ -140,6 +170,170 @@ Canonical examples: `test/refcount.test.ts`, `test/conv.test.ts`, `test/deno/web
 | Slot tracking | `Map<Slot, {ptr, size, ref}>`             | `Map<Slot, {buffer, size, ref}>`                      |
 | Sync read     | Direct memory view                        | `SyncReader` with staging buffer + `mapAsync`         |
 | Dispatch      | Instantiate Wasm module, call exported fn | `commandEncoder.dispatchWorkgroups()`, queue submit   |
+
+## WebGPU Backend Architecture
+
+This section explains WebGPU constraints relevant to jax-js development. Assumes familiarity with
+GPU concepts (buffers, shaders, workgroups) but not WebGPU-specific details.
+
+### WebGPU compute model primer
+
+WebGPU exposes GPU compute via **compute shaders** written in WGSL (WebGPU Shading Language). Key
+concepts:
+
+- **Workgroup**: A group of threads that execute together and can share memory. Threads within a
+  workgroup can synchronize via `workgroupBarrier()`.
+- **Dispatch**: Launches a grid of workgroups. Each thread gets a unique `global_invocation_id`.
+- **Storage buffers**: GPU memory readable/writable by shaders. Used for inputs and outputs.
+- **Uniform buffers**: Small, read-only memory for constants. Faster than storage buffers.
+
+**Critical limitation:** There is **no global barrier** in WebGPU. Threads in different workgroups
+cannot synchronize within a single dispatch. This fundamentally shapes how jax-js implements
+operations.
+
+### Hard limits and how jax-js handles them
+
+| Limit                              | Typical Value | Impact on jax-js                                   |
+| ---------------------------------- | ------------- | -------------------------------------------------- |
+| `maxStorageBuffersPerShaderStage`  | 8-10          | Limits kernel inputs; excess args trigger fallback |
+| `maxComputeWorkgroupsPerDimension` | 65535         | Large arrays need 2D grid splitting                |
+| `maxComputeWorkgroupSizeX`         | 256           | Limits threads per workgroup (Sort workgroup size) |
+| `minUniformBufferOffsetAlignment`  | 256 bytes     | Dynamic uniform offsets must be 256-byte aligned   |
+| `minStorageBufferOffsetAlignment`  | 256 bytes     | Can't use buffer offsets for arbitrary strides     |
+
+**Storage buffer limit handling:**
+
+```typescript
+// src/backend/webgpu.ts
+const maxArgs = limits.maxStorageBuffersPerShaderStage - 1; // Reserve 1 for output
+if (kernel.nargs > maxArgs) {
+  throw new Error(`Kernel has ${kernel.nargs} args, max is ${maxArgs}`);
+}
+```
+
+When a fused kernel would exceed the buffer limit, compilation fails. The frontend must split into
+smaller kernels (handled by `splitGraphDataflow()` in JIT).
+
+**Grid size handling:**
+
+When array size exceeds 65535 workgroups, `calculateGrid()` in `codegen.ts` splits into a 2D grid:
+
+```typescript
+// If size > 65535, split into 2D grid: (65535, ceil(size/65535))
+const gridX = Math.min(size, 65535);
+const gridY = Math.ceil(size / 65535);
+```
+
+Shader code uses `global_invocation_id.x + global_invocation_id.y * 65535u` to reconstruct the
+linear index.
+
+**Storage buffer offset alignment:**
+
+The 256-byte `minStorageBufferOffsetAlignment` means you can't bind a buffer at arbitrary offsets.
+For scan with strides like 48 bytes (a 4×3 f32 matrix), buffer offsets fail. jax-js solves this with
+**uniform-based offsets**: bind the entire buffer, pass the element offset as a uniform variable.
+See [WebGPU batched-scan details](#webgpu-batched-scan-details-routine-body) in Part 2.
+
+### Features exploited
+
+| Feature                     | How jax-js uses it                                          | Location                             |
+| --------------------------- | ----------------------------------------------------------- | ------------------------------------ |
+| **shader-f16**              | Float16 dtype support; requested at device creation         | `src/backend.ts` feature requests    |
+| **Workgroup shared memory** | Sort uses `var<workgroup>` for bitonic sort local exchanges | `src/backend/webgpu/routines.ts`     |
+| **workgroupBarrier()**      | Synchronizes threads within Sort workgroups                 | `bitonicSortShader` in routines.ts   |
+| **storageBarrier()**        | Memory fence for shared variable consistency                | `bitonicSortShader` in routines.ts   |
+| **Pipeline caching**        | Compiled pipelines stored by shader hash                    | `pipelineCache` in webgpu.ts         |
+| **Command batching**        | Multiple dispatches encoded before single queue.submit()    | `PendingExecute` in webgpu.ts        |
+| **Ping-pong buffers**       | Scan carry state alternates between two buffers             | `dispatchBatchedScan()` in webgpu.ts |
+| **Uniform buffers**         | Per-iteration offsets for batched scan                      | `scan-wrapper.ts`                    |
+
+**Pipeline caching detail:**
+
+```typescript
+// Pipelines cached by shader source hash
+const cacheKey = hashShaderSource(shaderCode);
+if (pipelineCache.has(cacheKey)) {
+  return pipelineCache.get(cacheKey);
+}
+const pipeline = device.createComputePipeline({ ... });
+pipelineCache.set(cacheKey, pipeline);
+```
+
+This avoids recompiling identical shaders (common with JIT-generated kernels).
+
+**Synchronous readback trick:**
+
+WebGPU normally requires async `buffer.mapAsync()` for reading GPU data. jax-js implements
+`SyncReader` (`src/backend/webgpu/reader.ts`) using an offscreen canvas with webgpu context —
+borrowed from TensorFlow.js. This enables `.dataSync()` for debugging, though `.data()` (async) is
+preferred for performance.
+
+### Features NOT exploited (opportunities)
+
+| Feature                   | What it enables                                     | Why not used yet                         |
+| ------------------------- | --------------------------------------------------- | ---------------------------------------- |
+| **Subgroups**             | SIMD-width operations (shuffle, reduce within wave) | Requires `subgroups` feature; not stable |
+| **Indirect dispatch**     | GPU-driven workgroup counts                         | No dynamic control flow needs it yet     |
+| **Texture sampling**      | Hardware-accelerated interpolation                  | All ops use storage buffers currently    |
+| **Tiled matrix multiply** | Shared memory blocking for large matmuls            | Matmul uses simple row×col accumulation  |
+| **Atomic operations**     | Lock-free reductions, histograms                    | Reductions done via shader accumulation  |
+| **timestamp-query**       | GPU-side profiling                                  | Requested but not wired up for profiling |
+| **Render pipelines**      | Visualization without readback                      | Would need separate rendering path       |
+
+**Subgroups opportunity:**
+
+Subgroups enable operations like `subgroupAdd()` that sum across a SIMD lane (typically 32-64
+threads) without explicit barriers. This would accelerate reductions significantly:
+
+```wgsl
+// Current (sequential accumulation):
+var acc = 0.0;
+for (var i = 0u; i < size; i++) { acc += data[i]; }
+
+// With subgroups (parallel within wave):
+let partial = subgroupAdd(data[local_id]);
+if (subgroup_invocation_id == 0) { atomicAdd(&result, partial); }
+```
+
+**Tiled matmul opportunity:**
+
+Current matmul computes `C[i,j] = sum(A[i,:] * B[:,j])` with each thread doing a full dot product.
+Tiled matmul loads tiles of A and B into shared memory, enabling data reuse:
+
+```wgsl
+// Tiled approach (not implemented):
+var<workgroup> tileA: array<f32, 16*16>;
+var<workgroup> tileB: array<f32, 16*16>;
+// Load tiles collaboratively, compute partial products, accumulate
+```
+
+This is a standard GPU optimization that could provide 5-10× speedup for large matrices.
+
+### WebGPU-specific scan constraints
+
+The "no global barrier" limitation creates scan-specific constraints documented in Part 2:
+
+| Constraint                        | Why it exists                                                | Consequence                   |
+| --------------------------------- | ------------------------------------------------------------ | ----------------------------- |
+| Per-element independence required | No cross-workgroup sync between iterations                   | Complex bodies → JS fallback  |
+| numCarry ≠ numY unsupported       | Native scan shader assumes 1:1 carry↔output mapping         | Falls back to JS loop         |
+| Internal buffer deps unsupported  | Shader can't allocate scratch temporaries between statements | Mandelbrot pattern → fallback |
+| Sort in scan uses fallback        | Sort shader already uses uniforms (offset conflict)          | Uniform buffer contention     |
+
+WASM backend handles all these cases because it can allocate temporaries and has true sequential
+control flow. WebGPU is more restricted but faster when patterns fit.
+
+### Key WebGPU files
+
+| File                                 | Purpose                                            |
+| ------------------------------------ | -------------------------------------------------- |
+| `src/backend.ts`                     | WebGPU init, adapter/device creation, feature reqs |
+| `src/backend/webgpu.ts`              | Main backend: kernels, scan, command encoding      |
+| `src/backend/webgpu/codegen.ts`      | `calculateGrid()`, WGSL helpers, `ShaderInfo`      |
+| `src/backend/webgpu/routines.ts`     | Bitonic sort, Cholesky, LU, TriangularSolve WGSL   |
+| `src/backend/webgpu/scan-wrapper.ts` | Transforms routine shaders for scan with offsets   |
+| `src/backend/webgpu/reader.ts`       | `SyncReader` for synchronous buffer readback       |
+| `src/backend/webgpu/builtins.ts`     | Shader snippets for special functions (erf, etc.)  |
 
 ### Autodiff and ownership
 
@@ -181,9 +375,11 @@ The JIT system lives in `src/frontend/jit.ts` and `src/frontend/jaxpr.ts`.
 
 **Pipeline:**
 
-1. **Tracing** – `makeJaxpr(f)` traces a function to produce a `Jaxpr` (IR in ANF form)
+1. **Tracing** – `makeJaxpr(f)` traces a function to produce a `Jaxpr` (intermediate representation
+   in A-Normal Form, where every subexpression is named)
 2. **Simplification** – `jaxpr.flatten().simplify()` canonicalizes the graph
-3. **Graph splitting** – `splitGraphDataflow()` identifies "black nodes" vs fusable ops
+3. **Graph splitting** – `splitGraphDataflow()` identifies "black nodes" (operations that can't be
+   fused, like reductions or routines) vs fusable elementwise ops
 4. **Kernel fusion** – Consecutive elementwise ops merge into a single `Kernel` (multi-output if
    needed)
 5. **Compilation** – `jitCompile(backend, jaxpr)` emits a `JitProgram` (list of `JitStep`s)
@@ -191,8 +387,8 @@ The JIT system lives in `src/frontend/jit.ts` and `src/frontend/jaxpr.ts`.
 
 **Multi-output kernel fusion:**
 
-When multiple black nodes have the same size and no reductions, they are batched into a multi-output
-`Kernel`. This reduces kernel dispatch overhead for functions with multiple outputs.
+When multiple non-fusable outputs have the same size and no reductions, they are batched into a
+multi-output `Kernel`. This reduces kernel dispatch overhead for functions with multiple outputs.
 
 - Inputs are unioned across all outputs, and expressions are reindexed accordingly
 - Example: `(a + b, a - b, a * b)` becomes one Kernel with 3 outputs and 2 inputs
@@ -230,7 +426,7 @@ The `Kernel` class uses an `outputs: KernelOutput[]` array to support 1..N outpu
 - Exporting a symbol from library but not `src/index.ts` → missing from published types
 - Changing WebGPU shaders without browser tests → silent breakage
 - **CPU backend GlobalView detection**: Collect both `AluOp.GlobalIndex` AND `AluOp.GlobalView`
-  nodes when finding used input buffers
+  (internal ALU expression types) when finding used input buffers
 - **JIT pending ops before scan**: Flush pending ops before scan step execution
 
 ## Known flaky tests
@@ -239,12 +435,12 @@ The `Kernel` class uses an `outputs: KernelOutput[]` array to support 1..N outpu
   errors at the edge of f32 machine epsilon. Not a bug — inherent to finite-difference verification.
 - **Deno WebGPU tests** (`test/deno/`): When running all Deno test files together in a single
   `deno test` invocation, GPU state pollution between files causes memory leak detection failures.
-  The `test:deno` script runs each file as a separate process to avoid this.
+  The `test:deno` script runs each file as a separate `deno test` command (chained with `&&`).
 
 > ⚠️ **IMPORTANT: Deno WebGPU test isolation** - Due to Deno's module caching and GPU state
 > persistence between test files, running all Deno tests together in a single process causes
-> spurious memory leak failures. The `test:deno` script runs each test file as a separate Deno
-> invocation to ensure proper isolation:
+> spurious memory leak failures. The `test:deno` script chains separate `deno test` commands for
+> each file to ensure proper isolation:
 >
 > ```bash
 > pnpm run test:deno  # Runs each file separately (RECOMMENDED)
@@ -362,18 +558,18 @@ const [carry, nullYs] = await lax.scan(f, init, xs);
 The CPU backend uses JavaScript-interpreted evaluation. It serves as the reference implementation
 for correctness testing.
 
-| Feature / Test             | Status                           | Notes                |
-| -------------------------- | -------------------------------- | -------------------- |
-| `scan basic`               | [✅ Pass](test/lax-scan.test.ts) |                      |
-| `scan with pytree carry`   | [✅ Pass](test/lax-scan.test.ts) |                      |
-| `reverse scan`             | [✅ Pass](test/lax-scan.test.ts) |                      |
-| `jit + scan`               | [✅ Pass](test/lax-scan.test.ts) |                      |
-| `JVP (forward-mode)`       | [✅ Pass](test/lax-scan.test.ts) |                      |
-| `VJP (reverse-mode)`       | [✅ Pass](test/lax-scan.test.ts) |                      |
-| `vmap`                     | [✅ Pass](test/lax-scan.test.ts) |                      |
-| `vmap` > `jit(vmap(scan))` | [✅ Pass](test/lax-scan.test.ts) |                      |
-| `vmap` > `vmap(jit(scan))` | [✅ Pass](test/lax-scan.test.ts) |                      |
-| `scan over views`          | [✅ Pass](test/lax-scan.test.ts) | sliced/transposed xs |
+| Feature / Test             | Status                           | Notes                                |
+| -------------------------- | -------------------------------- | ------------------------------------ |
+| `scan basic`               | [✅ Pass](test/lax-scan.test.ts) |                                      |
+| `scan with pytree carry`   | [✅ Pass](test/lax-scan.test.ts) | pytree = nested dict/array structure |
+| `reverse scan`             | [✅ Pass](test/lax-scan.test.ts) |                                      |
+| `jit + scan`               | [✅ Pass](test/lax-scan.test.ts) |                                      |
+| `JVP (forward-mode)`       | [✅ Pass](test/lax-scan.test.ts) |                                      |
+| `VJP (reverse-mode)`       | [✅ Pass](test/lax-scan.test.ts) |                                      |
+| `vmap`                     | [✅ Pass](test/lax-scan.test.ts) |                                      |
+| `vmap` > `jit(vmap(scan))` | [✅ Pass](test/lax-scan.test.ts) |                                      |
+| `vmap` > `vmap(jit(scan))` | [✅ Pass](test/lax-scan.test.ts) |                                      |
+| `scan over views`          | [✅ Pass](test/lax-scan.test.ts) | sliced/transposed xs                 |
 
 ### WASM Backend
 
@@ -401,19 +597,22 @@ module, eliminating JS/WASM boundary overhead per iteration.
 
 **Performance benchmarks:**
 
-- Fallback (JS loop, Kalman filter): ~308 iter/sec
-- Native scan (general, Kalman filter): ~1.5M iter/sec
+- Fallback (JS loop): ~500 iter/sec
+- Native scan (fused): ~7-13M iter/sec
 
 **Scan vs jit(loop) overhead:**
 
-| Matrix Size | Overhead | Notes                                 |
-| ----------- | -------- | ------------------------------------- |
-| 16×16       | **-73%** | Scan FASTER (fewer JS→WASM crossings) |
-| 32×32       | **-21%** | Scan FASTER                           |
-| 64×64       | +28%     | Loop faster                           |
-| 128×128     | +51%     | Loop faster                           |
+Native scan is consistently faster than manual `jit(loop)` at all tested sizes due to eliminating
+JS↔WASM boundary crossings per iteration:
 
-Crossover point: ~48×48 matrices.
+| Matrix Size | Overhead | Notes                                |
+| ----------- | -------- | ------------------------------------ |
+| 16×16       | **-98%** | Scan FASTER (single WASM invocation) |
+| 32×32       | **-95%** | Scan FASTER                          |
+| 64×64       | **-82%** | Scan FASTER                          |
+| 128×128     | **-33%** | Scan FASTER                          |
+
+Native scan compiles the entire loop into one WASM module, avoiding per-iteration overhead.
 
 ### WebGPU Backend
 
@@ -587,14 +786,37 @@ const [carry, nullYs] = lax.scan(f, init, xs);
 // Useful when you only need the final carry (e.g., Mandelbrot iteration count)
 ```
 
-**Body function — borrowed references:**
+**Body function — managed references:**
+
+Scan _manages_ the lifecycle of `carry` and `x` — don't dispose them manually. However, standard
+consumption rules apply inside the body (same as regular functions):
+
+- **Single use:** `np.add(carry, x)` — no `.ref` needed, the operation consumes them.
+- **Multiple uses:** Use `.ref` to keep alive for additional uses.
 
 ```ts
-const f = (carry, x) => {
-  // carry and x are BORROWED — do NOT dispose them
-  // Return NEW arrays for newCarry and y
-  const result = np.add(carry.ref, x.ref); // .ref because we use them
-  return [result, result.ref]; // .ref for dual-use (passthrough pattern)
+// ✓ Works: .ref keeps carry alive, then bare carry consumed in return
+const step = (carry, x) => {
+  const newCarry = np.add(carry.ref, x); // .ref: we'll use carry again
+  return [newCarry, carry]; // carry consumed here
+};
+
+// ✗ Fails: can't use carry in TWO separate operations after .ref
+const step = (carry, x) => {
+  const a = np.add(carry.ref, x); // first operation
+  const b = np.add(a, carry); // ERROR: second operation on carry
+  return [b, a.ref];
+};
+```
+
+**Workaround for complex bodies:** Use pytree carries so each field can be `.ref`'d independently:
+
+```ts
+const f = (carry: { a: np.Array; b: np.Array }, x) => {
+  // carry.a and carry.b are separate arrays with independent refcounts
+  const newA = np.add(carry.a.ref, carry.b.ref);
+  const newB = np.add(carry.b, np.array([1.0])); // carry.b consumed (last use)
+  return [{ a: newA, b: newB }, carry.a]; // carry.a consumed (last use)
 };
 ```
 
@@ -704,6 +926,55 @@ is whether the **outer loop** runs natively (native-scan/batched-scan) or via JS
 
 **Transform sandwiches:** Compositions like `jit(grad(scan))` where transforms wrap each other. The
 test suite verifies these work correctly by comparing against reference implementations.
+
+### How consumption rules are enforced
+
+The scan body's consumption rules work at both trace time and execution time via different
+mechanisms:
+
+**Trace time (JaxprTracer):** When `makeJaxpr` traces the body function, `carry` and `x` are
+`JaxprTracer` objects with explicit reference counting (`src/frontend/jaxpr.ts:567-590`):
+
+```typescript
+class JaxprTracer extends Tracer {
+  #rc: number = 1; // Reference count enforced even for tracers
+
+  get ref() {
+    if (this.#rc <= 0) throw new UseAfterFreeError(this);
+    this.#rc++;
+    return this;
+  }
+  dispose() {
+    if (this.#rc <= 0) throw new UseAfterFreeError(this);
+    this.#rc--;
+  }
+}
+```
+
+And `processPrimitive` consumes all input tracers:
+
+```typescript
+const avalsIn = tracers.map((t) => {
+  t.dispose(); // Standard consumption!
+  return t.aval;
+});
+```
+
+**Execution time (array.ts):** The scan impl rule creates `.ref` copies internally before calling
+`evalJaxpr` (`src/frontend/array.ts:1414-1420`):
+
+```typescript
+const jaxprInputs = [
+  ...constViews.map((c) => c.ref),
+  ...carry.map((c) => c.ref), // Scan creates .ref
+  ...xSlice,
+];
+// evalJaxpr consumes jaxprInputs
+```
+
+**Why this matters:** Code that works during tracing (with `jit()`) will also work at execution time
+(without `jit()`), and vice versa. A body function that double-consumes a variable will fail during
+tracing, catching the bug early rather than silently producing incorrect gradients.
 
 ### Debugging scan paths
 
@@ -1171,7 +1442,7 @@ Expression translation and shader generation share common code between regular k
 | ------------------------------- | ------------------------------------------------------- |
 | `translateAluOpToWgsl()`        | Binary/unary ops, comparisons, casts, ternary           |
 | `translateErfToWgsl()`          | Erf/Erfc with f32 precision wrapper                     |
-| `gen()` in `pipelineSource`     | CSE + special cases (inverseSqrt, NaN, Threefry)        |
+| `gen()` in `pipelineSource`     | CSE (common subexpression elimination) + special cases  |
 | `genScanExpressionWithRidx`     | Scan-specific GlobalIndex + inline generation           |
 | `createShaderEmitter()`         | Returns `{emit, pushIndent, popIndent, getCode}` helper |
 | `nativeScanShaderSource()`      | Wrapper delegating to multi version                     |
@@ -1270,8 +1541,8 @@ Cholesky, LU, and TriangularSolve now use the fused batched-scan path.
 
 - Deno test runner supports parallel module execution via `--parallel` flag or `DENO_JOBS`
   environment variable.
-- Current `test:deno` script uses `DENO_JOBS=1` to run test files sequentially, reducing GPU-related
-  flakiness.
+- The `test:deno` script chains separate `deno test` commands with `&&`, running each file in its
+  own process for proper GPU state isolation.
 
 ### Memory leak detection (Deno)
 

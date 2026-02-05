@@ -79,9 +79,40 @@ Differences vs a plain JS loop:
 
 **Body function:**
 
-- `carry` and `x` are **borrowed** — do NOT dispose them inside the body.
+- `carry` and `x` are **managed** by scan — do NOT manually dispose them.
+- Standard consumption rules apply inside the body (same as regular functions):
+  - **Single use:** `np.add(carry, x)` — no `.ref` needed, the operation consumes them.
+  - **Multiple uses:** Use `.ref` to keep alive for additional uses.
 - Return **new** arrays for `newCarry` and `y`.
-- For passthrough (same array used as both carry and output), use `.ref`: `[result.ref, result]`.
+- For passthrough (same array in both), use `.ref`: `[result.ref, result]`.
+
+**Example — multiple uses of carry:**
+
+```ts
+// ✓ Works: .ref keeps carry alive, then bare carry is consumed in return
+const step = (carry, x) => {
+  const newCarry = np.add(carry.ref, x); // .ref: we'll use carry again
+  return [newCarry, carry]; // carry consumed here
+};
+
+// ✗ Fails: can't use carry in TWO separate operations after .ref
+const step = (carry, x) => {
+  const a = np.add(carry.ref, x); // first operation
+  const b = np.add(a, carry); // ERROR: second operation on carry
+  return [b, a.ref];
+};
+```
+
+**Workaround for complex bodies:** Use pytree carries so each field can be `.ref`'d independently:
+
+```ts
+const step = (carry, x) => {
+  // carry.a and carry.b are separate arrays with independent refcounts
+  const newA = np.add(carry.a.ref, carry.b.ref);
+  const newB = np.add(carry.b, x); // carry.b consumed (last use)
+  return [{ a: newA, b: newB }, carry.a]; // carry.a consumed (last use)
+};
+```
 
 **Outputs (caller owns):**
 
