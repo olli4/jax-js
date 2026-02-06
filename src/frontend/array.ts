@@ -1156,8 +1156,31 @@ export class Array extends Tracer {
             const innerSizeBytes = prod(srcShape) * byteWidth(dst.dtype);
             const dstOffsetBytes = offset * innerSizeBytes;
             const backend = getBackend("webgpu") as any;
-            if (backend.copyBufferToBuffer) {
+            const canBufferCopy =
+              dstOffsetBytes % 4 === 0 && innerSizeBytes % 4 === 0;
+            if (backend.copyBufferToBuffer && canBufferCopy) {
               backend.copyBufferToBuffer(
+                srcSlot,
+                0,
+                dstSlot,
+                dstOffsetBytes,
+                innerSizeBytes,
+              );
+              backend.incRef(dstSlot);
+              return [
+                new Array({
+                  source: dstSlot,
+                  st: ShapeTracker.fromShape(dstShape),
+                  dtype: dst.dtype,
+                  weakType: dst.weakType,
+                  backend: getBackend(dst.device),
+                  committed: true,
+                  pending: [],
+                }),
+              ];
+            } else if (backend.copyBufferWithShader) {
+              // Use on-device copy shader when direct buffer copy is unavailable
+              backend.copyBufferWithShader(
                 srcSlot,
                 0,
                 dstSlot,
@@ -1235,7 +1258,8 @@ export class Array extends Tracer {
           initCarrySlots,
           xsSlots,
           xsAvals, // xs avals passed from scan step (correct after transforms like vmap)
-          _outputSlots,
+          preallocateY,
+          outputSlots,
         ) => {
           // Get avals from bodyJaxpr for wrapping slots
           const carryAvals = bodyJaxpr.inBinders
@@ -1290,11 +1314,22 @@ export class Array extends Tracer {
               }),
           );
 
-          // Accumulate y slices
-          const ySlices: Array[][] = [];
-          for (let j = 0; j < numY; j++) ySlices.push([]);
-
           const bodyOutAvals = bodyJaxpr.outs.map((v) => v.aval);
+          const canPreallocateY =
+            preallocateY &&
+            numY > 0 &&
+            outputSlots.length === numCarry + numY &&
+            ((backend as any).copyBufferToBuffer ||
+              (backend as any).copyBufferWithShader);
+          const yStrideBytes = bodyOutAvals
+            .slice(numCarry)
+            .map((aval) => prod(aval.shape) * byteWidth(aval.dtype));
+
+          // Accumulate y slices when preallocation is disabled
+          const ySlices: Array[][] = [];
+          if (!canPreallocateY) {
+            for (let j = 0; j < numY; j++) ySlices.push([]);
+          }
 
           for (let i = 0; i < length; i++) {
             // Create views for x slices (ref prevents dispose, #reshape applies new ST)
@@ -1376,9 +1411,39 @@ export class Array extends Tracer {
             const newCarry = outArrays.slice(0, numCarry);
             const ySlice = outArrays.slice(numCarry);
 
-            // Store y slices
-            for (let j = 0; j < numY; j++) {
-              ySlices[j].push(ySlice[j]);
+            // Store y slices or write directly into preallocated outputs
+            if (canPreallocateY) {
+              const writeIndex = reverse ? length - 1 - i : i;
+              for (let j = 0; j < numY; j++) {
+                const sizeBytes = yStrideBytes[j];
+                if (sizeBytes <= 0) continue;
+                const dstOffsetBytes = writeIndex * sizeBytes;
+                const ySlot = ySlice[j]._realizeSource();
+                const dstSlot = outputSlots[numCarry + j];
+                const canBufferCopy =
+                  dstOffsetBytes % 4 === 0 && sizeBytes % 4 === 0;
+                if ((backend as any).copyBufferToBuffer && canBufferCopy) {
+                  (backend as any).copyBufferToBuffer(
+                    ySlot,
+                    0,
+                    dstSlot,
+                    dstOffsetBytes,
+                    sizeBytes,
+                  );
+                } else if ((backend as any).copyBufferWithShader) {
+                  (backend as any).copyBufferWithShader(
+                    ySlot,
+                    0,
+                    dstSlot,
+                    dstOffsetBytes,
+                    sizeBytes,
+                  );
+                }
+              }
+            } else {
+              for (let j = 0; j < numY; j++) {
+                ySlices[j].push(ySlice[j]);
+              }
             }
 
             // For passthrough Y outputs, the ySlice arrays share slots with old carry.
@@ -1398,40 +1463,49 @@ export class Array extends Tracer {
               carry.forEach((c) => c.dispose());
             }
             carry = newCarry;
+
+            if (canPreallocateY) {
+              ySlice.forEach((y) => y.dispose());
+            }
           }
 
-          // Stack y outputs
+          // Stack y outputs (concat path only)
           // Use chunking to avoid exceeding WebGPU buffer limit (max 8 storage buffers per shader)
-          const stackedYs = ySlices.map((slices) => {
-            const reshaped = slices.map((s) => {
-              // ref.#reshape: ref prevents s from being freed, #reshape creates new Array with expanded dims
-              const expanded = s.ref.#reshape(s.#st.reshape([1, ...s.shape]));
-              s.dispose();
-              return expanded;
+          let stackedYs: Array[] = [];
+          if (!canPreallocateY) {
+            stackedYs = ySlices.map((slices) => {
+              const reshaped = slices.map((s) => {
+                // ref.#reshape: ref prevents s from being freed, #reshape creates new Array with expanded dims
+                const expanded = s.ref.#reshape(s.#st.reshape([1, ...s.shape]));
+                s.dispose();
+                return expanded;
+              });
+              // Concatenate in chunks of 6 to stay under buffer limit
+              // Each concat: 1 (accumulator) + 6 (chunk) = 7 inputs + 1 output = 8 buffers
+              let stacked = reshaped[0];
+              for (let i = 1; i < reshaped.length; i += 6) {
+                const chunk = reshaped.slice(i, i + 6);
+                stacked = coreConcatenate([stacked, ...chunk], 0) as Array;
+              }
+              // For reverse=true, stacked Y outputs are in reverse order (last iteration first),
+              // so flip them to match JAX semantics (outputs in same order as xs)
+              if (reverse) {
+                // Create boolean array for flip: [true, false, ...] to flip only axis 0
+                const flipArg = rep(stacked.ndim, false);
+                flipArg[0] = true;
+                const flipped = stacked.ref.#reshape(stacked.#st.flip(flipArg));
+                stacked.dispose();
+                return flipped;
+              }
+              return stacked;
             });
-            // Concatenate in chunks of 6 to stay under buffer limit
-            // Each concat: 1 (accumulator) + 6 (chunk) = 7 inputs + 1 output = 8 buffers
-            let stacked = reshaped[0];
-            for (let i = 1; i < reshaped.length; i += 6) {
-              const chunk = reshaped.slice(i, i + 6);
-              stacked = coreConcatenate([stacked, ...chunk], 0) as Array;
-            }
-            // For reverse=true, stacked Y outputs are in reverse order (last iteration first),
-            // so flip them to match JAX semantics (outputs in same order as xs)
-            if (reverse) {
-              // Create boolean array for flip: [true, false, ...] to flip only axis 0
-              const flipArg = rep(stacked.ndim, false);
-              flipArg[0] = true;
-              const flipped = stacked.ref.#reshape(stacked.#st.flip(flipArg));
-              stacked.dispose();
-              return flipped;
-            }
-            return stacked;
-          });
+          }
 
           // Realize outputs to get final slots
           const carryOutSlots = carry.map((c) => c._realizeSource());
-          const yOutSlots = stackedYs.map((y) => y._realizeSource());
+          const yOutSlots = canPreallocateY
+            ? outputSlots.slice(numCarry)
+            : stackedYs.map((y) => y._realizeSource());
 
           // CRITICAL: Collect pending ops from carry and stackedYs
           // The stacking via coreConcatenate creates new pending ops that are held by stackedYs.
@@ -1447,8 +1521,16 @@ export class Array extends Tracer {
           // The old Array objects will be garbage collected, and since they have pending ops
           // that are still referenced via finalPending, those ops won't be cancelled.
 
+          const outputs = [...carryOutSlots, ...yOutSlots];
+          if (outputSlots.length > 0) {
+            const outputSet = new Set(outputs);
+            for (const slot of outputSlots) {
+              if (!outputSet.has(slot)) backend.decRef(slot);
+            }
+          }
+
           return {
-            outputs: [...carryOutSlots, ...yOutSlots],
+            outputs,
             pending: finalPending,
           };
         };

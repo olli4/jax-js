@@ -31,6 +31,7 @@ import {
   calculateGrid,
   constToWgsl,
   dtypeToWgsl,
+  gridOffsetY,
   headerWgsl,
   ShaderInfo,
 } from "./webgpu/codegen";
@@ -154,7 +155,77 @@ export interface PreparedBatchedScan {
   offsetBuffer: GPUBuffer;
   /** Alignment of each iteration's offset data in the buffer. */
   offsetAlignment: number;
+  /** Per-carry copy strategy for ys stacking (true = use shader copy). */
+  copyUsesShader: boolean[];
 }
+
+const COPY_WORKGROUP_SIZE = 64;
+
+const COPY_SHADER_CODE = String.raw`
+${headerWgsl}
+
+struct CopyParams {
+  srcOffset: u32,
+  dstOffset: u32,
+  size: u32,
+  _pad: u32,
+}
+
+@group(0) @binding(0) var<storage, read> src: array<u32>;
+@group(0) @binding(1) var<storage, read_write> dst: array<u32>;
+@group(1) @binding(0) var<uniform> params: CopyParams;
+
+fn byte_mask(n: u32) -> u32 {
+  if (n >= 4u) { return 0xffffffffu; }
+  return (1u << (n * 8u)) - 1u;
+}
+
+fn load_unaligned(offset: u32) -> u32 {
+  let word = offset >> 2u;
+  let shift = (offset & 3u) * 8u;
+  if (shift == 0u) {
+    return src[word];
+  }
+  let low = src[word];
+  let high = src[word + 1u];
+  return (low >> shift) | (high << (32u - shift));
+}
+
+@compute @workgroup_size(${COPY_WORKGROUP_SIZE})
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+  let gid = id.x + id.y * ${gridOffsetY}u;
+
+  // Each thread handles one *destination word* exclusively, preventing
+  // read-modify-write races when dstOffset is not 4-byte aligned.
+  let firstDstWord = params.dstOffset >> 2u;
+  let wordIdx = firstDstWord + gid;
+  let lastDstWord = (params.dstOffset + params.size + 3u) >> 2u;
+  if (wordIdx >= lastDstWord) { return; }
+
+  // Byte range of this destination word
+  let wordByteStart = wordIdx * 4u;
+
+  // Intersect [dstOffset, dstOffset+size) with [wordByteStart, wordByteStart+4)
+  let copyStart = max(params.dstOffset, wordByteStart);
+  let copyEnd = min(params.dstOffset + params.size, wordByteStart + 4u);
+  let nbytes = copyEnd - copyStart;
+
+  // Read corresponding source bytes (unaligned read is safe)
+  let srcByteOff = params.srcOffset + (copyStart - params.dstOffset);
+  let value = load_unaligned(srcByteOff);
+
+  if (nbytes == 4u) {
+    // Full word write — entire word is within copy range
+    dst[wordIdx] = value;
+  } else {
+    // Partial word — preserve bytes outside the copy range
+    let shift = (copyStart & 3u) * 8u;
+    let mask = byte_mask(nbytes) << shift;
+    let cur = dst[wordIdx];
+    dst[wordIdx] = (cur & ~mask) | ((value << shift) & mask);
+  }
+}
+`.trim();
 
 /** Implementation of `Backend` that uses WebGPU in browsers. */
 export class WebGPUBackend implements Backend {
@@ -175,6 +246,7 @@ export class WebGPUBackend implements Backend {
 
   #cachedShaderMap = new Map<bigint, ShaderInfo>();
   #reusableZsb: GPUBuffer;
+  #copyPipeline: GPUComputePipeline | null = null;
 
   constructor(readonly device: GPUDevice) {
     if (DEBUG >= 3 && device.adapterInfo) {
@@ -324,6 +396,100 @@ export class WebGPUBackend implements Backend {
       paddedSize,
     );
     this.device.queue.submit([commandEncoder.finish()]);
+  }
+
+  copyBufferWithShader(
+    srcSlot: Slot,
+    srcOffset: number,
+    dstSlot: Slot,
+    dstOffset: number,
+    size: number,
+  ) {
+    if (size <= 0) return;
+    const { buffer: srcBuf } = this.#getBuffer(srcSlot);
+    const { buffer: dstBuf } = this.#getBuffer(dstSlot);
+    const commandEncoder = this.device.createCommandEncoder();
+    const uniformBuffer = this.#encodeCopyWithShader(
+      commandEncoder,
+      srcBuf,
+      srcOffset,
+      dstBuf,
+      dstOffset,
+      size,
+    );
+    this.device.queue.submit([commandEncoder.finish()]);
+    if (uniformBuffer) uniformBuffer.destroy();
+  }
+
+  #getCopyPipeline(): GPUComputePipeline {
+    if (this.#copyPipeline) return this.#copyPipeline;
+    // The passes field is only used by prepareSync to derive the pipeline layout;
+    // the actual grid size is computed per-dispatch in #encodeCopyWithShader.
+    const shader: ShaderInfo = {
+      code: COPY_SHADER_CODE,
+      numInputs: 1,
+      numOutputs: 1,
+      hasUniform: true,
+      passes: [{ grid: [1, 1], uniform: new Uint8Array(16) }],
+    };
+    this.#copyPipeline = this.pipelines.prepareSync(shader);
+    return this.#copyPipeline;
+  }
+
+  #encodeCopyWithShader(
+    commandEncoder: GPUCommandEncoder,
+    srcBuf: GPUBuffer,
+    srcOffset: number,
+    dstBuf: GPUBuffer,
+    dstOffset: number,
+    size: number,
+  ): GPUBuffer | null {
+    if (size <= 0) return null;
+    // Grid based on destination words (not source bytes) to match
+    // the shader's per-destination-word thread assignment.
+    const firstDstWord = dstOffset >>> 2;
+    const lastDstWord = (dstOffset + size + 3) >>> 2;
+    const words = lastDstWord - firstDstWord;
+    const workgroups = Math.ceil(words / COPY_WORKGROUP_SIZE);
+    if (workgroups === 0) return null;
+
+    const [gridX, gridY] = calculateGrid(workgroups);
+    const pipeline = this.#getCopyPipeline();
+
+    const storageBindGroup = this.device.createBindGroup({
+      layout: pipeline.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: { buffer: srcBuf } },
+        { binding: 1, resource: { buffer: dstBuf } },
+      ],
+    });
+
+    const uniformBuffer = this.device.createBuffer({
+      size: 16,
+      usage: GPUBufferUsage.UNIFORM,
+      mappedAtCreation: true,
+    });
+    new Uint32Array(uniformBuffer.getMappedRange()).set([
+      srcOffset,
+      dstOffset,
+      size,
+      0,
+    ]);
+    uniformBuffer.unmap();
+
+    const uniformBindGroup = this.device.createBindGroup({
+      layout: pipeline.getBindGroupLayout(1),
+      entries: [{ binding: 0, resource: { buffer: uniformBuffer } }],
+    });
+
+    const passEncoder = commandEncoder.beginComputePass();
+    passEncoder.setPipeline(pipeline);
+    passEncoder.setBindGroup(0, storageBindGroup);
+    passEncoder.setBindGroup(1, uniformBindGroup);
+    passEncoder.dispatchWorkgroups(gridX, gridY);
+    passEncoder.end();
+
+    return uniformBuffer;
   }
 
   #cachedShader(kernel: Kernel): ShaderInfo {
@@ -685,11 +851,14 @@ export class WebGPUBackend implements Backend {
       );
     }
 
+    const copyUsesShader = carrySizes.map((size) => size % 4 !== 0);
+
     return {
       params,
       wrappedShaders,
       offsetBuffer,
       offsetAlignment,
+      copyUsesShader,
     };
   }
 
@@ -708,7 +877,13 @@ export class WebGPUBackend implements Backend {
     carryOutSlots: Slot[],
     ysStackedSlots: Slot[],
   ): void {
-    const { params, wrappedShaders, offsetBuffer, offsetAlignment } = prepared;
+    const {
+      params,
+      wrappedShaders,
+      offsetBuffer,
+      offsetAlignment,
+      copyUsesShader,
+    } = prepared;
     const {
       length,
       carrySizes,
@@ -735,6 +910,7 @@ export class WebGPUBackend implements Backend {
     const carryPong = carrySizes.map((size) => this.#createBuffer(size));
 
     const commandEncoder = this.device.createCommandEncoder();
+    const copyUniformBuffers: GPUBuffer[] = [];
 
     // Copy initCarry to carryPing
     for (let i = 0; i < numCarry; i++) {
@@ -878,14 +1054,28 @@ export class WebGPUBackend implements Backend {
         // The routine wrote to writeCarry, which is carryPong (even iter) or carryPing (odd iter)
         const currentCarryBuffers = iter % 2 === 0 ? carryPong : carryPing;
         for (let c = 0; c < numCarry; c++) {
-          const yOffset = iter * carrySizes[c]; // Offset in ysStackedBuffers
-          commandEncoder.copyBufferToBuffer(
-            currentCarryBuffers[c],
-            0,
-            ysStackedBuffers[c],
-            yOffset,
-            carrySizes[c],
-          );
+          const copySize = carrySizes[c];
+          if (copySize <= 0) continue;
+          const yOffset = iter * copySize; // Offset in ysStackedBuffers
+          if (!copyUsesShader[c]) {
+            commandEncoder.copyBufferToBuffer(
+              currentCarryBuffers[c],
+              0,
+              ysStackedBuffers[c],
+              yOffset,
+              copySize,
+            );
+          } else {
+            const uniformBuffer = this.#encodeCopyWithShader(
+              commandEncoder,
+              currentCarryBuffers[c],
+              0,
+              ysStackedBuffers[c],
+              yOffset,
+              copySize,
+            );
+            if (uniformBuffer) copyUniformBuffers.push(uniformBuffer);
+          }
         }
       }
     }
@@ -893,17 +1083,35 @@ export class WebGPUBackend implements Backend {
     // Copy final carry to carryOut
     const finalCarry = length % 2 === 0 ? carryPing : carryPong;
     for (let i = 0; i < numCarry; i++) {
-      commandEncoder.copyBufferToBuffer(
-        finalCarry[i],
-        0,
-        carryOutBuffers[i],
-        0,
-        carrySizes[i],
-      );
+      const copySize = carrySizes[i];
+      if (copySize <= 0) continue;
+      if (!copyUsesShader[i]) {
+        commandEncoder.copyBufferToBuffer(
+          finalCarry[i],
+          0,
+          carryOutBuffers[i],
+          0,
+          copySize,
+        );
+      } else {
+        const uniformBuffer = this.#encodeCopyWithShader(
+          commandEncoder,
+          finalCarry[i],
+          0,
+          carryOutBuffers[i],
+          0,
+          copySize,
+        );
+        if (uniformBuffer) copyUniformBuffers.push(uniformBuffer);
+      }
     }
 
     // Submit all commands in one batch
     this.device.queue.submit([commandEncoder.finish()]);
+
+    for (const buf of copyUniformBuffers) {
+      buf.destroy();
+    }
 
     // Clean up ping-pong buffers (temporary, created per-dispatch)
     for (const buf of [...carryPing, ...carryPong]) {

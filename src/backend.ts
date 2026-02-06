@@ -245,6 +245,19 @@ export interface Backend {
     size: number,
   ): void;
 
+  /**
+   * Copy a contiguous range of bytes using an on-device (WGSL) copy shader.
+   * Backends may implement this to provide a GPU-dispatched copy when
+   * direct buffer-to-buffer copy is not available or desirable.
+   */
+  copyBufferWithShader?(
+    srcSlot: Slot,
+    srcOffset: number,
+    dstSlot: Slot,
+    dstOffset: number,
+    size: number,
+  ): void;
+
   /** Prepare a batched scan operation (WebGPU backend). */
   prepareBatchedScan?(params: any): any | null;
 

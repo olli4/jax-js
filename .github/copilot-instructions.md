@@ -316,16 +316,17 @@ See [WebGPU preencoded-routine details](#webgpu-preencoded-routine-details-routi
 
 ### Features exploited
 
-| Feature                     | How jax-js uses it                                          | Location                             |
-| --------------------------- | ----------------------------------------------------------- | ------------------------------------ |
-| **shader-f16**              | Float16 dtype support; requested at device creation         | `src/backend.ts` feature requests    |
-| **Workgroup shared memory** | Sort uses `var<workgroup>` for bitonic sort local exchanges | `src/backend/webgpu/routines.ts`     |
-| **workgroupBarrier()**      | Synchronizes threads within Sort workgroups                 | `bitonicSortShader` in routines.ts   |
-| **storageBarrier()**        | Memory fence for shared variable consistency                | `bitonicSortShader` in routines.ts   |
-| **Pipeline caching**        | Compiled pipelines stored by shader hash                    | `pipelineCache` in webgpu.ts         |
-| **Command batching**        | Multiple dispatches encoded before single queue.submit()    | `PendingExecute` in webgpu.ts        |
-| **Ping-pong buffers**       | Scan carry state alternates between two buffers             | `dispatchBatchedScan()` in webgpu.ts |
-| **Uniform buffers**         | Per-iteration offsets for batched scan                      | `scan-wrapper.ts`                    |
+| Feature                     | How jax-js uses it                                               | Location                             |
+| --------------------------- | ---------------------------------------------------------------- | ------------------------------------ |
+| **shader-f16**              | Float16 dtype support; requested at device creation              | `src/backend.ts` feature requests    |
+| **Workgroup shared memory** | Sort uses `var<workgroup>` for bitonic sort local exchanges      | `src/backend/webgpu/routines.ts`     |
+| **workgroupBarrier()**      | Synchronizes threads within Sort workgroups                      | `bitonicSortShader` in routines.ts   |
+| **storageBarrier()**        | Memory fence for shared variable consistency                     | `bitonicSortShader` in routines.ts   |
+| **Pipeline caching**        | Compiled pipelines stored by shader hash                         | `pipelineCache` in webgpu.ts         |
+| **Command batching**        | Multiple dispatches encoded before single queue.submit()         | `PendingExecute` in webgpu.ts        |
+| **Ping-pong buffers**       | Scan carry state alternates between two buffers                  | `dispatchBatchedScan()` in webgpu.ts |
+| **Uniform buffers**         | Per-iteration offsets for batched scan                           | `scan-wrapper.ts`                    |
+| **WGSL copy shader**        | Byte-level buffer copy when `copyBufferToBuffer` alignment fails | `COPY_SHADER_CODE` in webgpu.ts      |
 
 **Pipeline caching detail:**
 
@@ -592,6 +593,10 @@ const [finalCarry, stackedOutputs] = await lax.scan(f, initCarry, xs, options);
 - `checkpoint?: boolean | number` — Control gradient checkpointing for `grad(scan)`. Default
   (undefined/true) uses √N checkpointing. A number specifies the segment size. `false` stores all
   carries (O(N) memory).
+- `preallocateY?: boolean` — When true and using the JS fallback scan path, preallocates the stacked
+  Y output buffer and writes each iteration's Y directly via `copyBufferToBuffer` (4-byte aligned)
+  or the WGSL copy shader (unaligned). Avoids O(length) intermediate arrays from `coreConcatenate`.
+  No effect on compiled-loop or preencoded-routine paths (they already write directly).
 
 **Scan paths (`ScanPath` type):**
 
@@ -1743,40 +1748,35 @@ contributors should be aware of:
   object via `(flatF as any)._yTreedef = yTreedef`. This is invisible to TypeScript and could be
   replaced with a closure variable.
 
-- **Fallback Y stacking overhead & preallocated Y plan:** The `scanRunner` in `array.ts` currently
-  stacks Y outputs via chunked `coreConcatenate` (groups of 6), which creates O(length) intermediate
-  arrays for large iteration counts. Pre-allocating the final stacked-Y buffer and writing each
-  iteration's Y directly into its slice avoids those allocations and reduces memory churn.
-
-  Plan (short): implement a `dynamic_update_slice(dst, src, offset)` primitive and a
-  `arr.at(index).set(src)` convenience; extend `lax.scan` with an optional `{ preallocateY: true }`
-  (or autodetect when shapes are known) so the fallback path preallocates `ysStacked` and calls
-  `dynamic_update_slice` each iteration. On WebGPU, implement a small WGSL copy kernel that binds
-  the destination storage buffer and the source and accepts an `u32 offset` uniform (element index).
-  Use `queue.copyBufferToBuffer` as an optimization path when alignment and limits permit, and fall
-  back to the WGSL kernel otherwise. Add tests (passthrough Y, duplicate-slot outputs, Y=null) and
-  benchmarks to measure allocation/time improvements.
+- **Fallback Y stacking with `preallocateY`:** The `scanRunner` in `array.ts` supports two Y
+  stacking strategies. Without `preallocateY`, it accumulates Y slices and stacks them via chunked
+  `coreConcatenate` (groups of 6). With `preallocateY: true`, it preallocates the final stacked-Y
+  buffer and writes each iteration's Y directly using `copyBufferToBuffer` (when 4-byte aligned) or
+  the WGSL copy shader `COPY_SHADER_CODE` (when unaligned, e.g., f16 arrays with odd element
+  counts). The WGSL copy shader indexes by destination word to avoid read-modify-write races between
+  threads. See `test/scan-preallocate.test.ts` for edge-case coverage (duplicate-slot, passthrough,
+  reverse, length-0). The batched scan path (`dispatchBatchedScan`) also uses the WGSL copy shader
+  for ys stacking when carry sizes are not 4-byte aligned.
 
 ### Future work
 
-| Priority | Feature                                          | Notes                                                                                                                                                                                  |
-| -------- | ------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| High     | Preallocated Y stacking + `dynamic_update_slice` | Preallocate stacked outputs; implement `dynamic_update_slice` and WebGPU WGSL copy kernel (uniform offsets); add copyBufferToBuffer optimization, pipeline caching, tests & benchmarks |
-| Medium   | Mixed-dtype WebGPU scan shader                   | Per-binding dtype in `nativeScanMultiShaderSource`                                                                                                                                     |
-| Low      | Length-0 scan support                            | Return `(init, empty_ys)` for JAX compat                                                                                                                                               |
-| Low      | `lax.scatter` / `dynamic_slice`                  | Would enable Jaxpr-based routines                                                                                                                                                      |
+| Priority | Feature                         | Notes                                                         |
+| -------- | ------------------------------- | ------------------------------------------------------------- |
+| Medium   | Mixed-dtype WebGPU scan shader  | Per-binding dtype in `nativeScanMultiShaderSource`            |
+| Medium   | Auto-detect preallocateY        | Infer when preallocateY is beneficial without explicit opt-in |
+| Low      | Length-0 scan support           | Return `(init, empty_ys)` for JAX compat                      |
+| Low      | `lax.scatter` / `dynamic_slice` | Would enable Jaxpr-based routines                             |
 
-#### Planned implementation steps
+#### Completed: Preallocated Y stacking
 
-1. Add `dynamic_update_slice(dst, src, offset)` primitive and `arr.at(i).set(src)` frontend API.
-2. Implement CPU/WASM fast-path (memcpy) and general element-wise copy fallback.
-3. Add WebGPU WGSL copy kernel (dst, src, offset uniform) and pipeline caching in `webgpu` backend.
-4. Extend `lax.scan`/`scanRunner` to preallocate `ysStacked` when requested and use
-   `dynamic_update_slice` per iteration.
-5. Add preencoded-routine optimization for routine-only bodies: record
-   `dispatch + copyBufferToBuffer(dstOffset)` sequences when alignment allows.
-6. Add unit tests for correctness (passthrough, duplicate outputs, Y=null) and micro-benchmarks
-   comparing concat-based stacking vs preallocated direct-write.
+The following planned steps are now implemented:
+
+1. ✅ `dynamic_update_slice(dst, src, offset)` primitive and `arr.at(i).set(src)` frontend API.
+2. ✅ CPU/WASM fast-path (`copyBufferToBuffer`) and WGSL copy shader fallback.
+3. ✅ WebGPU WGSL copy kernel (`COPY_SHADER_CODE`) with pipeline caching.
+4. ✅ `scanRunner` preallocateY path — direct-write into preallocated output buffers.
+5. ✅ Batched scan (`dispatchBatchedScan`) uses shader copy for unaligned ys stacking.
+6. ✅ Tests: passthrough, duplicate-slot, reverse, length-0 (`test/scan-preallocate.test.ts`).
 
 ### WASM feature opportunities (assessed Feb 2026)
 
@@ -1793,13 +1793,14 @@ contributors should be aware of:
 
 ### Test files
 
-| File                                         | Purpose                            |
-| -------------------------------------------- | ---------------------------------- |
-| `test/lax-scan.test.ts`                      | Main scan test suite (~3000 lines) |
-| `test/jit-scan-dlm.test.ts`                  | Kalman filter integration tests    |
-| `test/deno/webgpu.test.ts`                   | Headless WebGPU tests via Deno     |
-| `test/deno/batched-scan.test.ts`             | Batched scan integration           |
-| `test/deno/batched-scan-integration.test.ts` | Multi-kernel WebGPU scan           |
+| File                                         | Purpose                                       |
+| -------------------------------------------- | --------------------------------------------- |
+| `test/lax-scan.test.ts`                      | Main scan test suite (~3000 lines)            |
+| `test/scan-preallocate.test.ts`              | preallocateY edge cases (dup/passthrough/rev) |
+| `test/jit-scan-dlm.test.ts`                  | Kalman filter integration tests               |
+| `test/deno/webgpu.test.ts`                   | Headless WebGPU tests via Deno                |
+| `test/deno/batched-scan.test.ts`             | Batched scan integration                      |
+| `test/deno/batched-scan-integration.test.ts` | Multi-kernel WebGPU scan                      |
 
 ### Deno WebGPU test guidelines
 
