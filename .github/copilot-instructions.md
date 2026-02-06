@@ -664,7 +664,7 @@ module, eliminating JS/WASM boundary overhead per iteration.
 **Performance benchmarks:**
 
 - Fallback (JS loop): ~500 iter/sec
-- Compiled-loop: ~7-13M iter/sec
+- Compiled-loop: ~13-16M iter/sec
 
 **Scan vs jit(loop) overhead:**
 
@@ -674,11 +674,12 @@ JS↔WASM boundary crossings per iteration:
 | Matrix Size | Overhead | Notes                                |
 | ----------- | -------- | ------------------------------------ |
 | 16×16       | **-98%** | Scan FASTER (single WASM invocation) |
-| 32×32       | **-95%** | Scan FASTER                          |
-| 64×64       | **-82%** | Scan FASTER                          |
-| 128×128     | **-33%** | Scan FASTER                          |
+| 32×32       | **-98%** | Scan FASTER                          |
+| 64×64       | **-96%** | Scan FASTER                          |
+| 128×128     | **-84%** | Scan FASTER                          |
 
-Compiled-loop compiles the entire loop into one WASM module, avoiding per-iteration overhead.
+Compiled-loop compiles the entire loop into one WASM module, avoiding per-iteration overhead. Memory
+copies within the loop use `memory.copy` (bulk memory) for efficient carry/output transfers.
 
 ### WebGPU Backend
 
@@ -1634,11 +1635,6 @@ contributors should be aware of:
   misclassify a user scan with even counts. Consider adding an explicit `isJvpTransformed` flag to
   `ScanParams` if this causes issues.
 
-- **Byte-by-byte copy in WASM scan codegen:** `codegenNativeScanGeneral()` uses `i32.load8_u` /
-  `i32.store8` loops for carry init, Y output copy, and carry update. Using `memory.copy` (bulk
-  memory proposal) or at minimum word-sized loads/stores would improve performance, especially for
-  large matrices (128×128 f32 = 65KB copied byte-by-byte 3× per iteration).
-
 - **`_yTreedef` side-channel:** In `lax-scan.ts`, the Y treedef is stashed on the `flatF` function
   object via `(flatF as any)._yTreedef = yTreedef`. This is invisible to TypeScript and could be
   replaced with a closure variable.
@@ -1649,12 +1645,20 @@ contributors should be aware of:
 
 ### Future work
 
-| Priority | Feature                         | Notes                                                          |
-| -------- | ------------------------------- | -------------------------------------------------------------- |
-| Medium   | `memory.copy` in WASM scan      | Replace byte-by-byte copy loops (~4× faster for large carries) |
-| Medium   | Mixed-dtype WebGPU scan shader  | Per-binding dtype in `nativeScanMultiShaderSource`             |
-| Low      | Length-0 scan support           | Return `(init, empty_ys)` for JAX compat                       |
-| Low      | `lax.scatter` / `dynamic_slice` | Would enable Jaxpr-based routines                              |
+| Priority | Feature                         | Notes                                              |
+| -------- | ------------------------------- | -------------------------------------------------- |
+| Medium   | Mixed-dtype WebGPU scan shader  | Per-binding dtype in `nativeScanMultiShaderSource` |
+| Low      | Length-0 scan support           | Return `(init, empty_ys)` for JAX compat           |
+| Low      | `lax.scatter` / `dynamic_slice` | Would enable Jaxpr-based routines                  |
+
+### WASM feature opportunities (assessed Feb 2026)
+
+| Priority | Feature            | Browser risk       | Impact      | Notes                                                                                |
+| -------- | ------------------ | ------------------ | ----------- | ------------------------------------------------------------------------------------ |
+| Medium   | i64 in wasmblr     | None (MVP)         | Medium-High | Unlocks proper f64 builtins (exp/log/sin/erf) and simplifies Threefry PRNG           |
+| Medium   | Relaxed SIMD (FMA) | Safari unsupported | High        | `f32x4.relaxed_madd` for 2× dot-product throughput; needs runtime feature detection  |
+| Low      | Threads / atomics  | Needs COOP/COEP    | Very High   | SharedArrayBuffer + Workers for parallel matmul/routines; major architectural change |
+| Low      | Sign extension ops | None               | Low         | `i32.extend8_s` etc.; marginal for float-focused workloads                           |
 
 ---
 

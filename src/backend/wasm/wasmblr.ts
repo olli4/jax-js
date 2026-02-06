@@ -142,6 +142,42 @@ class Memory {
     this.cg._emit(0x00);
   }
 
+  /**
+   * Bulk memory copy: copies `n` bytes from `src` to `dst`.
+   * Stack: [dst: i32, src: i32, n: i32] → []
+   * Part of the bulk memory operations proposal (supported in all modern runtimes).
+   */
+  copy() {
+    const cg = this.cg;
+    const n = cg._pop();
+    const src = cg._pop();
+    const dst = cg._pop();
+    assert(n.typeId === cg.i32.typeId, "memory.copy: expected i32 length");
+    assert(src.typeId === cg.i32.typeId, "memory.copy: expected i32 src");
+    assert(dst.typeId === cg.i32.typeId, "memory.copy: expected i32 dst");
+    cg._emit(0xfc); // prefix byte
+    cg._emit(encodeUnsigned(0x0a)); // memory.copy opcode
+    cg._emit(0x00); // dst memory index
+    cg._emit(0x00); // src memory index
+  }
+
+  /**
+   * Bulk memory fill: fills `n` bytes at `dst` with byte value `val`.
+   * Stack: [dst: i32, val: i32, n: i32] → []
+   */
+  fill() {
+    const cg = this.cg;
+    const n = cg._pop();
+    const val = cg._pop();
+    const dst = cg._pop();
+    assert(n.typeId === cg.i32.typeId, "memory.fill: expected i32 length");
+    assert(val.typeId === cg.i32.typeId, "memory.fill: expected i32 value");
+    assert(dst.typeId === cg.i32.typeId, "memory.fill: expected i32 dst");
+    cg._emit(0xfc); // prefix byte
+    cg._emit(encodeUnsigned(0x0b)); // memory.fill opcode
+    cg._emit(0x00); // memory index
+  }
+
   get isImport(): boolean {
     return this.aString.length > 0 && this.bString.length > 0;
   }

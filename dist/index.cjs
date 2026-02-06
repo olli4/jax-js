@@ -30,7 +30,7 @@ var __toESM = (mod$1, isNodeMode, target) => (target = mod$1 != null ? __create(
 }) : target, mod$1));
 
 //#endregion
-const require_backend = require('./backend-DUsm3qC3.cjs');
+const require_backend = require('./backend-CjvWQBLT.cjs');
 const require_scan_wrapper = require('./scan-wrapper-BeVQahyp.cjs');
 
 //#region src/frontend/convolution.ts
@@ -6241,7 +6241,7 @@ const transposeRules = {
 			for (let i = numPrimalCarry; i < forwardOuts.length; i++) forwardOuts[i].dispose();
 			return newCarry;
 		};
-		const useCheckpointing = checkpoint != null;
+		const useCheckpointing = checkpoint !== false;
 		const segmentSize = useCheckpointing ? typeof checkpoint === "number" ? checkpoint : Math.max(1, Math.ceil(Math.sqrt(length))) : length;
 		const allCarries = useCheckpointing ? null : [];
 		const checkpointCarries = useCheckpointing ? /* @__PURE__ */ new Map() : null;

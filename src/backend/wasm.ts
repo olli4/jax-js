@@ -1309,7 +1309,6 @@ function codegenNativeScanGeneral(
     // Local variables
     const iter = cg.local.declare(cg.i32); // scan iteration counter
     const gidx = cg.local.declare(cg.i32); // body kernel loop index
-    const copyIdx = cg.local.declare(cg.i32); // for memory copy loops
     const dataIdx = cg.local.declare(cg.i32); // data index for xs/ys (differs from iter when reverse)
 
     // Argument indices
@@ -1323,34 +1322,10 @@ function codegenNativeScanGeneral(
     // Step 1: Copy carryIn to carryOut (working buffer)
     for (let c = 0; c < numCarry; c++) {
       const size = carrySizes[c];
-      cg.i32.const(0);
-      cg.local.set(copyIdx);
-      cg.loop(cg.void);
-      {
-        cg.block(cg.void);
-        cg.local.get(copyIdx);
-        cg.i32.const(size);
-        cg.i32.ge_u();
-        cg.br_if(0);
-
-        // carryOut[c][copyIdx] = carryIn[c][copyIdx]
-        cg.local.get(carryOutBase + c);
-        cg.local.get(copyIdx);
-        cg.i32.add();
-        cg.local.get(carryInBase + c);
-        cg.local.get(copyIdx);
-        cg.i32.add();
-        cg.i32.load8_u(0);
-        cg.i32.store8(0);
-
-        cg.local.get(copyIdx);
-        cg.i32.const(1);
-        cg.i32.add();
-        cg.local.set(copyIdx);
-        cg.br(1);
-        cg.end();
-      }
-      cg.end();
+      cg.local.get(carryOutBase + c); // dst
+      cg.local.get(carryInBase + c); // src
+      cg.i32.const(size); // len
+      cg.memory.copy();
     }
 
     // Step 2: Main scan loop
@@ -1442,38 +1417,11 @@ function codegenNativeScanGeneral(
             const elemSize = params.elementSize ?? 4;
             const copySize = sortSize * elemSize;
 
-            // Copy loop: internal[i] = input[i]
-            cg.i32.const(0);
-            cg.local.set(copyIdx);
-            cg.loop(cg.void);
-            {
-              cg.block(cg.void);
-              cg.local.get(copyIdx);
-              cg.i32.const(copySize);
-              cg.i32.ge_u();
-              cg.br_if(0);
-
-              // internal[copyIdx] = input[copyIdx]
-              cg.local.get(internalsBase + internalIdx);
-              cg.local.get(copyIdx);
-              cg.i32.add();
-
-              // Get input pointer and add offset
-              pushSlotPtr(inputSlotIdx);
-              cg.local.get(copyIdx);
-              cg.i32.add();
-              cg.i32.load8_u(0);
-
-              cg.i32.store8(0);
-
-              cg.local.get(copyIdx);
-              cg.i32.const(1);
-              cg.i32.add();
-              cg.local.set(copyIdx);
-              cg.br(1);
-              cg.end();
-            }
-            cg.end();
+            // Copy input to internal buffer using memory.copy
+            cg.local.get(internalsBase + internalIdx); // dst
+            pushSlotPtr(inputSlotIdx); // src
+            cg.i32.const(copySize); // len
+            cg.memory.copy();
 
             // Now call sort with internal buffer as dataPtr
             cg.local.get(internalsBase + internalIdx); // dataPtr (in-place)
@@ -1678,54 +1626,28 @@ function codegenNativeScanGeneral(
           size = internalSizes[source.internalIdx!];
         }
 
-        // Copy loop: ysStacked[y][dataIdx * yStride + i] = src[i] for i in 0..size
-        cg.i32.const(0);
-        cg.local.set(copyIdx);
-        cg.loop(cg.void);
-        {
-          cg.block(cg.void);
-          cg.local.get(copyIdx);
-          cg.i32.const(size);
-          cg.i32.ge_u();
-          cg.br_if(0);
+        // Copy to ysStacked[y] at dataIdx * yStride using memory.copy
+        // dst = ysStacked[y] + dataIdx * yStride
+        cg.local.get(ysStackedBase + y);
+        cg.local.get(dataIdx);
+        cg.i32.const(yStride);
+        cg.i32.mul();
+        cg.i32.add();
 
-          // ysStacked[y] + dataIdx * yStride + copyIdx
-          cg.local.get(ysStackedBase + y);
+        // src depends on source type
+        if (isXsPassthrough) {
+          // xs[xsIdx] + dataIdx * xsStrides[xsIdx]
+          cg.local.get(xsBase + xsPassthroughIdx);
           cg.local.get(dataIdx);
-          cg.i32.const(yStride);
+          cg.i32.const(xsStrides[xsPassthroughIdx]);
           cg.i32.mul();
           cg.i32.add();
-          cg.local.get(copyIdx);
-          cg.i32.add();
-
-          // src[copyIdx] - different computation for xs-passthrough
-          if (isXsPassthrough) {
-            // xs[xsIdx] + dataIdx * xsStrides[xsIdx] + copyIdx
-            cg.local.get(xsBase + xsPassthroughIdx);
-            cg.local.get(dataIdx);
-            cg.i32.const(xsStrides[xsPassthroughIdx]);
-            cg.i32.mul();
-            cg.i32.add();
-            cg.local.get(copyIdx);
-            cg.i32.add();
-          } else {
-            cg.local.get(srcArgIdx);
-            cg.local.get(copyIdx);
-            cg.i32.add();
-          }
-          cg.i32.load8_u(0);
-
-          // store
-          cg.i32.store8(0);
-
-          cg.local.get(copyIdx);
-          cg.i32.const(1);
-          cg.i32.add();
-          cg.local.set(copyIdx);
-          cg.br(1);
-          cg.end();
+        } else {
+          cg.local.get(srcArgIdx);
         }
-        cg.end();
+
+        cg.i32.const(size); // len
+        cg.memory.copy();
       }
 
       // Step 2c: Copy carry outputs from internal buffers (or passthrough) to carryOut (for next iteration)
@@ -1740,34 +1662,10 @@ function codegenNativeScanGeneral(
             ? carryInBase + source.carryIdx!
             : internalsBase + source.internalIdx!;
 
-        cg.i32.const(0);
-        cg.local.set(copyIdx);
-        cg.loop(cg.void);
-        {
-          cg.block(cg.void);
-          cg.local.get(copyIdx);
-          cg.i32.const(size);
-          cg.i32.ge_u();
-          cg.br_if(0);
-
-          // carryOut[c][copyIdx] = src[copyIdx]
-          cg.local.get(carryOutBase + c);
-          cg.local.get(copyIdx);
-          cg.i32.add();
-          cg.local.get(srcLocal);
-          cg.local.get(copyIdx);
-          cg.i32.add();
-          cg.i32.load8_u(0);
-          cg.i32.store8(0);
-
-          cg.local.get(copyIdx);
-          cg.i32.const(1);
-          cg.i32.add();
-          cg.local.set(copyIdx);
-          cg.br(1);
-          cg.end();
-        }
-        cg.end();
+        cg.local.get(carryOutBase + c); // dst
+        cg.local.get(srcLocal); // src
+        cg.i32.const(size); // len
+        cg.memory.copy();
       }
 
       // iter++

@@ -1,5 +1,5 @@
 import { __export } from "./chunk-Cl8Af3a2.js";
-import { AluExp, AluGroup, AluOp, AluVar, DEBUG, DType, FpHash, Kernel, PPrint, Reduction, Routine, Routines, ShapeTracker, accessorAluExp, accessorGlobal, assertNonNull, byteWidth, checkAxis, checkInts, deepEqual, defaultDevice, devices, dtypedArray, dtypedJsArray, generalBroadcast, getBackend, init, invertPermutation, isFloatDtype, isNumberPair, isPermutation, normalizeAxis, partitionList, prod, promoteTypes, range, recursiveFlatten, rep, reportScanBodySteps, reportScanPath, runWithCache, setDebug, setScanBodyStepsCallback, toposort, unravelAlu, unzip2, zip, zipn } from "./backend-CF00Eezo.js";
+import { AluExp, AluGroup, AluOp, AluVar, DEBUG, DType, FpHash, Kernel, PPrint, Reduction, Routine, Routines, ShapeTracker, accessorAluExp, accessorGlobal, assertNonNull, byteWidth, checkAxis, checkInts, deepEqual, defaultDevice, devices, dtypedArray, dtypedJsArray, generalBroadcast, getBackend, init, invertPermutation, isFloatDtype, isNumberPair, isPermutation, normalizeAxis, partitionList, prod, promoteTypes, range, recursiveFlatten, rep, reportScanBodySteps, reportScanPath, runWithCache, setDebug, setScanBodyStepsCallback, toposort, unravelAlu, unzip2, zip, zipn } from "./backend-lemtRNrp.js";
 import { createAllIterationsOffsetsBuffer, wrapRoutineForScan } from "./scan-wrapper-TpkqHRRF.js";
 
 //#region src/frontend/convolution.ts
@@ -6204,7 +6204,7 @@ const transposeRules = {
 			for (let i = numPrimalCarry; i < forwardOuts.length; i++) forwardOuts[i].dispose();
 			return newCarry;
 		};
-		const useCheckpointing = checkpoint != null;
+		const useCheckpointing = checkpoint !== false;
 		const segmentSize = useCheckpointing ? typeof checkpoint === "number" ? checkpoint : Math.max(1, Math.ceil(Math.sqrt(length))) : length;
 		const allCarries = useCheckpointing ? null : [];
 		const checkpointCarries = useCheckpointing ? /* @__PURE__ */ new Map() : null;

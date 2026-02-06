@@ -938,10 +938,10 @@ interface PrimitiveParamsImpl extends Record<Primitive, Record<string, any>> {
     /** Accepted scan path(s). Throws if actual path is not in this list. */
     acceptPath?: string | string[];
     /**
-     * Enable gradient checkpointing to reduce memory from O(N) to O(√N).
-     * - `true`: use segment size of ceil(√N)
+     * Control gradient checkpointing for the backward pass.
+     * - `undefined` or `true` (default): use √N checkpointing with segment size ceil(√N)
      * - A positive integer: use that as the segment size
-     * - `undefined` (default): store all intermediate carries (O(N) memory)
+     * - `false`: store all intermediate carries (O(N) memory, no recomputation)
      */
     checkpoint?: boolean | number;
   };
@@ -1577,26 +1577,29 @@ interface ScanOptions {
    */
   acceptPath?: ScanPath | ScanPath[];
   /**
-   * Enable gradient checkpointing to reduce memory during reverse-mode autodiff.
+   * Control gradient checkpointing during reverse-mode autodiff.
    *
-   * When differentiating through scan with `grad()` or `vjp()`, all N intermediate
-   * carry values are stored by default, using O(N) memory. With checkpointing enabled,
-   * only O(√N) checkpoints are stored, and intermediate values are recomputed from
-   * the nearest checkpoint during the backward pass. This trades ~2× computation
-   * for significantly reduced memory usage.
+   * By default, `grad(scan)` uses √N checkpointing: only O(√N) intermediate carry
+   * values are stored, and the rest are recomputed from the nearest checkpoint
+   * during the backward pass. This trades ~2× computation for O(√N) memory.
    *
-   * - `true`: use segment size of `ceil(√N)`
+   * - `undefined` or `true` (default): use segment size of `ceil(√N)`
    * - A positive integer: use that as the segment size (larger = more memory, less recompute)
-   * - `undefined` (default): store all intermediate carries (O(N) memory)
+   * - `false`: store all N intermediate carries (O(N) memory, no recomputation)
    *
    * @example
    * ```ts
-   * // Enable automatic √N checkpointing
-   * const loss = (xs) => {
-   *   const [carry, _] = lax.scan(step, init, xs, { checkpoint: true });
+   * // Default: √N checkpointing is used automatically
+   * const dxs = grad((xs) => {
+   *   const [carry, _] = lax.scan(step, init, xs);
    *   return carry.sum();
-   * };
-   * const dxs = grad(loss)(xs); // Uses O(√N) memory instead of O(N)
+   * })(xs);
+   *
+   * // Opt out: store all carries (faster, more memory)
+   * const dxs2 = grad((xs) => {
+   *   const [carry, _] = lax.scan(step, init, xs, { checkpoint: false });
+   *   return carry.sum();
+   * })(xs);
    * ```
    */
   checkpoint?: boolean | number;

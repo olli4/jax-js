@@ -276,58 +276,41 @@ export class WasmHl {
 
   /**
    * Copy memory: dst[0..byteCount] = src[0..byteCount]
+   * Uses WebAssembly bulk memory.copy instruction.
    *
    * @param dst - Local variable index for destination pointer
    * @param src - Local variable index for source pointer
    * @param byteCount - Number of bytes to copy (constant)
-   * @param tmpIdx - Local variable index for temporary counter
+   * @param _tmpIdx - Unused (kept for API compatibility)
    */
-  memcpy(dst: number, src: number, byteCount: number, tmpIdx: number): void {
+  memcpy(dst: number, src: number, byteCount: number, _tmpIdx?: number): void {
     const { cg } = this;
-
-    this.forLoop(tmpIdx, 0, byteCount, () => {
-      // dst[tmpIdx] = src[tmpIdx]
-      cg.local.get(dst);
-      cg.local.get(tmpIdx);
-      cg.i32.add();
-
-      cg.local.get(src);
-      cg.local.get(tmpIdx);
-      cg.i32.add();
-      cg.i32.load8_u(0);
-
-      cg.i32.store8(0);
-    });
+    cg.local.get(dst);
+    cg.local.get(src);
+    cg.i32.const(byteCount);
+    cg.memory.copy();
   }
 
   /**
    * Copy memory with dynamic byte count.
+   * Uses WebAssembly bulk memory.copy instruction.
    *
    * @param dst - Local variable index for destination pointer
    * @param src - Local variable index for source pointer
    * @param byteCountExpr - Callback that pushes byte count (i32) onto stack
-   * @param tmpIdx - Local variable index for temporary counter
+   * @param _tmpIdx - Unused (kept for API compatibility)
    */
   memcpyDynamic(
     dst: number,
     src: number,
     byteCountExpr: () => void,
-    tmpIdx: number,
+    _tmpIdx?: number,
   ): void {
     const { cg } = this;
-
-    this.forLoop(tmpIdx, 0, byteCountExpr, () => {
-      cg.local.get(dst);
-      cg.local.get(tmpIdx);
-      cg.i32.add();
-
-      cg.local.get(src);
-      cg.local.get(tmpIdx);
-      cg.i32.add();
-      cg.i32.load8_u(0);
-
-      cg.i32.store8(0);
-    });
+    cg.local.get(dst);
+    cg.local.get(src);
+    byteCountExpr();
+    cg.memory.copy();
   }
 
   // ============================================================================
