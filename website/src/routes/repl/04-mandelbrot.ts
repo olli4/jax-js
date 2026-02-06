@@ -1,48 +1,41 @@
-import { jit, numpy as np } from "@jax-js/jax";
+import { jit, lax, numpy as np } from "@jax-js/jax";
 
-// This example draws a Mandelbrot fractal using array operations and jit() for each step.
+// This example draws a Mandelbrot fractal using lax.scan for the iteration loop.
+// The scan compiles to a fused GPU loop — all 100 iterations run in a single
+// WebGPU/WASM dispatch, with no JS overhead per step.
 const width = 750;
 const height = 600;
+const iters = 100;
 
-function mandelbrotIteration(
-  A: np.Array,
-  B: np.Array,
-  V: np.Array,
-  X: np.Array,
-  Y: np.Array,
-) {
-  const Asq = A.ref.mul(A.ref);
-  const Bsq = B.ref.mul(B.ref);
-  V = V.add(Asq.ref.add(Bsq.ref).less(100).astype(np.float32));
-  const A2 = np.clip(Asq.sub(Bsq).add(X), -50, 50);
-  const B2 = np.clip(A.mul(B).mul(2).add(Y), -50, 50);
-  return [A2, B2, V];
-}
+type Carry = { A: np.Array; B: np.Array; V: np.Array };
 
-function calculateMandelbrot(iters: number) {
-  const x = np.linspace(-2, 0.5, width);
-  const y = np.linspace(-1, 1, height);
+const calculateMandelbrot = jit((X: np.Array, Y: np.Array) => {
+  const step = (carry: Carry, _x: null): [Carry, null] => {
+    const { A, B, V } = carry;
+    const Asq = A.ref.mul(A.ref);
+    const Bsq = B.ref.mul(B.ref);
+    const newV = V.add(Asq.ref.add(Bsq.ref).less(100).astype(np.float32));
+    const newA = np.clip(Asq.sub(Bsq).add(X.ref), -50, 50);
+    const newB = np.clip(A.mul(B).mul(2).add(Y.ref), -50, 50);
+    return [{ A: newA, B: newB, V: newV }, null];
+  };
 
-  const [X, Y] = np.meshgrid([x, y]);
+  const init: Carry = {
+    A: np.zeros(X.shape),
+    B: np.zeros(Y.shape),
+    V: np.zeros(X.shape),
+  };
+  const [final, _ys] = lax.scan(step, init, null, { length: iters });
+  return final.V;
+});
 
-  const f = jit(mandelbrotIteration);
+const x = np.linspace(-2, 0.5, width);
+const y = np.linspace(-1, 1, height);
+const [X, Y] = np.meshgrid([x, y]);
 
-  let A = np.zeros(X.shape);
-  let B = np.zeros(Y.shape);
-  let V = np.zeros(X.shape);
-  for (let i = 0; i < iters; i++) {
-    [A, B, V] = f(A, B, V, X.ref, Y.ref);
-  }
-  X.dispose();
-  Y.dispose();
-  A.dispose();
-  B.dispose();
-
-  return V;
-}
-
-const ar = calculateMandelbrot(100);
-const image = np.subtract(1, ar.div(100));
+const ar = calculateMandelbrot(X, Y);
+calculateMandelbrot.dispose();
+const image = np.subtract(1, ar.div(iters));
 
 // The REPL has a displayImage() builtin for drawing image pixels.
 await displayImage(image);

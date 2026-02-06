@@ -13,7 +13,7 @@ import * as random from "./library/random";
 import * as scipySpecial from "./library/scipy-special";
 import * as tree from "./tree";
 import type { JsTree, JsTreeDef, MapJsTree } from "./tree";
-import { setDebug } from "./utils";
+import { type ScanPath, setDebug, setScanBodyStepsCallback } from "./utils";
 
 import "./polyfills";
 
@@ -25,6 +25,7 @@ export {
   type Device,
   devices,
   DType,
+  getBackend,
   Jaxpr,
   type JsTree,
   type JsTreeDef,
@@ -33,7 +34,9 @@ export {
   numpy,
   type OwnedFunction,
   random,
+  type ScanPath,
   setDebug,
+  setScanBodyStepsCallback,
   scipySpecial,
   tree,
 };
@@ -350,3 +353,10 @@ export async function devicePut<T extends JsTree<any>>(
   );
   return tree.unflatten(structure, yflat) as any;
 }
+
+// Testing utilities - exported for Deno WebGPU tests that need scan-wrapper functions
+// These should only be imported from dist, never from src, to avoid module isolation issues
+export {
+  wrapRoutineForScan,
+  createAllIterationsOffsetsBuffer,
+} from "./backend/webgpu/scan-wrapper";

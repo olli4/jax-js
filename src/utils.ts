@@ -18,6 +18,76 @@ export function setDebug(level: number) {
   DEBUG = level;
 }
 
+/**
+ * Scan path types for diagnostic tracking.
+ * - "compiled-loop": Entire scan loop compiled to native code (WASM module or WebGPU shader)
+ * - "preencoded-routine": Pre-encoded GPU command dispatches with uniform offsets per iteration (WebGPU only)
+ * - "fallback": JS loop calling body program per iteration (one or more JS↔backend boundary crossings)
+ */
+export type ScanPath = "compiled-loop" | "preencoded-routine" | "fallback";
+
+/** Callback for tracking scan body execute steps (for testing fusion). */
+export type ScanBodyStepsCallback = (
+  executeSteps: number,
+  backend: string,
+  details?: { numCarry?: number; numY?: number },
+) => void;
+
+let scanBodyStepsCallback: ScanBodyStepsCallback | null = null;
+
+/**
+ * Set a callback to be notified when scan body is analyzed.
+ * Reports the number of execute steps in the compiled body program.
+ *
+ * This is useful for testing kernel fusion in scan bodies. An ideal
+ * implementation would fuse elementwise multi-output bodies into a
+ * single kernel, but currently each output creates a separate kernel.
+ *
+ * @param callback - Function called with (executeSteps, backend, details).
+ *                   Pass null to disable tracking.
+ *
+ * @example
+ * ```ts
+ * let bodySteps = 0;
+ * setScanBodyStepsCallback((steps) => { bodySteps = steps; });
+ * jit(() => lax.scan(body, init, xs))();
+ * expect(bodySteps).toBe(1); // Would be 1 if fully fused
+ * setScanBodyStepsCallback(null); // cleanup
+ * ```
+ */
+export function setScanBodyStepsCallback(
+  callback: ScanBodyStepsCallback | null,
+): void {
+  scanBodyStepsCallback = callback;
+}
+
+/** Internal: report scan body step count to registered callback. */
+export function reportScanBodySteps(
+  executeSteps: number,
+  backend: string,
+  details?: { numCarry?: number; numY?: number },
+): void {
+  if (scanBodyStepsCallback) {
+    scanBodyStepsCallback(executeSteps, backend, details);
+  }
+}
+
+/**
+ * Internal: report scan path choice (no-op, kept for compatibility with jit.ts).
+ * Path verification is now done via `acceptPath` option on `lax.scan()`.
+ */
+export function reportScanPath(
+  _path: ScanPath,
+  _backend: string,
+  _details?: {
+    numConsts?: number;
+    numCarry?: number;
+    length?: number;
+  },
+): void {
+  // No-op. Path verification is handled by checkAcceptedPath in jit.ts.
+}
+
 export function assertNonNull<T>(value: T): asserts value is NonNullable<T> {}
 
 export function unzip2<T, U>(pairs: Iterable<[T, U]>): [T[], U[]] {

@@ -165,4 +165,62 @@ suite("map()", () => {
     const expected = { a: [5, 7], b: { c: 9 } };
     expect(result).toEqual(expected);
   });
+
+  test("should support spread array of trees (JAX-style)", () => {
+    // Equivalent to JAX's: jax.tree.map(lambda *v: sum(v), *trees)
+    type Tree = { a: number; b: number };
+    const trees: [Tree, Tree, Tree] = [
+      { a: 1, b: 2 },
+      { a: 10, b: 20 },
+      { a: 100, b: 200 },
+    ];
+    const result = map(
+      (...xs: number[]) => xs.reduce((a, b) => a + b, 0),
+      ...trees,
+    );
+    expect(result).toEqual({ a: 111, b: 222 });
+  });
+
+  test("should throw on structure mismatch", () => {
+    const tree1 = { a: 1, b: 2 };
+    const tree2 = { a: 1, c: 2 }; // Different key
+    // Use 'as any' to bypass TypeScript's compile-time check (we want runtime error)
+    expect(() =>
+      map((x: number, y: number) => x + y, tree1, tree2 as any),
+    ).toThrow(/tree structure mismatch/);
+  });
+
+  test("should throw on structure mismatch (different nesting)", () => {
+    const tree1 = { a: [1, 2] };
+    const tree2 = { a: 1 }; // Not nested
+    // Use 'as any' to bypass TypeScript's compile-time check (we want runtime error)
+    expect(() =>
+      map((x: number, y: number) => x + y, tree1, tree2 as any),
+    ).toThrow(/tree structure mismatch/);
+  });
+
+  test("should support isLeaf option", () => {
+    // Treat 2-element arrays as leaves (tuples)
+    const myTree = { point: [1, 2], values: [3, 4, 5] };
+    const result = map(
+      (x: number | number[]) =>
+        Array.isArray(x) ? x.reduce((a, b) => a + b, 0) : x * 10,
+      myTree,
+      { isLeaf: (x) => Array.isArray(x) && x.length === 2 },
+    );
+    // point is treated as leaf (sum=3), values is recursed (each * 10)
+    expect(result).toEqual({ point: 3, values: [30, 40, 50] });
+  });
+
+  test("isLeaf should apply to all trees", () => {
+    const tree1 = { data: [1, 2] };
+    const tree2 = { data: [10, 20] };
+    const result = map(
+      (a: number[], b: number[]) => [...a, ...b],
+      tree1,
+      tree2,
+      { isLeaf: (x: number | number[]) => Array.isArray(x) },
+    );
+    expect(result).toEqual({ data: [1, 2, 10, 20] });
+  });
 });

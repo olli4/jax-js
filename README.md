@@ -1,3 +1,313 @@
+# jax-js with `lax.scan`
+
+This is an unofficial jax-js version with `lax.scan` implemented by an AI coding agent under human
+supervision. For more information see
+[.github/copilot-instructions.md](.github/copilot-instructions.md#part-2-scan-feature-reference).
+
+You can use this by adding to your package.json:
+
+```json
+  "dependencies": {
+    "@jax-js/jax": "git+https://github.com/olli4/jax-js.git#feat/scan"
+  },
+```
+
+# Function: scan
+
+Scan a function over leading array axes while carrying along state. Think of `scan` as a functional
+`reduce` that also returns all intermediate results. It iterates over the leading axis of `xs`,
+threading a "carry" value through each step and collecting outputs.
+
+> Source: `src/library/lax-scan.ts` (generated HTML: `docs/_jax-js/jax/lax/scan.html`)
+
+---
+
+## Type signature
+
+```ts
+scan(f, init, xs) → [finalCarry, ys]
+scan(f, init, null, { length }) → [finalCarry, ys]  // carry-only scan
+
+// Where:
+// f: (carry: C, x: X | null) => [C, Y | null]  -- step function
+// init: C                               -- initial carry
+// xs: X[] | null                        -- input array or null for carry-only
+// finalCarry: C                         -- carry after last iteration
+// ys: Y[] | null                        -- stacked outputs (null if Y=null)
+```
+
+### Type parameters
+
+- `Carry extends JsTree<Array>`
+- `X extends JsTree<Array> | null | undefined`
+- `Y extends JsTree<Array> | null`
+
+---
+
+## Semantics
+
+Roughly equivalent JS implementation:
+
+```js
+function scan(f, init, xs) {
+  let carry = init;
+  const ys = [];
+  for (const x of xs) {
+    const [newCarry, y] = f(carry, x);
+    carry = newCarry;
+    ys.push(y);
+  }
+  return [carry, np.stack(ys)];
+}
+```
+
+Differences vs a plain JS loop:
+
+- `xs` and `ys` can be arbitrary pytrees (nested objects/arrays).
+- The scan can be compiled to efficient native code (WASM/WebGPU).
+- Supports autodiff: `grad(f)` works through `scan`.
+- Carry shape/dtype must be fixed across iterations.
+
+---
+
+## Reference-counting contract
+
+**Inputs (consumed):**
+
+- `init` and `xs` are consumed by `scan` (refcount decremented).
+- Use `.ref` if you need to keep inputs alive: `scan(f, init.ref, xs.ref)`.
+
+**Body function:**
+
+- `carry` and `x` are **managed** by scan — do NOT manually dispose them.
+- Standard consumption rules apply inside the body (same as regular functions):
+  - **Single use:** `np.add(carry, x)` — no `.ref` needed, the operation consumes them.
+  - **Multiple uses:** Use `.ref` to keep alive for additional uses.
+- Return **new** arrays for `newCarry` and `y`.
+- For passthrough (same array in both), use `.ref`: `[result.ref, result]`.
+
+**Example — multiple uses of carry:**
+
+```ts
+// ✓ Works: .ref keeps carry alive, then bare carry is consumed in return
+const step = (carry, x) => {
+  const newCarry = np.add(carry.ref, x); // .ref: we'll use carry again
+  return [newCarry, carry]; // carry consumed here
+};
+
+// ✗ Fails: can't use carry in TWO separate operations after .ref
+const step = (carry, x) => {
+  const a = np.add(carry.ref, x); // first operation
+  const b = np.add(a, carry); // ERROR: second operation on carry
+  return [b, a.ref];
+};
+```
+
+**Workaround for complex bodies:** Use pytree carries so each field can be `.ref`'d independently:
+
+```ts
+const step = (carry, x) => {
+  // carry.a and carry.b are separate arrays with independent refcounts
+  const newA = np.add(carry.a.ref, carry.b.ref);
+  const newB = np.add(carry.b, x); // carry.b consumed (last use)
+  return [{ a: newA, b: newB }, carry.a]; // carry.a consumed (last use)
+};
+```
+
+**Outputs (caller owns):**
+
+- `finalCarry` and `ys` are owned by the caller — dispose when done.
+
+---
+
+## Parameters
+
+- `f(carry, x) => [newCarry, y]` — step function
+  - `carry`: current state (same structure as `init`)
+  - `x`: slice of `xs` along axis 0, or `null` when `xs` is `null`
+  - `newCarry`: updated state (same structure/shape as `carry`)
+  - `y`: output for the iteration, or `null` to skip stacking
+
+- `init` — initial carry (array or pytree)
+- `xs` — input sequence or `null` (when `null`, you must provide `{ length }`)
+- `options` — `ScanOptions` object (optional)
+
+### ScanOptions
+
+- `length?: number` — iteration count (required if `xs === null`).
+- `reverse?: boolean` — process `xs` in reverse order (default `false`).
+- `acceptPath?: ScanPath | ScanPath[]` — accept only these paths: `"compiled-loop"` (native code),
+  `"preencoded-routine"` (GPU routines), or `"fallback"` (JS loop). Throws if actual path is not in
+  the list.
+- `checkpoint?: boolean | number` — control gradient checkpointing for `grad(scan)`. Default
+  (undefined/true) uses √N checkpointing (O(√N) memory, ~2× compute). A number specifies the segment
+  size. `false` stores all carries (O(N) memory, no recomputation).
+
+---
+
+## Returns
+
+`[finalCarry, ys]` where:
+
+- `finalCarry` has the same structure as `init`.
+- `ys` matches the shape/structure of `y` returned by `f`, with an added leading axis of size
+  `length`. If the body returns `null` for `y`, then `ys` is `null` and no memory is allocated for
+  stacked outputs.
+
+---
+
+## Examples (extracted from generated docs)
+
+### Cumulative sum
+
+```ts
+const step = (carry, x) => {
+  const sum = np.add(carry, x);
+  return [sum, sum.ref];
+};
+const init = np.array([0.0]);
+const xs = np.array([[1], [2], [3], [4], [5]]);
+const [final, sums] = await lax.scan(step, init, xs);
+// final = [15], sums = [[1],[3],[6],[10],[15]]
+```
+
+### Factorial
+
+```ts
+const step = (carry, x) => {
+  const next = np.multiply(carry, x);
+  return [next, next.ref];
+};
+const init = np.array([1]);
+const xs = np.array([[1], [2], [3], [4], [5]]);
+const [final, factorials] = await lax.scan(step, init, xs);
+// factorials = [[1],[2],[6],[24],[120]]
+```
+
+### Pytree carry
+
+```ts
+const step = (carry, x) => {
+  const newSum = np.add(carry.sum, x);
+  const newCount = np.add(carry.count, np.array([1]));
+  return [
+    { sum: newSum.ref, count: newCount.ref },
+    { sum: newSum, count: newCount },
+  ];
+};
+const init = { sum: np.array([0]), count: np.array([0]) };
+const xs = np.array([[10], [20], [30]]);
+const [final, history] = await lax.scan(step, init, xs);
+// final.sum = [60], final.count = [3]
+```
+
+### Reverse scan
+
+```ts
+// Process sequence from end to beginning
+const [final, ys] = await lax.scan(step, init, xs, { reverse: true });
+```
+
+---
+
+## jax-js Extensions
+
+These features extend JAX's scan API for TypeScript/JavaScript ergonomics:
+
+### `xs = null` (carry-only scan)
+
+Pass `null` as `xs` with `{ length }` to iterate without input arrays. Useful for generators, RNG
+sequences, Fibonacci, or any state-only iteration. The body receives `null` as the second argument.
+
+```ts
+const step = (carry, _x) => {
+  const next = np.add(carry.ref, np.array([1.0]));
+  return [next, carry];
+};
+const init = np.array([0.0]);
+const [final, ys] = await lax.scan(step, init, null, { length: 5 });
+// ys = [0,1,2,3,4], final = [5]
+```
+
+### `Y = null` (skip output stacking)
+
+Return `[newCarry, null]` from the body to skip allocating stacked outputs. Useful when you only
+need the final carry (e.g., Mandelbrot iteration counts). The returned `ys` will be `null`, saving
+memory for large iteration counts.
+
+```ts
+const step = (carry, x) => {
+  const Asq = carry.A.ref.mul(carry.A);
+  const newA = Asq.add(x);
+  const newCount = carry.count.add(Asq.less(100).astype(np.int32));
+  return [{ A: newA, count: newCount }, null];
+};
+
+const init = { A: np.zeros([100]), count: np.zeros([100], np.int32) };
+const [final, ys] = await lax.scan(step, init, xs);
+// ys is null — no memory allocated for intermediate outputs
+```
+
+---
+
+## JIT compilation patterns
+
+### `jit(scan)` — compile whole loop (recommended)
+
+```ts
+const scanFn = jit((init, xs) => lax.scan(step, init, xs));
+const [final, ys] = await scanFn(init, xs);
+scanFn.dispose();
+```
+
+### `scan(jit(body))` — JIT-compile step only (JS loop)
+
+Each iteration calls compiled code, but the loop itself runs in JS. Useful when the step is
+expensive but you want to inspect intermediate values or the scan body is dynamic.
+
+```ts
+const step = jit((carry, x) => {
+  const newCarry = np.add(carry, x);
+  return [newCarry, newCarry.ref];
+});
+
+const [final, ys] = await lax.scan(step, init, xs);
+step.dispose(); // Free compiled step function
+```
+
+### With `grad` for differentiation
+
+```ts
+const loss = (init, xs) => {
+  const [final, ys] = lax.scan(step, init, xs);
+  final.dispose();
+  return np.sum(ys);
+};
+
+const gradLoss = grad(loss);
+const [dInit, dXs] = await gradLoss(init, xs);
+```
+
+---
+
+## Autodiff
+
+- `grad` / JVP / VJP are supported through `scan`.
+- Current implementation stores all intermediate carries for reverse-mode (O(N) memory).
+- Roadmap: implement √N checkpointing to reduce memory to O(√N) with ~2× recompute.
+
+---
+
+## Implementation notes (where to look in the codebase)
+
+- Frontend / tracing & Jaxpr: `src/library/lax-scan.ts`.
+- Primitive: `Primitive.Scan` and backend lowerings (`native-scan`, `batched-scan`, `scan`).
+- WebGPU/WASM codegen and scan-specific helpers: `src/backend/*` (see `scan-wrapper.ts`,
+  `webgpu.ts`).
+- Tests: `test/lax-scan.test.ts`, `test/jit-scan-dlm.test.ts`.
+
+---
+
 <h1 align="center">jax-js: JAX in pure JavaScript</h1>
 
 <p align="center"><strong>
@@ -60,6 +370,7 @@ Here's a quick, high-level comparison with other popular web ML runtimes:
 | `jvp()` forward differentiation | ✅         | ❌              | ❌                 |
 | `jit()` kernel fusion           | ✅         | ❌              | ❌                 |
 | `vmap()` auto-vectorization     | ✅         | ❌              | ❌                 |
+| `lax.scan()` functional loops   | ✅         | ❌              | ❌                 |
 | Graph capture                   | ✅         | ❌              | ✅                 |
 | **Backends & Data**             |            |                 |                    |
 | WebGPU backend                  | ✅         | 🟡 Preview      | ✅                 |

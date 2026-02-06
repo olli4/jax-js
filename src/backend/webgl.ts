@@ -71,6 +71,11 @@ export class WebGLBackend implements Backend {
     this.#nextSlot = 1;
   }
 
+  /** Return the number of currently allocated slots (for leak detection). */
+  slotCount(): number {
+    return this.#buffers.size;
+  }
+
   /**
    * Allocate a buffer with a specific dtype.
    *
@@ -260,6 +265,11 @@ export class WebGLBackend implements Backend {
   }
 
   prepareKernelSync(kernel: Kernel): Executable<ShaderDispatch> {
+    if (kernel.isMultiOutput) {
+      throw new Error(
+        "Multi-output kernel not supported for WebGL - should fall back to single kernels",
+      );
+    }
     const shader = generateShader(kernel);
     const cached = this.#programCache.get(shader.code);
     if (cached) return new Executable(kernel, cached);

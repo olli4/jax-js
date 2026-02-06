@@ -94,6 +94,9 @@ export enum Primitive {
 
   // JIT compilation
   Jit = "jit",
+
+  // Control flow
+  Scan = "scan",
 }
 
 interface PrimitiveParamsImpl extends Record<Primitive, Record<string, any>> {
@@ -120,6 +123,22 @@ interface PrimitiveParamsImpl extends Record<Primitive, Record<string, any>> {
   [Primitive.Pad]: { width: Pair[] };
   [Primitive.TriangularSolve]: { unitDiagonal: boolean };
   [Primitive.Jit]: { name: string; jaxpr: Jaxpr; numConsts: number };
+  [Primitive.Scan]: {
+    jaxpr: Jaxpr;
+    numCarry: number;
+    numConsts: number;
+    length: number;
+    reverse: boolean;
+    /** Accepted scan path(s). Throws if actual path is not in this list. */
+    acceptPath?: string | string[];
+    /**
+     * Control gradient checkpointing for the backward pass.
+     * - `undefined` or `true` (default): use √N checkpointing with segment size ceil(√N)
+     * - A positive integer: use that as the segment size
+     * - `false`: store all intermediate carries (O(N) memory, no recomputation)
+     */
+    checkpoint?: boolean | number;
+  };
 }
 
 /** Type of parameters taken by each primitive. */

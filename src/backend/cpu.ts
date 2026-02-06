@@ -1,4 +1,4 @@
-import { AluOp, dtypedArray, Kernel } from "../alu";
+import { AluOp, DType, dtypedArray, Kernel } from "../alu";
 import { Backend, Device, Executable, Slot, SlotError } from "../backend";
 import { Routine, runCpuRoutine } from "../routine";
 import { tuneNullopt } from "../tuner";
@@ -43,6 +43,10 @@ export class CpuBackend implements Backend {
     if (buffer.ref === 0) {
       this.#buffers.delete(slot);
     }
+  }
+
+  slotCount(): number {
+    return this.#buffers.size;
   }
 
   async read(
@@ -90,15 +94,25 @@ export class CpuBackend implements Backend {
     }
 
     const kernel = exe.source as Kernel;
+    if (kernel.isMultiOutput) {
+      return this.#dispatchMultiKernel(kernel, inputs, outputs);
+    }
     const { exp, epilogue } = tuneNullopt(kernel);
     const inputBuffers = inputs.map((slot) => this.#getBuffer(slot));
     const outputBuffers = outputs.map((slot) => this.#getBuffer(slot));
 
+    // Collect both GlobalIndex and GlobalView nodes to determine which input buffers are used.
+    // GlobalView is used for lazy reshape/transpose operations within JIT.
     const usedArgs = new Map(
       [
-        ...exp.collect((exp) => exp.op === AluOp.GlobalIndex),
+        ...exp.collect(
+          (exp) => exp.op === AluOp.GlobalIndex || exp.op === AluOp.GlobalView,
+        ),
         ...(epilogue
-          ? epilogue.collect((exp) => exp.op === AluOp.GlobalIndex)
+          ? epilogue.collect(
+              (exp) =>
+                exp.op === AluOp.GlobalIndex || exp.op === AluOp.GlobalView,
+            )
           : []),
       ].map((exp) => [exp.arg[0] as number, exp.dtype]),
     );
@@ -129,6 +143,48 @@ export class CpuBackend implements Backend {
           acc = kernel.reduction.evaluate(acc, item);
         }
         outputArray[i] = epilogue!.evaluate({ acc, gidx: i }, globals);
+      }
+    }
+  }
+
+  #dispatchMultiKernel(kernel: Kernel, inputs: Slot[], outputs: Slot[]): void {
+    const inputBuffers = inputs.map((slot) => this.#getBuffer(slot));
+    const size = kernel.outputs[0].size;
+
+    // Collect all used args from all output expressions
+    const allUsedArgs = new Map<number, DType>();
+    for (const out of kernel.outputs) {
+      const usedArgs = out.exp.collect(
+        (exp) => exp.op === AluOp.GlobalIndex || exp.op === AluOp.GlobalView,
+      );
+      for (const exp of usedArgs) {
+        allUsedArgs.set(exp.arg[0] as number, exp.dtype);
+      }
+    }
+
+    const inputArrays = inputBuffers.map((buf, i) => {
+      const dtype = allUsedArgs.get(i);
+      if (!dtype) return null!;
+      return dtypedArray(dtype, buf);
+    });
+
+    const outputArrays = outputs.map((slot, i) =>
+      dtypedArray(kernel.dtypeAt(i), this.#getBuffer(slot)),
+    );
+
+    const globals = (gid: number, bufidx: number) => {
+      if (gid < 0 || gid >= inputArrays.length)
+        throw new Error("gid out of bounds: " + gid);
+      if (bufidx < 0 || bufidx >= inputArrays[gid].length)
+        throw new Error("bufidx out of bounds: " + bufidx);
+      return inputArrays[gid][bufidx];
+    };
+
+    // Multi-output kernels have no reduction support
+    for (let i = 0; i < size; i++) {
+      for (let outIdx = 0; outIdx < kernel.outputs.length; outIdx++) {
+        const out = kernel.outputs[outIdx];
+        outputArrays[outIdx][i] = out.exp.evaluate({ gidx: i }, globals);
       }
     }
   }
