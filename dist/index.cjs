@@ -30,8 +30,8 @@ var __toESM = (mod$1, isNodeMode, target) => (target = mod$1 != null ? __create(
 }) : target, mod$1));
 
 //#endregion
-const require_backend = require('./backend-AjwbgGNH.cjs');
-const require_scan_wrapper = require('./scan-wrapper-DwEpNxdy.cjs');
+const require_backend = require('./backend-BWk40kZB.cjs');
+const require_scan_wrapper = require('./scan-wrapper-BPGiR3nw.cjs');
 
 //#region src/frontend/convolution.ts
 /**
@@ -2044,7 +2044,7 @@ var JitProgram = class {
 					}
 				}
 				if (require_backend.DEBUG >= 2) console.log(`[jit.scan] Before scanRunner: outputSlots=${outputSlots}, step.outputs=${step.outputs}`);
-				const result = scanRunner(step.bodyProgram, this.backend, step.bodyJaxpr, step.length, step.numCarry, step.numConsts, step.numX, step.numY, step.reverse, constSlots, initCarrySlots, xsSlots, step.xsAvals, step.preallocateY ?? false, outputSlots);
+				const result = scanRunner(step.bodyProgram, this.backend, step.bodyJaxpr, step.length, step.numCarry, step.numConsts, step.numX, step.numY, step.reverse, constSlots, initCarrySlots, xsSlots, step.xsAvals, outputSlots);
 				if (require_backend.DEBUG >= 2) console.log(`[jit.scan] After scanRunner: result.outputs=${result.outputs}`);
 				for (let i = 0; i < step.outputs.length; i++) scope.set(step.outputs[i], result.outputs[i]);
 				if (require_backend.DEBUG >= 2) console.log(`[jit.scan] After scope.set: scope.get(${step.outputs[0]})=${scope.get(step.outputs[0])}`);
@@ -2333,8 +2333,7 @@ function jitCompile(backend, jaxpr) {
 				initCarry: initCarryIds,
 				xs: xsIds,
 				xsAvals,
-				outputs,
-				preallocateY: params.preallocateY ?? false
+				outputs
 			});
 			continue;
 		}
@@ -4236,7 +4235,7 @@ var Array$1 = class Array$1 extends Tracer {
 				const { backend, committed } = Array$1.#computeBackend("jit", args);
 				args = args.map((ar) => ar._putSync(backend));
 				const jp = jitCompile(backend, jaxpr);
-				const scanRunner = (bodyProgram, _backend, bodyJaxpr, length, numCarry, _numConsts, _numX, numY, reverse, constSlots, initCarrySlots, xsSlots, xsAvals, preallocateY, outputSlots) => {
+				const scanRunner = (bodyProgram, _backend, bodyJaxpr, length, numCarry, _numConsts, _numX, numY, reverse, constSlots, initCarrySlots, xsSlots, xsAvals, outputSlots) => {
 					const carryAvals = bodyJaxpr.inBinders.slice(constSlots.length, constSlots.length + numCarry).map((v) => v.aval);
 					const constSlotsRealized = constSlots;
 					const xs = xsSlots.map((slot, i) => new Array$1({
@@ -4248,16 +4247,6 @@ var Array$1 = class Array$1 extends Tracer {
 						committed,
 						pending: []
 					}));
-					const xSliceSts = xs.map((x) => {
-						const sliceSts = [];
-						const squeezedShape = x.shape.slice(1);
-						for (let iter = 0; iter < length; iter++) {
-							const i = reverse ? length - 1 - iter : iter;
-							const slicePairs = x.shape.map((s, axis) => axis === 0 ? [i, i + 1] : [0, s]);
-							sliceSts.push(x.#st.shrink(slicePairs).reshape(squeezedShape));
-						}
-						return sliceSts;
-					});
 					let carry = initCarrySlots.map((slot, i) => new Array$1({
 						source: slot,
 						st: require_backend.ShapeTracker.fromShape(carryAvals[i].shape),
@@ -4268,12 +4257,17 @@ var Array$1 = class Array$1 extends Tracer {
 						pending: []
 					}));
 					const bodyOutAvals = bodyJaxpr.outs.map((v) => v.aval);
-					const canPreallocateY = preallocateY && numY > 0 && outputSlots.length === numCarry + numY && (backend.copyBufferToBuffer || backend.copyBufferWithShader);
+					const canDirectWriteY = numY > 0 && outputSlots.length === numCarry + numY && (backend.copyBufferToBuffer || backend.copyBufferWithShader);
 					const yStrideBytes = bodyOutAvals.slice(numCarry).map((aval) => require_backend.prod(aval.shape) * require_backend.byteWidth(aval.dtype));
 					const ySlices = [];
-					if (!canPreallocateY) for (let j = 0; j < numY; j++) ySlices.push([]);
+					if (!canDirectWriteY) for (let j = 0; j < numY; j++) ySlices.push([]);
 					for (let i = 0; i < length; i++) {
-						const xSlice = xs.map((x, xIdx) => x.ref.#reshape(xSliceSts[xIdx][i]));
+						const dataIdx = reverse ? length - 1 - i : i;
+						const xSlice = xs.map((x) => {
+							const slicePairs = x.shape.map((s, axis) => axis === 0 ? [dataIdx, dataIdx + 1] : [0, s]);
+							const squeezedShape = x.shape.slice(1);
+							return x.ref.#reshape(x.#st.shrink(slicePairs).reshape(squeezedShape));
+						});
 						const carrySlots = carry.map((c) => c._realizeSource());
 						const xSliceSlots = xSlice.map((x) => x._realizeSource());
 						for (const x of xSlice) for (const exe of x.#pending) {
@@ -4308,7 +4302,7 @@ var Array$1 = class Array$1 extends Tracer {
 						});
 						const newCarry = outArrays.slice(0, numCarry);
 						const ySlice = outArrays.slice(numCarry);
-						if (canPreallocateY) {
+						if (canDirectWriteY) {
 							const writeIndex = reverse ? length - 1 - i : i;
 							for (let j = 0; j < numY; j++) {
 								const sizeBytes = yStrideBytes[j];
@@ -4330,10 +4324,10 @@ var Array$1 = class Array$1 extends Tracer {
 							carry.forEach((c) => c.dispose());
 						}
 						carry = newCarry;
-						if (canPreallocateY) ySlice.forEach((y) => y.dispose());
+						if (canDirectWriteY) ySlice.forEach((y) => y.dispose());
 					}
 					let stackedYs = [];
-					if (!canPreallocateY) stackedYs = ySlices.map((slices) => {
+					if (!canDirectWriteY) stackedYs = ySlices.map((slices) => {
 						const reshaped = slices.map((s) => {
 							const expanded = s.ref.#reshape(s.#st.reshape([1, ...s.shape]));
 							s.dispose();
@@ -4354,7 +4348,7 @@ var Array$1 = class Array$1 extends Tracer {
 						return stacked;
 					});
 					const carryOutSlots = carry.map((c) => c._realizeSource());
-					const yOutSlots = canPreallocateY ? outputSlots.slice(numCarry) : stackedYs.map((y) => y._realizeSource());
+					const yOutSlots = canDirectWriteY ? outputSlots.slice(numCarry) : stackedYs.map((y) => y._realizeSource());
 					const carryPending = carry.flatMap((c) => c.#pending);
 					const ysPending = stackedYs.flatMap((y) => y.#pending);
 					const finalPending = [...carryPending, ...ysPending];
@@ -4396,22 +4390,50 @@ var Array$1 = class Array$1 extends Tracer {
 				const numX = xs.length;
 				const numY = jaxpr.outs.length - numCarry;
 				if (jaxpr.inBinders.length !== numConsts + numCarry + numX) throw new Error(`scan jaxpr expects ${jaxpr.inBinders.length} inputs, got ${numConsts + numCarry + numX}`);
-				const xSliceSts = xs.map((x) => {
-					const sliceSts = [];
-					const squeezedShape = x.shape.slice(1);
-					for (let iter = 0; iter < length; iter++) {
-						const i = reverse ? length - 1 - iter : iter;
-						const slicePairs = x.shape.map((s, axis) => axis === 0 ? [i, i + 1] : [0, s]);
-						sliceSts.push(x.#st.shrink(slicePairs).reshape(squeezedShape));
-					}
-					return sliceSts;
-				});
 				const constViews = consts.map((c) => c.ref.#reshape(c.#st));
+				const { backend } = Array$1.#computeBackend("scan", args);
+				const bodyOutAvals = jaxpr.outs.map((v) => v.aval);
+				const canDirectWriteY = numY > 0 && (backend.copyBufferToBuffer || backend.copyBufferWithShader);
+				const yStrideBytes = bodyOutAvals.slice(numCarry).map((aval) => require_backend.prod(aval.shape) * require_backend.byteWidth(aval.dtype));
+				const preallocatedYs = [];
+				const preallocatedSlots = [];
+				if (canDirectWriteY) {
+					const yOutAtoms = jaxpr.outs.slice(numCarry);
+					for (const atom of yOutAtoms) {
+						const aval = atom.aval;
+						const ySizeBytes = length * require_backend.prod(aval.shape) * require_backend.byteWidth(aval.dtype);
+						if (ySizeBytes === 0) {
+							const stacked = zeros([length, ...aval.shape], {
+								dtype: aval.dtype,
+								device: backend.type
+							});
+							preallocatedYs.push(stacked);
+							preallocatedSlots.push(stacked._realizeSource());
+							continue;
+						}
+						const slot = backend.malloc(ySizeBytes);
+						preallocatedSlots.push(slot);
+						preallocatedYs.push(new Array$1({
+							source: slot,
+							st: require_backend.ShapeTracker.fromShape([length, ...aval.shape]),
+							dtype: aval.dtype,
+							weakType: aval.weakType,
+							backend,
+							committed: true,
+							pending: []
+						}));
+					}
+				}
 				const ySlices = [];
-				for (let j = 0; j < numY; j++) ySlices.push([]);
+				if (!canDirectWriteY) for (let j = 0; j < numY; j++) ySlices.push([]);
 				let carry = initCarry;
 				for (let i = 0; i < length; i++) {
-					const xSlice = xs.map((x, xIdx) => x.ref.#reshape(xSliceSts[xIdx][i]));
+					const dataIdx = reverse ? length - 1 - i : i;
+					const xSlice = xs.map((x) => {
+						const slicePairs = x.shape.map((s, axis) => axis === 0 ? [dataIdx, dataIdx + 1] : [0, s]);
+						const squeezedShape = x.shape.slice(1);
+						return x.ref.#reshape(x.#st.shrink(slicePairs).reshape(squeezedShape));
+					});
 					const jaxprInputs = [
 						...constViews.map((c) => c.ref),
 						...carry.map((c) => c.ref),
@@ -4420,7 +4442,24 @@ var Array$1 = class Array$1 extends Tracer {
 					const outs = evalJaxpr(jaxpr, jaxprInputs);
 					const newCarry = outs.slice(0, numCarry);
 					const ySlice = outs.slice(numCarry);
-					for (let j = 0; j < numY; j++) ySlices[j].push(ySlice[j]);
+					if (canDirectWriteY) {
+						const writeIndex = reverse ? length - 1 - i : i;
+						for (let j = 0; j < numY; j++) {
+							const sizeBytes = yStrideBytes[j];
+							if (sizeBytes <= 0) continue;
+							const dstOffsetBytes = writeIndex * sizeBytes;
+							const ySlot = ySlice[j]._realizeSource();
+							for (const exe of ySlice[j].#pending) {
+								exe.prepareSync();
+								exe.submit();
+							}
+							const dstSlot = preallocatedSlots[j];
+							const canBufferCopy = dstOffsetBytes % 4 === 0 && sizeBytes % 4 === 0;
+							if (backend.copyBufferToBuffer && canBufferCopy) backend.copyBufferToBuffer(ySlot, 0, dstSlot, dstOffsetBytes, sizeBytes);
+							else if (backend.copyBufferWithShader) backend.copyBufferWithShader(ySlot, 0, dstSlot, dstOffsetBytes, sizeBytes);
+							ySlice[j].dispose();
+						}
+					} else for (let j = 0; j < numY; j++) ySlices[j].push(ySlice[j]);
 					if (i > 0) carry.forEach((c) => c.dispose());
 					carry = newCarry;
 				}
@@ -4428,6 +4467,7 @@ var Array$1 = class Array$1 extends Tracer {
 				xs.forEach((x) => x.dispose());
 				consts.forEach((c) => c.dispose());
 				constViews.forEach((c) => c.dispose());
+				if (canDirectWriteY) return [...carry, ...preallocatedYs];
 				const stackedYs = ySlices.map((slices) => {
 					const reshaped = slices.map((s) => {
 						const expanded = s.ref.#reshape(s.#st.reshape([1, ...s.shape]));
@@ -8927,7 +8967,7 @@ function triangularSolve(a, b, { leftSide = false, lower = false, transposeA = f
 */
 function scan(f, init$1, xs, options) {
 	const opts = options ?? {};
-	const { length: lengthOpt, reverse = false, acceptPath, checkpoint, preallocateY = true } = opts;
+	const { length: lengthOpt, reverse = false, acceptPath, checkpoint } = opts;
 	const xsIsNull = xs === null;
 	const [initFlat, initTreedef] = flatten(init$1);
 	const [xsFlat, xsTreedef] = xsIsNull ? [[], null] : flatten(xs);
@@ -8988,8 +9028,7 @@ function scan(f, init$1, xs, options) {
 		length: n,
 		reverse,
 		acceptPath,
-		checkpoint,
-		preallocateY
+		checkpoint
 	});
 	initFlat.forEach((arr) => arr.dispose());
 	xsFlat.forEach((arr) => arr.dispose());

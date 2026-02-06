@@ -142,12 +142,6 @@ interface PrimitiveParamsImpl extends Record<Primitive, Record<string, any>> {
      * - `false`: store all intermediate carries (O(N) memory, no recomputation)
      */
     checkpoint?: boolean | number;
-    /**
-     * If true, preallocate stacked-Y buffers on the scan fallback path and
-     * write each iteration's Y directly into the preallocated buffers using
-     * `dynamic_update_slice`/`arr.at(i).set(src)` to avoid concat churn.
-     */
-    preallocateY?: boolean;
   };
 }
 

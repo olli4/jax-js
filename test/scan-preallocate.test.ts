@@ -7,15 +7,15 @@ beforeAll(async () => {
   if (devices.includes("cpu")) defaultDevice("cpu");
 });
 
-describe("lax.scan preallocateY", () => {
-  it("produces correct stacked outputs with preallocateY=true", async () => {
+describe("lax.scan preallocated ys", () => {
+  it("produces correct stacked outputs", async () => {
     const step = (carry: any, x: any): [any, any] => {
       const nc = carry.add(x);
       return [nc, nc];
     };
     const initCarry = np.zeros([1]);
     const xs = np.array([[1], [2], [3], [4]]);
-    const f = jit(() => lax.scan(step, initCarry, xs, { preallocateY: true }));
+    const f = jit(() => lax.scan(step, initCarry, xs));
 
     const [final, ys] = f();
     const yjs = await ys.jsAsync();
@@ -24,14 +24,14 @@ describe("lax.scan preallocateY", () => {
     final.dispose();
   });
 
-  it("handles duplicate-slot ys with preallocateY=true", async () => {
+  it("handles duplicate-slot ys", async () => {
     const step = (carry: np.Array, x: np.Array): [np.Array, any] => {
       const nc = np.add(carry, x);
       return [nc, { a: nc.ref, b: nc.ref }];
     };
     const initCarry = np.zeros([1]);
     const xs = np.array([[1], [2], [3]]);
-    const f = jit(() => lax.scan(step, initCarry, xs, { preallocateY: true }));
+    const f = jit(() => lax.scan(step, initCarry, xs));
 
     const [final, ys] = f();
     const ysObj = ys as { a: np.Array; b: np.Array };
@@ -42,7 +42,7 @@ describe("lax.scan preallocateY", () => {
     final.dispose();
   });
 
-  it("handles passthrough ys with preallocateY=true", async () => {
+  it("handles passthrough ys", async () => {
     const step = (carry: np.Array, x: np.Array): [np.Array, np.Array] => {
       const carryRef = carry.ref;
       const nc = np.add(carry, x);
@@ -50,7 +50,7 @@ describe("lax.scan preallocateY", () => {
     };
     const initCarry = np.zeros([1]);
     const xs = np.array([[1], [2], [3]]);
-    const f = jit(() => lax.scan(step, initCarry, xs, { preallocateY: true }));
+    const f = jit(() => lax.scan(step, initCarry, xs));
 
     const [final, ys] = f();
     const yjs = await ys.jsAsync();
@@ -58,16 +58,14 @@ describe("lax.scan preallocateY", () => {
     final.dispose();
   });
 
-  it("handles reverse=true with preallocateY=true", async () => {
+  it("handles reverse=true", async () => {
     const step = (carry: np.Array, x: np.Array): [np.Array, np.Array] => {
       const nc = np.add(carry, x);
       return [nc, nc];
     };
     const initCarry = np.zeros([1]);
     const xs = np.array([[1], [2], [3], [4]]);
-    const f = jit(() =>
-      lax.scan(step, initCarry, xs, { preallocateY: true, reverse: true }),
-    );
+    const f = jit(() => lax.scan(step, initCarry, xs, { reverse: true }));
 
     const [final, ys] = f();
     const yjs = await ys.jsAsync();
@@ -77,14 +75,14 @@ describe("lax.scan preallocateY", () => {
     final.dispose();
   });
 
-  it("handles length=0 with preallocateY=true", async () => {
+  it("handles length=0", async () => {
     const step = (carry: np.Array, x: np.Array): [np.Array, np.Array] => {
       const nc = np.add(carry, x);
       return [nc, nc];
     };
     const initCarry = np.zeros([1]);
     const xs = np.zeros([0, 1]);
-    const f = jit(() => lax.scan(step, initCarry, xs, { preallocateY: true }));
+    const f = jit(() => lax.scan(step, initCarry, xs));
 
     const [final, ys] = f();
     const yjs = await ys.jsAsync();

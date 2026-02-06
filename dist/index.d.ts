@@ -555,6 +555,10 @@ interface Backend {
   read(slot: Slot, start?: number, count?: number): Promise<Uint8Array<ArrayBuffer>>;
   /** Read a range of bytes from a buffer, blocking variant. */
   readSync(slot: Slot, start?: number, count?: number): Uint8Array<ArrayBuffer>;
+  /** Copy bytes between two device buffers (optional fast path). */
+  copyBufferToBuffer?(src: Slot, srcOffset: number, dst: Slot, dstOffset: number, size: number): void;
+  /** Copy bytes between two device buffers using a shader (optional). */
+  copyBufferWithShader?(src: Slot, srcOffset: number, dst: Slot, dstOffset: number, size: number): void;
   /** Prepare an expression to be executed later. */
   prepareKernel(kernel: Kernel): Promise<Executable>;
   /** Prepare an expression to be executed later, blocking variant. */
@@ -931,12 +935,6 @@ interface PrimitiveParamsImpl extends Record<Primitive, Record<string, any>> {
      * - `false`: store all intermediate carries (O(N) memory, no recomputation)
      */
     checkpoint?: boolean | number;
-    /**
-     * If true, preallocate stacked-Y buffers on the scan fallback path and
-     * write each iteration's Y directly into the preallocated buffers using
-     * `dynamic_update_slice`/`arr.at(i).set(src)` to avoid concat churn.
-     */
-    preallocateY?: boolean;
   };
 }
 /** Type of parameters taken by each primitive. */
@@ -1605,14 +1603,6 @@ interface ScanOptions {
    * ```
    */
   checkpoint?: boolean | number;
-  /**
-   * If true (default), the scan fallback path will preallocate stacked-Y
-   * buffers and write each iteration's Y directly into the preallocated
-   * buffers. This avoids stack overflow on long scans and reduces intermediate
-   * allocations. Set to false only for debugging.
-   * @default true
-   */
-  preallocateY?: boolean;
 }
 /**
  * Scan a function over leading array axes while carrying along state.

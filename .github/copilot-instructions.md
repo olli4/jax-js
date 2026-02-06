@@ -593,11 +593,10 @@ const [finalCarry, stackedOutputs] = await lax.scan(f, initCarry, xs, options);
 - `checkpoint?: boolean | number` — Control gradient checkpointing for `grad(scan)`. Default
   (undefined/true) uses √N checkpointing. A number specifies the segment size. `false` stores all
   carries (O(N) memory).
-- `preallocateY?: boolean` — When true (default) and using the JS fallback scan path, preallocates
-  the stacked Y output buffer and writes each iteration's Y directly via `copyBufferToBuffer`
-  (4-byte aligned) or the WGSL copy shader (unaligned). Avoids stack overflow on long scans and
-  reduces O(length) intermediate arrays from `coreConcatenate`. No effect on compiled-loop or
-  preencoded-routine paths (they already write directly).
+- Fallback Y stacking: the JS fallback scan path preallocates the stacked Y output buffer and writes
+  each iteration's Y directly via `copyBufferToBuffer` (4-byte aligned) or the WGSL copy shader
+  (unaligned). This avoids stack overflow on long scans and reduces O(length) intermediate arrays
+  from `coreConcatenate`. Compiled-loop and preencoded-routine already write directly.
 
 **Scan paths (`ScanPath` type):**
 
@@ -1747,23 +1746,21 @@ contributors should be aware of:
   object via `(flatF as any)._yTreedef = yTreedef`. This is invisible to TypeScript and could be
   replaced with a closure variable.
 
-- **Fallback Y stacking with `preallocateY`:** The `scanRunner` in `array.ts` supports two Y
-  stacking strategies. Without `preallocateY`, it accumulates Y slices and stacks them via chunked
-  `coreConcatenate` (groups of 6). With `preallocateY: true`, it preallocates the final stacked-Y
-  buffer and writes each iteration's Y directly using `copyBufferToBuffer` (when 4-byte aligned) or
-  the WGSL copy shader `COPY_SHADER_CODE` (when unaligned, e.g., f16 arrays with odd element
-  counts). The WGSL copy shader indexes by destination word to avoid read-modify-write races between
-  threads. See `test/scan-preallocate.test.ts` for edge-case coverage (duplicate-slot, passthrough,
-  reverse, length-0). The preencoded scan path (`dispatchPreencodedScan`) also uses the WGSL copy
-  shader for ys stacking when carry sizes are not 4-byte aligned.
+- **Fallback Y stacking:** The `scanRunner` in `array.ts` preallocates the final stacked-Y buffer
+  and writes each iteration's Y directly using `copyBufferToBuffer` (when 4-byte aligned) or the
+  WGSL copy shader `COPY_SHADER_CODE` (when unaligned, e.g., f16 arrays with odd element counts).
+  The WGSL copy shader indexes by destination word to avoid read-modify-write races between threads.
+  See `test/scan-preallocate.test.ts` for edge-case coverage (duplicate-slot, passthrough, reverse,
+  length-0). The preencoded scan path (`dispatchPreencodedScan`) also uses the WGSL copy shader for
+  ys stacking when carry sizes are not 4-byte aligned.
 
 ### Future work
 
-| Priority | Feature                         | Notes                                                         |
-| -------- | ------------------------------- | ------------------------------------------------------------- |
-| Medium   | Mixed-dtype WebGPU scan shader  | Per-binding dtype in `nativeScanMultiShaderSource`            |
-| Medium   | Auto-detect preallocateY        | Infer when preallocateY is beneficial without explicit opt-in |
-| Low      | `lax.scatter` / `dynamic_slice` | Would enable Jaxpr-based routines                             |
+| Priority | Feature                         | Notes                                              |
+| -------- | ------------------------------- | -------------------------------------------------- |
+| Medium   | Mixed-dtype WebGPU scan shader  | Per-binding dtype in `nativeScanMultiShaderSource` |
+| Medium   | WebGL copy for scan stacking    | Enable direct-write stacked Ys on WebGL fallback   |
+| Low      | `lax.scatter` / `dynamic_slice` | Would enable Jaxpr-based routines                  |
 
 #### Completed: Preallocated Y stacking
 
@@ -1772,7 +1769,7 @@ The following planned steps are now implemented:
 1. ✅ `dynamic_update_slice(dst, src, offset)` primitive and `arr.at(i).set(src)` frontend API.
 2. ✅ CPU/WASM fast-path (`copyBufferToBuffer`) and WGSL copy shader fallback.
 3. ✅ WebGPU WGSL copy kernel (`COPY_SHADER_CODE`) with pipeline caching.
-4. ✅ `scanRunner` preallocateY path — direct-write into preallocated output buffers.
+4. ✅ `scanRunner` direct-write path — preallocated stacked-Y output buffers.
 5. ✅ Preencoded scan (`dispatchPreencodedScan`) uses shader copy for unaligned ys stacking.
 6. ✅ Tests: passthrough, duplicate-slot, reverse, length-0 (`test/scan-preallocate.test.ts`).
 
@@ -1791,14 +1788,14 @@ The following planned steps are now implemented:
 
 ### Test files
 
-| File                                            | Purpose                                       |
-| ----------------------------------------------- | --------------------------------------------- |
-| `test/lax-scan.test.ts`                         | Main scan test suite (~3000 lines)            |
-| `test/scan-preallocate.test.ts`                 | preallocateY edge cases (dup/passthrough/rev) |
-| `test/jit-scan-dlm.test.ts`                     | Kalman filter integration tests               |
-| `test/deno/webgpu.test.ts`                      | Headless WebGPU tests via Deno                |
-| `test/deno/preencoded-scan.test.ts`             | Preencoded scan integration                   |
-| `test/deno/preencoded-scan-integration.test.ts` | Multi-kernel WebGPU scan                      |
+| File                                            | Purpose                                         |
+| ----------------------------------------------- | ----------------------------------------------- |
+| `test/lax-scan.test.ts`                         | Main scan test suite (~3000 lines)              |
+| `test/scan-preallocate.test.ts`                 | preallocated Y edge cases (dup/passthrough/rev) |
+| `test/jit-scan-dlm.test.ts`                     | Kalman filter integration tests                 |
+| `test/deno/webgpu.test.ts`                      | Headless WebGPU tests via Deno                  |
+| `test/deno/preencoded-scan.test.ts`             | Preencoded scan integration                     |
+| `test/deno/preencoded-scan-integration.test.ts` | Multi-kernel WebGPU scan                        |
 
 ### Deno WebGPU test guidelines
 

@@ -186,6 +186,24 @@ export interface Backend {
   /** Read a range of bytes from a buffer, blocking variant. */
   readSync(slot: Slot, start?: number, count?: number): Uint8Array<ArrayBuffer>;
 
+  /** Copy bytes between two device buffers (optional fast path). */
+  copyBufferToBuffer?(
+    src: Slot,
+    srcOffset: number,
+    dst: Slot,
+    dstOffset: number,
+    size: number,
+  ): void;
+
+  /** Copy bytes between two device buffers using a shader (optional). */
+  copyBufferWithShader?(
+    src: Slot,
+    srcOffset: number,
+    dst: Slot,
+    dstOffset: number,
+    size: number,
+  ): void;
+
   /** Prepare an expression to be executed later. */
   prepareKernel(kernel: Kernel): Promise<Executable>;
 

@@ -231,6 +231,18 @@ export class WasmBackend implements Backend {
     return buffer.slice(start, start + count);
   }
 
+  copyBufferToBuffer(
+    src: Slot,
+    srcOffset: number,
+    dst: Slot,
+    dstOffset: number,
+    size: number,
+  ): void {
+    const srcBuf = this.#getBuffer(src);
+    const dstBuf = this.#getBuffer(dst);
+    dstBuf.set(srcBuf.subarray(srcOffset, srcOffset + size), dstOffset);
+  }
+
   async prepareKernel(kernel: Kernel): Promise<Executable<WasmProgram>> {
     return this.prepareKernelSync(kernel);
   }

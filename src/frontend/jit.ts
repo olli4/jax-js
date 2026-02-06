@@ -77,7 +77,6 @@ export type JitStep =
       xs: JitId[];
       xsAvals: ShapedArray[]; // xs avals from the scan's input (for shape tracking)
       outputs: JitId[]; // [carry_out..., stacked_ys...]
-      preallocateY?: boolean;
     }
   | {
       type: "compiled-loop";
@@ -125,7 +124,6 @@ export type ScanRunner = (
   initCarrySlots: Slot[],
   xsSlots: Slot[],
   xsAvals: ShapedArray[],
-  preallocateY: boolean,
   outputSlots: Slot[],
 ) => { outputs: Slot[]; pending: PendingExecute[] };
 
@@ -355,9 +353,6 @@ export class JitProgram {
             initCarrySlots,
             xsSlots,
             step.xsAvals,
-            // Pass the preallocateY hint to the scanRunner so it can preallocate
-            // and write outputs directly into the provided outputSlots when true.
-            step.preallocateY ?? false,
             outputSlots,
           );
 
@@ -881,8 +876,6 @@ export function jitCompile(backend: Backend, jaxpr: Jaxpr): JitProgram {
         xs: xsIds,
         xsAvals,
         outputs,
-        // Carry forward preallocation hint from the original primitive params
-        preallocateY: params.preallocateY ?? false,
       });
       continue;
     }
