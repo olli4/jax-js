@@ -593,10 +593,11 @@ const [finalCarry, stackedOutputs] = await lax.scan(f, initCarry, xs, options);
 - `checkpoint?: boolean | number` — Control gradient checkpointing for `grad(scan)`. Default
   (undefined/true) uses √N checkpointing. A number specifies the segment size. `false` stores all
   carries (O(N) memory).
-- `preallocateY?: boolean` — When true and using the JS fallback scan path, preallocates the stacked
-  Y output buffer and writes each iteration's Y directly via `copyBufferToBuffer` (4-byte aligned)
-  or the WGSL copy shader (unaligned). Avoids O(length) intermediate arrays from `coreConcatenate`.
-  No effect on compiled-loop or preencoded-routine paths (they already write directly).
+- `preallocateY?: boolean` — When true (default) and using the JS fallback scan path, preallocates
+  the stacked Y output buffer and writes each iteration's Y directly via `copyBufferToBuffer`
+  (4-byte aligned) or the WGSL copy shader (unaligned). Avoids stack overflow on long scans and
+  reduces O(length) intermediate arrays from `coreConcatenate`. No effect on compiled-loop or
+  preencoded-routine paths (they already write directly).
 
 **Scan paths (`ScanPath` type):**
 

@@ -142,9 +142,9 @@ const step = (carry, x) => {
 - `checkpoint?: boolean | number` — control gradient checkpointing for `grad(scan)`. Default
   (undefined/true) uses √N checkpointing (O(√N) memory, ~2× compute). A number specifies the segment
   size. `false` stores all carries (O(N) memory, no recomputation).
-- `preallocateY?: boolean` — when `true`, the scan fallback path preallocates the stacked-Y output
-  buffer and writes each iteration's Y directly, avoiding intermediate allocations from
-  concatenation.
+- `preallocateY?: boolean` — when `true` (default), the scan fallback path preallocates the
+  stacked-Y output buffer and writes each iteration's Y directly, avoiding stack overflow on long
+  scans and reducing intermediate allocations.
 
 ---
 

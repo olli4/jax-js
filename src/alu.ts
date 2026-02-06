@@ -603,34 +603,80 @@ export class AluExp implements FpHashable {
   /**
    * Simplify the expression by replacing any known patterns and deduping
    * identical subexpressions.
+   *
+   * Uses iterative post-order traversal to avoid stack overflow on deep trees.
    */
   simplify(cache: Map<bigint, AluExp> = new Map()): AluExp {
-    // Cache this to avoid recomputing if it's called twice.
+    // Fast path: already simplified
     if (this.#simplified !== undefined) return this.#simplified;
 
-    // Extra help: `cache` can be used across multiple calls.
+    // Iterative post-order traversal to handle deep expression trees without
+    // stack overflow. We first collect all nodes in post-order (children before
+    // parents), then process them iteratively.
+    const toProcess: AluExp[] = [];
+    const stack: AluExp[] = [this];
+    const visited = new Set<AluExp>();
+
+    // Build post-order list
+    while (stack.length > 0) {
+      const node = stack[stack.length - 1];
+
+      // Skip if already simplified or cached
+      if (node.#simplified !== undefined || cache.has(node.getHash())) {
+        stack.pop();
+        continue;
+      }
+
+      if (visited.has(node)) {
+        // All children processed, add to process list
+        stack.pop();
+        toProcess.push(node);
+      } else {
+        visited.add(node);
+        // Push children (they will be processed first)
+        for (const child of node.src) {
+          if (child.#simplified === undefined && !cache.has(child.getHash())) {
+            stack.push(child);
+          }
+        }
+      }
+    }
+
+    // Process nodes in post-order (children are guaranteed to be simplified first)
+    for (const node of toProcess) {
+      node.#simplifyNode(cache);
+    }
+
+    return this.#simplified ?? this;
+  }
+
+  /** Simplify a single node, assuming all children are already simplified. */
+  #simplifyNode(cache: Map<bigint, AluExp>): void {
+    if (this.#simplified !== undefined) return;
+
     const hash = this.getHash();
     const prevCachedValue = cache.get(hash);
     if (prevCachedValue !== undefined) {
-      return (this.#simplified = prevCachedValue);
+      this.#simplified = prevCachedValue;
+      return;
     }
+
     const simplified = this.#simplifyInner(cache);
     const simplifiedHash = simplified.getHash();
     const prevSimplified = cache.get(simplifiedHash);
     if (prevSimplified !== undefined) {
       cache.set(hash, prevSimplified);
       this.#simplified = prevSimplified;
-      return prevSimplified;
     } else {
       cache.set(hash, simplified);
       cache.set(simplifiedHash, simplified);
       this.#simplified = simplified;
-      return simplified;
     }
   }
 
   #simplifyInner(cache: Map<bigint, AluExp>): AluExp {
-    const src = this.src.map((x) => x.simplify(cache));
+    // Children are already simplified (by iterative traversal), just look them up
+    const src = this.src.map((x) => x.#simplified ?? x.simplify(cache));
     const { op } = this;
 
     // Constant folding.
