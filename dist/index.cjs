@@ -30,7 +30,7 @@ var __toESM = (mod$1, isNodeMode, target) => (target = mod$1 != null ? __create(
 }) : target, mod$1));
 
 //#endregion
-const require_backend = require('./backend-CjvWQBLT.cjs');
+const require_backend = require('./backend-CRnKzaQU.cjs');
 const require_scan_wrapper = require('./scan-wrapper-BeVQahyp.cjs');
 
 //#region src/frontend/convolution.ts

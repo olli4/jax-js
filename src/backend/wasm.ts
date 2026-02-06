@@ -1257,6 +1257,154 @@ function codegenNativeScanGeneral(
     });
   }
 
+  // ---- Direct-write optimization analysis ----
+  // For each internal buffer, check if it can be redirected:
+  // - Write kernel output directly to carryOut instead of internal buffer
+  // - Also write inline to ysStacked in the kernel loop if Y needs it
+  // This eliminates memory.copy calls in Steps 2b and 2c for kernel outputs.
+  //
+  // An internal buffer can be redirected if:
+  // 1. It's produced by a Kernel step (not a Routine)
+  // 2. The kernel has no reduction (prevents self-overwrite when reading carry
+  //    in the reduction inner loop across elements)
+  // 3. No other step reads from it (no data dependencies)
+  // 4. It maps to exactly one carry output (carryOutSources)
+  // 5. No Y output is a passthrough from the target carry index
+  //    (passthrough reads OLD carry, but direct-write overwrites it in the kernel)
+  // 6. No later step reads the target carry index as an input
+  //    (later steps should see the carry from the START of the iteration)
+  //
+  // When redirected:
+  // - Kernel writes to carryOut[c] instead of internals[idx]
+  // - If a Y output also references this internal, we emit a second store in the kernel loop
+  // - Step 2b and 2c skip the memory.copy for this internal
+
+  // Helper: collect all carry indices referenced by an expression
+  const numInputs = numConsts + numCarry + numX;
+  function collectCarryReads(exp: AluExp): Set<number> {
+    const result = new Set<number>();
+    exp.fold((e: AluExp) => {
+      if (e.op === AluOp.GlobalIndex || e.op === AluOp.GlobalView) {
+        const gid = (e.arg as number[])[0];
+        if (gid >= numConsts && gid < numConsts + numCarry) {
+          result.add(gid - numConsts);
+        }
+      }
+    });
+    return result;
+  }
+
+  // Track which internal buffers are read by other steps
+  const internalReadByStep = new Set<number>();
+  for (const step of steps) {
+    for (const slotIdx of step.inputSlots) {
+      if (slotIdx >= numInputs) {
+        internalReadByStep.add(slotIdx - numInputs);
+      }
+    }
+  }
+
+  // Collect per-step carry reads (which carry indices each step's kernel accesses)
+  const stepCarryReads: Set<number>[] = [];
+  for (const step of steps) {
+    const reads = new Set<number>();
+    if (step.source instanceof Kernel) {
+      for (const out of step.source.outputs) {
+        for (const c of collectCarryReads(out.exp)) reads.add(c);
+        if (out.reduction?.epilogue) {
+          for (const c of collectCarryReads(out.reduction.epilogue))
+            reads.add(c);
+        }
+      }
+    }
+    stepCarryReads.push(reads);
+  }
+
+  // For each internal buffer, find if it maps to a carry output
+  const internalToCarry = new Map<number, number>(); // internalIdx → carryIdx
+  for (let c = 0; c < numCarry; c++) {
+    const src = carryOutSources[c];
+    if (src.type === "internal") {
+      internalToCarry.set(src.internalIdx!, c);
+    }
+  }
+
+  // For each internal buffer, find if it maps to a Y output
+  const internalToY = new Map<number, number>(); // internalIdx → yIdx
+  for (let y = 0; y < numY; y++) {
+    const src = yOutputSources[y];
+    if (src.type === "internal") {
+      internalToY.set(src.internalIdx!, y);
+    }
+  }
+
+  // Set of carry indices that have a Y passthrough reading from them
+  const yPassthroughCarries = new Set<number>();
+  for (let y = 0; y < numY; y++) {
+    const src = yOutputSources[y];
+    if (src.type === "passthrough") {
+      yPassthroughCarries.add(src.carryIdx!);
+    }
+  }
+
+  // Build the redirect map: internalIdx → { carryIdx, yIdx? }
+  // Only for kernel steps where all safety conditions are met
+  interface DirectWrite {
+    carryIdx: number; // write to carryOut[carryIdx] instead of internal
+    yIdx?: number; // also write inline to ysStacked[yIdx] (if applicable)
+  }
+  const directWriteMap = new Map<number, DirectWrite>();
+
+  // Find which internal buffers are produced by each step
+  for (let stepIdx = 0; stepIdx < steps.length; stepIdx++) {
+    const step = steps[stepIdx];
+    if (step.source instanceof Kernel) {
+      // Condition 2: no reduction (prevents self-overwrite in reduction inner loop)
+      if (step.source.hasReduction) continue;
+
+      const indices = step.source.isMultiOutput
+        ? step.outputInternalIndices!
+        : [step.outputInternalIdx];
+
+      for (const intIdx of indices) {
+        if (!internalToCarry.has(intIdx)) continue; // Condition 4: maps to carry
+        if (internalReadByStep.has(intIdx)) continue; // Condition 3: not read by other step
+
+        const carryIdx = internalToCarry.get(intIdx)!;
+
+        // Condition 5: no Y passthrough from the target carry
+        if (yPassthroughCarries.has(carryIdx)) continue;
+
+        // Condition 6: no later step reads the target carry
+        let laterStepReadsCarry = false;
+        for (let s = stepIdx + 1; s < steps.length; s++) {
+          if (stepCarryReads[s].has(carryIdx)) {
+            laterStepReadsCarry = true;
+            break;
+          }
+        }
+        if (laterStepReadsCarry) continue;
+
+        const dw: DirectWrite = { carryIdx };
+        if (internalToY.has(intIdx)) {
+          dw.yIdx = internalToY.get(intIdx)!;
+        }
+        directWriteMap.set(intIdx, dw);
+      }
+    }
+  }
+
+  if (DEBUG >= 2 && directWriteMap.size > 0) {
+    console.log(
+      `[wasm-scan] direct-write optimization: ${directWriteMap.size} internal buffers redirected`,
+      [...directWriteMap.entries()].map(([intIdx, dw]) => ({
+        intIdx,
+        carryIdx: dw.carryIdx,
+        yIdx: dw.yIdx,
+      })),
+    );
+  }
+
   const cg = new CodeGenerator();
   cg.memory.import("env", "memory");
 
@@ -1483,20 +1631,71 @@ function codegenNativeScanGeneral(
             // For each output, compute and store value
             for (let outIdx = 0; outIdx < tunedOutputs.length; outIdx++) {
               const out = tunedOutputs[outIdx];
-              const internalIdx = outIndices[outIdx];
+              const outIntIdx = outIndices[outIdx];
+              const dw = directWriteMap.get(outIntIdx);
+              const bw = byteWidth(out.dtype);
+              const storeAlign = Math.log2(bw);
 
-              // Compute output address: internals[internalIdx] + gidx * elementSize
-              cg.local.get(internalsBase + internalIdx);
-              cg.local.get(gidx);
-              cg.i32.const(byteWidth(out.dtype));
-              cg.i32.mul();
-              cg.i32.add();
+              if (dw) {
+                // Direct-write: store to carryOut instead of internal buffer
+                // If also a Y output, use local.tee to store to both destinations
+                if (dw.yIdx !== undefined) {
+                  // Need value in a temp local for two stores
+                  const tmpVal = cg.local.declare(dty(cg, null, out.dtype));
+                  translateExpWithGeneralScanContext(
+                    cg,
+                    funcs,
+                    out.exp,
+                    scanCtx,
+                  );
+                  cg.local.set(tmpVal);
 
-              // Translate expression and push value onto stack
-              translateExpWithGeneralScanContext(cg, funcs, out.exp, scanCtx);
+                  // Store to carryOut[carryIdx] + gidx * bw
+                  cg.local.get(carryOutBase + dw.carryIdx);
+                  cg.local.get(gidx);
+                  cg.i32.const(bw);
+                  cg.i32.mul();
+                  cg.i32.add();
+                  cg.local.get(tmpVal);
+                  dty(cg, null, out.dtype).store(storeAlign);
 
-              // Store result to internal buffer (address already on stack)
-              dty(cg, null, out.dtype).store(Math.log2(byteWidth(out.dtype)));
+                  // Store to ysStacked[yIdx] + dataIdx * yStride + gidx * bw
+                  cg.local.get(ysStackedBase + dw.yIdx);
+                  cg.local.get(dataIdx);
+                  cg.i32.const(ysStrides[dw.yIdx]);
+                  cg.i32.mul();
+                  cg.i32.add();
+                  cg.local.get(gidx);
+                  cg.i32.const(bw);
+                  cg.i32.mul();
+                  cg.i32.add();
+                  cg.local.get(tmpVal);
+                  dty(cg, null, out.dtype).store(storeAlign);
+                } else {
+                  // Only carryOut destination
+                  cg.local.get(carryOutBase + dw.carryIdx);
+                  cg.local.get(gidx);
+                  cg.i32.const(bw);
+                  cg.i32.mul();
+                  cg.i32.add();
+                  translateExpWithGeneralScanContext(
+                    cg,
+                    funcs,
+                    out.exp,
+                    scanCtx,
+                  );
+                  dty(cg, null, out.dtype).store(storeAlign);
+                }
+              } else {
+                // Original: store to internal buffer
+                cg.local.get(internalsBase + outIntIdx);
+                cg.local.get(gidx);
+                cg.i32.const(bw);
+                cg.i32.mul();
+                cg.i32.add();
+                translateExpWithGeneralScanContext(cg, funcs, out.exp, scanCtx);
+                dty(cg, null, out.dtype).store(storeAlign);
+              }
             }
 
             // gidx++
@@ -1513,6 +1712,10 @@ function codegenNativeScanGeneral(
           const kernel = step.source;
           const tune = tuneNullopt(kernel);
           const re = kernel.reduction;
+          const dw = directWriteMap.get(internalIdx);
+          const bw = byteWidth(kernel.dtype);
+          const storeAlign = Math.log2(bw);
+          const needsDualStore = dw && dw.yIdx !== undefined;
 
           // Inner loop over kernel output elements
           cg.i32.const(0);
@@ -1525,10 +1728,16 @@ function codegenNativeScanGeneral(
             cg.i32.ge_u();
             cg.br_if(0);
 
-            // Compute output address: internals[internalIdx] + gidx * elementSize
-            cg.local.get(internalsBase + internalIdx);
+            // Compute primary output address
+            if (dw) {
+              // Direct-write: store to carryOut[carryIdx] + gidx * bw
+              cg.local.get(carryOutBase + dw.carryIdx);
+            } else {
+              // Original: store to internals[internalIdx] + gidx * bw
+              cg.local.get(internalsBase + internalIdx);
+            }
             cg.local.get(gidx);
-            cg.i32.const(byteWidth(kernel.dtype));
+            cg.i32.const(bw);
             cg.i32.mul();
             cg.i32.add();
 
@@ -1582,10 +1791,28 @@ function codegenNativeScanGeneral(
               translateExpWithGeneralScanContext(cg, funcs, tune.exp, scanCtx);
             }
 
-            // Store result to internal buffer (address already on stack)
-            dty(cg, null, kernel.dtype).store(
-              Math.log2(byteWidth(kernel.dtype)),
-            );
+            if (needsDualStore) {
+              // Save value to temp local, then store to both destinations
+              const tmpVal = cg.local.declare(dty(cg, null, kernel.dtype));
+              cg.local.tee(tmpVal);
+              // Store to primary (carryOut) - address is already on stack below
+              dty(cg, null, kernel.dtype).store(storeAlign);
+              // Store to ysStacked[yIdx] + dataIdx * yStride + gidx * bw
+              cg.local.get(ysStackedBase + dw!.yIdx!);
+              cg.local.get(dataIdx);
+              cg.i32.const(ysStrides[dw!.yIdx!]);
+              cg.i32.mul();
+              cg.i32.add();
+              cg.local.get(gidx);
+              cg.i32.const(bw);
+              cg.i32.mul();
+              cg.i32.add();
+              cg.local.get(tmpVal);
+              dty(cg, null, kernel.dtype).store(storeAlign);
+            } else {
+              // Store result (address already on stack)
+              dty(cg, null, kernel.dtype).store(storeAlign);
+            }
 
             // gidx++
             cg.local.get(gidx);
@@ -1603,6 +1830,16 @@ function codegenNativeScanGeneral(
       // NOTE: Must run BEFORE carry update (2c) so passthrough reads OLD carry values
       for (let y = 0; y < numY; y++) {
         const source = yOutputSources[y];
+
+        // Skip if this Y output was already direct-written by the kernel
+        if (
+          source.type === "internal" &&
+          directWriteMap.has(source.internalIdx!) &&
+          directWriteMap.get(source.internalIdx!)!.yIdx === y
+        ) {
+          continue;
+        }
+
         const yStride = ysStrides[y];
 
         // Determine source pointer and size
@@ -1653,6 +1890,15 @@ function codegenNativeScanGeneral(
       // Step 2c: Copy carry outputs from internal buffers (or passthrough) to carryOut (for next iteration)
       for (let c = 0; c < numCarry; c++) {
         const source = carryOutSources[c];
+
+        // Skip if this carry output was already direct-written by the kernel
+        if (
+          source.type === "internal" &&
+          directWriteMap.has(source.internalIdx!)
+        ) {
+          continue;
+        }
+
         const size = carrySizes[c];
 
         // For passthrough, the carry output is the carry input (no copy needed if same buffer)

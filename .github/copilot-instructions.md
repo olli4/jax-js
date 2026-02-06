@@ -664,7 +664,17 @@ module, eliminating JS/WASM boundary overhead per iteration.
 **Performance benchmarks:**
 
 - Fallback (JS loop): ~500 iter/sec
-- Compiled-loop: ~13-16M iter/sec
+- Compiled-loop: ~50-80M iter/sec (small elementwise bodies, L=1000)
+- Compiled-loop with direct-write: **40-65% faster** than without for small bodies
+
+**Small scan throughput (L=1000 iterations, WASM compiled-loop):**
+
+| Body Pattern               | Throughput    | Notes                                    |
+| -------------------------- | ------------- | ---------------------------------------- |
+| Cumsum (scalar)            | ~62M iter/sec | 1 carry, 1 Y, direct-write active        |
+| Carry-only (4×4, Y=null)   | ~50M iter/sec | 1 carry, no Y output                     |
+| Elementwise (n=4, Y=carry) | ~78M iter/sec | 1 carry, 1 Y, direct-write active        |
+| Passthrough Y (4×4)        | ~35M iter/sec | Y = old carry, direct-write not eligible |
 
 **Scan vs jit(loop) overhead:**
 
@@ -1198,6 +1208,24 @@ All WASM scan variants use `codegenNativeScanGeneral`:
    - Copy Y outputs from source (carry passthrough, xs passthrough, or internal buffer)
    - Copy carry outputs for next iteration
 5. Free internal buffers, return WebAssembly.Module
+
+**Direct-write optimization:**
+
+When a kernel step's output is used only as a carry output (and optionally also as a Y output), the
+kernel writes directly to `carryOut` (and `ysStacked`) instead of an internal buffer. This
+eliminates `memory.copy` calls in steps 2b/2c, providing **40-65% speedup** for small scan bodies.
+
+Eligibility conditions (all must be met):
+
+1. Output produced by a Kernel step (not a Routine)
+2. Kernel has no reduction (prevents self-overwrite during inner loop)
+3. Internal buffer not read by any other step
+4. Maps to exactly one carry output
+5. No Y output is a passthrough from the target carry (passthrough reads OLD carry)
+6. No later step reads the target carry as input
+
+When a Y output also references the same internal buffer, the kernel uses `local.tee` to store the
+computed value to both `carryOut` and `ysStacked` in a single pass.
 
 **Y output sources (`YOutputSource` type):**
 
