@@ -146,6 +146,21 @@ pnpm test                          # Run all tests
 
 These match the checks in `.github/workflows/ci.yaml`.
 
+### Rebase to main
+
+When the user asks to "rebase to main", perform these steps:
+
+1. `git fetch origin` — update remote refs
+2. `git rebase origin/main` — rebase current branch onto latest main
+3. If conflicts occur, resolve them (prefer keeping both sides' intent), then
+   `git add <resolved files>` and `GIT_EDITOR=true git rebase --continue` (use `GIT_EDITOR=true` to
+   avoid opening an interactive editor)
+4. `pnpm vitest run` — verify all tests pass after rebase
+5. `git push --force-with-lease` — update remote branch (safe force-push)
+
+**Important:** Always use `GIT_EDITOR=true` when running `git rebase --continue` to prevent the
+terminal from getting stuck in vim. Always use `--force-with-lease` (not `--force`) for the push.
+
 ### Temporary files
 
 Use `tmp/` in the project root for temporary/scratch files. This directory is gitignored and allows
