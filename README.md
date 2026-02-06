@@ -306,7 +306,8 @@ const [dInit, dXs] = await gradLoss(init, xs);
 ## Implementation notes (where to look in the codebase)
 
 - Frontend / tracing & Jaxpr: `src/library/lax-scan.ts`.
-- Primitive: `Primitive.Scan` and backend lowerings (`native-scan`, `batched-scan`, `scan`).
+- Primitive: `Primitive.Scan` and backend lowerings (`compiled-loop`, `preencoded-routine`,
+  `fallback`).
 - WebGPU/WASM codegen and scan-specific helpers: `src/backend/*` (see `scan-wrapper.ts`,
   `webgpu.ts`).
 - Tests: `test/lax-scan.test.ts`, `test/jit-scan-dlm.test.ts`, `test/scan-preallocate.test.ts`,

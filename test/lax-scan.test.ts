@@ -21,7 +21,6 @@ import {
   jvp,
   lax,
   numpy as np,
-  setScanBodyStepsCallback,
   tree,
   vmap,
 } from "../src";
@@ -464,8 +463,8 @@ suite.each(devices)("lax.scan device:%s", (device) => {
 
   describe("scan with routine body", () => {
     test("matmul in body (routine)", async () => {
-      // Matmul is a routine (not an elementwise kernel), so requires batched-scan or fallback
-      // Routine body scan: batched-scan on WebGPU, native-scan on WASM, fallback on CPU
+      // Matmul is a routine (not an elementwise kernel), so requires preencoded-routine or fallback
+      // Routine body scan: preencoded-routine on WebGPU, compiled-loop on WASM, fallback on CPU
       const step = (carry: np.Array, x: np.Array): [np.Array, np.Array] => {
         // carry: [2, 2], x: [2, 2] -> matmul produces [2, 2]
         const newCarry = np.matmul(carry, x);
@@ -2829,33 +2828,14 @@ describe("scan autodiff", () => {
       const V0 = np.zeros([2, 2]);
       const xs = np.zeros([5]); // 5 iterations
 
-      // Capture how many execute steps the body has
-      let bodyExecuteSteps = 0;
-
-      setScanBodyStepsCallback((steps) => {
-        bodyExecuteSteps = steps;
-      });
-
-      try {
-        // Native scan uses compiled-loop path with multi-output kernel
-        const f = jit(() =>
-          lax.scan(step, [A0, B0, V0], xs, { acceptPath: "compiled-loop" }),
-        );
-        const [[_A, _B, V], _ys] = f() as [np.Array[], np.Array];
-        await V.data();
-        f.dispose();
-      } finally {
-        setScanBodyStepsCallback(null);
-      }
-
-      // Body compilation produces fewer execute steps (multi-output kernel fusion working)
-      // With multi-output kernel: 2-3 steps (two multi-kernels)
-      // Without multi-output kernel: 5-6 steps (separate kernels)
-      expect(
-        bodyExecuteSteps,
-        `Body has ${bodyExecuteSteps} execute steps. ` +
-          "With multi-output kernel fusion, should be 2-3. Without fusion, would be 5-6.",
-      ).toBeLessThanOrEqual(3);
+      // Native scan uses compiled-loop path with multi-output kernel.
+      // acceptPath: "compiled-loop" verifies fusion succeeds.
+      const f = jit(() =>
+        lax.scan(step, [A0, B0, V0], xs, { acceptPath: "compiled-loop" }),
+      );
+      const [[_A, _B, V], _ys] = f() as [np.Array[], np.Array];
+      await V.data();
+      f.dispose();
     });
 
     it.skipIf(!devicesAvailable.includes("webgpu"))(

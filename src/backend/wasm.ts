@@ -546,32 +546,7 @@ export class WasmBackend implements Backend {
     try {
       const bytes = codegenNativeScanGeneral(params);
       const module = new WebAssembly.Module(bytes);
-      // Create a synthetic executable for typing purposes
-      // Find the first Kernel to use as the source (or create a dummy one)
-      let firstKernel: Kernel | null = null;
-      for (const step of params.steps) {
-        if (step.source instanceof Kernel) {
-          firstKernel = step.source;
-          break;
-        }
-      }
-      if (!firstKernel) {
-        // All steps are Routines - create a minimal dummy kernel for the Executable type
-        // This is a hack but the Executable is just used to hold the module
-        firstKernel = Kernel.single(
-          0,
-          0,
-          AluExp.const(DType.Float32, 0),
-          undefined,
-        );
-      }
-      const syntheticKernel = Kernel.single(
-        firstKernel.nargs,
-        firstKernel.size,
-        firstKernel.exp,
-        firstKernel.reduction,
-      );
-      return new Executable(syntheticKernel, { module });
+      return new Executable(null, { module });
     } catch (e) {
       if (DEBUG >= 1) {
         console.warn("General native scan codegen failed:", e);

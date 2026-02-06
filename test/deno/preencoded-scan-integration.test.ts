@@ -1,7 +1,7 @@
 /**
  * Integration test for scan with various body types on WebGPU.
  *
- * Note: Batched scan is only used when:
+ * Note: Preencoded scan is only used when:
  * - Body is a single Routine step (not Kernel)
  * - Routine doesn't already use uniforms (excludes Sort/Argsort)
  * - numCarry === numY
@@ -11,9 +11,8 @@
  *
  * Test Environment: Deno native WebGPU (requires GPU hardware)
  * Why Deno: Provides working WebGPU access when Chromium's implementation doesn't work.
- * Regular test equivalent: test/batched-scan-integration.test.ts (may skip on some systems)
  *
- * Run with: deno test --unstable-webgpu --allow-read --allow-env --no-check test/deno/batched-scan-integration.test.ts
+ * Run with: deno test --unstable-webgpu --allow-read --allow-env --no-check test/deno/preencoded-scan-integration.test.ts
  */
 
 import {
@@ -64,7 +63,7 @@ Deno.test({
       // Concatenate, sort, and take the first 4 elements (a streaming min-heap)
       // But wait, that's multiple operations...
       //
-      // For batched scan to work, we need EXACTLY one routine call.
+      // For preencoded scan to work, we need EXACTLY one routine call.
       // Since sort outputs the sorted array, we can't do anything else.
       //
       // Simplest case: sort the incoming x, pass the sorted x as both carry and output

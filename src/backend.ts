@@ -258,11 +258,11 @@ export interface Backend {
     size: number,
   ): void;
 
-  /** Prepare a batched scan operation (WebGPU backend). */
-  prepareBatchedScan?(params: any): any | null;
+  /** Prepare a preencoded scan operation (WebGPU backend). */
+  preparePreencodedScan?(params: any): any | null;
 
-  /** Dispatch a batched scan operation (WebGPU backend). */
-  dispatchBatchedScan?(
+  /** Dispatch a preencoded scan operation (WebGPU backend). */
+  dispatchPreencodedScan?(
     prepared: any,
     consts: Slot[],
     initCarry: Slot[],
@@ -274,8 +274,8 @@ export interface Backend {
 
 export class Executable<T = any> {
   constructor(
-    /** The `Kernel` or `Routine` that was prepared. */
-    readonly source: Kernel | Routine,
+    /** The `Kernel` or `Routine` that was prepared (null for scan-only executables). */
+    readonly source: Kernel | Routine | null,
     /** Extra data specific to the backend running this executable. */
     readonly data: T,
   ) {}

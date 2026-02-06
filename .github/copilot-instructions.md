@@ -316,17 +316,17 @@ See [WebGPU preencoded-routine details](#webgpu-preencoded-routine-details-routi
 
 ### Features exploited
 
-| Feature                     | How jax-js uses it                                               | Location                             |
-| --------------------------- | ---------------------------------------------------------------- | ------------------------------------ |
-| **shader-f16**              | Float16 dtype support; requested at device creation              | `src/backend.ts` feature requests    |
-| **Workgroup shared memory** | Sort uses `var<workgroup>` for bitonic sort local exchanges      | `src/backend/webgpu/routines.ts`     |
-| **workgroupBarrier()**      | Synchronizes threads within Sort workgroups                      | `bitonicSortShader` in routines.ts   |
-| **storageBarrier()**        | Memory fence for shared variable consistency                     | `bitonicSortShader` in routines.ts   |
-| **Pipeline caching**        | Compiled pipelines stored by shader hash                         | `pipelineCache` in webgpu.ts         |
-| **Command batching**        | Multiple dispatches encoded before single queue.submit()         | `PendingExecute` in webgpu.ts        |
-| **Ping-pong buffers**       | Scan carry state alternates between two buffers                  | `dispatchBatchedScan()` in webgpu.ts |
-| **Uniform buffers**         | Per-iteration offsets for batched scan                           | `scan-wrapper.ts`                    |
-| **WGSL copy shader**        | Byte-level buffer copy when `copyBufferToBuffer` alignment fails | `COPY_SHADER_CODE` in webgpu.ts      |
+| Feature                     | How jax-js uses it                                               | Location                                |
+| --------------------------- | ---------------------------------------------------------------- | --------------------------------------- |
+| **shader-f16**              | Float16 dtype support; requested at device creation              | `src/backend.ts` feature requests       |
+| **Workgroup shared memory** | Sort uses `var<workgroup>` for bitonic sort local exchanges      | `src/backend/webgpu/routines.ts`        |
+| **workgroupBarrier()**      | Synchronizes threads within Sort workgroups                      | `bitonicSortShader` in routines.ts      |
+| **storageBarrier()**        | Memory fence for shared variable consistency                     | `bitonicSortShader` in routines.ts      |
+| **Pipeline caching**        | Compiled pipelines stored by shader hash                         | `pipelineCache` in webgpu.ts            |
+| **Command batching**        | Multiple dispatches encoded before single queue.submit()         | `PendingExecute` in webgpu.ts           |
+| **Ping-pong buffers**       | Scan carry state alternates between two buffers                  | `dispatchPreencodedScan()` in webgpu.ts |
+| **Uniform buffers**         | Per-iteration offsets for preencoded scan                        | `scan-wrapper.ts`                       |
+| **WGSL copy shader**        | Byte-level buffer copy when `copyBufferToBuffer` alignment fails | `COPY_SHADER_CODE` in webgpu.ts         |
 
 **Pipeline caching detail:**
 
@@ -1188,7 +1188,7 @@ The `tryPrepareNativeScan()` dispatcher routes to backend-specific implementatio
 
 - **WebGPU kernel-only** → `tryPrepareWebGPUNativeScan()` → uses `prepareNativeScan()` or
   `prepareNativeScanMulti()`
-- **WebGPU routine body** → `tryPrepareBatchedScan()` → uses `prepareBatchedScan()`
+- **WebGPU routine body** → `tryPreparePreencodedScan()` → uses `preparePreencodedScan()`
 - **WASM (kernels + routines)** → `tryPrepareWasmNativeScan()` → uses `prepareNativeScanGeneral()`
 
 ### Compiled-loop eligibility
@@ -1215,7 +1215,7 @@ The `tryPrepareNativeScan()` dispatcher routes to backend-specific implementatio
 - **No internal buffer dependencies** between steps (falls back otherwise)
 - **No carry passthrough** (every carry must be produced by a kernel)
 
-**WebGPU batched-scan** (via `tryPrepareBatchedScan`):
+**WebGPU preencoded-routine** (via `tryPreparePreencodedScan`):
 
 - Exactly 1 Routine step (single routine body)
 - `numCarry === numY` (passthrough pattern)
@@ -1754,8 +1754,8 @@ contributors should be aware of:
   the WGSL copy shader `COPY_SHADER_CODE` (when unaligned, e.g., f16 arrays with odd element
   counts). The WGSL copy shader indexes by destination word to avoid read-modify-write races between
   threads. See `test/scan-preallocate.test.ts` for edge-case coverage (duplicate-slot, passthrough,
-  reverse, length-0). The batched scan path (`dispatchBatchedScan`) also uses the WGSL copy shader
-  for ys stacking when carry sizes are not 4-byte aligned.
+  reverse, length-0). The preencoded scan path (`dispatchPreencodedScan`) also uses the WGSL copy
+  shader for ys stacking when carry sizes are not 4-byte aligned.
 
 ### Future work
 
@@ -1773,7 +1773,7 @@ The following planned steps are now implemented:
 2. ✅ CPU/WASM fast-path (`copyBufferToBuffer`) and WGSL copy shader fallback.
 3. ✅ WebGPU WGSL copy kernel (`COPY_SHADER_CODE`) with pipeline caching.
 4. ✅ `scanRunner` preallocateY path — direct-write into preallocated output buffers.
-5. ✅ Batched scan (`dispatchBatchedScan`) uses shader copy for unaligned ys stacking.
+5. ✅ Preencoded scan (`dispatchPreencodedScan`) uses shader copy for unaligned ys stacking.
 6. ✅ Tests: passthrough, duplicate-slot, reverse, length-0 (`test/scan-preallocate.test.ts`).
 
 ### WASM feature opportunities (assessed Feb 2026)
@@ -1791,14 +1791,14 @@ The following planned steps are now implemented:
 
 ### Test files
 
-| File                                         | Purpose                                       |
-| -------------------------------------------- | --------------------------------------------- |
-| `test/lax-scan.test.ts`                      | Main scan test suite (~3000 lines)            |
-| `test/scan-preallocate.test.ts`              | preallocateY edge cases (dup/passthrough/rev) |
-| `test/jit-scan-dlm.test.ts`                  | Kalman filter integration tests               |
-| `test/deno/webgpu.test.ts`                   | Headless WebGPU tests via Deno                |
-| `test/deno/batched-scan.test.ts`             | Batched scan integration                      |
-| `test/deno/batched-scan-integration.test.ts` | Multi-kernel WebGPU scan                      |
+| File                                            | Purpose                                       |
+| ----------------------------------------------- | --------------------------------------------- |
+| `test/lax-scan.test.ts`                         | Main scan test suite (~3000 lines)            |
+| `test/scan-preallocate.test.ts`                 | preallocateY edge cases (dup/passthrough/rev) |
+| `test/jit-scan-dlm.test.ts`                     | Kalman filter integration tests               |
+| `test/deno/webgpu.test.ts`                      | Headless WebGPU tests via Deno                |
+| `test/deno/preencoded-scan.test.ts`             | Preencoded scan integration                   |
+| `test/deno/preencoded-scan-integration.test.ts` | Multi-kernel WebGPU scan                      |
 
 ### Deno WebGPU test guidelines
 
@@ -1808,8 +1808,8 @@ The following planned steps are now implemented:
   `adapter.requestDevice()`.
 - Creating a second `GPUDevice` can destabilize Deno's WebGPU runtime and cause flakiness, memory
   leaks, or segfaults across test files.
-- Use the `getJaxJsWebGPUDevice()` helper pattern (see `test/deno/batched-scan.test.ts`) to access
-  the backend's device.
+- Use the `getJaxJsWebGPUDevice()` helper pattern (see `test/deno/preencoded-scan.test.ts`) to
+  access the backend's device.
 - **Never call `device.destroy()`** on the shared backend device — let the backend manage its
   lifecycle.
 

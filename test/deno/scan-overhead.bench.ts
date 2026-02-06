@@ -113,13 +113,13 @@ console.log(
   `\nProjected time for n=${kalmanIters}: ${estimatedKalman.toFixed(1)}ms`,
 );
 
-// If we had batched dispatch (1 roundtrip total):
-const batchedOverhead = 0.2; // ~200µs for single submit
+// If we had preencoded dispatch (1 roundtrip total):
+const preencodedOverhead = 0.2; // ~200µs for single submit
 console.log(
-  `With batched scan (theoretical): ${batchedOverhead.toFixed(1)}ms + compute time`,
+  `With preencoded scan (theoretical): ${preencodedOverhead.toFixed(1)}ms + compute time`,
 );
 console.log(
-  `Potential speedup: ~${(estimatedKalman / batchedOverhead).toFixed(0)}×`,
+  `Potential speedup: ~${(estimatedKalman / preencodedOverhead).toFixed(0)}×`,
 );
 
 console.log("\n=== Done ===");

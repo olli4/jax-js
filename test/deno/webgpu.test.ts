@@ -461,8 +461,8 @@ Deno.test({
 
       defaultDevice("webgpu");
 
-      // Matmul (for larger matrices) is a "routine" not a kernel, so uses batched-scan
-      // Note: Very small matmuls may fuse into kernels; we use 2x2 which typically uses batched-scan
+      // Matmul (for larger matrices) is a "routine" not a kernel, so uses preencoded-routine
+      // Note: Very small matmuls may fuse into kernels; we use 2x2 which typically uses preencoded-routine
       const step = (carry: np.Array, x: np.Array): [np.Array, np.Array] => {
         const newCarry = np.matmul(carry, x);
         return [newCarry.ref, newCarry];

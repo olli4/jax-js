@@ -27,8 +27,6 @@ import {
   prod,
   range,
   rep,
-  reportScanBodySteps,
-  reportScanPath,
   type ScanPath,
 } from "../utils";
 import { aluCompare, PendingExecute } from "./array";
@@ -99,7 +97,7 @@ export type JitStep =
   | {
       type: "preencoded-routine";
       /** Pre-encoded routine params (stored for dispatch). */
-      batchedParams: any; // BatchedScanParams from webgpu.ts
+      preencodedParams: any; // PreencodedScanParams from webgpu.ts
       length: number;
       numCarry: number;
       numConsts: number;
@@ -452,9 +450,9 @@ export class JitProgram {
           const carryOutSlots = outputSlots.slice(0, step.numCarry);
           const ysStackedSlots = outputSlots.slice(step.numCarry);
 
-          if (this.backend.dispatchBatchedScan) {
-            this.backend.dispatchBatchedScan(
-              step.batchedParams, // PreparedBatchedScan
+          if (this.backend.dispatchPreencodedScan) {
+            this.backend.dispatchPreencodedScan(
+              step.preencodedParams, // PreparedPreencodedScan
               constSlots,
               initCarrySlots,
               xsSlots,
@@ -463,7 +461,7 @@ export class JitProgram {
             );
           } else {
             throw new Error(
-              "internal: preencoded-routine requires backend.dispatchBatchedScan",
+              "internal: preencoded-routine requires backend.dispatchPreencodedScan",
             );
           }
           break;
@@ -805,11 +803,6 @@ export function jitCompile(backend: Backend, jaxpr: Jaxpr): JitProgram {
         // Report compiled-loop path (loop runs in native code)
         const pathError = checkAcceptedPath("compiled-loop", acceptPath);
         if (pathError) throw new Error(pathError);
-        reportScanPath("compiled-loop", backend.type, {
-          numConsts,
-          numCarry,
-          length,
-        });
 
         // Use compiled loop (entire scan loop in native code)
         builder.steps.push({
@@ -829,8 +822,8 @@ export function jitCompile(backend: Backend, jaxpr: Jaxpr): JitProgram {
         continue;
       }
 
-      // Try to use batched scan for routine bodies (WebGPU only, matmul/conv/etc.)
-      const batchedParams = tryPrepareBatchedScan(
+      // Try to use preencoded scan for routine bodies (WebGPU only, matmul/conv/etc.)
+      const preencodedParams = tryPreparePreencodedScan(
         backend,
         bodyProgram,
         bodyJaxpr,
@@ -839,22 +832,16 @@ export function jitCompile(backend: Backend, jaxpr: Jaxpr): JitProgram {
         numConsts,
         numX,
         numY,
-        eqn,
         reverse,
       );
 
-      if (batchedParams) {
+      if (preencodedParams) {
         // Use pre-encoded routine dispatches (preencoded-routine path)
         const pathError = checkAcceptedPath("preencoded-routine", acceptPath);
         if (pathError) throw new Error(pathError);
-        reportScanPath("preencoded-routine", backend.type, {
-          numConsts,
-          numCarry,
-          length,
-        });
         builder.steps.push({
           type: "preencoded-routine",
-          batchedParams,
+          preencodedParams,
           length,
           numCarry,
           numConsts,
@@ -879,11 +866,6 @@ export function jitCompile(backend: Backend, jaxpr: Jaxpr): JitProgram {
           : undefined;
       const pathError = checkAcceptedPath("fallback", acceptPath, extraInfo);
       if (pathError) throw new Error(pathError);
-      reportScanPath("fallback", backend.type, {
-        numConsts,
-        numCarry,
-        length,
-      });
       builder.steps.push({
         type: "scan",
         bodyProgram,
@@ -1679,16 +1661,15 @@ function getScanBufferSizes(
 }
 
 /**
- * Try to prepare a batched scan for routine bodies (matmul, conv, etc.).
- * Returns the PreparedBatchedScan params if possible, null otherwise.
+ * Try to prepare a preencoded scan for routine bodies (matmul, conv, etc.).
+ * Returns the PreparedPreencodedScan params if possible, null otherwise.
  *
- * Batched scan is only supported when:
+ * Preencoded scan is only supported when:
  * 1. Backend is WebGPU
  * 2. Body program contains exactly one execute step with a Routine (not Kernel)
- * 3. MVP: No constants support
- * 4. MVP: numCarry === numY (carry and output are the same)
+ * 3. numCarry === numY (carry and output are the same)
  */
-function tryPrepareBatchedScan(
+function tryPreparePreencodedScan(
   backend: Backend,
   bodyProgram: JitProgram,
   bodyJaxpr: Jaxpr,
@@ -1697,13 +1678,12 @@ function tryPrepareBatchedScan(
   numConsts: number,
   numX: number,
   numY: number,
-  eqn: { inputs: (Var | Lit)[]; outBinders: Var[] },
   reverse: boolean,
 ): any | null {
-  // Returns PreparedBatchedScan or null
-  // Only WebGPU backend supports batched scan
+  // Only WebGPU backend supports preencoded scan
   if (backend.type !== "webgpu") {
-    if (DEBUG >= 2) console.log("Batched scan: skipped, unsupported backend");
+    if (DEBUG >= 2)
+      console.log("Preencoded scan: skipped, unsupported backend");
     return null;
   }
 
@@ -1714,25 +1694,25 @@ function tryPrepareBatchedScan(
   if (executeSteps.length !== 1) {
     if (DEBUG >= 2)
       console.log(
-        `Batched scan: skipped, ${executeSteps.length} execute steps (need exactly 1)`,
+        `Preencoded scan: skipped, ${executeSteps.length} execute steps (need exactly 1)`,
       );
     return null;
   }
 
   const execStep = executeSteps[0] as Extract<JitStep, { type: "execute" }>;
   if (!(execStep.source instanceof Routine)) {
-    if (DEBUG >= 2) console.log("Batched scan: skipped, not a Routine");
+    if (DEBUG >= 2) console.log("Preencoded scan: skipped, not a Routine");
     return null;
   }
 
   const bodyRoutine = execStep.source;
 
-  // MVP: Only support case where carry and y are the same (like cumulative matmul)
+  // Only support case where carry and y are the same (like cumulative matmul)
   // This means numCarry === numY and the outputs reference the same variables
   if (numCarry !== numY) {
     if (DEBUG >= 2)
       console.log(
-        `Batched scan: skipped, numCarry=${numCarry} !== numY=${numY}`,
+        `Preencoded scan: skipped, numCarry=${numCarry} !== numY=${numY}`,
       );
     return null;
   }
@@ -1752,13 +1732,15 @@ function tryPrepareBatchedScan(
   // xs has leading dimension = length, so stride = size_without_leading_dim
   const xsElemStrides = xAvals.map((a) => a.size); // elements per slice
 
-  // Compute ys strides (same as carry for MVP)
+  // Compute ys strides (same as carry when numCarry === numY)
   const ysElemStrides = carryAvals.map((a) => a.size); // elements per slice
 
   // Try to prepare the routine executable
   if (!backend.prepareRoutineSync) {
     if (DEBUG >= 2)
-      console.log("Batched scan: skipped, backend has no prepareRoutineSync");
+      console.log(
+        "Preencoded scan: skipped, backend has no prepareRoutineSync",
+      );
     return null;
   }
 
@@ -1766,18 +1748,21 @@ function tryPrepareBatchedScan(
   try {
     bodyRoutineExe = backend.prepareRoutineSync(bodyRoutine);
   } catch (e) {
-    if (DEBUG >= 2) console.warn("Batched scan: prepareRoutineSync failed:", e);
-    return null;
-  }
-
-  // Try to prepare batched scan
-  if (!backend.prepareBatchedScan) {
     if (DEBUG >= 2)
-      console.log("Batched scan: skipped, backend has no prepareBatchedScan");
+      console.warn("Preencoded scan: prepareRoutineSync failed:", e);
     return null;
   }
 
-  const batchedScanParams = {
+  // Try to prepare preencoded scan
+  if (!backend.preparePreencodedScan) {
+    if (DEBUG >= 2)
+      console.log(
+        "Preencoded scan: skipped, backend has no preparePreencodedScan",
+      );
+    return null;
+  }
+
+  const preencodedScanParams = {
     length,
     carrySizes,
     xsElemStrides,
@@ -1794,17 +1779,17 @@ function tryPrepareBatchedScan(
   };
 
   try {
-    const prepared = backend.prepareBatchedScan(batchedScanParams);
+    const prepared = backend.preparePreencodedScan(preencodedScanParams);
     if (prepared) {
       if (DEBUG >= 1)
         console.log(
-          `Batched scan: SUCCESS! Using WebGPU batched scan for ${bodyRoutine.name}`,
+          `Preencoded scan: SUCCESS! Using WebGPU preencoded scan for ${bodyRoutine.name}`,
         );
     }
     return prepared;
   } catch (e) {
     if (DEBUG >= 2) {
-      console.warn("Batched scan preparation failed:", e);
+      console.warn("Preencoded scan preparation failed:", e);
     }
     return null;
   }
@@ -2248,9 +2233,6 @@ function tryPrepareWasmNativeScan(
           : ""),
     );
   }
-
-  // Report body steps for testing (to verify kernel fusion)
-  reportScanBodySteps(executeSteps.length, "wasm", { numCarry, numY });
 
   // Number of jaxpr inputs
   const numInputs = numConsts + numCarry + numX;

@@ -381,7 +381,9 @@ export function scan<
     return new ShapedArray(aval.shape.slice(1), aval.dtype, aval.weakType);
   });
 
-  // Create a wrapper function that takes flat arrays and returns flat arrays
+  // Create a wrapper function that takes flat arrays and returns flat arrays.
+  // yTreedef_ is captured by the closure and set during tracing.
+  let yTreedef_: tree.JsTreeDef | undefined;
   const flatF = (
     carryFlat: Array[],
     xSliceFlat: Array[],
@@ -395,8 +397,7 @@ export function scan<
     const [newCarryFlat] = tree.flatten(newCarry);
     // tree.flatten handles null as empty node with no leaves (NodeType.None)
     const [yFlat, yTreedef] = tree.flatten(y as JsTree<Array>);
-    // Store yTreedef for later reconstruction
-    (flatF as any)._yTreedef = yTreedef;
+    yTreedef_ = yTreedef;
     return [newCarryFlat, yFlat];
   };
 
@@ -444,12 +445,11 @@ export function scan<
 
     // Reconstruct pytrees
     const finalCarry = tree.unflatten(initTreedef, finalCarryFlat) as Carry;
-    // yTreedef is set by the traced flatF (it ran during makeJaxpr)
-    const yTreedef = (flatF as any)._yTreedef;
+    // yTreedef_ is set by the traced flatF (it ran during makeJaxpr)
     const ys =
-      yTreedef === tree.JsTreeDef.none
+      yTreedef_ === tree.JsTreeDef.none
         ? (null as Y)
-        : (tree.unflatten(yTreedef, yFlatEmpty) as Y);
+        : (tree.unflatten(yTreedef_!, yFlatEmpty) as Y);
 
     // Dispose inputs and tracing artifacts
     initFlat.forEach((arr) => arr.dispose());
@@ -493,8 +493,7 @@ export function scan<
   // Reconstruct pytrees
   // tree.unflatten handles None treedef -> returns null
   const finalCarry = tree.unflatten(initTreedef, carryOut) as Carry;
-  const yTreedef = (flatF as any)._yTreedef;
-  const ys = tree.unflatten(yTreedef, ysFlat) as Y;
+  const ys = tree.unflatten(yTreedef_!, ysFlat) as Y;
 
   return [finalCarry, ys];
 }

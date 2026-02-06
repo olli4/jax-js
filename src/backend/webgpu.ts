@@ -112,8 +112,8 @@ export interface NativeScanMultiParams {
   reverse?: boolean;
 }
 
-/** Parameters for batched scan execution on WebGPU (routine body like matmul). */
-export interface BatchedScanParams {
+/** Parameters for preencoded scan execution on WebGPU (routine body like matmul). */
+export interface PreencodedScanParams {
   /** Number of scan iterations (length of xs along axis 0). */
   length: number;
   /** Sizes of each carry buffer in bytes. */
@@ -146,9 +146,9 @@ export interface BatchedScanParams {
   routineOutputJitIds: number[];
 }
 
-/** Prepared batched scan with wrapped shaders and offset buffer. */
-export interface PreparedBatchedScan {
-  params: BatchedScanParams;
+/** Prepared preencoded scan with wrapped shaders and offset buffer. */
+export interface PreparedPreencodedScan {
+  params: PreencodedScanParams;
   /** Shaders with uniform offset support. */
   wrappedShaders: ShaderDispatch[];
   /** GPU buffer containing all iteration offsets. */
@@ -711,36 +711,19 @@ export class WebGPUBackend implements Backend {
   }
 
   /**
-   * Dispatch a multi-kernel native scan operation.
-   * Same buffer layout as dispatchNativeScan.
+   * Returns the minimum uniform buffer offset alignment for preencoded scan.
    */
-  dispatchNativeScanMulti(
-    exe: Executable<ShaderDispatch[]>,
-    consts: Slot[],
-    initCarry: Slot[],
-    xs: Slot[],
-    carryOut: Slot[],
-    ysStacked: Slot[],
-  ): void {
-    // Same dispatch logic as single-kernel scan
-    this.dispatchNativeScan(exe, consts, initCarry, xs, carryOut, ysStacked);
-  }
-
-  /**
-   * Check if batched scan can be used for a routine body.
-   * Returns the minimum uniform buffer offset alignment for dynamic offsets.
-   */
-  getBatchedScanAlignment(): number {
+  getPreencodedScanAlignment(): number {
     // Use minUniformBufferOffsetAlignment for dynamic uniform offsets
     // This is typically 256 bytes on most GPUs
     return this.device.limits.minUniformBufferOffsetAlignment ?? 256;
   }
 
   /**
-   * Prepare a batched scan operation for routine bodies (matmul, conv, etc.).
+   * Prepare a preencoded scan operation for routine bodies (matmul, conv, etc.).
    * Returns the prepared executable if successful, null otherwise.
    *
-   * Batched scan encodes all iteration dispatches in a single command buffer,
+   * Preencoded scan encodes all iteration dispatches in a single command buffer,
    * eliminating JS roundtrip overhead per iteration. Uses ping-pong buffers
    * for carry state and uniform-based offset bindings for xs/ys slicing.
    *
@@ -749,7 +732,9 @@ export class WebGPUBackend implements Backend {
    * 2. Adding uniform offset variables to the shader
    * 3. Using dynamic uniform buffer offsets for per-iteration offsets
    */
-  prepareBatchedScan(params: BatchedScanParams): PreparedBatchedScan | null {
+  preparePreencodedScan(
+    params: PreencodedScanParams,
+  ): PreparedPreencodedScan | null {
     const {
       xsElemStrides,
       ysElemStrides,
@@ -767,15 +752,15 @@ export class WebGPUBackend implements Backend {
 
     // Verify the routine is valid
     if (!bodyRoutine || bodyRoutine.data.length === 0) {
-      if (DEBUG >= 2) console.log("Batched scan: invalid routine");
+      if (DEBUG >= 2) console.log("Preencoded scan: invalid routine");
       return null;
     }
 
     // Skip if no xs/ys to offset (pure carry operation)
     if (numX === 0 && numY === 0) {
       if (DEBUG >= 2)
-        console.log("Batched scan: no xs/ys, using direct dispatch");
-      // Could still optimize with batched command buffer, but simpler to fall back
+        console.log("Preencoded scan: no xs/ys, using direct dispatch");
+      // Could still optimize with preencoded command buffer, but simpler to fall back
       return null;
     }
 
@@ -793,7 +778,7 @@ export class WebGPUBackend implements Backend {
       // Skip routines that already use uniforms (like Sort) - they conflict with our offset uniform
       if (shader.hasUniform) {
         if (DEBUG >= 2)
-          console.log("Batched scan: shader already has uniform, skipping");
+          console.log("Preencoded scan: shader already has uniform, skipping");
         return null;
       }
 
@@ -805,7 +790,7 @@ export class WebGPUBackend implements Backend {
       if (!wrapped.hasUniform) {
         // No bindings need offsets, fall back
         if (DEBUG >= 2)
-          console.log("Batched scan: shader doesn't need offsets");
+          console.log("Preencoded scan: shader doesn't need offsets");
         return null;
       }
 
@@ -825,7 +810,7 @@ export class WebGPUBackend implements Backend {
     }
 
     // Create the combined uniform buffer with all iteration offsets
-    const alignment = this.getBatchedScanAlignment();
+    const alignment = this.getPreencodedScanAlignment();
     const { buffer: offsetData, alignment: offsetAlignment } =
       createAllIterationsOffsetsBuffer(
         numX,
@@ -848,7 +833,7 @@ export class WebGPUBackend implements Backend {
 
     if (DEBUG >= 1) {
       console.log(
-        `Batched scan: prepared for ${length} iterations with uniform offsets`,
+        `Preencoded scan: prepared for ${length} iterations with uniform offsets`,
       );
     }
 
@@ -864,14 +849,14 @@ export class WebGPUBackend implements Backend {
   }
 
   /**
-   * Dispatch a batched scan operation with routine body.
+   * Dispatch a preencoded scan operation with routine body.
    *
    * Uses ping-pong buffers for carry and uniform-based offsets for xs/ys.
    * All iteration dispatches are encoded in a single command buffer.
    * Dynamic uniform buffer offsets are used for per-iteration offset values.
    */
-  dispatchBatchedScan(
-    prepared: PreparedBatchedScan,
+  dispatchPreencodedScan(
+    prepared: PreparedPreencodedScan,
     constSlots: Slot[],
     initCarrySlots: Slot[],
     xsSlots: Slot[],
@@ -985,15 +970,15 @@ export class WebGPUBackend implements Backend {
           });
         }
 
-        // Output bindings: for each routine output, determine its scan buffer
-        // In the MVP (numCarry === numY, passthrough pattern), all routine outputs
+        // Output bindings: for each routine output, determine its scan buffer.
+        // With numCarry === numY (passthrough pattern), all routine outputs
         // go to carry (ping-pong buffers). The ys are copied from carry after dispatch.
         for (let i = 0; i < routineOutputJitIds.length; i++) {
           // In passthrough pattern, routine output i → carry output i
           const buffer = writeCarry[i];
           if (!buffer) {
             throw new Error(
-              `Batched scan: routine output ${i} has no corresponding carry buffer ` +
+              `Preencoded scan: routine output ${i} has no corresponding carry buffer ` +
                 `(writeCarry.length=${writeCarry.length})`,
             );
           }
@@ -1118,7 +1103,7 @@ export class WebGPUBackend implements Backend {
     for (const buf of [...carryPing, ...carryPong]) {
       buf.destroy();
     }
-    // Note: offsetBuffer is NOT destroyed here - it's owned by PreparedBatchedScan
+    // Note: offsetBuffer is NOT destroyed here - it's owned by PreparedPreencodedScan
     // and may be reused if the JIT-compiled function is called multiple times.
   }
 
@@ -1609,9 +1594,9 @@ function nativeScanShaderSource(
     reverse,
   } = params;
 
-  // For MVP, we support single carry/output with matching sizes
+  // Single carry/output with matching sizes
   if (numCarry !== 1 || ysStrides.length !== 1) {
-    throw new Error("Native scan: only single carry/output supported for now");
+    throw new Error("Native scan: only single carry/output supported");
   }
 
   // Convert to multi-step format: single step writing to carry0

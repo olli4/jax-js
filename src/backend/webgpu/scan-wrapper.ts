@@ -2,7 +2,7 @@
  * WGSL shader transformation for scan-aware routine dispatch.
  *
  * Transforms a routine shader to accept per-iteration offsets for xs/ys buffers,
- * enabling batched command buffer dispatch without minStorageBufferOffsetAlignment
+ * enabling preencoded command buffer dispatch without minStorageBufferOffsetAlignment
  * constraints.
  *
  * Key insight: We know exactly which bindings need offsets from the scan signature:
@@ -19,6 +19,7 @@
  */
 
 import { ShaderInfo } from "./codegen";
+import { DEBUG } from "../../utils";
 
 export interface BufferBinding {
   group: number;
@@ -163,7 +164,8 @@ export function transformArrayAccesses(
       }
 
       if (depth !== 0) {
-        console.warn(`Unmatched bracket in array access: ${name}`);
+        if (DEBUG >= 1)
+          console.warn(`Unmatched bracket in array access: ${name}`);
         continue;
       }
 
