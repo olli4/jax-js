@@ -1197,35 +1197,90 @@ The `tryPrepareNativeScan()` dispatcher routes to backend-specific implementatio
 
 ### WASM compiled-loop details
 
-All WASM scan variants use `codegenNativeScanGeneral`:
+All WASM scan variants use `codegenNativeScanGeneral` in `src/backend/wasm.ts`:
 
-1. Allocate WASM locals: iteration counter, data index, element indices
-2. Allocate internal temporary buffers for intermediate results
-3. Copy initCarry to carryOut (working buffer)
-4. Generate outer loop (iter = 0..length):
-   - Compute dataIdx (reverse-aware)
-   - For each step: evaluate kernel or call imported routine
-   - Copy Y outputs from source (carry passthrough, xs passthrough, or internal buffer)
-   - Copy carry outputs for next iteration
-5. Free internal buffers, return WebAssembly.Module
+1. **Pre-analysis** — Build `directWriteMap` deciding which internal buffers can be redirected
+2. Import routine functions and helper math functions
+3. Allocate WASM locals: iteration counter, data index, element indices
+4. **Step 1**: Copy initCarry to carryOut (working buffer) via `memory.copy`
+5. **Step 2**: Main scan loop (iter = 0..length):
+   - Compute dataIdx (reverse-aware: `length - 1 - iter` or `iter`)
+   - **Step 2a**: For each step, execute kernel or call imported routine
+   - **Step 2b**: Copy Y outputs to `ysStacked` at iteration offset
+   - **Step 2c**: Copy carry outputs to `carryOut` for next iteration
+6. Return compiled `WebAssembly.Module`
 
-**Direct-write optimization:**
+**Direct-write optimization (pre-analysis phase):**
 
-When a kernel step's output is used only as a carry output (and optionally also as a Y output), the
-kernel writes directly to `carryOut` (and `ysStacked`) instead of an internal buffer. This
-eliminates `memory.copy` calls in steps 2b/2c, providing **40-65% speedup** for small scan bodies.
+Before generating any WASM code, `codegenNativeScanGeneral` analyzes the scan body to build a
+`directWriteMap: Map<internalIdx, { carryIdx, yIdx? }>`. This maps internal buffer indices to their
+redirect targets. The analysis walks expression trees via `AluExp.fold()` to collect carry read
+patterns per step.
+
+When a kernel step is eligible for direct-write:
+
+- **Step 2a**: The kernel's store instruction targets `carryOut[carryIdx]` instead of
+  `internals[internalIdx]`. If `yIdx` is also set, uses `local.tee` to store the computed value to
+  both `carryOut` and `ysStacked[yIdx]` in a single expression evaluation.
+- **Step 2b**: The `memory.copy` for this Y output is skipped (already written inline).
+- **Step 2c**: The `memory.copy` for this carry output is skipped (already written inline).
+
+For multi-output kernels, each output is analyzed independently — some may use direct-write while
+others fall back to internal buffers.
 
 Eligibility conditions (all must be met):
 
 1. Output produced by a Kernel step (not a Routine)
 2. Kernel has no reduction (prevents self-overwrite during inner loop)
-3. Internal buffer not read by any other step
+3. Internal buffer not read by any other step (no data dependencies)
 4. Maps to exactly one carry output
-5. No Y output is a passthrough from the target carry (passthrough reads OLD carry)
-6. No later step reads the target carry as input
+5. No Y output is a passthrough from the target carry (passthrough reads OLD carry, but direct-write
+   overwrites carry during the kernel loop)
+6. No later step reads the target carry as input (later steps should see the carry from the START of
+   the iteration, not the partially-overwritten value)
 
-When a Y output also references the same internal buffer, the kernel uses `local.tee` to store the
-computed value to both `carryOut` and `ysStacked` in a single pass.
+**Why condition 5 matters:**
+
+```ts
+// This body has Y = old carry (passthrough):
+const step = (carry, x) => {
+  const newC = carry.add(x);
+  return [newC, carry]; // Y reads OLD carry value
+};
+```
+
+If we direct-wrote `newC` to `carryOut` during the kernel loop (element by element), then the
+passthrough copy `Y = carry` would read a mix of old and new carry values. The passthrough copy in
+Step 2b reads from `carryOut`, and at element `i`, elements `0..i-1` would already be overwritten.
+This is why direct-write is disabled when any Y output is a passthrough from the target carry.
+
+**Why condition 6 matters:**
+
+```ts
+// Multi-step body where step 2 reads the carry that step 1 writes to:
+const step = (carry, x) => {
+  const a = carry.A.add(x); // Step 1: writes to carry.A
+  const b = carry.A.ref.mul(x); // Step 2: reads carry.A (needs OLD value!)
+  return [{ A: a, B: b }, null];
+};
+```
+
+If step 1 direct-wrote to `carryOut.A`, step 2 would read partially-overwritten values instead of
+the carry entering the iteration. Direct-write is disabled for `carry.A` in this case.
+
+**Performance impact:**
+
+For small scan bodies (L=1000), eliminating `memory.copy` provides **40-65% speedup**:
+
+| Pattern             | Without direct-write | With direct-write | Speedup |
+| ------------------- | -------------------- | ----------------- | ------- |
+| Cumsum (scalar)     | ~44M iter/sec        | ~62M iter/sec     | +41%    |
+| Elementwise (n=4)   | ~48M iter/sec        | ~78M iter/sec     | +63%    |
+| Carry-only (4×4)    | ~40M iter/sec        | ~50M iter/sec     | +25%    |
+| Passthrough Y (4×4) | ~35M iter/sec        | ~35M iter/sec     | N/A     |
+
+The elementwise case benefits most because it eliminates both internal→carry AND internal→Y copies.
+Carry-only (Y=null) only eliminates the carry copy. Passthrough Y is ineligible (condition 5).
 
 **Y output sources (`YOutputSource` type):**
 
@@ -1562,6 +1617,7 @@ Expression translation and shader generation share common code between regular k
 | `codegenWasmKernel()`                  | Entry point, dispatches based on `isMultiOutput`    |
 | `codegenWasmSinglePath()`              | Single-output kernel (supports reduction)           |
 | `codegenWasmMultiPath()`               | Multi-output kernel (no reduction)                  |
+| `codegenNativeScanGeneral()`           | Full scan loop codegen with direct-write analysis   |
 
 **WebGPU Backend:**
 
