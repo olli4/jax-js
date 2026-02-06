@@ -1,2 +1,5 @@
 pnpm exec lint-staged
 
+# Run the full test suite before committing to catch regressions early
+pnpm vitest run
+

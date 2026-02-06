@@ -6,6 +6,7 @@
 // This version uses the Scan primitive for efficient execution.
 
 import type { Array } from "../frontend/array";
+import { zeros } from "../frontend/array";
 import { bind, getAval, Primitive, ShapedArray } from "../frontend/core";
 import { makeJaxpr } from "../frontend/jaxpr";
 import * as tree from "../tree";
@@ -356,13 +357,12 @@ export function scan<
   // Determine scan length from input
   const n = lengthOpt ?? (xsFlat.length > 0 ? xsFlat[0].shape[0] : 0);
 
-  if (n === 0) {
-    throw new Error(
-      xsIsNull
-        ? "scan: length option is required when xs is null"
-        : "scan: cannot determine length from empty inputs",
-    );
-  }
+  // NOTE: We no longer throw early on n === 0 because we need to trace the
+  // body function to discover the Y treedef. After tracing, we'll handle the
+  // length-0 case and return (init, empty_ys) to match JAX behavior.
+  // For xs === null, we still require an explicit length option to be provided
+  // (unless it was provided and equals 0).
+  // (See: Issue: support length-0 scans for JAX compatibility)
 
   // Get abstract values for carry and x_slice (xs with leading dim removed)
   const carryAvals = initFlat.map((arr) => ShapedArray.fromAval(getAval(arr)));
@@ -410,6 +410,51 @@ export function scan<
   );
   const jaxpr = closedJaxpr.jaxpr;
   const consts = closedJaxpr.consts;
+
+  // Handle length-0 scans: return (init, empty_ys) like JAX.
+  if (n === 0) {
+    // If xs was null and length wasn't explicitly provided, this is an error
+    // (cannot infer length). Otherwise, construct empty outputs.
+    if (xsIsNull && lengthOpt === undefined) {
+      throw new Error("scan: length option is required when xs is null");
+    }
+
+    // Final carry is the initial carry (transfer ownership). Take refs so the
+    // returned carry is owned by the caller, then dispose the original inputs.
+    const finalCarryFlat = initFlat.map((arr) => arr.ref);
+
+    // Build empty Y leaves based on jaxpr outputs. The jaxpr outputs are the
+    // flattened [newCarry..., y...], so the Y leaf avals are after numCarry.
+    const numCarry = initFlat.length;
+    const yOutAtoms = jaxpr.outs.slice(numCarry);
+
+    const yFlatEmpty = yOutAtoms.map((atom) => {
+      // atom should be a Var with an aval describing the single-iteration y
+      if (atom instanceof Error)
+        throw new Error("unexpected jaxpr output atom");
+      const aval = (atom as any).aval as ShapedArray;
+      // If aval is missing or has zero leaves, create an empty scalar array
+      const yShape = aval.shape;
+      const emptyShape = [0, ...yShape];
+      return zeros(emptyShape, { dtype: aval.dtype });
+    });
+
+    // Reconstruct pytrees
+    const finalCarry = tree.unflatten(initTreedef, finalCarryFlat) as Carry;
+    // yTreedef is set by the traced flatF (it ran during makeJaxpr)
+    const yTreedef = (flatF as any)._yTreedef;
+    const ys =
+      yTreedef === tree.JsTreeDef.none
+        ? (null as Y)
+        : (tree.unflatten(yTreedef, yFlatEmpty) as Y);
+
+    // Dispose inputs and tracing artifacts
+    initFlat.forEach((arr) => arr.dispose());
+    xsFlat.forEach((arr) => arr.dispose());
+    closedJaxpr.dispose();
+
+    return [finalCarry, ys];
+  }
 
   // Call the Scan primitive
   // Args: [...consts, ...initCarry, ...xs]

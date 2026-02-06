@@ -100,6 +100,82 @@ describe("lax.scan", () => {
       const outputData = await outputs.data();
       expect(Array.from(outputData)).toEqual([1, 2, 6, 24, 120]);
     });
+
+    it("handles length-0 scans with xs array (returns init and empty ys)", async () => {
+      const step = (carry: np.Array, x: np.Array): [np.Array, np.Array] => {
+        const newCarry = np.add(carry, x);
+        return [newCarry, newCarry.ref];
+      };
+
+      const init = np.array([42.0]);
+      const xs = np.zeros([0, 1]); // zero-length leading axis
+
+      const [final, outputs] = await lax.scan(step, init, xs);
+
+      const finalData = await final.data();
+      expect(finalData[0]).toBeCloseTo(42.0);
+
+      const outData = await outputs.data();
+      expect(Array.from(outData)).toEqual([]);
+    });
+
+    it("handles xs=null length-0 scans with explicit length (returns init and empty ys)", async () => {
+      const step = (carry: np.Array, _x: null): [np.Array, np.Array] => {
+        // carry-only body that would normally return the carry
+        return [carry, carry.ref];
+      };
+
+      const init = np.array([7.0]);
+
+      const [final, outputs] = await lax.scan(step, init, null, { length: 0 });
+
+      const finalData = await final.data();
+      expect(finalData[0]).toBeCloseTo(7.0);
+
+      const outData = await outputs.data();
+      expect(Array.from(outData)).toEqual([]);
+    });
+
+    it("length-0 scan with pytree Y returns empty per-leaf arrays", async () => {
+      type Y = { a: np.Array; b: np.Array };
+
+      const step = (carry: np.Array, x: np.Array): [np.Array, Y] => {
+        const newCarry = np.add(carry, x);
+        return [
+          newCarry,
+          { a: newCarry.ref, b: np.multiply(newCarry, np.array([2.0])) },
+        ];
+      };
+
+      const init = np.array([3.0]);
+      const xs = np.zeros([0, 1]);
+
+      const [final, ys] = await lax.scan(step, init, xs);
+      const finalData = await final.data();
+      expect(finalData[0]).toBeCloseTo(3.0);
+
+      // ys should be a pytree with per-leaf empty arrays
+      expect(ys).not.toBeNull();
+      const aData = await ys.a.data();
+      const bData = await ys.b.data();
+      expect(aData.length).toBe(0);
+      expect(bData.length).toBe(0);
+    });
+
+    it("length-0 scan with Y=null returns null", async () => {
+      const step = (carry: np.Array, x: np.Array): [np.Array, null] => {
+        const newCarry = np.add(carry, x);
+        return [newCarry, null];
+      };
+
+      const init = np.array([5.0]);
+      const xs = np.zeros([0, 1]);
+
+      const [final, ys] = await lax.scan(step, init, xs);
+      const finalData = await final.data();
+      expect(finalData[0]).toBeCloseTo(5.0);
+      expect(ys).toBeNull();
+    });
   });
 
   describe("scan with pytree carry", () => {

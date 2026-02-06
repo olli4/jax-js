@@ -534,10 +534,15 @@ The `Kernel` class uses an `outputs: KernelOutput[]` array to support 1..N outpu
 **Before every commit**, AI agents MUST:
 
 1. Run pre-commit CI checks (see above)
-2. Update documentation when adding new features or APIs
-3. Add/adjust tests exercising `.ref` and `.dispose()` for new behavior
-4. Export new public symbols from `src/index.ts`
-5. Update `FEATURES.md` for user-visible changes
+2. Ensure the **pre-commit hook** is installed (run `pnpm prepare` if needed). The repository will
+   run linting and the _full test suite_ automatically when you commit.
+3. Run the _full test suite_ locally (`pnpm vitest run`) after finishing code changes to verify
+   there are no regressions.
+4. Update documentation when adding new features or APIs
+5. Add/adjust tests exercising `.ref` and `.dispose()` for new behavior — add focused unit tests for
+   any bugfixes or edge cases
+6. Export new public symbols from `src/index.ts`
+7. Update `FEATURES.md` for user-visible changes
 
 ## Documentation files
 
