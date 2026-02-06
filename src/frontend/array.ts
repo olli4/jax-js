@@ -875,6 +875,117 @@ export class Array extends Tracer {
     };
   }
 
+  static #stackScanYs(ySlices: Array[][], reverse: boolean): Array[] {
+    return ySlices.map((slices) => {
+      const reshaped = slices.map((s) => {
+        const expanded = s.ref.#reshape(s.#st.reshape([1, ...s.shape]));
+        s.dispose();
+        return expanded;
+      });
+      let stacked = reshaped[0];
+      for (let i = 1; i < reshaped.length; i += 6) {
+        const chunk = reshaped.slice(i, i + 6);
+        stacked = coreConcatenate([stacked, ...chunk], 0) as Array;
+      }
+      if (reverse) {
+        const flipArg = rep(stacked.ndim, false);
+        flipArg[0] = true;
+        const flipped = stacked.ref.#reshape(stacked.#st.flip(flipArg));
+        stacked.dispose();
+        return flipped;
+      }
+      return stacked;
+    });
+  }
+
+  static #runScanFallbackLoop(params: {
+    length: number;
+    reverse: boolean;
+    numCarry: number;
+    numY: number;
+    xs: Array[];
+    initCarry: Array[];
+    bodyOutAvals: ShapedArray[];
+    runBody: (carry: Array[], xSlice: Array[], iter: number) => Array[];
+    writeY?: (
+      writeIndex: number,
+      ySlice: Array[],
+      yStrideBytes: number[],
+    ) => void;
+    onBeforeCarryDispose?: (oldCarry: Array[], ySlice: Array[]) => void;
+    disposeXSlices: boolean;
+  }): { carry: Array[]; ySlices: Array[][]; usedDirectWrite: boolean } {
+    const {
+      length,
+      reverse,
+      numCarry,
+      numY,
+      xs,
+      initCarry,
+      bodyOutAvals,
+      runBody,
+      writeY,
+      onBeforeCarryDispose,
+      disposeXSlices,
+    } = params;
+
+    const canDirectWriteY = numY > 0 && !!writeY;
+    const yStrideBytes = bodyOutAvals
+      .slice(numCarry)
+      .map((aval) => prod(aval.shape) * byteWidth(aval.dtype));
+
+    const ySlices: Array[][] = [];
+    if (!canDirectWriteY) {
+      for (let j = 0; j < numY; j++) ySlices.push([]);
+    }
+
+    let carry = initCarry;
+
+    for (let i = 0; i < length; i++) {
+      const dataIdx = reverse ? length - 1 - i : i;
+      const xSlice = xs.map((x) => {
+        const slicePairs: Pair[] = x.shape.map((s, axis) =>
+          axis === 0 ? [dataIdx, dataIdx + 1] : [0, s],
+        );
+        const squeezedShape = x.shape.slice(1);
+        return x.ref.#reshape(x.#st.shrink(slicePairs).reshape(squeezedShape));
+      });
+
+      const outs = runBody(carry, xSlice, i);
+
+      const newCarry = outs.slice(0, numCarry);
+      const ySlice = outs.slice(numCarry);
+
+      if (canDirectWriteY) {
+        const writeIndex = reverse ? length - 1 - i : i;
+        writeY!(writeIndex, ySlice, yStrideBytes);
+      } else {
+        for (let j = 0; j < numY; j++) {
+          ySlices[j].push(ySlice[j]);
+        }
+      }
+
+      if (i > 0 && onBeforeCarryDispose) {
+        onBeforeCarryDispose(carry, ySlice);
+      }
+
+      if (i > 0) {
+        carry.forEach((c) => c.dispose());
+      }
+      carry = newCarry;
+
+      if (canDirectWriteY) {
+        ySlice.forEach((y) => y.dispose());
+      }
+
+      if (disposeXSlices) {
+        xSlice.forEach((x) => x.dispose());
+      }
+    }
+
+    return { carry, ySlices, usedDirectWrite: canDirectWriteY };
+  }
+
   //
   // Internal methods follow, not public API. Do not use.
   //
@@ -1302,36 +1413,54 @@ export class Array extends Tracer {
             numY > 0 &&
             outputSlots.length === numCarry + numY &&
             (backend.copyBufferToBuffer || backend.copyBufferWithShader);
-          const yStrideBytes = bodyOutAvals
-            .slice(numCarry)
-            .map((aval) => prod(aval.shape) * byteWidth(aval.dtype));
 
-          // Accumulate y slices when preallocation is disabled
-          const ySlices: Array[][] = [];
-          if (!canDirectWriteY) {
-            for (let j = 0; j < numY; j++) ySlices.push([]);
-          }
+          const writeY = canDirectWriteY
+            ? (writeIndex: number, ySlice: Array[], yStrideBytes: number[]) => {
+                for (let j = 0; j < numY; j++) {
+                  const sizeBytes = yStrideBytes[j];
+                  if (sizeBytes <= 0) continue;
+                  const dstOffsetBytes = writeIndex * sizeBytes;
+                  const ySlot = ySlice[j]._realizeSource();
+                  const dstSlot = outputSlots[numCarry + j];
+                  const canBufferCopy =
+                    dstOffsetBytes % 4 === 0 && sizeBytes % 4 === 0;
+                  if (backend.copyBufferToBuffer && canBufferCopy) {
+                    backend.copyBufferToBuffer(
+                      ySlot,
+                      0,
+                      dstSlot,
+                      dstOffsetBytes,
+                      sizeBytes,
+                    );
+                  } else if (backend.copyBufferWithShader) {
+                    backend.copyBufferWithShader(
+                      ySlot,
+                      0,
+                      dstSlot,
+                      dstOffsetBytes,
+                      sizeBytes,
+                    );
+                  }
+                }
+              }
+            : undefined;
 
-          for (let i = 0; i < length; i++) {
-            const dataIdx = reverse ? length - 1 - i : i;
-            // Create views for x slices (ref prevents dispose, #reshape applies new ST)
-            const xSlice = xs.map((x) => {
-              const slicePairs: Pair[] = x.shape.map((s, axis) =>
-                axis === 0 ? [dataIdx, dataIdx + 1] : [0, s],
-              );
-              const squeezedShape = x.shape.slice(1);
-              return x.ref.#reshape(
-                x.#st.shrink(slicePairs).reshape(squeezedShape),
-              );
-            });
+          const onBeforeCarryDispose = (oldCarry: Array[], ySlice: Array[]) => {
+            const oldCarrySlots = new Set(
+              oldCarry.map((c) => c._realizeSource()),
+            );
+            for (const y of ySlice) {
+              const slot = y._realizeSource();
+              if (oldCarrySlots.has(slot)) {
+                backend.incRef(slot);
+              }
+            }
+          };
 
-            // Realize inputs to get Slots for bodyProgram.execute()
-            const carrySlots = carry.map((c) => c._realizeSource());
+          const runBody = (curCarry: Array[], xSlice: Array[], i: number) => {
+            const carrySlots = curCarry.map((c) => c._realizeSource());
             const xSliceSlots = xSlice.map((x) => x._realizeSource());
 
-            // CRITICAL: Submit xSlice pending ops BEFORE bodyProgram.execute()!
-            // #realize() creates pending ops but doesn't submit them. The bodyProgram
-            // reads from xSliceSlots immediately, so we must submit the realization kernels first.
             for (const x of xSlice) {
               for (const exe of x.#pending) {
                 exe.prepareSync();
@@ -1345,7 +1474,6 @@ export class Array extends Tracer {
               );
             }
 
-            // Execute compiled body program!
             const { outputs: bodyOuts, pending } = bodyProgram.execute([
               ...constSlotsRealized,
               ...carrySlots,
@@ -1358,28 +1486,14 @@ export class Array extends Tracer {
               );
             }
 
-            // CRITICAL: Submit pending ops immediately so carry data is ready for next iteration.
-            // Unlike the non-jit scan which uses evalJaxpr (eager execution), the jit body
-            // uses bodyProgram.execute which creates pending ops. These must be submitted
-            // before the next iteration reads from the carry slots.
             for (const exe of pending) {
               exe.prepareSync();
               exe.submit();
             }
 
-            // Note: After submit(), pending ops have already released their buffer refs.
-            // We don't need to track them in allPending anymore since they're done.
-
-            // Dispose x slices (they were consumed)
-            xSlice.forEach((x) => x.dispose());
-
-            // Wrap output slots as Arrays (pending ops already submitted, so no pending)
-            // CRITICAL: bodyOuts may have duplicate slots (e.g., [5,5] when body returns [x, x.ref])
-            // Each Array takes ownership of its slot, so we need to incRef for duplicates.
             const seenSlots = new Set<Slot>();
-            const outArrays = bodyOuts.map((slot, j) => {
+            return bodyOuts.map((slot, j) => {
               if (seenSlots.has(slot)) {
-                // Duplicate slot - incRef so both Arrays can own it
                 backend.incRef(slot);
               } else {
                 seenSlots.add(slot);
@@ -1391,102 +1505,30 @@ export class Array extends Tracer {
                 weakType: bodyOutAvals[j].weakType,
                 backend,
                 committed,
-                pending: [], // Already submitted
+                pending: [],
               });
             });
+          };
 
-            // Split outputs
-            const newCarry = outArrays.slice(0, numCarry);
-            const ySlice = outArrays.slice(numCarry);
+          const loopResult = Array.#runScanFallbackLoop({
+            length,
+            reverse,
+            numCarry,
+            numY,
+            xs,
+            initCarry: carry,
+            bodyOutAvals,
+            runBody,
+            writeY,
+            onBeforeCarryDispose,
+            disposeXSlices: true,
+          });
 
-            // Store y slices or write directly into preallocated outputs
-            if (canDirectWriteY) {
-              const writeIndex = reverse ? length - 1 - i : i;
-              for (let j = 0; j < numY; j++) {
-                const sizeBytes = yStrideBytes[j];
-                if (sizeBytes <= 0) continue;
-                const dstOffsetBytes = writeIndex * sizeBytes;
-                const ySlot = ySlice[j]._realizeSource();
-                const dstSlot = outputSlots[numCarry + j];
-                const canBufferCopy =
-                  dstOffsetBytes % 4 === 0 && sizeBytes % 4 === 0;
-                if (backend.copyBufferToBuffer && canBufferCopy) {
-                  backend.copyBufferToBuffer(
-                    ySlot,
-                    0,
-                    dstSlot,
-                    dstOffsetBytes,
-                    sizeBytes,
-                  );
-                } else if (backend.copyBufferWithShader) {
-                  backend.copyBufferWithShader(
-                    ySlot,
-                    0,
-                    dstSlot,
-                    dstOffsetBytes,
-                    sizeBytes,
-                  );
-                }
-              }
-            } else {
-              for (let j = 0; j < numY; j++) {
-                ySlices[j].push(ySlice[j]);
-              }
-            }
+          carry = loopResult.carry;
 
-            // For passthrough Y outputs, the ySlice arrays share slots with old carry.
-            // We need to incRef those slots before disposing old carry, otherwise
-            // the slot gets freed while ySlice still needs it.
-            // Find slots that are shared between ySlice and old carry.
-            if (i > 0) {
-              const oldCarrySlots = new Set(
-                carry.map((c) => c._realizeSource()),
-              );
-              for (const y of ySlice) {
-                const slot = y._realizeSource();
-                if (oldCarrySlots.has(slot)) {
-                  backend.incRef(slot);
-                }
-              }
-              carry.forEach((c) => c.dispose());
-            }
-            carry = newCarry;
-
-            if (canDirectWriteY) {
-              ySlice.forEach((y) => y.dispose());
-            }
-          }
-
-          // Stack y outputs (concat path only)
-          // Use chunking to avoid exceeding WebGPU buffer limit (max 8 storage buffers per shader)
           let stackedYs: Array[] = [];
-          if (!canDirectWriteY) {
-            stackedYs = ySlices.map((slices) => {
-              const reshaped = slices.map((s) => {
-                // ref.#reshape: ref prevents s from being freed, #reshape creates new Array with expanded dims
-                const expanded = s.ref.#reshape(s.#st.reshape([1, ...s.shape]));
-                s.dispose();
-                return expanded;
-              });
-              // Concatenate in chunks of 6 to stay under buffer limit
-              // Each concat: 1 (accumulator) + 6 (chunk) = 7 inputs + 1 output = 8 buffers
-              let stacked = reshaped[0];
-              for (let i = 1; i < reshaped.length; i += 6) {
-                const chunk = reshaped.slice(i, i + 6);
-                stacked = coreConcatenate([stacked, ...chunk], 0) as Array;
-              }
-              // For reverse=true, stacked Y outputs are in reverse order (last iteration first),
-              // so flip them to match JAX semantics (outputs in same order as xs)
-              if (reverse) {
-                // Create boolean array for flip: [true, false, ...] to flip only axis 0
-                const flipArg = rep(stacked.ndim, false);
-                flipArg[0] = true;
-                const flipped = stacked.ref.#reshape(stacked.#st.flip(flipArg));
-                stacked.dispose();
-                return flipped;
-              }
-              return stacked;
-            });
+          if (!loopResult.usedDirectWrite) {
+            stackedYs = Array.#stackScanYs(loopResult.ySlices, reverse);
           }
 
           // Realize outputs to get final slots
@@ -1580,9 +1622,6 @@ export class Array extends Tracer {
         const canDirectWriteY =
           numY > 0 &&
           (backend.copyBufferToBuffer || backend.copyBufferWithShader);
-        const yStrideBytes = bodyOutAvals
-          .slice(numCarry)
-          .map((aval) => prod(aval.shape) * byteWidth(aval.dtype));
 
         const preallocatedYs: Array[] = [];
         const preallocatedSlots: Slot[] = [];
@@ -1617,87 +1656,66 @@ export class Array extends Tracer {
           }
         }
 
-        // Accumulate output slices for each y (when preallocation is disabled)
-        const ySlices: Array[][] = [];
-        if (!canDirectWriteY) {
-          for (let j = 0; j < numY; j++) ySlices.push([]);
-        }
-
         let carry = initCarry;
 
-        for (let i = 0; i < length; i++) {
-          const dataIdx = reverse ? length - 1 - i : i;
-          // Create views using per-iteration ShapeTrackers (ref prevents dispose)
-          const xSlice = xs.map((x) => {
-            const slicePairs: Pair[] = x.shape.map((s, axis) =>
-              axis === 0 ? [dataIdx, dataIdx + 1] : [0, s],
-            );
-            const squeezedShape = x.shape.slice(1);
-            return x.ref.#reshape(
-              x.#st.shrink(slicePairs).reshape(squeezedShape),
-            );
-          });
+        const writeY = canDirectWriteY
+          ? (writeIndex: number, ySlice: Array[], yStrideBytes: number[]) => {
+              for (let j = 0; j < numY; j++) {
+                const sizeBytes = yStrideBytes[j];
+                if (sizeBytes <= 0) continue;
+                const dstOffsetBytes = writeIndex * sizeBytes;
+                const ySlot = ySlice[j]._realizeSource();
+                for (const exe of ySlice[j].#pending) {
+                  exe.prepareSync();
+                  exe.submit();
+                }
+                const dstSlot = preallocatedSlots[j];
+                const canBufferCopy =
+                  dstOffsetBytes % 4 === 0 && sizeBytes % 4 === 0;
+                if (backend.copyBufferToBuffer && canBufferCopy) {
+                  backend.copyBufferToBuffer(
+                    ySlot,
+                    0,
+                    dstSlot,
+                    dstOffsetBytes,
+                    sizeBytes,
+                  );
+                } else if (backend.copyBufferWithShader) {
+                  backend.copyBufferWithShader(
+                    ySlot,
+                    0,
+                    dstSlot,
+                    dstOffsetBytes,
+                    sizeBytes,
+                  );
+                }
+              }
+            }
+          : undefined;
 
-          // Build jaxpr inputs: consts + carry + x_slice
+        const runBody = (curCarry: Array[], xSlice: Array[]) => {
           const jaxprInputs = [
             ...constViews.map((c) => c.ref),
-            ...carry.map((c) => c.ref),
+            ...curCarry.map((c) => c.ref),
             ...xSlice,
           ];
+          return evalJaxpr(jaxpr, jaxprInputs) as Array[];
+        };
 
-          // Execute jaxpr - this consumes jaxprInputs
-          const outs = evalJaxpr(jaxpr, jaxprInputs) as Array[];
+        const loopResult = Array.#runScanFallbackLoop({
+          length,
+          reverse,
+          numCarry,
+          numY,
+          xs,
+          initCarry: carry,
+          bodyOutAvals,
+          runBody,
+          writeY,
+          disposeXSlices: false,
+        });
 
-          // Split outputs into new carry and y_slice
-          const newCarry = outs.slice(0, numCarry);
-          const ySlice = outs.slice(numCarry);
-
-          if (canDirectWriteY) {
-            const writeIndex = reverse ? length - 1 - i : i;
-            for (let j = 0; j < numY; j++) {
-              const sizeBytes = yStrideBytes[j];
-              if (sizeBytes <= 0) continue;
-              const dstOffsetBytes = writeIndex * sizeBytes;
-              const ySlot = ySlice[j]._realizeSource();
-              for (const exe of ySlice[j].#pending) {
-                exe.prepareSync();
-                exe.submit();
-              }
-              const dstSlot = preallocatedSlots[j];
-              const canBufferCopy =
-                dstOffsetBytes % 4 === 0 && sizeBytes % 4 === 0;
-              if (backend.copyBufferToBuffer && canBufferCopy) {
-                backend.copyBufferToBuffer(
-                  ySlot,
-                  0,
-                  dstSlot,
-                  dstOffsetBytes,
-                  sizeBytes,
-                );
-              } else if (backend.copyBufferWithShader) {
-                backend.copyBufferWithShader(
-                  ySlot,
-                  0,
-                  dstSlot,
-                  dstOffsetBytes,
-                  sizeBytes,
-                );
-              }
-              ySlice[j].dispose();
-            }
-          } else {
-            // Store y_slice for stacking
-            for (let j = 0; j < numY; j++) {
-              ySlices[j].push(ySlice[j]);
-            }
-          }
-
-          // Dispose old carry (except on first iteration where it's initCarry)
-          if (i > 0) {
-            carry.forEach((c) => c.dispose());
-          }
-          carry = newCarry;
-        }
+        carry = loopResult.carry;
 
         // Dispose inputs
         initCarry.forEach((c) => c.dispose());
@@ -1705,38 +1723,11 @@ export class Array extends Tracer {
         consts.forEach((c) => c.dispose());
         constViews.forEach((c) => c.dispose());
 
-        if (canDirectWriteY) {
+        if (loopResult.usedDirectWrite) {
           return [...carry, ...preallocatedYs];
         }
 
-        // Stack y outputs along axis 0
-        const stackedYs = ySlices.map((slices) => {
-          const reshaped = slices.map((s) => {
-            // ref.#reshape: ref prevents s from being freed, #reshape creates new Array with expanded dims
-            const expanded = s.ref.#reshape(s.#st.reshape([1, ...s.shape]));
-            s.dispose();
-            return expanded;
-          });
-          // Concatenate in chunks of 6 to stay under buffer limit
-          // Each concat: 1 (accumulator) + 6 (chunk) = 7 inputs + 1 output = 8 buffers
-          let stacked = reshaped[0];
-          for (let i = 1; i < reshaped.length; i += 6) {
-            const chunk = reshaped.slice(i, i + 6);
-            stacked = coreConcatenate([stacked, ...chunk], 0) as Array;
-          }
-          // For reverse=true, stacked Y outputs are in reverse order (last iteration first),
-          // so flip them to match JAX semantics (outputs in same order as xs)
-          if (reverse) {
-            // Create boolean array for flip: [true, false, ...] to flip only axis 0
-            const flipArg = rep(stacked.ndim, false);
-            flipArg[0] = true;
-            const flipped = stacked.ref.#reshape(stacked.#st.flip(flipArg));
-            stacked.dispose();
-            return flipped;
-          }
-          return stacked;
-        });
-
+        const stackedYs = Array.#stackScanYs(loopResult.ySlices, reverse);
         return [...carry, ...stackedYs];
       },
     };

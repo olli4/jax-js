@@ -1938,15 +1938,12 @@ function jit$1(f, opts) {
 }
 
 //#endregion
-//#region src/frontend/jit.ts
+//#region src/frontend/scan-plan.ts
 /**
 * Check if a chosen scan path satisfies the acceptPath constraint.
 * Returns an error message if the path is not allowed, or null if OK.
 *
 * Special case: an empty array `[]` always rejects, showing the chosen path.
-* This is useful for debugging to discover which path was selected.
-*
-* @param extraInfo Optional extra info to include in the error message (e.g., dispatch count)
 */
 function checkAcceptedPath(chosenPath, acceptPath, extraInfo) {
 	if (!acceptPath) return null;
@@ -1956,6 +1953,605 @@ function checkAcceptedPath(chosenPath, acceptPath, extraInfo) {
 	if (!allowedPaths.includes(chosenPath)) return `Scan acceptPath constraint not satisfied: got "${chosenPath}" but accepted paths are [${allowedPaths.map((p) => `"${p}"`).join(", ")}]${suffix}`;
 	return null;
 }
+/**
+* Extract buffer sizes and strides from body jaxpr for native scan codegen.
+* Shared by WebGPU and WASM native scan implementations.
+*/
+function getScanBufferSizes(bodyJaxpr, numConsts, numCarry, numX) {
+	const constAvals = bodyJaxpr.inBinders.slice(0, numConsts).map((v) => v.aval);
+	const carryAvals = bodyJaxpr.inBinders.slice(numConsts, numConsts + numCarry).map((v) => v.aval);
+	const xAvals = bodyJaxpr.inBinders.slice(numConsts + numCarry, numConsts + numCarry + numX).map((v) => v.aval);
+	const yAvals = bodyJaxpr.outs.slice(numCarry).map((v) => v.aval);
+	return {
+		constSizes: constAvals.map((a) => a.size * require_backend.byteWidth(a.dtype)),
+		carrySizes: carryAvals.map((a) => a.size * require_backend.byteWidth(a.dtype)),
+		xsStrides: xAvals.map((a) => a.size * require_backend.byteWidth(a.dtype)),
+		ysStrides: yAvals.map((a) => a.size * require_backend.byteWidth(a.dtype))
+	};
+}
+/**
+* Try to prepare a preencoded scan for routine bodies (matmul, conv, etc.).
+*/
+function tryPreparePreencodedScan(backend, bodyProgram, bodyJaxpr, length, numCarry, numConsts, numX, numY, reverse) {
+	if (backend.type !== "webgpu") {
+		if (require_backend.DEBUG >= 2) console.log("Preencoded scan: skipped, unsupported backend");
+		return null;
+	}
+	const executeSteps = bodyProgram.steps.filter((s) => s.type === "execute");
+	if (executeSteps.length !== 1) {
+		if (require_backend.DEBUG >= 2) console.log(`Preencoded scan: skipped, ${executeSteps.length} execute steps (need exactly 1)`);
+		return null;
+	}
+	const execStep = executeSteps[0];
+	if (!(execStep.source instanceof require_backend.Routine)) {
+		if (require_backend.DEBUG >= 2) console.log("Preencoded scan: skipped, not a Routine");
+		return null;
+	}
+	if (numCarry !== numY) {
+		if (require_backend.DEBUG >= 2) console.log(`Preencoded scan: skipped, numCarry=${numCarry} !== numY=${numY}`);
+		return null;
+	}
+	const carryAvals = bodyJaxpr.inBinders.slice(numConsts, numConsts + numCarry).map((v) => v.aval);
+	const xAvals = bodyJaxpr.inBinders.slice(numConsts + numCarry).map((v) => v.aval);
+	const carrySizes = carryAvals.map((a) => a.size * require_backend.byteWidth(a.dtype));
+	const xsElemStrides = xAvals.map((a) => a.size);
+	const ysElemStrides = carryAvals.map((a) => a.size);
+	if (!backend.prepareRoutineSync) {
+		if (require_backend.DEBUG >= 2) console.log("Preencoded scan: skipped, backend has no prepareRoutineSync");
+		return null;
+	}
+	let bodyRoutineExe;
+	try {
+		bodyRoutineExe = backend.prepareRoutineSync(execStep.source);
+	} catch (e$1) {
+		if (require_backend.DEBUG >= 2) console.warn("Preencoded scan: prepareRoutineSync failed:", e$1);
+		return null;
+	}
+	if (!backend.preparePreencodedScan) {
+		if (require_backend.DEBUG >= 2) console.log("Preencoded scan: skipped, backend has no preparePreencodedScan");
+		return null;
+	}
+	const preencodedScanParams = {
+		length,
+		carrySizes,
+		xsElemStrides,
+		ysElemStrides,
+		bodyRoutine: bodyRoutineExe,
+		numCarry,
+		numX,
+		numY,
+		numConsts,
+		reverse,
+		routineInputJitIds: execStep.inputs,
+		routineOutputJitIds: execStep.outputs
+	};
+	try {
+		const prepared = backend.preparePreencodedScan(preencodedScanParams);
+		if (prepared && require_backend.DEBUG >= 1) console.log(`Preencoded scan: SUCCESS! Using WebGPU preencoded scan for ${execStep.source.name}`);
+		return prepared;
+	} catch (e$1) {
+		if (require_backend.DEBUG >= 2) console.warn("Preencoded scan preparation failed:", e$1);
+		return null;
+	}
+}
+/**
+* Try to prepare a native scan for WebGPU with kernel-only body.
+*/
+function tryPrepareWebGPUNativeScan(backend, bodyProgram, bodyJaxpr, executeSteps, length, numCarry, numConsts, numX, numY, reverse) {
+	if (require_backend.DEBUG >= 2) console.log(`[webgpu-scan] trying with numCarry=${numCarry}, numY=${numY}, steps=${executeSteps.length}`);
+	const { constSizes, carrySizes, xsStrides, ysStrides } = getScanBufferSizes(bodyJaxpr, numConsts, numCarry, numX);
+	const numInputs = numConsts + numCarry + numX;
+	if (executeSteps.length === 1 && numCarry === 1 && numY === 1) {
+		const step = executeSteps[0];
+		const kernel = step.source;
+		const reindexMap = [];
+		for (const inputId of step.inputs) if (inputId < numInputs) reindexMap.push(inputId);
+		else {
+			if (require_backend.DEBUG >= 2) console.log("[webgpu-scan] single kernel has internal buffer ref");
+			return null;
+		}
+		const reindexedExp = kernel.exp.reindexGids(reindexMap);
+		const reindexedReduction = kernel.reduction?.reindexGids(reindexMap);
+		const reindexedKernel = require_backend.Kernel.single(numInputs, kernel.size, reindexedExp, reindexedReduction);
+		const params$1 = {
+			length,
+			numConsts,
+			constSizes,
+			carrySizes,
+			xsStrides,
+			ysStrides,
+			bodyKernel: reindexedKernel,
+			numCarry,
+			reverse
+		};
+		if (!backend.prepareNativeScan) {
+			if (require_backend.DEBUG >= 2) console.log("[webgpu-scan] backend has no prepareNativeScan");
+			return null;
+		}
+		try {
+			const exe = backend.prepareNativeScan(params$1);
+			if (exe && require_backend.DEBUG >= 1) console.log("[webgpu-scan] SUCCESS! Using WebGPU native scan (single kernel)");
+			return exe ? { executable: exe } : null;
+		} catch (e$1) {
+			if (require_backend.DEBUG >= 2) console.warn("[webgpu-scan] prepareNativeScan failed:", e$1);
+		}
+		return null;
+	}
+	if (numCarry !== numY && numY !== 0) {
+		if (require_backend.DEBUG >= 2) console.log(`[webgpu-scan] multi-kernel requires numCarry === numY or numY === 0, got ${numCarry} !== ${numY}`);
+		return null;
+	}
+	const hasInternalDeps = executeSteps.some((step) => step.inputs.some((inputId) => inputId >= numInputs));
+	if (hasInternalDeps) {
+		if (require_backend.DEBUG >= 2) console.log("[webgpu-scan] multi-kernel: internal buffer dependencies not supported, falling back");
+		return null;
+	}
+	const slotToSource = /* @__PURE__ */ new Map();
+	for (let i = 0; i < executeSteps.length; i++) {
+		const step = executeSteps[i];
+		for (let outIdx = 0; outIdx < step.outputs.length; outIdx++) slotToSource.set(step.outputs[outIdx], {
+			stepIdx: i,
+			outputIdxInStep: outIdx,
+			step
+		});
+	}
+	const carryOutSlots = bodyProgram.outputs.slice(0, numCarry);
+	const carryInputSlots = bodyProgram.inputs.slice(numConsts, numConsts + numCarry);
+	const carrySourceInfos = [];
+	for (let carryIdx = 0; carryIdx < numCarry; carryIdx++) {
+		const slot = carryOutSlots[carryIdx];
+		const passthroughIdx = carryInputSlots.indexOf(slot);
+		if (passthroughIdx !== -1) {
+			if (require_backend.DEBUG >= 2) console.log(`[webgpu-scan] multi-kernel: carry ${carryIdx} is passthrough, not supported`);
+			return null;
+		}
+		const source = slotToSource.get(slot);
+		if (!source) {
+			if (require_backend.DEBUG >= 2) console.log(`[webgpu-scan] multi-kernel: carry output ${carryIdx} (slot ${slot}) not produced by any step`);
+			return null;
+		}
+		carrySourceInfos.push({
+			source,
+			carryIdx
+		});
+	}
+	const multiSteps = [];
+	let totalOutputs = 0;
+	for (const step of executeSteps) totalOutputs += step.outputs.length;
+	const slotToOutputIdx = /* @__PURE__ */ new Map();
+	let outputIdx = 0;
+	for (const step of executeSteps) for (const outId of step.outputs) slotToOutputIdx.set(outId, outputIdx++);
+	for (const { source, carryIdx } of carrySourceInfos) {
+		const { step, outputIdxInStep } = source;
+		const stepSource = step.source;
+		const inputs = [];
+		for (const inputId of step.inputs) if (inputId < numInputs) inputs.push(inputId);
+		else {
+			const outIdx = slotToOutputIdx.get(inputId);
+			if (outIdx !== void 0) inputs.push(numInputs + outIdx);
+			else {
+				if (require_backend.DEBUG >= 2) console.log(`[webgpu-scan] multi-kernel: input ${inputId} not mapped`);
+				return null;
+			}
+		}
+		let reindexedKernel;
+		if (stepSource instanceof require_backend.Kernel) {
+			const output = stepSource.outputs[outputIdxInStep];
+			const reindexedExp = output.exp.reindexGids(inputs);
+			const reindexedReduction = output.reduction?.reindexGids(inputs);
+			reindexedKernel = require_backend.Kernel.single(numInputs + totalOutputs, output.size, reindexedExp, reindexedReduction);
+		} else {
+			if (require_backend.DEBUG >= 2) console.log("[webgpu-scan] multi-kernel: unexpected source type at step");
+			return null;
+		}
+		multiSteps.push({
+			kernel: reindexedKernel,
+			inputs,
+			outputCarryIdx: carryIdx,
+			outputSize: reindexedKernel.size
+		});
+	}
+	const params = {
+		length,
+		numConsts,
+		constSizes,
+		numCarry,
+		carrySizes,
+		numX,
+		xsStrides,
+		numY,
+		ysStrides,
+		steps: multiSteps,
+		reverse
+	};
+	const webgpuBackend = backend;
+	if (!webgpuBackend.prepareNativeScanMulti) {
+		if (require_backend.DEBUG >= 2) console.log("[webgpu-scan] backend has no prepareNativeScanMulti");
+		return null;
+	}
+	try {
+		const exe = webgpuBackend.prepareNativeScanMulti(params);
+		if (exe && require_backend.DEBUG >= 1) console.log(`[webgpu-scan] SUCCESS! Using WebGPU native scan (${multiSteps.length} kernels)`);
+		return exe ? { executable: exe } : null;
+	} catch (e$1) {
+		if (require_backend.DEBUG >= 2) console.warn("[webgpu-scan] prepareNativeScanMulti failed:", e$1);
+	}
+	return null;
+}
+/**
+* Try to prepare a native scan for WASM backend.
+*/
+function tryPrepareWasmNativeScan(backend, bodyProgram, bodyJaxpr, executeSteps, length, numCarry, numConsts, numX, numY, reverse) {
+	if (require_backend.DEBUG >= 2) console.log(`[wasm-scan] trying with numCarry=${numCarry}, numY=${numY}, steps=${executeSteps.length}`);
+	const usedRoutines = /* @__PURE__ */ new Set();
+	const supportedRoutines = new Set([
+		require_backend.Routines.Cholesky,
+		require_backend.Routines.Sort,
+		require_backend.Routines.TriangularSolve,
+		require_backend.Routines.LU,
+		require_backend.Routines.Argsort
+	]);
+	for (const step of executeSteps) if (step.source instanceof require_backend.Routine) {
+		const routineName = step.source.name;
+		if (!supportedRoutines.has(routineName)) {
+			if (require_backend.DEBUG >= 1) console.log(`[wasm-scan] skipped, unsupported routine in scan body: ${require_backend.Routines[routineName]}`);
+			return null;
+		}
+		usedRoutines.add(routineName);
+	}
+	if (require_backend.DEBUG >= 1) {
+		const routineNames = [...usedRoutines].map((r) => require_backend.Routines[r]);
+		console.log(`[wasm-scan] Analyzing body: ${executeSteps.length} execute steps, numCarry=${numCarry}, numY=${numY}` + (routineNames.length > 0 ? `, routines: ${routineNames.join(", ")}` : ""));
+	}
+	const numInputs = numConsts + numCarry + numX;
+	const { constSizes, carrySizes, xsStrides, ysStrides } = getScanBufferSizes(bodyJaxpr, numConsts, numCarry, numX);
+	const slotToInternal = /* @__PURE__ */ new Map();
+	const stepToInternalBase = /* @__PURE__ */ new Map();
+	const internalSizes = [];
+	for (let i = 0; i < executeSteps.length; i++) {
+		const step = executeSteps[i];
+		const source = step.source;
+		stepToInternalBase.set(i, internalSizes.length);
+		if (source instanceof require_backend.Kernel) if (source.isMultiOutput) for (let outIdx = 0; outIdx < source.outputs.length; outIdx++) {
+			const internalIdx = internalSizes.length;
+			slotToInternal.set(step.outputs[outIdx], internalIdx);
+			internalSizes.push(source.outputs[outIdx].size * require_backend.byteWidth(source.dtypeAt(outIdx)));
+		}
+		else {
+			const internalIdx = internalSizes.length;
+			slotToInternal.set(step.outputs[0], internalIdx);
+			internalSizes.push(source.size * require_backend.byteWidth(source.dtype));
+		}
+		else {
+			const routine = source;
+			for (let outIdx = 0; outIdx < step.outputs.length; outIdx++) {
+				const internalIdx = internalSizes.length;
+				slotToInternal.set(step.outputs[outIdx], internalIdx);
+				const outShape = routine.type.outputShapes[outIdx];
+				const outDtype = routine.type.outputDtypes[outIdx];
+				internalSizes.push(require_backend.prod(outShape) * require_backend.byteWidth(outDtype));
+			}
+		}
+	}
+	let auxBufferSize = 0;
+	let elementSize = 4;
+	for (const step of executeSteps) if (step.source instanceof require_backend.Routine) {
+		const routine = step.source;
+		const dtype = routine.type.inputDtypes[0];
+		elementSize = require_backend.byteWidth(dtype);
+		if (routine.name === require_backend.Routines.Sort) {
+			const inputShape = routine.type.inputShapes[0];
+			const sortDim = inputShape[inputShape.length - 1];
+			auxBufferSize = Math.max(auxBufferSize, sortDim * elementSize);
+		} else if (routine.name === require_backend.Routines.Argsort) {
+			const inputShape = routine.type.inputShapes[0];
+			const sortDim = inputShape[inputShape.length - 1];
+			auxBufferSize = Math.max(auxBufferSize, sortDim * 4);
+		}
+	}
+	const routineInfos = [];
+	const stepToRoutineInfoIdx = /* @__PURE__ */ new Map();
+	for (let i = 0; i < executeSteps.length; i++) {
+		const step = executeSteps[i];
+		if (step.source instanceof require_backend.Routine) {
+			const routine = step.source;
+			const routineName = routine.name;
+			const isF64 = routine.type.inputDtypes[0] === require_backend.DType.Float64;
+			const dtype = isF64 ? "f64" : "f32";
+			const routineInfoIdx = routineInfos.length;
+			stepToRoutineInfoIdx.set(i, routineInfoIdx);
+			if (routineName === require_backend.Routines.Cholesky) {
+				const inputShape = routine.type.inputShapes[0];
+				const n = inputShape[inputShape.length - 1];
+				routineInfos.push({
+					routine: routineName,
+					exportName: "cholesky",
+					numParams: 2,
+					dtype,
+					sizeParams: [n]
+				});
+			} else if (routineName === require_backend.Routines.Sort) {
+				const inputShape = routine.type.inputShapes[0];
+				const n = inputShape[inputShape.length - 1];
+				routineInfos.push({
+					routine: routineName,
+					exportName: "sort",
+					numParams: 2,
+					dtype,
+					sizeParams: [n]
+				});
+			} else if (routineName === require_backend.Routines.TriangularSolve) {
+				const aShape = routine.type.inputShapes[0];
+				const bShape = routine.type.inputShapes[1];
+				const n = aShape[aShape.length - 1];
+				const batchRows = bShape[bShape.length - 1];
+				const unitDiagonal = routine.params?.unitDiagonal ?? false;
+				const lower = false;
+				routineInfos.push({
+					routine: routineName,
+					exportName: "triangular_solve",
+					numParams: 3,
+					dtype,
+					sizeParams: [n, batchRows],
+					unitDiagonal,
+					lower
+				});
+			} else if (routineName === require_backend.Routines.LU) {
+				const inputShape = routine.type.inputShapes[0];
+				const m = inputShape[inputShape.length - 2];
+				const n = inputShape[inputShape.length - 1];
+				routineInfos.push({
+					routine: routineName,
+					exportName: "lu",
+					numParams: 4,
+					dtype,
+					sizeParams: [m, n]
+				});
+			} else if (routineName === require_backend.Routines.Argsort) {
+				const inputShape = routine.type.inputShapes[0];
+				const n = inputShape[inputShape.length - 1];
+				routineInfos.push({
+					routine: routineName,
+					exportName: "argsort",
+					numParams: 4,
+					dtype,
+					sizeParams: [n]
+				});
+			}
+		}
+	}
+	const steps = [];
+	for (let i = 0; i < executeSteps.length; i++) {
+		const step = executeSteps[i];
+		const source = step.source;
+		const inputSlots = [];
+		for (const inputId of step.inputs) if (inputId < numInputs) inputSlots.push(inputId);
+		else {
+			const internalIdx = slotToInternal.get(inputId);
+			if (internalIdx === void 0) {
+				if (require_backend.DEBUG >= 1) console.log(`[wasm-scan] skipped, input ${inputId} not found in slot mapping`);
+				return null;
+			}
+			inputSlots.push(numInputs + internalIdx);
+		}
+		if (source instanceof require_backend.Kernel) {
+			const reindexMap = inputSlots;
+			const reindexedOutputs = source.outputs.map((out) => ({
+				size: out.size,
+				exp: out.exp.reindexGids(reindexMap),
+				reduction: out.reduction?.reindexGids(reindexMap)
+			}));
+			const reindexedKernel = require_backend.Kernel.multi(numInputs + internalSizes.length, reindexedOutputs);
+			const internalBase = stepToInternalBase.get(i);
+			if (source.isMultiOutput) {
+				const outputInternalIndices = [];
+				for (let outIdx = 0; outIdx < source.outputs.length; outIdx++) outputInternalIndices.push(internalBase + outIdx);
+				steps.push({
+					source: reindexedKernel,
+					inputSlots,
+					outputInternalIdx: internalBase,
+					outputInternalIndices
+				});
+			} else steps.push({
+				source: reindexedKernel,
+				inputSlots,
+				outputInternalIdx: internalBase
+			});
+		} else {
+			const routine = source;
+			const routineName = routine.name;
+			const routineInfoIdx = stepToRoutineInfoIdx.get(i);
+			const internalBase = stepToInternalBase.get(i);
+			const numOutputs = routine.type.outputShapes.length;
+			const outputInternalIndices = [];
+			for (let outIdx = 0; outIdx < numOutputs; outIdx++) outputInternalIndices.push(internalBase + outIdx);
+			let staticParams = [];
+			if (routineName === require_backend.Routines.Cholesky) {
+				const inputShape = routine.type.inputShapes[0];
+				const n = inputShape[inputShape.length - 1];
+				staticParams = [n];
+			} else if (routineName === require_backend.Routines.Sort) {
+				const inputShape = routine.type.inputShapes[0];
+				const n = inputShape[inputShape.length - 1];
+				staticParams = [n];
+			} else if (routineName === require_backend.Routines.TriangularSolve) {
+				const aShape = routine.type.inputShapes[0];
+				const bShape = routine.type.inputShapes[1];
+				const n = aShape[aShape.length - 1];
+				const batchRows = bShape[bShape.length - 1];
+				const numBatches = 1;
+				const unitDiagonal = routine.params?.unitDiagonal ? 1 : 0;
+				const lower = 0;
+				staticParams = [
+					n,
+					batchRows,
+					numBatches,
+					unitDiagonal,
+					lower
+				];
+			} else if (routineName === require_backend.Routines.LU) {
+				const inputShape = routine.type.inputShapes[0];
+				const m = inputShape[inputShape.length - 2];
+				const n = inputShape[inputShape.length - 1];
+				staticParams = [m, n];
+			} else if (routineName === require_backend.Routines.Argsort) {
+				const inputShape = routine.type.inputShapes[0];
+				const n = inputShape[inputShape.length - 1];
+				staticParams = [n];
+			}
+			steps.push({
+				source,
+				inputSlots,
+				outputInternalIdx: internalBase,
+				outputInternalIndices,
+				routineCallInfo: {
+					routineInfoIdx,
+					staticParams
+				}
+			});
+		}
+	}
+	const carryOutSlots = bodyProgram.outputs.slice(0, numCarry);
+	const carryInputSlots = bodyProgram.inputs.slice(numConsts, numConsts + numCarry);
+	const carryOutSources = [];
+	for (const slot of carryOutSlots) {
+		const carryIdx = carryInputSlots.indexOf(slot);
+		if (carryIdx !== -1) {
+			carryOutSources.push({
+				type: "passthrough",
+				carryIdx
+			});
+			continue;
+		}
+		const internalIdx = slotToInternal.get(slot);
+		if (internalIdx === void 0) {
+			if (require_backend.DEBUG >= 1) console.log(`[wasm-scan] skipped, carry output slot ${slot} not produced by any execute step`);
+			return null;
+		}
+		carryOutSources.push({
+			type: "internal",
+			internalIdx
+		});
+	}
+	const xsInputSlots = bodyProgram.inputs.slice(numConsts + numCarry, numConsts + numCarry + numX);
+	const yOutputSlots = bodyProgram.outputs.slice(numCarry);
+	const yOutputSources = [];
+	for (const slot of yOutputSlots) {
+		const carryIdx = carryInputSlots.indexOf(slot);
+		if (carryIdx !== -1) {
+			yOutputSources.push({
+				type: "passthrough",
+				carryIdx
+			});
+			continue;
+		}
+		const xsIdx = xsInputSlots.indexOf(slot);
+		if (xsIdx !== -1) {
+			yOutputSources.push({
+				type: "xs-passthrough",
+				xsIdx
+			});
+			continue;
+		}
+		const internalIdx = slotToInternal.get(slot);
+		if (internalIdx === void 0) {
+			if (require_backend.DEBUG >= 1) console.log(`[wasm-scan] skipped, Y output slot ${slot} not found`);
+			return null;
+		}
+		yOutputSources.push({
+			type: "internal",
+			internalIdx
+		});
+	}
+	if (!backend.prepareNativeScanGeneral) {
+		if (require_backend.DEBUG >= 2) console.log("[wasm-scan] backend has no prepareNativeScanGeneral");
+		return null;
+	}
+	const params = {
+		length,
+		numConsts,
+		constSizes,
+		numCarry,
+		carrySizes,
+		numX,
+		xsStrides,
+		numY,
+		ysStrides,
+		internalSizes,
+		steps,
+		carryOutSources,
+		yOutputSources,
+		reverse,
+		auxBufferSize,
+		elementSize,
+		routineInfos: routineInfos.length > 0 ? routineInfos : void 0
+	};
+	try {
+		const exe = backend.prepareNativeScanGeneral(params);
+		if (exe) {
+			if (require_backend.DEBUG >= 1) {
+				const hasRoutines = steps.some((s) => s.source instanceof require_backend.Routine);
+				console.log(`[wasm-scan] SUCCESS! Using WASM native scan with ${steps.length} steps` + (hasRoutines ? " (includes routines)" : ""));
+			}
+			return {
+				executable: exe,
+				internalSizes,
+				params
+			};
+		}
+		return null;
+	} catch (e$1) {
+		if (require_backend.DEBUG >= 2) console.warn("[wasm-scan] preparation failed:", e$1);
+		return null;
+	}
+}
+/**
+* Try to prepare a native scan executable.
+*/
+function tryPrepareNativeScan(backend, bodyProgram, bodyJaxpr, length, numCarry, numConsts, numX, numY, reverse) {
+	const executeSteps = bodyProgram.steps.filter((s) => s.type === "execute");
+	if (executeSteps.length === 0) {
+		if (require_backend.DEBUG >= 1) console.log("[compiled-loop] skipped, no execute steps");
+		return null;
+	}
+	const allKernels = executeSteps.every((s) => s.source instanceof require_backend.Kernel);
+	if (backend.type === "webgpu" && allKernels) return tryPrepareWebGPUNativeScan(backend, bodyProgram, bodyJaxpr, executeSteps, length, numCarry, numConsts, numX, numY, reverse);
+	if (backend.type === "wasm") return tryPrepareWasmNativeScan(backend, bodyProgram, bodyJaxpr, executeSteps, length, numCarry, numConsts, numX, numY, reverse);
+	if (require_backend.DEBUG >= 1) console.log(`[compiled-loop] skipped, backend=${backend.type} not supported`);
+	return null;
+}
+function planScan(backend, bodyProgram, bodyJaxpr, length, numCarry, numConsts, numX, numY, reverse, acceptPath) {
+	const nativeScanResult = tryPrepareNativeScan(backend, bodyProgram, bodyJaxpr, length, numCarry, numConsts, numX, numY, reverse);
+	if (nativeScanResult) {
+		const pathError$1 = checkAcceptedPath("compiled-loop", acceptPath);
+		if (pathError$1) throw new Error(pathError$1);
+		return {
+			path: "compiled-loop",
+			executable: nativeScanResult.executable,
+			params: nativeScanResult.params
+		};
+	}
+	const preencodedParams = tryPreparePreencodedScan(backend, bodyProgram, bodyJaxpr, length, numCarry, numConsts, numX, numY, reverse);
+	if (preencodedParams) {
+		const pathError$1 = checkAcceptedPath("preencoded-routine", acceptPath);
+		if (pathError$1) throw new Error(pathError$1);
+		return {
+			path: "preencoded-routine",
+			preencodedParams
+		};
+	}
+	const dispatchCount = bodyProgram.steps.filter((s) => s.type === "execute").length;
+	const extraInfo = backend.type === "webgpu" ? `${dispatchCount} GPU dispatch${dispatchCount !== 1 ? "es" : ""} per iteration` : void 0;
+	const pathError = checkAcceptedPath("fallback", acceptPath, extraInfo);
+	if (pathError) throw new Error(pathError);
+	return {
+		path: "fallback",
+		extraInfo
+	};
+}
+
+//#endregion
+//#region src/frontend/jit.ts
 /** Result of compiling a Jaxpr. Can be evaluated on a series of inputs. */
 var JitProgram = class {
 	constructor(backend, steps, inputs, outputs) {
@@ -2274,14 +2870,11 @@ function jitCompile(backend, jaxpr) {
 				});
 			}
 			const bodyProgram = jitCompile(backend, bodyJaxpr);
-			const nativeScanResult = tryPrepareNativeScan(backend, bodyProgram, bodyJaxpr, length, numCarry, numConsts, numX, numY, reverse);
-			const nativeScanExe = nativeScanResult?.executable ?? null;
-			if (nativeScanExe) {
-				const pathError$1 = checkAcceptedPath("compiled-loop", acceptPath);
-				if (pathError$1) throw new Error(pathError$1);
+			const scanPlan = planScan(backend, bodyProgram, bodyJaxpr, length, numCarry, numConsts, numX, numY, reverse, acceptPath);
+			if (scanPlan.path === "compiled-loop") {
 				builder.steps.push({
 					type: "compiled-loop",
-					executable: nativeScanExe,
+					executable: scanPlan.executable,
 					length,
 					numCarry,
 					numConsts,
@@ -2291,17 +2884,14 @@ function jitCompile(backend, jaxpr) {
 					initCarry: initCarryIds,
 					xs: xsIds,
 					outputs,
-					generalParams: nativeScanResult?.params
+					generalParams: scanPlan.params
 				});
 				continue;
 			}
-			const preencodedParams = tryPreparePreencodedScan(backend, bodyProgram, bodyJaxpr, length, numCarry, numConsts, numX, numY, reverse);
-			if (preencodedParams) {
-				const pathError$1 = checkAcceptedPath("preencoded-routine", acceptPath);
-				if (pathError$1) throw new Error(pathError$1);
+			if (scanPlan.path === "preencoded-routine") {
 				builder.steps.push({
 					type: "preencoded-routine",
-					preencodedParams,
+					preencodedParams: scanPlan.preencodedParams,
 					length,
 					numCarry,
 					numConsts,
@@ -2315,10 +2905,6 @@ function jitCompile(backend, jaxpr) {
 				});
 				continue;
 			}
-			const dispatchCount = bodyProgram.steps.filter((s) => s.type === "execute").length;
-			const extraInfo = backend.type === "webgpu" ? `${dispatchCount} GPU dispatch${dispatchCount !== 1 ? "es" : ""} per iteration` : void 0;
-			const pathError = checkAcceptedPath("fallback", acceptPath, extraInfo);
-			if (pathError) throw new Error(pathError);
 			builder.steps.push({
 				type: "scan",
 				bodyProgram,
@@ -2779,606 +3365,6 @@ function splitGraphDataflow(backend, jaxpr) {
 		}
 	}
 	return blackNodes;
-}
-/**
-* Extract buffer sizes and strides from body jaxpr for native scan codegen.
-* Shared by WebGPU and WASM native scan implementations.
-*/
-function getScanBufferSizes(bodyJaxpr, numConsts, numCarry, numX) {
-	const constAvals = bodyJaxpr.inBinders.slice(0, numConsts).map((v) => v.aval);
-	const carryAvals = bodyJaxpr.inBinders.slice(numConsts, numConsts + numCarry).map((v) => v.aval);
-	const xAvals = bodyJaxpr.inBinders.slice(numConsts + numCarry, numConsts + numCarry + numX).map((v) => v.aval);
-	const yAvals = bodyJaxpr.outs.slice(numCarry).map((v) => v.aval);
-	return {
-		constSizes: constAvals.map((a) => a.size * require_backend.byteWidth(a.dtype)),
-		carrySizes: carryAvals.map((a) => a.size * require_backend.byteWidth(a.dtype)),
-		xsStrides: xAvals.map((a) => a.size * require_backend.byteWidth(a.dtype)),
-		ysStrides: yAvals.map((a) => a.size * require_backend.byteWidth(a.dtype))
-	};
-}
-/**
-* Try to prepare a preencoded scan for routine bodies (matmul, conv, etc.).
-* Returns the PreparedPreencodedScan params if possible, null otherwise.
-*
-* Preencoded scan is only supported when:
-* 1. Backend is WebGPU
-* 2. Body program contains exactly one execute step with a Routine (not Kernel)
-* 3. numCarry === numY (carry and output are the same)
-*/
-function tryPreparePreencodedScan(backend, bodyProgram, bodyJaxpr, length, numCarry, numConsts, numX, numY, reverse) {
-	if (backend.type !== "webgpu") {
-		if (require_backend.DEBUG >= 2) console.log("Preencoded scan: skipped, unsupported backend");
-		return null;
-	}
-	const executeSteps = bodyProgram.steps.filter((s) => s.type === "execute");
-	if (executeSteps.length !== 1) {
-		if (require_backend.DEBUG >= 2) console.log(`Preencoded scan: skipped, ${executeSteps.length} execute steps (need exactly 1)`);
-		return null;
-	}
-	const execStep = executeSteps[0];
-	if (!(execStep.source instanceof require_backend.Routine)) {
-		if (require_backend.DEBUG >= 2) console.log("Preencoded scan: skipped, not a Routine");
-		return null;
-	}
-	const bodyRoutine = execStep.source;
-	if (numCarry !== numY) {
-		if (require_backend.DEBUG >= 2) console.log(`Preencoded scan: skipped, numCarry=${numCarry} !== numY=${numY}`);
-		return null;
-	}
-	const carryAvals = bodyJaxpr.inBinders.slice(numConsts, numConsts + numCarry).map((v) => v.aval);
-	const xAvals = bodyJaxpr.inBinders.slice(numConsts + numCarry).map((v) => v.aval);
-	const carrySizes = carryAvals.map((a) => a.size * require_backend.byteWidth(a.dtype));
-	const xsElemStrides = xAvals.map((a) => a.size);
-	const ysElemStrides = carryAvals.map((a) => a.size);
-	if (!backend.prepareRoutineSync) {
-		if (require_backend.DEBUG >= 2) console.log("Preencoded scan: skipped, backend has no prepareRoutineSync");
-		return null;
-	}
-	let bodyRoutineExe;
-	try {
-		bodyRoutineExe = backend.prepareRoutineSync(bodyRoutine);
-	} catch (e$1) {
-		if (require_backend.DEBUG >= 2) console.warn("Preencoded scan: prepareRoutineSync failed:", e$1);
-		return null;
-	}
-	if (!backend.preparePreencodedScan) {
-		if (require_backend.DEBUG >= 2) console.log("Preencoded scan: skipped, backend has no preparePreencodedScan");
-		return null;
-	}
-	const preencodedScanParams = {
-		length,
-		carrySizes,
-		xsElemStrides,
-		ysElemStrides,
-		bodyRoutine: bodyRoutineExe,
-		numCarry,
-		numX,
-		numY,
-		numConsts,
-		reverse,
-		routineInputJitIds: execStep.inputs,
-		routineOutputJitIds: execStep.outputs
-	};
-	try {
-		const prepared = backend.preparePreencodedScan(preencodedScanParams);
-		if (prepared) {
-			if (require_backend.DEBUG >= 1) console.log(`Preencoded scan: SUCCESS! Using WebGPU preencoded scan for ${bodyRoutine.name}`);
-		}
-		return prepared;
-	} catch (e$1) {
-		if (require_backend.DEBUG >= 2) console.warn("Preencoded scan preparation failed:", e$1);
-		return null;
-	}
-}
-/**
-* Try to prepare a native scan for WebGPU with kernel-only body.
-* Uses the existing WebGPU native scan infrastructure.
-*
-* Supports:
-* - Single kernel with single carry/output → prepareNativeScan
-* - Multi-kernel or multi-carry/output → prepareNativeScanMulti
-*/
-function tryPrepareWebGPUNativeScan(backend, bodyProgram, bodyJaxpr, executeSteps, length, numCarry, numConsts, numX, numY, reverse) {
-	if (require_backend.DEBUG >= 2) console.log(`[webgpu-scan] trying with numCarry=${numCarry}, numY=${numY}, steps=${executeSteps.length}`);
-	const { constSizes, carrySizes, xsStrides, ysStrides } = getScanBufferSizes(bodyJaxpr, numConsts, numCarry, numX);
-	const numInputs = numConsts + numCarry + numX;
-	if (executeSteps.length === 1 && numCarry === 1 && numY === 1) {
-		const step = executeSteps[0];
-		const kernel = step.source;
-		const reindexMap = [];
-		for (const inputId of step.inputs) if (inputId < numInputs) reindexMap.push(inputId);
-		else {
-			if (require_backend.DEBUG >= 2) console.log("[webgpu-scan] single kernel has internal buffer ref");
-			return null;
-		}
-		const reindexedExp = kernel.exp.reindexGids(reindexMap);
-		const reindexedReduction = kernel.reduction?.reindexGids(reindexMap);
-		const reindexedKernel = require_backend.Kernel.single(numInputs, kernel.size, reindexedExp, reindexedReduction);
-		const params$1 = {
-			length,
-			numConsts,
-			constSizes,
-			carrySizes,
-			xsStrides,
-			ysStrides,
-			bodyKernel: reindexedKernel,
-			numCarry,
-			reverse
-		};
-		if (!backend.prepareNativeScan) {
-			if (require_backend.DEBUG >= 2) console.log("[webgpu-scan] backend has no prepareNativeScan");
-			return null;
-		}
-		try {
-			const exe = backend.prepareNativeScan(params$1);
-			if (exe) {
-				if (require_backend.DEBUG >= 1) console.log(`[webgpu-scan] SUCCESS! Using WebGPU native scan (single kernel)`);
-				return {
-					executable: exe,
-					internalSizes: []
-				};
-			}
-		} catch (e$1) {
-			if (require_backend.DEBUG >= 2) console.warn("[webgpu-scan] prepareNativeScan failed:", e$1);
-		}
-		return null;
-	}
-	if (numCarry !== numY && numY !== 0) {
-		if (require_backend.DEBUG >= 2) console.log(`[webgpu-scan] multi-kernel requires numCarry === numY or numY === 0, got ${numCarry} !== ${numY}`);
-		return null;
-	}
-	const hasInternalDeps = executeSteps.some((step) => step.inputs.some((inputId) => inputId >= numInputs));
-	if (hasInternalDeps) {
-		if (require_backend.DEBUG >= 2) console.log(`[webgpu-scan] multi-kernel: internal buffer dependencies not supported, falling back`);
-		return null;
-	}
-	const slotToSource = /* @__PURE__ */ new Map();
-	for (let i = 0; i < executeSteps.length; i++) {
-		const step = executeSteps[i];
-		for (let outIdx = 0; outIdx < step.outputs.length; outIdx++) slotToSource.set(step.outputs[outIdx], {
-			stepIdx: i,
-			outputIdxInStep: outIdx,
-			step
-		});
-	}
-	const carryOutSlots = bodyProgram.outputs.slice(0, numCarry);
-	const carryInputSlots = bodyProgram.inputs.slice(numConsts, numConsts + numCarry);
-	const carrySourceInfos = [];
-	for (let carryIdx = 0; carryIdx < numCarry; carryIdx++) {
-		const slot = carryOutSlots[carryIdx];
-		const passthroughIdx = carryInputSlots.indexOf(slot);
-		if (passthroughIdx !== -1) {
-			if (require_backend.DEBUG >= 2) console.log(`[webgpu-scan] multi-kernel: carry ${carryIdx} is passthrough, not supported`);
-			return null;
-		}
-		const source = slotToSource.get(slot);
-		if (!source) {
-			if (require_backend.DEBUG >= 2) console.log(`[webgpu-scan] multi-kernel: carry output ${carryIdx} (slot ${slot}) not produced by any step`);
-			return null;
-		}
-		carrySourceInfos.push({
-			source,
-			carryIdx
-		});
-	}
-	const multiSteps = [];
-	let totalOutputs = 0;
-	for (const step of executeSteps) totalOutputs += step.outputs.length;
-	const slotToOutputIdx = /* @__PURE__ */ new Map();
-	let outputIdx = 0;
-	for (const step of executeSteps) for (const outId of step.outputs) slotToOutputIdx.set(outId, outputIdx++);
-	for (const { source, carryIdx } of carrySourceInfos) {
-		const { step, outputIdxInStep } = source;
-		const stepSource = step.source;
-		const inputs = [];
-		for (const inputId of step.inputs) if (inputId < numInputs) inputs.push(inputId);
-		else {
-			const outIdx = slotToOutputIdx.get(inputId);
-			if (outIdx !== void 0) inputs.push(numInputs + outIdx);
-			else {
-				if (require_backend.DEBUG >= 2) console.log(`[webgpu-scan] multi-kernel: input ${inputId} not mapped`);
-				return null;
-			}
-		}
-		let reindexedKernel;
-		if (stepSource instanceof require_backend.Kernel) {
-			const output = stepSource.outputs[outputIdxInStep];
-			const reindexedExp = output.exp.reindexGids(inputs);
-			const reindexedReduction = output.reduction?.reindexGids(inputs);
-			reindexedKernel = require_backend.Kernel.single(numInputs + totalOutputs, output.size, reindexedExp, reindexedReduction);
-		} else {
-			if (require_backend.DEBUG >= 2) console.log(`[webgpu-scan] multi-kernel: unexpected source type at step`);
-			return null;
-		}
-		multiSteps.push({
-			kernel: reindexedKernel,
-			inputs,
-			outputCarryIdx: carryIdx,
-			outputSize: reindexedKernel.size
-		});
-	}
-	const params = {
-		length,
-		numConsts,
-		constSizes,
-		numCarry,
-		carrySizes,
-		numX,
-		xsStrides,
-		numY,
-		ysStrides,
-		steps: multiSteps,
-		reverse
-	};
-	const webgpuBackend = backend;
-	if (!webgpuBackend.prepareNativeScanMulti) {
-		if (require_backend.DEBUG >= 2) console.log("[webgpu-scan] backend has no prepareNativeScanMulti");
-		return null;
-	}
-	try {
-		const exe = webgpuBackend.prepareNativeScanMulti(params);
-		if (exe) {
-			if (require_backend.DEBUG >= 1) console.log(`[webgpu-scan] SUCCESS! Using WebGPU native scan (${multiSteps.length} kernels)`);
-			return {
-				executable: exe,
-				internalSizes: []
-			};
-		}
-	} catch (e$1) {
-		if (require_backend.DEBUG >= 2) console.warn("[webgpu-scan] prepareNativeScanMulti failed:", e$1);
-	}
-	return null;
-}
-/**
-* Try to prepare a native scan executable.
-* Routes to backend-specific implementations:
-* - WebGPU kernel-only → tryPrepareWebGPUNativeScan
-* - WASM (kernels + routines) → tryPrepareWasmNativeScan
-*/
-function tryPrepareNativeScan(backend, bodyProgram, bodyJaxpr, length, numCarry, numConsts, numX, numY, reverse) {
-	const executeSteps = bodyProgram.steps.filter((s) => s.type === "execute");
-	if (executeSteps.length === 0) {
-		if (require_backend.DEBUG >= 1) console.log("[compiled-loop] skipped, no execute steps");
-		return null;
-	}
-	const allKernels = executeSteps.every((s) => s.source instanceof require_backend.Kernel);
-	if (backend.type === "webgpu" && allKernels) return tryPrepareWebGPUNativeScan(backend, bodyProgram, bodyJaxpr, executeSteps, length, numCarry, numConsts, numX, numY, reverse);
-	if (backend.type === "wasm") return tryPrepareWasmNativeScan(backend, bodyProgram, bodyJaxpr, executeSteps, length, numCarry, numConsts, numX, numY, reverse);
-	if (require_backend.DEBUG >= 1) console.log(`[compiled-loop] skipped, backend=${backend.type} not supported`);
-	return null;
-}
-/**
-* Try to prepare a native scan for WASM backend.
-* Supports:
-* - Single kernel bodies (like cumsum)
-* - Multiple independent kernels (like Kalman filter with 2 matmuls)
-* - Bodies with data dependencies between steps
-* - Bodies where numCarry !== numY
-* - Routine steps (Cholesky, Sort, TriangularSolve, LU, Argsort)
-*/
-function tryPrepareWasmNativeScan(backend, bodyProgram, bodyJaxpr, executeSteps, length, numCarry, numConsts, numX, numY, reverse) {
-	if (require_backend.DEBUG >= 2) console.log(`[wasm-scan] trying with numCarry=${numCarry}, numY=${numY}, steps=${executeSteps.length}`);
-	const usedRoutines = /* @__PURE__ */ new Set();
-	const supportedRoutines = new Set([
-		require_backend.Routines.Cholesky,
-		require_backend.Routines.Sort,
-		require_backend.Routines.TriangularSolve,
-		require_backend.Routines.LU,
-		require_backend.Routines.Argsort
-	]);
-	for (const step of executeSteps) if (step.source instanceof require_backend.Routine) {
-		const routineName = step.source.name;
-		if (!supportedRoutines.has(routineName)) {
-			if (require_backend.DEBUG >= 1) console.log(`[wasm-scan] skipped, unsupported routine in scan body: ${require_backend.Routines[routineName]}`);
-			return null;
-		}
-		usedRoutines.add(routineName);
-	}
-	if (require_backend.DEBUG >= 1) {
-		const routineNames = [...usedRoutines].map((r) => require_backend.Routines[r]);
-		console.log(`[wasm-scan] Analyzing body: ${executeSteps.length} execute steps, numCarry=${numCarry}, numY=${numY}` + (routineNames.length > 0 ? `, routines: ${routineNames.join(", ")}` : ""));
-	}
-	const numInputs = numConsts + numCarry + numX;
-	const { constSizes, carrySizes, xsStrides, ysStrides } = getScanBufferSizes(bodyJaxpr, numConsts, numCarry, numX);
-	const slotToInternal = /* @__PURE__ */ new Map();
-	const stepToInternalBase = /* @__PURE__ */ new Map();
-	const internalSizes = [];
-	for (let i = 0; i < executeSteps.length; i++) {
-		const step = executeSteps[i];
-		const source = step.source;
-		stepToInternalBase.set(i, internalSizes.length);
-		if (source instanceof require_backend.Kernel) if (source.isMultiOutput) for (let outIdx = 0; outIdx < source.outputs.length; outIdx++) {
-			const internalIdx = internalSizes.length;
-			slotToInternal.set(step.outputs[outIdx], internalIdx);
-			internalSizes.push(source.outputs[outIdx].size * require_backend.byteWidth(source.dtypeAt(outIdx)));
-		}
-		else {
-			const internalIdx = internalSizes.length;
-			slotToInternal.set(step.outputs[0], internalIdx);
-			internalSizes.push(source.size * require_backend.byteWidth(source.dtype));
-		}
-		else {
-			const routine = source;
-			for (let outIdx = 0; outIdx < step.outputs.length; outIdx++) {
-				const internalIdx = internalSizes.length;
-				slotToInternal.set(step.outputs[outIdx], internalIdx);
-				const outShape = routine.type.outputShapes[outIdx];
-				const outDtype = routine.type.outputDtypes[outIdx];
-				internalSizes.push(require_backend.prod(outShape) * require_backend.byteWidth(outDtype));
-			}
-		}
-	}
-	let auxBufferSize = 0;
-	let elementSize = 4;
-	for (const step of executeSteps) if (step.source instanceof require_backend.Routine) {
-		const routine = step.source;
-		const dtype = routine.type.inputDtypes[0];
-		elementSize = require_backend.byteWidth(dtype);
-		if (routine.name === require_backend.Routines.Sort) {
-			const inputShape = routine.type.inputShapes[0];
-			const sortDim = inputShape[inputShape.length - 1];
-			auxBufferSize = Math.max(auxBufferSize, sortDim * elementSize);
-		} else if (routine.name === require_backend.Routines.Argsort) {
-			const inputShape = routine.type.inputShapes[0];
-			const sortDim = inputShape[inputShape.length - 1];
-			auxBufferSize = Math.max(auxBufferSize, sortDim * 4);
-		}
-	}
-	const routineInfos = [];
-	const stepToRoutineInfoIdx = /* @__PURE__ */ new Map();
-	for (let i = 0; i < executeSteps.length; i++) {
-		const step = executeSteps[i];
-		if (step.source instanceof require_backend.Routine) {
-			const routine = step.source;
-			const routineName = routine.name;
-			const isF64 = routine.type.inputDtypes[0] === require_backend.DType.Float64;
-			const dtype = isF64 ? "f64" : "f32";
-			const routineInfoIdx = routineInfos.length;
-			stepToRoutineInfoIdx.set(i, routineInfoIdx);
-			if (routineName === require_backend.Routines.Cholesky) {
-				const inputShape = routine.type.inputShapes[0];
-				const n = inputShape[inputShape.length - 1];
-				routineInfos.push({
-					routine: routineName,
-					exportName: "cholesky",
-					numParams: 2,
-					dtype,
-					sizeParams: [n]
-				});
-			} else if (routineName === require_backend.Routines.Sort) {
-				const inputShape = routine.type.inputShapes[0];
-				const n = inputShape[inputShape.length - 1];
-				routineInfos.push({
-					routine: routineName,
-					exportName: "sort",
-					numParams: 2,
-					dtype,
-					sizeParams: [n]
-				});
-			} else if (routineName === require_backend.Routines.TriangularSolve) {
-				const aShape = routine.type.inputShapes[0];
-				const bShape = routine.type.inputShapes[1];
-				const n = aShape[aShape.length - 1];
-				const batchRows = bShape[bShape.length - 1];
-				const unitDiagonal = routine.params?.unitDiagonal ?? false;
-				const lower = false;
-				routineInfos.push({
-					routine: routineName,
-					exportName: "triangular_solve",
-					numParams: 3,
-					dtype,
-					sizeParams: [n, batchRows],
-					unitDiagonal,
-					lower
-				});
-			} else if (routineName === require_backend.Routines.LU) {
-				const inputShape = routine.type.inputShapes[0];
-				const m = inputShape[inputShape.length - 2];
-				const n = inputShape[inputShape.length - 1];
-				routineInfos.push({
-					routine: routineName,
-					exportName: "lu",
-					numParams: 4,
-					dtype,
-					sizeParams: [m, n]
-				});
-			} else if (routineName === require_backend.Routines.Argsort) {
-				const inputShape = routine.type.inputShapes[0];
-				const n = inputShape[inputShape.length - 1];
-				routineInfos.push({
-					routine: routineName,
-					exportName: "argsort",
-					numParams: 4,
-					dtype,
-					sizeParams: [n]
-				});
-			}
-		}
-	}
-	const steps = [];
-	for (let i = 0; i < executeSteps.length; i++) {
-		const step = executeSteps[i];
-		const source = step.source;
-		const inputSlots = [];
-		for (const inputId of step.inputs) if (inputId < numInputs) inputSlots.push(inputId);
-		else {
-			const internalIdx = slotToInternal.get(inputId);
-			if (internalIdx === void 0) {
-				if (require_backend.DEBUG >= 1) console.log(`[wasm-scan] skipped, input ${inputId} not found in slot mapping`);
-				return null;
-			}
-			inputSlots.push(numInputs + internalIdx);
-		}
-		if (source instanceof require_backend.Kernel) {
-			const reindexMap = inputSlots;
-			const reindexedOutputs = source.outputs.map((out) => ({
-				size: out.size,
-				exp: out.exp.reindexGids(reindexMap),
-				reduction: out.reduction?.reindexGids(reindexMap)
-			}));
-			const reindexedKernel = require_backend.Kernel.multi(numInputs + internalSizes.length, reindexedOutputs);
-			const internalBase = stepToInternalBase.get(i);
-			if (source.isMultiOutput) {
-				const outputInternalIndices = [];
-				for (let outIdx = 0; outIdx < source.outputs.length; outIdx++) outputInternalIndices.push(internalBase + outIdx);
-				steps.push({
-					source: reindexedKernel,
-					inputSlots,
-					outputInternalIdx: internalBase,
-					outputInternalIndices
-				});
-			} else steps.push({
-				source: reindexedKernel,
-				inputSlots,
-				outputInternalIdx: internalBase
-			});
-		} else {
-			const routine = source;
-			const routineName = routine.name;
-			const routineInfoIdx = stepToRoutineInfoIdx.get(i);
-			const internalBase = stepToInternalBase.get(i);
-			const numOutputs = routine.type.outputShapes.length;
-			const outputInternalIndices = [];
-			for (let outIdx = 0; outIdx < numOutputs; outIdx++) outputInternalIndices.push(internalBase + outIdx);
-			let staticParams = [];
-			if (routineName === require_backend.Routines.Cholesky) {
-				const inputShape = routine.type.inputShapes[0];
-				const n = inputShape[inputShape.length - 1];
-				staticParams = [n];
-			} else if (routineName === require_backend.Routines.Sort) {
-				const inputShape = routine.type.inputShapes[0];
-				const n = inputShape[inputShape.length - 1];
-				staticParams = [n];
-			} else if (routineName === require_backend.Routines.TriangularSolve) {
-				const aShape = routine.type.inputShapes[0];
-				const bShape = routine.type.inputShapes[1];
-				const n = aShape[aShape.length - 1];
-				const batchRows = bShape[bShape.length - 1];
-				const numBatches = 1;
-				const unitDiagonal = routine.params?.unitDiagonal ? 1 : 0;
-				const lower = 0;
-				staticParams = [
-					n,
-					batchRows,
-					numBatches,
-					unitDiagonal,
-					lower
-				];
-			} else if (routineName === require_backend.Routines.LU) {
-				const inputShape = routine.type.inputShapes[0];
-				const m = inputShape[inputShape.length - 2];
-				const n = inputShape[inputShape.length - 1];
-				staticParams = [m, n];
-			} else if (routineName === require_backend.Routines.Argsort) {
-				const inputShape = routine.type.inputShapes[0];
-				const n = inputShape[inputShape.length - 1];
-				staticParams = [n];
-			}
-			steps.push({
-				source,
-				inputSlots,
-				outputInternalIdx: internalBase,
-				outputInternalIndices,
-				routineCallInfo: {
-					routineInfoIdx,
-					staticParams
-				}
-			});
-		}
-	}
-	const carryOutSlots = bodyProgram.outputs.slice(0, numCarry);
-	const carryInputSlots = bodyProgram.inputs.slice(numConsts, numConsts + numCarry);
-	const carryOutSources = [];
-	for (const slot of carryOutSlots) {
-		const carryIdx = carryInputSlots.indexOf(slot);
-		if (carryIdx !== -1) {
-			carryOutSources.push({
-				type: "passthrough",
-				carryIdx
-			});
-			continue;
-		}
-		const internalIdx = slotToInternal.get(slot);
-		if (internalIdx === void 0) {
-			if (require_backend.DEBUG >= 1) console.log(`[wasm-scan] skipped, carry output slot ${slot} not produced by any execute step`);
-			return null;
-		}
-		carryOutSources.push({
-			type: "internal",
-			internalIdx
-		});
-	}
-	const xsInputSlots = bodyProgram.inputs.slice(numConsts + numCarry, numConsts + numCarry + numX);
-	const yOutputSlots = bodyProgram.outputs.slice(numCarry);
-	const yOutputSources = [];
-	for (const slot of yOutputSlots) {
-		const carryIdx = carryInputSlots.indexOf(slot);
-		if (carryIdx !== -1) {
-			yOutputSources.push({
-				type: "passthrough",
-				carryIdx
-			});
-			continue;
-		}
-		const xsIdx = xsInputSlots.indexOf(slot);
-		if (xsIdx !== -1) {
-			yOutputSources.push({
-				type: "xs-passthrough",
-				xsIdx
-			});
-			continue;
-		}
-		const internalIdx = slotToInternal.get(slot);
-		if (internalIdx === void 0) {
-			if (require_backend.DEBUG >= 1) console.log(`[wasm-scan] skipped, Y output slot ${slot} not found`);
-			return null;
-		}
-		yOutputSources.push({
-			type: "internal",
-			internalIdx
-		});
-	}
-	if (!backend.prepareNativeScanGeneral) {
-		if (require_backend.DEBUG >= 2) console.log("[wasm-scan] backend has no prepareNativeScanGeneral");
-		return null;
-	}
-	const params = {
-		length,
-		numConsts,
-		constSizes,
-		numCarry,
-		carrySizes,
-		numX,
-		xsStrides,
-		numY,
-		ysStrides,
-		internalSizes,
-		steps,
-		carryOutSources,
-		yOutputSources,
-		reverse,
-		auxBufferSize,
-		elementSize,
-		routineInfos: routineInfos.length > 0 ? routineInfos : void 0
-	};
-	try {
-		const exe = backend.prepareNativeScanGeneral(params);
-		if (exe) {
-			if (require_backend.DEBUG >= 1) {
-				const hasRoutines = steps.some((s) => s.source instanceof require_backend.Routine);
-				console.log(`[wasm-scan] SUCCESS! Using WASM native scan with ${steps.length} steps` + (hasRoutines ? " (includes routines)" : ""));
-			}
-			return {
-				executable: exe,
-				internalSizes,
-				params
-			};
-		}
-		return null;
-	} catch (e$1) {
-		if (require_backend.DEBUG >= 2) console.warn("[wasm-scan] preparation failed:", e$1);
-		return null;
-	}
 }
 
 //#endregion
@@ -3965,6 +3951,61 @@ var Array$1 = class Array$1 extends Tracer {
 		const that = this;
 		return { set: (src) => dynamicUpdateSlice(that, src, index) };
 	}
+	static #stackScanYs(ySlices, reverse) {
+		return ySlices.map((slices) => {
+			const reshaped = slices.map((s) => {
+				const expanded = s.ref.#reshape(s.#st.reshape([1, ...s.shape]));
+				s.dispose();
+				return expanded;
+			});
+			let stacked = reshaped[0];
+			for (let i = 1; i < reshaped.length; i += 6) {
+				const chunk = reshaped.slice(i, i + 6);
+				stacked = concatenate$1([stacked, ...chunk], 0);
+			}
+			if (reverse) {
+				const flipArg = require_backend.rep(stacked.ndim, false);
+				flipArg[0] = true;
+				const flipped = stacked.ref.#reshape(stacked.#st.flip(flipArg));
+				stacked.dispose();
+				return flipped;
+			}
+			return stacked;
+		});
+	}
+	static #runScanFallbackLoop(params) {
+		const { length, reverse, numCarry, numY, xs, initCarry, bodyOutAvals, runBody, writeY, onBeforeCarryDispose, disposeXSlices } = params;
+		const canDirectWriteY = numY > 0 && !!writeY;
+		const yStrideBytes = bodyOutAvals.slice(numCarry).map((aval) => require_backend.prod(aval.shape) * require_backend.byteWidth(aval.dtype));
+		const ySlices = [];
+		if (!canDirectWriteY) for (let j = 0; j < numY; j++) ySlices.push([]);
+		let carry = initCarry;
+		for (let i = 0; i < length; i++) {
+			const dataIdx = reverse ? length - 1 - i : i;
+			const xSlice = xs.map((x) => {
+				const slicePairs = x.shape.map((s, axis) => axis === 0 ? [dataIdx, dataIdx + 1] : [0, s]);
+				const squeezedShape = x.shape.slice(1);
+				return x.ref.#reshape(x.#st.shrink(slicePairs).reshape(squeezedShape));
+			});
+			const outs = runBody(carry, xSlice, i);
+			const newCarry = outs.slice(0, numCarry);
+			const ySlice = outs.slice(numCarry);
+			if (canDirectWriteY) {
+				const writeIndex = reverse ? length - 1 - i : i;
+				writeY(writeIndex, ySlice, yStrideBytes);
+			} else for (let j = 0; j < numY; j++) ySlices[j].push(ySlice[j]);
+			if (i > 0 && onBeforeCarryDispose) onBeforeCarryDispose(carry, ySlice);
+			if (i > 0) carry.forEach((c) => c.dispose());
+			carry = newCarry;
+			if (canDirectWriteY) ySlice.forEach((y) => y.dispose());
+			if (disposeXSlices) xSlice.forEach((x) => x.dispose());
+		}
+		return {
+			carry,
+			ySlices,
+			usedDirectWrite: canDirectWriteY
+		};
+	}
 	/** @private Internal plumbing method for Array / Tracer ops. */
 	static _implRules() {
 		return {
@@ -4258,17 +4299,27 @@ var Array$1 = class Array$1 extends Tracer {
 					}));
 					const bodyOutAvals = bodyJaxpr.outs.map((v) => v.aval);
 					const canDirectWriteY = numY > 0 && outputSlots.length === numCarry + numY && (backend.copyBufferToBuffer || backend.copyBufferWithShader);
-					const yStrideBytes = bodyOutAvals.slice(numCarry).map((aval) => require_backend.prod(aval.shape) * require_backend.byteWidth(aval.dtype));
-					const ySlices = [];
-					if (!canDirectWriteY) for (let j = 0; j < numY; j++) ySlices.push([]);
-					for (let i = 0; i < length; i++) {
-						const dataIdx = reverse ? length - 1 - i : i;
-						const xSlice = xs.map((x) => {
-							const slicePairs = x.shape.map((s, axis) => axis === 0 ? [dataIdx, dataIdx + 1] : [0, s]);
-							const squeezedShape = x.shape.slice(1);
-							return x.ref.#reshape(x.#st.shrink(slicePairs).reshape(squeezedShape));
-						});
-						const carrySlots = carry.map((c) => c._realizeSource());
+					const writeY = canDirectWriteY ? (writeIndex, ySlice, yStrideBytes) => {
+						for (let j = 0; j < numY; j++) {
+							const sizeBytes = yStrideBytes[j];
+							if (sizeBytes <= 0) continue;
+							const dstOffsetBytes = writeIndex * sizeBytes;
+							const ySlot = ySlice[j]._realizeSource();
+							const dstSlot = outputSlots[numCarry + j];
+							const canBufferCopy = dstOffsetBytes % 4 === 0 && sizeBytes % 4 === 0;
+							if (backend.copyBufferToBuffer && canBufferCopy) backend.copyBufferToBuffer(ySlot, 0, dstSlot, dstOffsetBytes, sizeBytes);
+							else if (backend.copyBufferWithShader) backend.copyBufferWithShader(ySlot, 0, dstSlot, dstOffsetBytes, sizeBytes);
+						}
+					} : void 0;
+					const onBeforeCarryDispose = (oldCarry, ySlice) => {
+						const oldCarrySlots = new Set(oldCarry.map((c) => c._realizeSource()));
+						for (const y of ySlice) {
+							const slot = y._realizeSource();
+							if (oldCarrySlots.has(slot)) backend.incRef(slot);
+						}
+					};
+					const runBody = (curCarry, xSlice, i) => {
+						const carrySlots = curCarry.map((c) => c._realizeSource());
 						const xSliceSlots = xSlice.map((x) => x._realizeSource());
 						for (const x of xSlice) for (const exe of x.#pending) {
 							exe.prepareSync();
@@ -4285,9 +4336,8 @@ var Array$1 = class Array$1 extends Tracer {
 							exe.prepareSync();
 							exe.submit();
 						}
-						xSlice.forEach((x) => x.dispose());
 						const seenSlots = /* @__PURE__ */ new Set();
-						const outArrays = bodyOuts.map((slot, j) => {
+						return bodyOuts.map((slot, j) => {
 							if (seenSlots.has(slot)) backend.incRef(slot);
 							else seenSlots.add(slot);
 							return new Array$1({
@@ -4300,53 +4350,23 @@ var Array$1 = class Array$1 extends Tracer {
 								pending: []
 							});
 						});
-						const newCarry = outArrays.slice(0, numCarry);
-						const ySlice = outArrays.slice(numCarry);
-						if (canDirectWriteY) {
-							const writeIndex = reverse ? length - 1 - i : i;
-							for (let j = 0; j < numY; j++) {
-								const sizeBytes = yStrideBytes[j];
-								if (sizeBytes <= 0) continue;
-								const dstOffsetBytes = writeIndex * sizeBytes;
-								const ySlot = ySlice[j]._realizeSource();
-								const dstSlot = outputSlots[numCarry + j];
-								const canBufferCopy = dstOffsetBytes % 4 === 0 && sizeBytes % 4 === 0;
-								if (backend.copyBufferToBuffer && canBufferCopy) backend.copyBufferToBuffer(ySlot, 0, dstSlot, dstOffsetBytes, sizeBytes);
-								else if (backend.copyBufferWithShader) backend.copyBufferWithShader(ySlot, 0, dstSlot, dstOffsetBytes, sizeBytes);
-							}
-						} else for (let j = 0; j < numY; j++) ySlices[j].push(ySlice[j]);
-						if (i > 0) {
-							const oldCarrySlots = new Set(carry.map((c) => c._realizeSource()));
-							for (const y of ySlice) {
-								const slot = y._realizeSource();
-								if (oldCarrySlots.has(slot)) backend.incRef(slot);
-							}
-							carry.forEach((c) => c.dispose());
-						}
-						carry = newCarry;
-						if (canDirectWriteY) ySlice.forEach((y) => y.dispose());
-					}
-					let stackedYs = [];
-					if (!canDirectWriteY) stackedYs = ySlices.map((slices) => {
-						const reshaped = slices.map((s) => {
-							const expanded = s.ref.#reshape(s.#st.reshape([1, ...s.shape]));
-							s.dispose();
-							return expanded;
-						});
-						let stacked = reshaped[0];
-						for (let i = 1; i < reshaped.length; i += 6) {
-							const chunk = reshaped.slice(i, i + 6);
-							stacked = concatenate$1([stacked, ...chunk], 0);
-						}
-						if (reverse) {
-							const flipArg = require_backend.rep(stacked.ndim, false);
-							flipArg[0] = true;
-							const flipped = stacked.ref.#reshape(stacked.#st.flip(flipArg));
-							stacked.dispose();
-							return flipped;
-						}
-						return stacked;
+					};
+					const loopResult = Array$1.#runScanFallbackLoop({
+						length,
+						reverse,
+						numCarry,
+						numY,
+						xs,
+						initCarry: carry,
+						bodyOutAvals,
+						runBody,
+						writeY,
+						onBeforeCarryDispose,
+						disposeXSlices: true
 					});
+					carry = loopResult.carry;
+					let stackedYs = [];
+					if (!loopResult.usedDirectWrite) stackedYs = Array$1.#stackScanYs(loopResult.ySlices, reverse);
 					const carryOutSlots = carry.map((c) => c._realizeSource());
 					const yOutSlots = canDirectWriteY ? outputSlots.slice(numCarry) : stackedYs.map((y) => y._realizeSource());
 					const carryPending = carry.flatMap((c) => c.#pending);
@@ -4394,7 +4414,6 @@ var Array$1 = class Array$1 extends Tracer {
 				const { backend } = Array$1.#computeBackend("scan", args);
 				const bodyOutAvals = jaxpr.outs.map((v) => v.aval);
 				const canDirectWriteY = numY > 0 && (backend.copyBufferToBuffer || backend.copyBufferWithShader);
-				const yStrideBytes = bodyOutAvals.slice(numCarry).map((aval) => require_backend.prod(aval.shape) * require_backend.byteWidth(aval.dtype));
 				const preallocatedYs = [];
 				const preallocatedSlots = [];
 				if (canDirectWriteY) {
@@ -4424,70 +4443,50 @@ var Array$1 = class Array$1 extends Tracer {
 						}));
 					}
 				}
-				const ySlices = [];
-				if (!canDirectWriteY) for (let j = 0; j < numY; j++) ySlices.push([]);
 				let carry = initCarry;
-				for (let i = 0; i < length; i++) {
-					const dataIdx = reverse ? length - 1 - i : i;
-					const xSlice = xs.map((x) => {
-						const slicePairs = x.shape.map((s, axis) => axis === 0 ? [dataIdx, dataIdx + 1] : [0, s]);
-						const squeezedShape = x.shape.slice(1);
-						return x.ref.#reshape(x.#st.shrink(slicePairs).reshape(squeezedShape));
-					});
+				const writeY = canDirectWriteY ? (writeIndex, ySlice, yStrideBytes) => {
+					for (let j = 0; j < numY; j++) {
+						const sizeBytes = yStrideBytes[j];
+						if (sizeBytes <= 0) continue;
+						const dstOffsetBytes = writeIndex * sizeBytes;
+						const ySlot = ySlice[j]._realizeSource();
+						for (const exe of ySlice[j].#pending) {
+							exe.prepareSync();
+							exe.submit();
+						}
+						const dstSlot = preallocatedSlots[j];
+						const canBufferCopy = dstOffsetBytes % 4 === 0 && sizeBytes % 4 === 0;
+						if (backend.copyBufferToBuffer && canBufferCopy) backend.copyBufferToBuffer(ySlot, 0, dstSlot, dstOffsetBytes, sizeBytes);
+						else if (backend.copyBufferWithShader) backend.copyBufferWithShader(ySlot, 0, dstSlot, dstOffsetBytes, sizeBytes);
+					}
+				} : void 0;
+				const runBody = (curCarry, xSlice) => {
 					const jaxprInputs = [
 						...constViews.map((c) => c.ref),
-						...carry.map((c) => c.ref),
+						...curCarry.map((c) => c.ref),
 						...xSlice
 					];
-					const outs = evalJaxpr(jaxpr, jaxprInputs);
-					const newCarry = outs.slice(0, numCarry);
-					const ySlice = outs.slice(numCarry);
-					if (canDirectWriteY) {
-						const writeIndex = reverse ? length - 1 - i : i;
-						for (let j = 0; j < numY; j++) {
-							const sizeBytes = yStrideBytes[j];
-							if (sizeBytes <= 0) continue;
-							const dstOffsetBytes = writeIndex * sizeBytes;
-							const ySlot = ySlice[j]._realizeSource();
-							for (const exe of ySlice[j].#pending) {
-								exe.prepareSync();
-								exe.submit();
-							}
-							const dstSlot = preallocatedSlots[j];
-							const canBufferCopy = dstOffsetBytes % 4 === 0 && sizeBytes % 4 === 0;
-							if (backend.copyBufferToBuffer && canBufferCopy) backend.copyBufferToBuffer(ySlot, 0, dstSlot, dstOffsetBytes, sizeBytes);
-							else if (backend.copyBufferWithShader) backend.copyBufferWithShader(ySlot, 0, dstSlot, dstOffsetBytes, sizeBytes);
-							ySlice[j].dispose();
-						}
-					} else for (let j = 0; j < numY; j++) ySlices[j].push(ySlice[j]);
-					if (i > 0) carry.forEach((c) => c.dispose());
-					carry = newCarry;
-				}
+					return evalJaxpr(jaxpr, jaxprInputs);
+				};
+				const loopResult = Array$1.#runScanFallbackLoop({
+					length,
+					reverse,
+					numCarry,
+					numY,
+					xs,
+					initCarry: carry,
+					bodyOutAvals,
+					runBody,
+					writeY,
+					disposeXSlices: false
+				});
+				carry = loopResult.carry;
 				initCarry.forEach((c) => c.dispose());
 				xs.forEach((x) => x.dispose());
 				consts.forEach((c) => c.dispose());
 				constViews.forEach((c) => c.dispose());
-				if (canDirectWriteY) return [...carry, ...preallocatedYs];
-				const stackedYs = ySlices.map((slices) => {
-					const reshaped = slices.map((s) => {
-						const expanded = s.ref.#reshape(s.#st.reshape([1, ...s.shape]));
-						s.dispose();
-						return expanded;
-					});
-					let stacked = reshaped[0];
-					for (let i = 1; i < reshaped.length; i += 6) {
-						const chunk = reshaped.slice(i, i + 6);
-						stacked = concatenate$1([stacked, ...chunk], 0);
-					}
-					if (reverse) {
-						const flipArg = require_backend.rep(stacked.ndim, false);
-						flipArg[0] = true;
-						const flipped = stacked.ref.#reshape(stacked.#st.flip(flipArg));
-						stacked.dispose();
-						return flipped;
-					}
-					return stacked;
-				});
+				if (loopResult.usedDirectWrite) return [...carry, ...preallocatedYs];
+				const stackedYs = Array$1.#stackScanYs(loopResult.ySlices, reverse);
 				return [...carry, ...stackedYs];
 			}
 		};
