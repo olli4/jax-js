@@ -79,6 +79,7 @@ export type JitStep =
       xs: JitId[];
       xsAvals: ShapedArray[]; // xs avals from the scan's input (for shape tracking)
       outputs: JitId[]; // [carry_out..., stacked_ys...]
+      preallocateY?: boolean;
     }
   | {
       type: "compiled-loop";
@@ -126,6 +127,7 @@ export type ScanRunner = (
   initCarrySlots: Slot[],
   xsSlots: Slot[],
   xsAvals: ShapedArray[],
+  preallocateY: boolean,
   outputSlots: Slot[],
 ) => { outputs: Slot[]; pending: PendingExecute[] };
 
@@ -355,6 +357,9 @@ export class JitProgram {
             initCarrySlots,
             xsSlots,
             step.xsAvals,
+            // Pass the preallocateY hint to the scanRunner so it can preallocate
+            // and write outputs directly into the provided outputSlots when true.
+            step.preallocateY ?? false,
             outputSlots,
           );
 
@@ -894,6 +899,8 @@ export function jitCompile(backend: Backend, jaxpr: Jaxpr): JitProgram {
         xs: xsIds,
         xsAvals,
         outputs,
+        // Carry forward preallocation hint from the original primitive params
+        preallocateY: (params as any).preallocateY ?? false,
       });
       continue;
     }
@@ -1378,6 +1385,10 @@ const jitRules: { [P in Primitive]: JitRule<P> } = {
   }),
   [Primitive.Shrink]: reshapeJit((st, { slice }) => st.shrink(slice)),
   [Primitive.Pad]: reshapeJit((st, { width }) => st.pad(width)),
+  [Primitive.DynamicUpdateSlice]: (_args, _as, _params) => {
+    // JIT compilation for dynamic_update_slice is not implemented yet.
+    throw new Error("jit: dynamic_update_slice is not implemented");
+  },
   [Primitive.Sort]: routineNoJit(),
   [Primitive.Argsort]: routineNoJit(),
   [Primitive.TriangularSolve]: routineNoJit(),

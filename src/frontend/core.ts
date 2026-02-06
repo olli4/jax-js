@@ -84,6 +84,8 @@ export enum Primitive {
   Flip = "flip",
   Shrink = "shrink",
   Pad = "pad",
+  // Update a contiguous slice along an axis: dst[axis=offset:offset+len] = src
+  DynamicUpdateSlice = "dynamic_update_slice",
 
   // Routines (custom lowering)
   Sort = "sort", // sort(x, axis=-1)
@@ -121,6 +123,8 @@ interface PrimitiveParamsImpl extends Record<Primitive, Record<string, any>> {
   [Primitive.Flip]: { axis: number[] };
   [Primitive.Shrink]: { slice: Pair[] };
   [Primitive.Pad]: { width: Pair[] };
+  // Update a contiguous slice along a single axis: dst[axis=offset:offset+src.shape[axis]] = src
+  [Primitive.DynamicUpdateSlice]: { offset: number; axis: number };
   [Primitive.TriangularSolve]: { unitDiagonal: boolean };
   [Primitive.Jit]: { name: string; jaxpr: Jaxpr; numConsts: number };
   [Primitive.Scan]: {
@@ -138,6 +142,12 @@ interface PrimitiveParamsImpl extends Record<Primitive, Record<string, any>> {
      * - `false`: store all intermediate carries (O(N) memory, no recomputation)
      */
     checkpoint?: boolean | number;
+    /**
+     * If true, preallocate stacked-Y buffers on the scan fallback path and
+     * write each iteration's Y directly into the preallocated buffers using
+     * `dynamic_update_slice`/`arr.at(i).set(src)` to avoid concat churn.
+     */
+    preallocateY?: boolean;
   };
 }
 
@@ -496,6 +506,21 @@ export function pad(
     throw new Error(`Invalid pad(): expected ${nd} axes, got ${w.length}`);
   }
   return bind1(Primitive.Pad, [x], { width: w });
+}
+
+export function dynamicUpdateSlice(
+  dst: TracerValue,
+  src: TracerValue,
+  offset: number,
+  axis: number = 0,
+) {
+  offset = Math.floor(offset);
+  if (!Number.isInteger(offset) || offset < 0) {
+    throw new Error(
+      `dynamicUpdateSlice: offset must be a nonnegative integer, got ${offset}`,
+    );
+  }
+  return bind1(Primitive.DynamicUpdateSlice, [dst, src], { offset, axis });
 }
 
 export function triangularSolve(

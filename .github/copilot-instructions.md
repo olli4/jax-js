@@ -1743,17 +1743,40 @@ contributors should be aware of:
   object via `(flatF as any)._yTreedef = yTreedef`. This is invisible to TypeScript and could be
   replaced with a closure variable.
 
-- **Fallback Y stacking overhead:** The `scanRunner` in `array.ts` stacks Y outputs via chunked
-  `coreConcatenate` (groups of 6). For large iteration counts, this creates O(length) intermediate
-  arrays. Pre-allocating the output buffer would be more efficient.
+- **Fallback Y stacking overhead & preallocated Y plan:** The `scanRunner` in `array.ts` currently
+  stacks Y outputs via chunked `coreConcatenate` (groups of 6), which creates O(length) intermediate
+  arrays for large iteration counts. Pre-allocating the final stacked-Y buffer and writing each
+  iteration's Y directly into its slice avoids those allocations and reduces memory churn.
+
+  Plan (short): implement a `dynamic_update_slice(dst, src, offset)` primitive and a
+  `arr.at(index).set(src)` convenience; extend `lax.scan` with an optional `{ preallocateY: true }`
+  (or autodetect when shapes are known) so the fallback path preallocates `ysStacked` and calls
+  `dynamic_update_slice` each iteration. On WebGPU, implement a small WGSL copy kernel that binds
+  the destination storage buffer and the source and accepts an `u32 offset` uniform (element index).
+  Use `queue.copyBufferToBuffer` as an optimization path when alignment and limits permit, and fall
+  back to the WGSL kernel otherwise. Add tests (passthrough Y, duplicate-slot outputs, Y=null) and
+  benchmarks to measure allocation/time improvements.
 
 ### Future work
 
-| Priority | Feature                         | Notes                                              |
-| -------- | ------------------------------- | -------------------------------------------------- |
-| Medium   | Mixed-dtype WebGPU scan shader  | Per-binding dtype in `nativeScanMultiShaderSource` |
-| Low      | Length-0 scan support           | Return `(init, empty_ys)` for JAX compat           |
-| Low      | `lax.scatter` / `dynamic_slice` | Would enable Jaxpr-based routines                  |
+| Priority | Feature                                          | Notes                                                                                                                                                                                  |
+| -------- | ------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| High     | Preallocated Y stacking + `dynamic_update_slice` | Preallocate stacked outputs; implement `dynamic_update_slice` and WebGPU WGSL copy kernel (uniform offsets); add copyBufferToBuffer optimization, pipeline caching, tests & benchmarks |
+| Medium   | Mixed-dtype WebGPU scan shader                   | Per-binding dtype in `nativeScanMultiShaderSource`                                                                                                                                     |
+| Low      | Length-0 scan support                            | Return `(init, empty_ys)` for JAX compat                                                                                                                                               |
+| Low      | `lax.scatter` / `dynamic_slice`                  | Would enable Jaxpr-based routines                                                                                                                                                      |
+
+#### Planned implementation steps
+
+1. Add `dynamic_update_slice(dst, src, offset)` primitive and `arr.at(i).set(src)` frontend API.
+2. Implement CPU/WASM fast-path (memcpy) and general element-wise copy fallback.
+3. Add WebGPU WGSL copy kernel (dst, src, offset uniform) and pipeline caching in `webgpu` backend.
+4. Extend `lax.scan`/`scanRunner` to preallocate `ysStacked` when requested and use
+   `dynamic_update_slice` per iteration.
+5. Add preencoded-routine optimization for routine-only bodies: record
+   `dispatch + copyBufferToBuffer(dstOffset)` sequences when alignment allows.
+6. Add unit tests for correctness (passthrough, duplicate outputs, Y=null) and micro-benchmarks
+   comparing concat-based stacking vs preallocated direct-write.
 
 ### WASM feature opportunities (assessed Feb 2026)
 

@@ -304,6 +304,28 @@ export class WebGPUBackend implements Backend {
     return this.syncReader.read(buffer, start, count);
   }
 
+  copyBufferToBuffer(
+    srcSlot: Slot,
+    srcOffset: number,
+    dstSlot: Slot,
+    dstOffset: number,
+    size: number,
+  ) {
+    const { buffer: srcBuf } = this.#getBuffer(srcSlot);
+    const { buffer: dstBuf } = this.#getBuffer(dstSlot);
+    const commandEncoder = this.device.createCommandEncoder();
+    // Pad size to 4 bytes to avoid alignment issues in some drivers
+    const paddedSize = Math.ceil(size / 4) * 4;
+    commandEncoder.copyBufferToBuffer(
+      srcBuf,
+      srcOffset,
+      dstBuf,
+      dstOffset,
+      paddedSize,
+    );
+    this.device.queue.submit([commandEncoder.finish()]);
+  }
+
   #cachedShader(kernel: Kernel): ShaderInfo {
     const cacheKey = FpHash.hash(kernel);
     let result = this.#cachedShaderMap.get(cacheKey);

@@ -79,6 +79,12 @@ export interface ScanOptions {
    * ```
    */
   checkpoint?: boolean | number;
+  /**
+   * If true, the scan fallback path will preallocate stacked-Y buffers and
+   * write each iteration's Y directly into the preallocated buffers.
+   * This reduces intermediate allocations at the cost of an extra copy path.
+   */
+  preallocateY?: boolean;
 }
 
 /**
@@ -345,7 +351,13 @@ export function scan<
   options?: ScanOptions,
 ): [Carry, Y] {
   const opts: ScanOptions = options ?? {};
-  const { length: lengthOpt, reverse = false, acceptPath, checkpoint } = opts;
+  const {
+    length: lengthOpt,
+    reverse = false,
+    acceptPath,
+    checkpoint,
+    preallocateY = false,
+  } = opts;
 
   // Handle xs=null case (carry-only scan with no input arrays)
   const xsIsNull = xs === null;
@@ -475,6 +487,7 @@ export function scan<
     reverse,
     acceptPath,
     checkpoint,
+    preallocateY,
   });
 
   // Dispose original inputs

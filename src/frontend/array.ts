@@ -37,6 +37,7 @@ import {
   CompareOp,
   exp as coreExp,
   mul as coreMul,
+  dynamicUpdateSlice,
   getAval,
   ndim,
   newMain,
@@ -862,6 +863,18 @@ export class Array extends Tracer {
     return this.dataSync()[0];
   }
 
+  /**
+   * Convenience accessor for index/update-like usage: `arr.at(i).set(src)`.
+   * Currently supports a single `axis=0` offset and integer index. Returns
+   * a new array where the slice at `index` along axis 0 is replaced by `src`.
+   */
+  at(index: number) {
+    const that = this;
+    return {
+      set: (src: TracerValue) => dynamicUpdateSlice(that, src, index),
+    };
+  }
+
   //
   // Internal methods follow, not public API. Do not use.
   //
@@ -1077,6 +1090,112 @@ export class Array extends Tracer {
       },
       [Primitive.Pad]([x], { width }) {
         return [x.#reshape(x.#st.pad(width))];
+      },
+      [Primitive.DynamicUpdateSlice]([dst, src], { offset, axis }) {
+        const dstShape = dst.shape;
+        const srcShape = src.shape;
+
+        // Mode 1: same rank, axis in range
+        if (dstShape.length === srcShape.length) {
+          for (let i = 0; i < dstShape.length; i++) {
+            if (i === axis) continue;
+            if (dstShape[i] !== srcShape[i]) {
+              throw new Error(
+                "dynamicUpdateSlice: dst and src must match on non-updated axes",
+              );
+            }
+          }
+          if (offset + srcShape[axis] > dstShape[axis]) {
+            throw new Error(
+              "dynamicUpdateSlice: offset + src.shape[axis] out of bounds",
+            );
+          }
+          const innerBefore = prod(dstShape.slice(axis + 1));
+          const outerBefore = prod(dstShape.slice(0, axis));
+          const dstData = dst.dataSync();
+          const srcData = src.dataSync();
+          for (let out = 0; out < outerBefore; out++) {
+            for (let i = 0; i < srcShape[axis]; i++) {
+              const srcStart = (out * srcShape[axis] + i) * innerBefore;
+              const dstStart =
+                (out * dstShape[axis] + offset + i) * innerBefore;
+              dstData.set(
+                srcData.subarray(srcStart, srcStart + innerBefore),
+                dstStart,
+              );
+            }
+          }
+          return [
+            array(dstData, {
+              shape: dstShape,
+              dtype: dst.dtype,
+              device: dst.device,
+            }),
+          ];
+        }
+
+        // Mode 2: stacked dst at axis=0
+        if (axis === 0 && dstShape.length === srcShape.length + 1) {
+          for (let i = 0; i < srcShape.length; i++) {
+            if (dstShape[i + 1] !== srcShape[i]) {
+              throw new Error(
+                "dynamicUpdateSlice: dst and src must match on non-updated axes (stacked mode)",
+              );
+            }
+          }
+          if (offset + 1 > dstShape[0]) {
+            throw new Error(
+              "dynamicUpdateSlice: offset out of bounds for stacked dst",
+            );
+          }
+
+          // Fast path: WebGPU buffer copy when both src/dst are on WebGPU
+          if (dst.device === "webgpu" && src.device === "webgpu") {
+            const dstSlot = dst._realizeSource();
+            const srcSlot = src._realizeSource();
+            const innerSizeBytes = prod(srcShape) * byteWidth(dst.dtype);
+            const dstOffsetBytes = offset * innerSizeBytes;
+            const backend = getBackend("webgpu") as any;
+            if (backend.copyBufferToBuffer) {
+              backend.copyBufferToBuffer(
+                srcSlot,
+                0,
+                dstSlot,
+                dstOffsetBytes,
+                innerSizeBytes,
+              );
+              backend.incRef(dstSlot);
+              return [
+                new Array({
+                  source: dstSlot,
+                  st: ShapeTracker.fromShape(dstShape),
+                  dtype: dst.dtype,
+                  weakType: dst.weakType,
+                  backend: getBackend(dst.device),
+                  committed: true,
+                  pending: [],
+                }),
+              ];
+            }
+          }
+
+          const dstData = dst.dataSync();
+          const srcData = src.dataSync();
+          const innerSize = prod(srcShape);
+          const dstStart = offset * innerSize;
+          dstData.set(srcData as any, dstStart);
+          return [
+            array(dstData, {
+              shape: dstShape,
+              dtype: dst.dtype,
+              device: dst.device,
+            }),
+          ];
+        }
+
+        throw new Error(
+          "dynamicUpdateSlice: unsupported dst/src shapes for update",
+        );
       },
       [Primitive.Sort]: Array.#routine(Primitive.Sort),
       [Primitive.Argsort]: Array.#routine(Primitive.Argsort),

@@ -943,6 +943,32 @@ export const abstractEvalRules: { [P in Primitive]: AbstractEvalRule<P> } = {
     const newShape = x.shape.map((dim, i) => dim + width[i][0] + width[i][1]);
     return [new ShapedArray(newShape, x.dtype, x.weakType)];
   },
+  [Primitive.DynamicUpdateSlice]([dst, src], { offset, axis }) {
+    if (!(dst instanceof ShapedArray) || !(src instanceof ShapedArray)) {
+      throw new TypeError("dynamicUpdateSlice expects shaped array inputs");
+    }
+    const dstShape = dst.shape;
+    const srcShape = src.shape;
+    if (dstShape.length === srcShape.length) {
+      for (let i = 0; i < dstShape.length; i++) {
+        if (i === axis) continue;
+        if (dstShape[i] !== srcShape[i])
+          throw new TypeError("dynamicUpdateSlice: shape mismatch");
+      }
+      if (offset + srcShape[axis] > dstShape[axis])
+        throw new TypeError("dynamicUpdateSlice: out of bounds");
+    } else if (axis === 0 && dstShape.length === srcShape.length + 1) {
+      for (let i = 0; i < srcShape.length; i++) {
+        if (dstShape[i + 1] !== srcShape[i])
+          throw new TypeError("dynamicUpdateSlice: stacked shape mismatch");
+      }
+      if (offset + 1 > dstShape[0])
+        throw new TypeError("dynamicUpdateSlice: stacked out of bounds");
+    } else {
+      throw new TypeError("dynamicUpdateSlice: unsupported shapes");
+    }
+    return [new ShapedArray(dst.shape, dst.dtype, dst.weakType)];
+  },
   [Primitive.Sort]([x]) {
     if (x.ndim === 0) throw new TypeError("sort: requires at least 1D input");
     return [ShapedArray.fromAval(x)];

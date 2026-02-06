@@ -216,6 +216,10 @@ const jvpRules: { [P in Primitive]: JvpRule<P> } = {
     dx.dispose(); // Non-differentiable operation.
     return [[bitcast(x.ref, dtype)], [zerosLike(x)]];
   },
+  [Primitive.DynamicUpdateSlice]([dst, src], [ddst, dsrc], { offset, axis }) {
+    // JVP for dynamic update slice is not implemented. Throw to avoid silent errors.
+    throw new Error("JVP: dynamic_update_slice is not implemented");
+  },
   [Primitive.Sin]([x], [dx]) {
     return [[sin(x.ref)], [cos(x).mul(dx)]];
   },

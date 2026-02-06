@@ -1,6 +1,7 @@
 import { DType } from "./alu";
 import { defaultDevice, Device, devices, getBackend, init } from "./backend";
 import { Array, ArrayLike } from "./frontend/array";
+import { dynamicUpdateSlice } from "./frontend/core";
 import * as jaxprModule from "./frontend/jaxpr";
 import { ClosedJaxpr, Jaxpr, OwnedFunction } from "./frontend/jaxpr";
 import * as jvpModule from "./frontend/jvp";
@@ -39,6 +40,8 @@ export {
   setScanBodyStepsCallback,
   scipySpecial,
   tree,
+  // Low-level helper: copy a contiguous slice into dst at `offset` (axis=0 by default).
+  dynamicUpdateSlice,
 };
 
 /**

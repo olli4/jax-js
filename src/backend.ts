@@ -236,6 +236,15 @@ export interface Backend {
     ysStacked: Slot[],
   ): void;
 
+  /** Copy a contiguous range of bytes from src buffer to dst buffer. */
+  copyBufferToBuffer?(
+    srcSlot: Slot,
+    srcOffset: number,
+    dstSlot: Slot,
+    dstOffset: number,
+    size: number,
+  ): void;
+
   /** Prepare a batched scan operation (WebGPU backend). */
   prepareBatchedScan?(params: any): any | null;
 
