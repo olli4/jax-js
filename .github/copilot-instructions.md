@@ -12,12 +12,18 @@ These notes help AI coding agents be immediately productive. The document has tw
 ## What is jax-js?
 
 jax-js is a JavaScript/TypeScript port of [JAX](https://github.com/google/jax), Google's library for
-high-performance numerical computing. It enables:
+high-performance numerical computing. It brings **numerical computing and machine learning** to the
+web as a first-class capability — not just model inference, but the full stack: array operations,
+automatic differentiation, JIT compilation, and composable transformations.
 
 - **NumPy-like array operations** in the browser or Node.js
 - **Automatic differentiation** — compute gradients of arbitrary functions for ML training
 - **JIT compilation** — trace functions once, compile to optimized GPU/WASM code
 - **Transformations** — `grad`, `vmap`, `jit` compose to build complex ML pipelines
+
+The target audience is broad: scientists, artists, ML practitioners, data scientists — anyone who
+needs numerical computing but shouldn't have to write GPU shaders or manage a Python environment.
+jax-js makes the JAX/NumPy API available anywhere a browser (or Node.js/Deno) runs.
 
 ### Key concepts
 
@@ -35,6 +41,65 @@ combines them into one.
 jax-js traces `f` to build a computation graph, then applies the chain rule automatically. The `jvp`
 (forward-mode) and `vjp` (reverse-mode) primitives enable efficient gradient computation for
 different use cases.
+
+## Project vision & design philosophy
+
+jax-js solves two problems simultaneously: **numerical computing in the browser** (statistics,
+signal processing, simulations, classical ML) and **GPU compute in the browser** (WebGPU shaders,
+parallel number crunching). JAX's tracing-based design is the ideal bridge — it lets users write
+high-level array code that compiles down to fast native kernels automatically.
+
+### Generative compiler over static kernel libraries
+
+The central architectural bet is that **generating kernels from an IR at runtime beats shipping a
+library of pre-compiled kernels** (which is what TensorFlow.js and ONNX Runtime Web do). This means:
+
+- New operations don't require new hand-written kernels — `matmul` is just reshape + multiply +
+  reduce, compiled via `jit`.
+- Kernel fusion happens automatically across arbitrary operation chains.
+- Performance scales with compiler improvements, not manual kernel engineering.
+- The library stays lightweight — XLA is 200+ KLoC, far too large for a browser bundle.
+
+This approach draws from tinygrad's insight that a minimal set of operations + a view-tracking
+system (ShapeTracker) + simple fusion heuristics can get you surprisingly far. Combined with JAX's
+tracing model, it yields a composable system where `grad`, `jit`, and `vmap` all interoperate
+naturally.
+
+### Design tradeoffs to keep in mind
+
+- **"80% of XLA" philosophy** — jax-js aims for the sweet spot of correctness and performance
+  without squeezing out every last drop. We don't know what hardware we're running on (it's a
+  browser library), so we target **3–5× of optimal** rather than peak.
+- **Lightweight over exhaustive** — prefer a small, composable set of primitives over a large
+  surface area of specialized ops. If something can be expressed via existing primitives and `jit`,
+  that's preferred over adding a new backend kernel.
+- **Move semantics over GC** — JavaScript has no reliable destructor, so jax-js uses explicit
+  ownership (`.ref` / `.dispose()`). This is a deliberate choice, not a workaround. It enables
+  predictable memory management on GPU, which is essential for real applications.
+- **Compounding returns** — every improvement to the compiler makes _all_ operations faster, every
+  new primitive gets autodiff for free, every `jit`-wrapped function gets kernel fusion
+  automatically. Prioritize work that compounds.
+
+### Development priorities
+
+When deciding what to work on, prefer work in this order:
+
+1. **Correctness first** — tests, reference-counting discipline, cross-backend consistency.
+2. **API breadth** — approximate NumPy/JAX API compatibility (see `FEATURES.md` for the status
+   table). The goal is that common JAX/NumPy patterns can be ported with minimal changes.
+3. **Performance** — there is significant headroom, especially in:
+   - WASM backend (SIMD, loop unrolling, multi-threading via SharedArrayBuffer).
+   - Transformer inference (currently ~1/3 of raw matmul GFLOP/s).
+   - Conv2d and other operations that haven't been tuned yet.
+4. **Demos and applications** — fluid simulations, neural networks, audio processing, embedding
+   search, fractals. These serve as integration tests and showcase what's possible.
+
+### What jax-js is NOT
+
+- Not a model-serving runtime like ONNX Runtime — it's a **framework** for writing and training
+  numerical programs, not just running pre-packaged inference.
+- Not trying to match XLA's peak CUDA performance — the target is the browser and web runtimes.
+- Not a Python replacement — it's for when you want numerical computing **where JavaScript runs**.
 
 ## Architecture overview
 
@@ -526,16 +591,7 @@ Unlike Python JAX, jax-js supports null inputs and outputs for efficiency:
 - **xs=null:** When xs is null, you must provide `length` option. Body receives null as x.
 - **Y=null:** Body can return `[newCarry, null]` to skip output stacking entirely.
 
-```ts
-// xs=null: carry-only scan with no input arrays
-const [carry, ys] = await lax.scan(f, init, null, { length: 100 });
-// f: (carry, null) => [newCarry, y]
-
-// Y=null: skip output stacking (saves memory)
-const [carry, nullYs] = await lax.scan(f, init, xs);
-// f: (carry, x) => [newCarry, null]
-// nullYs is null, not an empty array
-```
+See [API Contract](#scan-reference-contract) for code examples and ownership details.
 
 **Use cases:**
 
@@ -723,8 +779,6 @@ See the [Routine System](#routine-system) section for implementation details and
 | **CPU**    | JavaScript (TypedArray) | `src/routine.ts`                 | Sequential (for debugging) |
 | **WASM**   | wasmblr (runtime gen)   | `src/backend/wasm/routines/*.ts` | Sequential (optimized)     |
 | **WebGPU** | Hand-written WGSL       | `src/backend/webgpu/routines.ts` | Parallel (GPU-optimized)   |
-
-**Why 3 routine implementations (CPU/WASM/WebGPU)?**
 
 1. **CPU backend assumes WASM unavailable** — exists for environments without WebAssembly
 2. **WebGPU uses different algorithms** — GPU parallelism requires fundamentally different
@@ -1525,6 +1579,8 @@ kernel"
 | Mixed kernel+routine bodies on WebGPU | Falls back to JS loop                | WebGPU  |
 | `grad(scan)` ~2× compute overhead     | Use `{ checkpoint: false }` for O(N) | All     |
 | Sort in scan body on WebGPU           | Uses JS loop (uniforms)              | WebGPU  |
+| Mixed-dtype carries on WebGPU         | Use WASM backend or same-dtype carry | WebGPU  |
+| Length-0 scans throw                  | Guard with `if (n > 0)` before scan  | All     |
 
 **WebGPU preencoded-routine requirements:** WebGPU can only use `preencoded-routine` for scan bodies
 that are:
@@ -1559,11 +1615,46 @@ const step = (carry, x) => {
 **Note on Sort in scan body:** Sort already uses a uniform buffer for its configuration, which
 conflicts with the scan offset uniform.
 
+**Mixed-dtype carry on WebGPU:** The `nativeScanMultiShaderSource()` shader generator uses
+`steps[0].kernel.dtype` for all buffer bindings. If a scan body has mixed dtypes (e.g., f32 carry +
+i32 counter), the shader would produce incorrect results. WASM compiled-loop handles mixed dtypes
+correctly since each buffer is typed independently.
+
+**Length-0 scans:** JAX Python returns `(init, empty_ys)` for length-0 scans. jax-js throws an error
+instead. This affects edge cases where scan length is data-dependent.
+
+### Code quality notes
+
+These are not bugs but areas where the implementation uses pragmatic shortcuts that future
+contributors should be aware of:
+
+- **JVP detection heuristic:** `linearize.ts` uses `numCarry % 2 === 0 && numY % 2 === 0` to detect
+  JVP-transformed scans during partial evaluation and transposition. This works because JVP always
+  doubles carries/outputs, and this code only runs during autodiff. However, it could theoretically
+  misclassify a user scan with even counts. Consider adding an explicit `isJvpTransformed` flag to
+  `ScanParams` if this causes issues.
+
+- **Byte-by-byte copy in WASM scan codegen:** `codegenNativeScanGeneral()` uses `i32.load8_u` /
+  `i32.store8` loops for carry init, Y output copy, and carry update. Using `memory.copy` (bulk
+  memory proposal) or at minimum word-sized loads/stores would improve performance, especially for
+  large matrices (128×128 f32 = 65KB copied byte-by-byte 3× per iteration).
+
+- **`_yTreedef` side-channel:** In `lax-scan.ts`, the Y treedef is stashed on the `flatF` function
+  object via `(flatF as any)._yTreedef = yTreedef`. This is invisible to TypeScript and could be
+  replaced with a closure variable.
+
+- **Fallback Y stacking overhead:** The `scanRunner` in `array.ts` stacks Y outputs via chunked
+  `coreConcatenate` (groups of 6). For large iteration counts, this creates O(length) intermediate
+  arrays. Pre-allocating the output buffer would be more efficient.
+
 ### Future work
 
-| Priority | Feature                         | Notes                             |
-| -------- | ------------------------------- | --------------------------------- |
-| Low      | `lax.scatter` / `dynamic_slice` | Would enable Jaxpr-based routines |
+| Priority | Feature                         | Notes                                                          |
+| -------- | ------------------------------- | -------------------------------------------------------------- |
+| Medium   | `memory.copy` in WASM scan      | Replace byte-by-byte copy loops (~4× faster for large carries) |
+| Medium   | Mixed-dtype WebGPU scan shader  | Per-binding dtype in `nativeScanMultiShaderSource`             |
+| Low      | Length-0 scan support           | Return `(init, empty_ys)` for JAX compat                       |
+| Low      | `lax.scatter` / `dynamic_slice` | Would enable Jaxpr-based routines                              |
 
 ---
 
@@ -1573,7 +1664,7 @@ conflicts with the scan offset uniform.
 
 | File                                         | Purpose                            |
 | -------------------------------------------- | ---------------------------------- |
-| `test/lax-scan.test.ts`                      | Main scan test suite (~2800 lines) |
+| `test/lax-scan.test.ts`                      | Main scan test suite (~3000 lines) |
 | `test/jit-scan-dlm.test.ts`                  | Kalman filter integration tests    |
 | `test/deno/webgpu.test.ts`                   | Headless WebGPU tests via Deno     |
 | `test/deno/batched-scan.test.ts`             | Batched scan integration           |
@@ -1629,24 +1720,9 @@ Deno.test({
 
 ### Scan path verification
 
-Use the `acceptPath` option to verify expected scan paths:
-
-```ts
-// Ensure compiled-loop or preencoded-routine is used (throws if fallback)
-const [carry, ys] = await lax.scan(f, init, xs, {
-  acceptPath: ["compiled-loop", "preencoded-routine"],
-});
-
-// Verify a specific path is used
-await lax.scan(f, init, xs, { acceptPath: "compiled-loop" });
-
-// Debug: discover which path was chosen (always throws)
-await lax.scan(f, init, xs, { acceptPath: [] });
-// Error: Scan path debug: chose "compiled-loop"
-```
-
-**Why this matters:** Tests may silently fall back to JS loop. Use
-`acceptPath: ["compiled-loop", "preencoded-routine"]` to ensure tests fail if this regresses.
+See [Debugging scan paths](#debugging-scan-paths) for full `acceptPath` usage and examples. Always
+use `acceptPath: ["compiled-loop", "preencoded-routine"]` in tests to ensure native compilation
+doesn't silently regress to JS fallback.
 
 ### Test coverage by category
 
