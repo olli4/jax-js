@@ -596,7 +596,8 @@ const [finalCarry, stackedOutputs] = await lax.scan(f, initCarry, xs, options);
 - Fallback Y stacking: the JS fallback scan path preallocates the stacked Y output buffer and writes
   each iteration's Y directly via `copyBufferToBuffer` (4-byte aligned) or the WGSL copy shader
   (unaligned). This avoids stack overflow on long scans and reduces O(length) intermediate arrays
-  from `coreConcatenate`. Compiled-loop and preencoded-routine already write directly.
+  from `coreConcatenate`. The fallback loop and stacking are centralized in shared helpers so jit
+  and non-jit scans use identical behavior.
 
 **Scan paths (`ScanPath` type):**
 
@@ -632,8 +633,9 @@ See [API Contract](#scan-reference-contract) for code examples and ownership det
 | `src/library/lax-scan.ts`            | Public API                                                    |
 | `src/frontend/core.ts`               | `Primitive.Scan` enum + params type                           |
 | `src/frontend/jaxpr.ts`              | Abstract eval rule                                            |
-| `src/frontend/array.ts`              | Scan impl rule with `scanRunner` callback                     |
+| `src/frontend/array.ts`              | Scan impl rule and shared JS fallback loop/stacking helpers   |
 | `src/frontend/jit.ts`                | JIT step types: `scan`, `compiled-loop`, `preencoded-routine` |
+| `src/frontend/scan-plan.ts`          | Central scan path selection + backend preparation             |
 | `src/frontend/linearize.ts`          | JVP + transpose rules for autodiff                            |
 | `src/frontend/vmap.ts`               | Scan vmap rule (batches independent scans)                    |
 | `src/backend/wasm.ts`                | Compiled-loop codegen                                         |
