@@ -1,3 +1,5 @@
+const require_backend = require('./backend-AjwbgGNH.cjs');
+
 //#region src/backend/webgpu/scan-wrapper.ts
 /**
 * Parse buffer declarations from WGSL source.
@@ -69,7 +71,7 @@ function transformArrayAccesses(code, bindings) {
 				i++;
 			}
 			if (depth !== 0) {
-				console.warn(`Unmatched bracket in array access: ${name}`);
+				if (require_backend.DEBUG >= 1) console.warn(`Unmatched bracket in array access: ${name}`);
 				continue;
 			}
 			const endBracket = i - 1;
@@ -169,4 +171,15 @@ function createAllIterationsOffsetsBuffer(numX, numY, length, xsElemStrides, ysE
 }
 
 //#endregion
-export { createAllIterationsOffsetsBuffer, wrapRoutineForScan };
+Object.defineProperty(exports, 'createAllIterationsOffsetsBuffer', {
+  enumerable: true,
+  get: function () {
+    return createAllIterationsOffsetsBuffer;
+  }
+});
+Object.defineProperty(exports, 'wrapRoutineForScan', {
+  enumerable: true,
+  get: function () {
+    return wrapRoutineForScan;
+  }
+});

@@ -1,3 +1,4 @@
+import { DEBUG } from "./backend-BLx6HGHC.js";
 
 //#region src/backend/webgpu/scan-wrapper.ts
 /**
@@ -70,7 +71,7 @@ function transformArrayAccesses(code, bindings) {
 				i++;
 			}
 			if (depth !== 0) {
-				console.warn(`Unmatched bracket in array access: ${name}`);
+				if (DEBUG >= 1) console.warn(`Unmatched bracket in array access: ${name}`);
 				continue;
 			}
 			const endBracket = i - 1;
@@ -170,15 +171,4 @@ function createAllIterationsOffsetsBuffer(numX, numY, length, xsElemStrides, ysE
 }
 
 //#endregion
-Object.defineProperty(exports, 'createAllIterationsOffsetsBuffer', {
-  enumerable: true,
-  get: function () {
-    return createAllIterationsOffsetsBuffer;
-  }
-});
-Object.defineProperty(exports, 'wrapRoutineForScan', {
-  enumerable: true,
-  get: function () {
-    return wrapRoutineForScan;
-  }
-});
+export { createAllIterationsOffsetsBuffer, wrapRoutineForScan };

@@ -1,3 +1,4 @@
+
 //#region src/pprint.ts
 /** General class for pretty-printing expressions with indentation. */
 var PPrint = class PPrint {
@@ -51,39 +52,6 @@ let DEBUG = 0;
 function setDebug(level) {
 	DEBUG = level;
 }
-let scanBodyStepsCallback = null;
-/**
-* Set a callback to be notified when scan body is analyzed.
-* Reports the number of execute steps in the compiled body program.
-*
-* This is useful for testing kernel fusion in scan bodies. An ideal
-* implementation would fuse elementwise multi-output bodies into a
-* single kernel, but currently each output creates a separate kernel.
-*
-* @param callback - Function called with (executeSteps, backend, details).
-*                   Pass null to disable tracking.
-*
-* @example
-* ```ts
-* let bodySteps = 0;
-* setScanBodyStepsCallback((steps) => { bodySteps = steps; });
-* jit(() => lax.scan(body, init, xs))();
-* expect(bodySteps).toBe(1); // Would be 1 if fully fused
-* setScanBodyStepsCallback(null); // cleanup
-* ```
-*/
-function setScanBodyStepsCallback(callback) {
-	scanBodyStepsCallback = callback;
-}
-/** Internal: report scan body step count to registered callback. */
-function reportScanBodySteps(executeSteps, backend, details) {
-	if (scanBodyStepsCallback) scanBodyStepsCallback(executeSteps, backend, details);
-}
-/**
-* Internal: report scan path choice (no-op, kept for compatibility with jit.ts).
-* Path verification is now done via `acceptPath` option on `lax.scan()`.
-*/
-function reportScanPath(_path, _backend, _details) {}
 function assertNonNull(value) {}
 function unzip2(pairs) {
 	const lst1 = [];
@@ -794,28 +762,54 @@ var AluExp = class AluExp {
 	/**
 	* Simplify the expression by replacing any known patterns and deduping
 	* identical subexpressions.
+	*
+	* Uses iterative post-order traversal to avoid stack overflow on deep trees.
 	*/
 	simplify(cache = /* @__PURE__ */ new Map()) {
 		if (this.#simplified !== void 0) return this.#simplified;
+		const toProcess = [];
+		const stack = [this];
+		const visited = /* @__PURE__ */ new Set();
+		while (stack.length > 0) {
+			const node = stack[stack.length - 1];
+			if (node.#simplified !== void 0 || cache.has(node.getHash())) {
+				stack.pop();
+				continue;
+			}
+			if (visited.has(node)) {
+				stack.pop();
+				toProcess.push(node);
+			} else {
+				visited.add(node);
+				for (const child of node.src) if (child.#simplified === void 0 && !cache.has(child.getHash())) stack.push(child);
+			}
+		}
+		for (const node of toProcess) node.#simplifyNode(cache);
+		return this.#simplified ?? this;
+	}
+	/** Simplify a single node, assuming all children are already simplified. */
+	#simplifyNode(cache) {
+		if (this.#simplified !== void 0) return;
 		const hash = this.getHash();
 		const prevCachedValue = cache.get(hash);
-		if (prevCachedValue !== void 0) return this.#simplified = prevCachedValue;
+		if (prevCachedValue !== void 0) {
+			this.#simplified = prevCachedValue;
+			return;
+		}
 		const simplified = this.#simplifyInner(cache);
 		const simplifiedHash = simplified.getHash();
 		const prevSimplified = cache.get(simplifiedHash);
 		if (prevSimplified !== void 0) {
 			cache.set(hash, prevSimplified);
 			this.#simplified = prevSimplified;
-			return prevSimplified;
 		} else {
 			cache.set(hash, simplified);
 			cache.set(simplifiedHash, simplified);
 			this.#simplified = simplified;
-			return simplified;
 		}
 	}
 	#simplifyInner(cache) {
-		const src = this.src.map((x) => x.simplify(cache));
+		const src = this.src.map((x) => x.#simplified ?? x.simplify(cache));
 		const { op } = this;
 		if (src.every((x) => x.op === AluOp.Const) && !AluGroup.Variable.has(op)) {
 			const newExp$1 = new AluExp(op, this.dtype, src, this.arg);
@@ -3491,11 +3485,11 @@ var CodeGenerator = class {
 		this._emit(27);
 	}
 	/** Import a JavaScript function; returns its index. */
-	importFunction(module, name, inputTypes, outputTypes) {
+	importFunction(module$1, name, inputTypes, outputTypes) {
 		if (this.#functions.length > 0) throw new Error("function imports must precede defining functions");
 		const idx = this.#importedFunctions.length;
 		this.#importedFunctions.push({
-			module,
+			module: module$1,
 			name,
 			inputTypes,
 			outputTypes
@@ -5948,10 +5942,10 @@ var ModuleLRUCache = class {
 		}
 		return void 0;
 	}
-	set(key, module) {
+	set(key, module$1) {
 		if (this.#cache.size >= this.#maxSize && !this.#cache.has(key)) this.#evictLRU();
 		this.#cache.set(key, {
-			module,
+			module: module$1,
 			lastAccess: ++this.#accessCounter
 		});
 	}
@@ -5997,14 +5991,14 @@ function argsortKey(params) {
 */
 function getCholeskyModule(params) {
 	const key = choleskyKey(params);
-	let module = moduleCache$1.get(key);
-	if (!module) {
+	let module$1 = moduleCache$1.get(key);
+	if (!module$1) {
 		const useSIMD = params.dtype === "f32" && params.n >= 32;
 		const bytes = useSIMD ? buildCholeskySimdModule(params.n) : buildCholeskyModuleSized(params.n, params.dtype);
-		module = new WebAssembly.Module(bytes);
-		moduleCache$1.set(key, module);
+		module$1 = new WebAssembly.Module(bytes);
+		moduleCache$1.set(key, module$1);
 	}
-	return module;
+	return module$1;
 }
 /**
 * Get a size-specialized TriangularSolve module.
@@ -6012,13 +6006,13 @@ function getCholeskyModule(params) {
 */
 function getTriangularSolveModule(params) {
 	const key = triangularSolveKey(params);
-	let module = moduleCache$1.get(key);
-	if (!module) {
+	let module$1 = moduleCache$1.get(key);
+	if (!module$1) {
 		const bytes = buildTriangularSolveModuleSized(params.n, params.batchRows, params.dtype, params.unitDiagonal, params.lower);
-		module = new WebAssembly.Module(bytes);
-		moduleCache$1.set(key, module);
+		module$1 = new WebAssembly.Module(bytes);
+		moduleCache$1.set(key, module$1);
 	}
-	return module;
+	return module$1;
 }
 /**
 * Get a size-specialized LU module.
@@ -6026,13 +6020,13 @@ function getTriangularSolveModule(params) {
 */
 function getLUModule(params) {
 	const key = luKey(params);
-	let module = moduleCache$1.get(key);
-	if (!module) {
+	let module$1 = moduleCache$1.get(key);
+	if (!module$1) {
 		const bytes = buildLUModuleSized(params.m, params.n, params.dtype);
-		module = new WebAssembly.Module(bytes);
-		moduleCache$1.set(key, module);
+		module$1 = new WebAssembly.Module(bytes);
+		moduleCache$1.set(key, module$1);
 	}
-	return module;
+	return module$1;
 }
 /**
 * Get a size-specialized Sort module.
@@ -6040,13 +6034,13 @@ function getLUModule(params) {
 */
 function getSortModule(params) {
 	const key = sortKey(params);
-	let module = moduleCache$1.get(key);
-	if (!module) {
+	let module$1 = moduleCache$1.get(key);
+	if (!module$1) {
 		const bytes = buildSortModuleSized(params.n, params.dtype);
-		module = new WebAssembly.Module(bytes);
-		moduleCache$1.set(key, module);
+		module$1 = new WebAssembly.Module(bytes);
+		moduleCache$1.set(key, module$1);
 	}
-	return module;
+	return module$1;
 }
 /**
 * Get a size-specialized Argsort module.
@@ -6054,13 +6048,13 @@ function getSortModule(params) {
 */
 function getArgsortModule(params) {
 	const key = argsortKey(params);
-	let module = moduleCache$1.get(key);
-	if (!module) {
+	let module$1 = moduleCache$1.get(key);
+	if (!module$1) {
 		const bytes = buildArgsortModuleSized(params.n, params.dtype);
-		module = new WebAssembly.Module(bytes);
-		moduleCache$1.set(key, module);
+		module$1 = new WebAssembly.Module(bytes);
+		moduleCache$1.set(key, module$1);
 	}
-	return module;
+	return module$1;
 }
 
 //#endregion
@@ -6128,11 +6122,11 @@ var WasmBackend = class {
 	}
 	prepareKernelSync(kernel) {
 		const kernelHash = FpHash.hash(kernel);
-		const module = runWithCache(moduleCache, kernelHash.toString(), () => {
+		const module$1 = runWithCache(moduleCache, kernelHash.toString(), () => {
 			const bytes = codegenWasmKernel(kernel);
 			return new WebAssembly.Module(bytes);
 		});
-		return new Executable(kernel, { module });
+		return new Executable(kernel, { module: module$1 });
 	}
 	async prepareRoutine(routine) {
 		return this.prepareRoutineSync(routine);
@@ -6168,11 +6162,11 @@ var WasmBackend = class {
 		func(...ptrs);
 	}
 	/** Get or create a WASM instance for a size-specialized routine module. */
-	#getRoutineInstanceForModule(module) {
-		let instance = this.#instanceCache.get(module);
+	#getRoutineInstanceForModule(module$1) {
+		let instance = this.#instanceCache.get(module$1);
 		if (!instance) {
-			instance = new WebAssembly.Instance(module, { env: { memory: this.#memory } });
-			this.#instanceCache.set(module, instance);
+			instance = new WebAssembly.Instance(module$1, { env: { memory: this.#memory } });
+			this.#instanceCache.set(module$1, instance);
 		}
 		return instance;
 	}
@@ -6227,11 +6221,11 @@ var WasmBackend = class {
 		const n = shape[shape.length - 1];
 		const batchSize = shape.slice(0, -2).reduce((a, b) => a * b, 1);
 		const dtype = elementSize === 4 ? "f32" : "f64";
-		const module = getCholeskyModule({
+		const module$1 = getCholeskyModule({
 			n,
 			dtype
 		});
-		const instance = this.#getRoutineInstanceForModule(module);
+		const instance = this.#getRoutineInstanceForModule(module$1);
 		const func = instance.exports.cholesky_batched;
 		func(this.#buffers.get(inputs[0]).ptr, this.#buffers.get(outputs[0]).ptr, batchSize);
 	}
@@ -6244,14 +6238,14 @@ var WasmBackend = class {
 		const dtype = elementSize === 4 ? "f32" : "f64";
 		const unitDiagonal = routine.params?.unitDiagonal ?? false;
 		const lower = routine.params?.lower ?? false;
-		const module = getTriangularSolveModule({
+		const module$1 = getTriangularSolveModule({
 			n,
 			batchRows,
 			dtype,
 			unitDiagonal,
 			lower
 		});
-		const instance = this.#getRoutineInstanceForModule(module);
+		const instance = this.#getRoutineInstanceForModule(module$1);
 		const func = instance.exports.triangular_solve_batched;
 		func(this.#buffers.get(inputs[0]).ptr, this.#buffers.get(inputs[1]).ptr, this.#buffers.get(outputs[0]).ptr, numBatches);
 	}
@@ -6261,12 +6255,12 @@ var WasmBackend = class {
 		const n = shape[shape.length - 1];
 		const batchSize = shape.slice(0, -2).reduce((a, b) => a * b, 1);
 		const dtype = elementSize === 4 ? "f32" : "f64";
-		const module = getLUModule({
+		const module$1 = getLUModule({
 			m,
 			n,
 			dtype
 		});
-		const instance = this.#getRoutineInstanceForModule(module);
+		const instance = this.#getRoutineInstanceForModule(module$1);
 		const func = instance.exports.lu_batched;
 		func(this.#buffers.get(inputs[0]).ptr, this.#buffers.get(outputs[0]).ptr, this.#buffers.get(outputs[1]).ptr, this.#buffers.get(outputs[2]).ptr, batchSize);
 	}
@@ -6280,11 +6274,11 @@ var WasmBackend = class {
 		const outBuf = this.#buffers.get(outputs[0]);
 		new Uint8Array(this.#memory.buffer, outBuf.ptr, totalSize).set(new Uint8Array(this.#memory.buffer, inBuf.ptr, totalSize));
 		const auxPtr = this.#allocator.malloc(n * elementSize);
-		const module = getSortModule({
+		const module$1 = getSortModule({
 			n,
 			dtype
 		});
-		const instance = this.#getRoutineInstanceForModule(module);
+		const instance = this.#getRoutineInstanceForModule(module$1);
 		const func = instance.exports.sort_batched;
 		func(outBuf.ptr, auxPtr, batchSize);
 		this.#allocator.free(auxPtr);
@@ -6295,11 +6289,11 @@ var WasmBackend = class {
 		const batchSize = shape.slice(0, -1).reduce((a, b) => a * b, 1);
 		const dtype = elementSize === 4 ? "f32" : "f64";
 		const auxPtr = this.#allocator.malloc(n * 4);
-		const module = getArgsortModule({
+		const module$1 = getArgsortModule({
 			n,
 			dtype
 		});
-		const instance = this.#getRoutineInstanceForModule(module);
+		const instance = this.#getRoutineInstanceForModule(module$1);
 		const func = instance.exports.argsort_batched;
 		func(this.#buffers.get(inputs[0]).ptr, this.#buffers.get(outputs[0]).ptr, this.#buffers.get(outputs[1]).ptr, auxPtr, batchSize);
 		this.#allocator.free(auxPtr);
@@ -6322,15 +6316,8 @@ var WasmBackend = class {
 		if (params.steps.length === 0) return null;
 		try {
 			const bytes = codegenNativeScanGeneral(params);
-			const module = new WebAssembly.Module(bytes);
-			let firstKernel = null;
-			for (const step of params.steps) if (step.source instanceof Kernel) {
-				firstKernel = step.source;
-				break;
-			}
-			if (!firstKernel) firstKernel = Kernel.single(0, 0, AluExp.const(DType.Float32, 0), void 0);
-			const syntheticKernel = Kernel.single(firstKernel.nargs, firstKernel.size, firstKernel.exp, firstKernel.reduction);
-			return new Executable(syntheticKernel, { module });
+			const module$1 = new WebAssembly.Module(bytes);
+			return new Executable(null, { module: module$1 });
 		} catch (e) {
 			if (DEBUG >= 1) console.warn("General native scan codegen failed:", e);
 			return null;
@@ -7322,7 +7309,7 @@ async function createBackend(device) {
 		if (!navigator.gpu) return null;
 		const adapter = await navigator.gpu.requestAdapter({ powerPreference: "high-performance" });
 		if (!adapter) return null;
-		const { WebGPUBackend } = await import("./webgpu-Bg7_9IZW.js");
+		const { WebGPUBackend } = await Promise.resolve().then(() => require("./webgpu-DPdUNDxX.cjs"));
 		const importantLimits = [
 			"maxBufferSize",
 			"maxComputeInvocationsPerWorkgroup",
@@ -7360,7 +7347,7 @@ async function createBackend(device) {
 		});
 		if (!gl) return null;
 		if (!gl.getExtension("EXT_color_buffer_float")) return null;
-		const { WebGLBackend } = await import("./webgl-BhcBK1NZ.js");
+		const { WebGLBackend } = await Promise.resolve().then(() => require("./webgl-CdfHPBKK.cjs"));
 		return new WebGLBackend(gl);
 	} else throw new Error(`Backend not found: ${device}`);
 }
@@ -7396,4 +7383,327 @@ var UnsupportedRoutineError = class extends Error {
 };
 
 //#endregion
-export { AluExp, AluGroup, AluOp, AluVar, DEBUG, DType, Executable, FpHash, Kernel, PPrint, Reduction, Routine, Routines, ShapeTracker, SlotError, UnsupportedOpError, UnsupportedRoutineError, accessorAluExp, accessorGlobal, assertNonNull, byteWidth, checkAxis, checkInts, deepEqual, defaultDevice, devices, dtypedArray, dtypedJsArray, findPow2, generalBroadcast, getBackend, init, invertPermutation, isFloatDtype, isNumberPair, isPermutation, mapSetUnion, normalizeAxis, partitionList, prod, promoteTypes, range, recursiveFlatten, rep, reportScanBodySteps, reportScanPath, runWithCache, setDebug, setScanBodyStepsCallback, strip1, toposort, tuneNullopt, tuneWebgpu, unravelAlu, unzip2, zip, zipn };
+Object.defineProperty(exports, 'AluExp', {
+  enumerable: true,
+  get: function () {
+    return AluExp;
+  }
+});
+Object.defineProperty(exports, 'AluGroup', {
+  enumerable: true,
+  get: function () {
+    return AluGroup;
+  }
+});
+Object.defineProperty(exports, 'AluOp', {
+  enumerable: true,
+  get: function () {
+    return AluOp;
+  }
+});
+Object.defineProperty(exports, 'AluVar', {
+  enumerable: true,
+  get: function () {
+    return AluVar;
+  }
+});
+Object.defineProperty(exports, 'DEBUG', {
+  enumerable: true,
+  get: function () {
+    return DEBUG;
+  }
+});
+Object.defineProperty(exports, 'DType', {
+  enumerable: true,
+  get: function () {
+    return DType;
+  }
+});
+Object.defineProperty(exports, 'Executable', {
+  enumerable: true,
+  get: function () {
+    return Executable;
+  }
+});
+Object.defineProperty(exports, 'FpHash', {
+  enumerable: true,
+  get: function () {
+    return FpHash;
+  }
+});
+Object.defineProperty(exports, 'Kernel', {
+  enumerable: true,
+  get: function () {
+    return Kernel;
+  }
+});
+Object.defineProperty(exports, 'PPrint', {
+  enumerable: true,
+  get: function () {
+    return PPrint;
+  }
+});
+Object.defineProperty(exports, 'Reduction', {
+  enumerable: true,
+  get: function () {
+    return Reduction;
+  }
+});
+Object.defineProperty(exports, 'Routine', {
+  enumerable: true,
+  get: function () {
+    return Routine;
+  }
+});
+Object.defineProperty(exports, 'Routines', {
+  enumerable: true,
+  get: function () {
+    return Routines;
+  }
+});
+Object.defineProperty(exports, 'ShapeTracker', {
+  enumerable: true,
+  get: function () {
+    return ShapeTracker;
+  }
+});
+Object.defineProperty(exports, 'SlotError', {
+  enumerable: true,
+  get: function () {
+    return SlotError;
+  }
+});
+Object.defineProperty(exports, 'UnsupportedOpError', {
+  enumerable: true,
+  get: function () {
+    return UnsupportedOpError;
+  }
+});
+Object.defineProperty(exports, 'UnsupportedRoutineError', {
+  enumerable: true,
+  get: function () {
+    return UnsupportedRoutineError;
+  }
+});
+Object.defineProperty(exports, 'accessorAluExp', {
+  enumerable: true,
+  get: function () {
+    return accessorAluExp;
+  }
+});
+Object.defineProperty(exports, 'accessorGlobal', {
+  enumerable: true,
+  get: function () {
+    return accessorGlobal;
+  }
+});
+Object.defineProperty(exports, 'assertNonNull', {
+  enumerable: true,
+  get: function () {
+    return assertNonNull;
+  }
+});
+Object.defineProperty(exports, 'byteWidth', {
+  enumerable: true,
+  get: function () {
+    return byteWidth;
+  }
+});
+Object.defineProperty(exports, 'checkAxis', {
+  enumerable: true,
+  get: function () {
+    return checkAxis;
+  }
+});
+Object.defineProperty(exports, 'checkInts', {
+  enumerable: true,
+  get: function () {
+    return checkInts;
+  }
+});
+Object.defineProperty(exports, 'deepEqual', {
+  enumerable: true,
+  get: function () {
+    return deepEqual;
+  }
+});
+Object.defineProperty(exports, 'defaultDevice', {
+  enumerable: true,
+  get: function () {
+    return defaultDevice;
+  }
+});
+Object.defineProperty(exports, 'devices', {
+  enumerable: true,
+  get: function () {
+    return devices;
+  }
+});
+Object.defineProperty(exports, 'dtypedArray', {
+  enumerable: true,
+  get: function () {
+    return dtypedArray;
+  }
+});
+Object.defineProperty(exports, 'dtypedJsArray', {
+  enumerable: true,
+  get: function () {
+    return dtypedJsArray;
+  }
+});
+Object.defineProperty(exports, 'findPow2', {
+  enumerable: true,
+  get: function () {
+    return findPow2;
+  }
+});
+Object.defineProperty(exports, 'generalBroadcast', {
+  enumerable: true,
+  get: function () {
+    return generalBroadcast;
+  }
+});
+Object.defineProperty(exports, 'getBackend', {
+  enumerable: true,
+  get: function () {
+    return getBackend;
+  }
+});
+Object.defineProperty(exports, 'init', {
+  enumerable: true,
+  get: function () {
+    return init;
+  }
+});
+Object.defineProperty(exports, 'invertPermutation', {
+  enumerable: true,
+  get: function () {
+    return invertPermutation;
+  }
+});
+Object.defineProperty(exports, 'isFloatDtype', {
+  enumerable: true,
+  get: function () {
+    return isFloatDtype;
+  }
+});
+Object.defineProperty(exports, 'isNumberPair', {
+  enumerable: true,
+  get: function () {
+    return isNumberPair;
+  }
+});
+Object.defineProperty(exports, 'isPermutation', {
+  enumerable: true,
+  get: function () {
+    return isPermutation;
+  }
+});
+Object.defineProperty(exports, 'mapSetUnion', {
+  enumerable: true,
+  get: function () {
+    return mapSetUnion;
+  }
+});
+Object.defineProperty(exports, 'normalizeAxis', {
+  enumerable: true,
+  get: function () {
+    return normalizeAxis;
+  }
+});
+Object.defineProperty(exports, 'partitionList', {
+  enumerable: true,
+  get: function () {
+    return partitionList;
+  }
+});
+Object.defineProperty(exports, 'prod', {
+  enumerable: true,
+  get: function () {
+    return prod;
+  }
+});
+Object.defineProperty(exports, 'promoteTypes', {
+  enumerable: true,
+  get: function () {
+    return promoteTypes;
+  }
+});
+Object.defineProperty(exports, 'range', {
+  enumerable: true,
+  get: function () {
+    return range;
+  }
+});
+Object.defineProperty(exports, 'recursiveFlatten', {
+  enumerable: true,
+  get: function () {
+    return recursiveFlatten;
+  }
+});
+Object.defineProperty(exports, 'rep', {
+  enumerable: true,
+  get: function () {
+    return rep;
+  }
+});
+Object.defineProperty(exports, 'runWithCache', {
+  enumerable: true,
+  get: function () {
+    return runWithCache;
+  }
+});
+Object.defineProperty(exports, 'setDebug', {
+  enumerable: true,
+  get: function () {
+    return setDebug;
+  }
+});
+Object.defineProperty(exports, 'strip1', {
+  enumerable: true,
+  get: function () {
+    return strip1;
+  }
+});
+Object.defineProperty(exports, 'toposort', {
+  enumerable: true,
+  get: function () {
+    return toposort;
+  }
+});
+Object.defineProperty(exports, 'tuneNullopt', {
+  enumerable: true,
+  get: function () {
+    return tuneNullopt;
+  }
+});
+Object.defineProperty(exports, 'tuneWebgpu', {
+  enumerable: true,
+  get: function () {
+    return tuneWebgpu;
+  }
+});
+Object.defineProperty(exports, 'unravelAlu', {
+  enumerable: true,
+  get: function () {
+    return unravelAlu;
+  }
+});
+Object.defineProperty(exports, 'unzip2', {
+  enumerable: true,
+  get: function () {
+    return unzip2;
+  }
+});
+Object.defineProperty(exports, 'zip', {
+  enumerable: true,
+  get: function () {
+    return zip;
+  }
+});
+Object.defineProperty(exports, 'zipn', {
+  enumerable: true,
+  get: function () {
+    return zipn;
+  }
+});

@@ -143,34 +143,6 @@ declare function setDebug(level: number): void;
  * - "fallback": JS loop calling body program per iteration (one or more JS↔backend boundary crossings)
  */
 type ScanPath = "compiled-loop" | "preencoded-routine" | "fallback";
-/** Callback for tracking scan body execute steps (for testing fusion). */
-type ScanBodyStepsCallback = (executeSteps: number, backend: string, details?: {
-  numCarry?: number;
-  numY?: number;
-}) => void;
-/**
- * Set a callback to be notified when scan body is analyzed.
- * Reports the number of execute steps in the compiled body program.
- *
- * This is useful for testing kernel fusion in scan bodies. An ideal
- * implementation would fuse elementwise multi-output bodies into a
- * single kernel, but currently each output creates a separate kernel.
- *
- * @param callback - Function called with (executeSteps, backend, details).
- *                   Pass null to disable tracking.
- *
- * @example
- * ```ts
- * let bodySteps = 0;
- * setScanBodyStepsCallback((steps) => { bodySteps = steps; });
- * jit(() => lax.scan(body, init, xs))();
- * expect(bodySteps).toBe(1); // Would be 1 if fully fused
- * setScanBodyStepsCallback(null); // cleanup
- * ```
- */
-declare function setScanBodyStepsCallback(callback: ScanBodyStepsCallback | null): void;
-/** Internal: report scan body step count to registered callback. */
-
 /** @inline */
 type RecursiveArray<T> = T | RecursiveArray<T>[];
 interface FpHashable {
@@ -304,6 +276,8 @@ declare class AluExp implements FpHashable {
   /**
    * Simplify the expression by replacing any known patterns and deduping
    * identical subexpressions.
+   *
+   * Uses iterative post-order traversal to avoid stack overflow on deep trees.
    */
   simplify(cache?: Map<bigint, AluExp>): AluExp;
   /** Resolve this to a value, or `undefined` if not possible. */
@@ -605,18 +579,26 @@ interface Backend {
   prepareNativeScan?(params: any): Executable | null;
   /** Dispatch a native scan operation (WebGPU backend). */
   dispatchNativeScan?(exe: Executable, consts: Slot[], initCarry: Slot[], xs: Slot[], carryOut: Slot[], ysStacked: Slot[]): void;
-  /** Prepare a batched scan operation (WebGPU backend). */
-  prepareBatchedScan?(params: any): any | null;
-  /** Dispatch a batched scan operation (WebGPU backend). */
-  dispatchBatchedScan?(prepared: any, consts: Slot[], initCarry: Slot[], xs: Slot[], carryOut: Slot[], ysStacked: Slot[]): void;
+  /** Copy a contiguous range of bytes from src buffer to dst buffer. */
+  copyBufferToBuffer?(srcSlot: Slot, srcOffset: number, dstSlot: Slot, dstOffset: number, size: number): void;
+  /**
+   * Copy a contiguous range of bytes using an on-device (WGSL) copy shader.
+   * Backends may implement this to provide a GPU-dispatched copy when
+   * direct buffer-to-buffer copy is not available or desirable.
+   */
+  copyBufferWithShader?(srcSlot: Slot, srcOffset: number, dstSlot: Slot, dstOffset: number, size: number): void;
+  /** Prepare a preencoded scan operation (WebGPU backend). */
+  preparePreencodedScan?(params: any): any | null;
+  /** Dispatch a preencoded scan operation (WebGPU backend). */
+  dispatchPreencodedScan?(prepared: any, consts: Slot[], initCarry: Slot[], xs: Slot[], carryOut: Slot[], ysStacked: Slot[]): void;
 }
 declare class Executable<T = any> {
-  /** The `Kernel` or `Routine` that was prepared. */
-  readonly source: Kernel | Routine;
+  /** The `Kernel` or `Routine` that was prepared (null for scan-only executables). */
+  readonly source: Kernel | Routine | null;
   /** Extra data specific to the backend running this executable. */
   readonly data: T;
-  constructor(/** The `Kernel` or `Routine` that was prepared. */
-  source: Kernel | Routine, /** Extra data specific to the backend running this executable. */
+  constructor(/** The `Kernel` or `Routine` that was prepared (null for scan-only executables). */
+  source: Kernel | Routine | null, /** Extra data specific to the backend running this executable. */
   data: T);
 }
 declare namespace tree_d_exports {
@@ -850,6 +832,7 @@ declare enum Primitive {
   Flip = "flip",
   Shrink = "shrink",
   Pad = "pad",
+  DynamicUpdateSlice = "dynamic_update_slice",
   Sort = "sort",
   // sort(x, axis=-1)
   Argsort = "argsort",
@@ -921,6 +904,10 @@ interface PrimitiveParamsImpl extends Record<Primitive, Record<string, any>> {
   [Primitive.Pad]: {
     width: Pair[];
   };
+  [Primitive.DynamicUpdateSlice]: {
+    offset: number;
+    axis: number;
+  };
   [Primitive.TriangularSolve]: {
     unitDiagonal: boolean;
   };
@@ -944,6 +931,12 @@ interface PrimitiveParamsImpl extends Record<Primitive, Record<string, any>> {
      * - `false`: store all intermediate carries (O(N) memory, no recomputation)
      */
     checkpoint?: boolean | number;
+    /**
+     * If true, preallocate stacked-Y buffers on the scan fallback path and
+     * write each iteration's Y directly into the preallocated buffers using
+     * `dynamic_update_slice`/`arr.at(i).set(src)` to avoid concat churn.
+     */
+    preallocateY?: boolean;
   };
 }
 /** Type of parameters taken by each primitive. */
@@ -960,6 +953,7 @@ type Axis = number | number[] | null;
 type ReduceOpts = {
   keepdims?: boolean;
 };
+declare function dynamicUpdateSlice(dst: TracerValue, src: TracerValue, offset: number, axis?: number): Tracer;
 type MainTrace = {
   level: number;
   traceType: new (main: MainTrace) => Trace;
@@ -1317,6 +1311,14 @@ declare class Array extends Tracer {
    * either be rank-0, or all dimensions of the shape are 1.
    */
   item(): number;
+  /**
+   * Convenience accessor for index/update-like usage: `arr.at(i).set(src)`.
+   * Currently supports a single `axis=0` offset and integer index. Returns
+   * a new array where the slice at `index` along axis 0 is replaced by `src`.
+   */
+  at(index: number): {
+    set: (src: TracerValue) => Tracer;
+  };
   /** @private Internal plumbing method for Array / Tracer ops. */
   static _implRules(): typeof implRules;
   /** @private */
@@ -1603,6 +1605,14 @@ interface ScanOptions {
    * ```
    */
   checkpoint?: boolean | number;
+  /**
+   * If true (default), the scan fallback path will preallocate stacked-Y
+   * buffers and write each iteration's Y directly into the preallocated
+   * buffers. This avoids stack overflow on long scans and reduces intermediate
+   * allocations. Set to false only for debugging.
+   * @default true
+   */
+  preallocateY?: boolean;
 }
 /**
  * Scan a function over leading array axes while carrying along state.
@@ -3326,4 +3336,4 @@ declare function blockUntilReady<T extends JsTree<any>>(x: T): Promise<T>;
  */
 declare function devicePut<T extends JsTree<any>>(x: T, device?: Device): Promise<MapJsTree<T, number | boolean, Array>>;
 //#endregion
-export { Array, ClosedJaxpr, DType, type Device, Jaxpr, type JsTree, type JsTreeDef, type OwnedFunction, type ScanPath, blockUntilReady, createAllIterationsOffsetsBuffer, defaultDevice, devicePut, devices, getBackend, grad, hessian, init, jacfwd, jacrev as jacobian, jacrev, jit, jvp, lax_d_exports as lax, linearize, makeJaxpr, nn_d_exports as nn, numpy_d_exports as numpy, random_d_exports as random, scipy_special_d_exports as scipySpecial, setDebug, setScanBodyStepsCallback, tree_d_exports as tree, valueAndGrad, vjp, vmap, wrapRoutineForScan };
+export { Array, ClosedJaxpr, DType, type Device, Jaxpr, type JsTree, type JsTreeDef, type OwnedFunction, type ScanPath, blockUntilReady, createAllIterationsOffsetsBuffer, defaultDevice, devicePut, devices, dynamicUpdateSlice, getBackend, grad, hessian, init, jacfwd, jacrev as jacobian, jacrev, jit, jvp, lax_d_exports as lax, linearize, makeJaxpr, nn_d_exports as nn, numpy_d_exports as numpy, random_d_exports as random, scipy_special_d_exports as scipySpecial, setDebug, tree_d_exports as tree, valueAndGrad, vjp, vmap, wrapRoutineForScan };

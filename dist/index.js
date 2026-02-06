@@ -1,6 +1,6 @@
 import { __export } from "./chunk-Cl8Af3a2.js";
-import { AluExp, AluGroup, AluOp, AluVar, DEBUG, DType, FpHash, Kernel, PPrint, Reduction, Routine, Routines, ShapeTracker, accessorAluExp, accessorGlobal, assertNonNull, byteWidth, checkAxis, checkInts, deepEqual, defaultDevice, devices, dtypedArray, dtypedJsArray, generalBroadcast, getBackend, init, invertPermutation, isFloatDtype, isNumberPair, isPermutation, normalizeAxis, partitionList, prod, promoteTypes, range, recursiveFlatten, rep, reportScanBodySteps, reportScanPath, runWithCache, setDebug, setScanBodyStepsCallback, toposort, unravelAlu, unzip2, zip, zipn } from "./backend-D0-RPF-J.js";
-import { createAllIterationsOffsetsBuffer, wrapRoutineForScan } from "./scan-wrapper-TpkqHRRF.js";
+import { AluExp, AluGroup, AluOp, AluVar, DEBUG, DType, FpHash, Kernel, PPrint, Reduction, Routine, Routines, ShapeTracker, accessorAluExp, accessorGlobal, assertNonNull, byteWidth, checkAxis, checkInts, deepEqual, defaultDevice, devices, dtypedArray, dtypedJsArray, generalBroadcast, getBackend, init, invertPermutation, isFloatDtype, isNumberPair, isPermutation, normalizeAxis, partitionList, prod, promoteTypes, range, recursiveFlatten, rep, runWithCache, setDebug, toposort, unravelAlu, unzip2, zip, zipn } from "./backend-BLx6HGHC.js";
+import { createAllIterationsOffsetsBuffer, wrapRoutineForScan } from "./scan-wrapper-Dml-rzI-.js";
 
 //#region src/frontend/convolution.ts
 /**
@@ -409,6 +409,7 @@ let Primitive = /* @__PURE__ */ function(Primitive$1) {
 	Primitive$1["Flip"] = "flip";
 	Primitive$1["Shrink"] = "shrink";
 	Primitive$1["Pad"] = "pad";
+	Primitive$1["DynamicUpdateSlice"] = "dynamic_update_slice";
 	Primitive$1["Sort"] = "sort";
 	Primitive$1["Argsort"] = "argsort";
 	Primitive$1["TriangularSolve"] = "triangular_solve";
@@ -642,6 +643,14 @@ function pad$1(x, width) {
 		w = rep(nd, () => [w0, w1]);
 	} else if (w.length !== nd) throw new Error(`Invalid pad(): expected ${nd} axes, got ${w.length}`);
 	return bind1(Primitive.Pad, [x], { width: w });
+}
+function dynamicUpdateSlice(dst, src, offset, axis = 0) {
+	offset = Math.floor(offset);
+	if (!Number.isInteger(offset) || offset < 0) throw new Error(`dynamicUpdateSlice: offset must be a nonnegative integer, got ${offset}`);
+	return bind1(Primitive.DynamicUpdateSlice, [dst, src], {
+		offset,
+		axis
+	});
 }
 function triangularSolve$1(a, b, { lower = false, unitDiagonal = false } = {}) {
 	const as = getShape(a);
@@ -1760,6 +1769,22 @@ const abstractEvalRules = {
 		const newShape = x.shape.map((dim, i) => dim + width[i][0] + width[i][1]);
 		return [new ShapedArray(newShape, x.dtype, x.weakType)];
 	},
+	[Primitive.DynamicUpdateSlice]([dst, src], { offset, axis }) {
+		if (!(dst instanceof ShapedArray) || !(src instanceof ShapedArray)) throw new TypeError("dynamicUpdateSlice expects shaped array inputs");
+		const dstShape = dst.shape;
+		const srcShape = src.shape;
+		if (dstShape.length === srcShape.length) {
+			for (let i = 0; i < dstShape.length; i++) {
+				if (i === axis) continue;
+				if (dstShape[i] !== srcShape[i]) throw new TypeError("dynamicUpdateSlice: shape mismatch");
+			}
+			if (offset + srcShape[axis] > dstShape[axis]) throw new TypeError("dynamicUpdateSlice: out of bounds");
+		} else if (axis === 0 && dstShape.length === srcShape.length + 1) {
+			for (let i = 0; i < srcShape.length; i++) if (dstShape[i + 1] !== srcShape[i]) throw new TypeError("dynamicUpdateSlice: stacked shape mismatch");
+			if (offset + 1 > dstShape[0]) throw new TypeError("dynamicUpdateSlice: stacked out of bounds");
+		} else throw new TypeError("dynamicUpdateSlice: unsupported shapes");
+		return [new ShapedArray(dst.shape, dst.dtype, dst.weakType)];
+	},
 	[Primitive.Sort]([x]) {
 		if (x.ndim === 0) throw new TypeError("sort: requires at least 1D input");
 		return [ShapedArray.fromAval(x)];
@@ -1984,7 +2009,7 @@ var JitProgram = class {
 					}
 				}
 				if (DEBUG >= 2) console.log(`[jit.scan] Before scanRunner: outputSlots=${outputSlots}, step.outputs=${step.outputs}`);
-				const result = scanRunner(step.bodyProgram, this.backend, step.bodyJaxpr, step.length, step.numCarry, step.numConsts, step.numX, step.numY, step.reverse, constSlots, initCarrySlots, xsSlots, step.xsAvals, outputSlots);
+				const result = scanRunner(step.bodyProgram, this.backend, step.bodyJaxpr, step.length, step.numCarry, step.numConsts, step.numX, step.numY, step.reverse, constSlots, initCarrySlots, xsSlots, step.xsAvals, step.preallocateY ?? false, outputSlots);
 				if (DEBUG >= 2) console.log(`[jit.scan] After scanRunner: result.outputs=${result.outputs}`);
 				for (let i = 0; i < step.outputs.length; i++) scope.set(step.outputs[i], result.outputs[i]);
 				if (DEBUG >= 2) console.log(`[jit.scan] After scope.set: scope.get(${step.outputs[0]})=${scope.get(step.outputs[0])}`);
@@ -2021,8 +2046,8 @@ var JitProgram = class {
 				const outputSlots = step.outputs.map((id) => scope.get(id));
 				const carryOutSlots = outputSlots.slice(0, step.numCarry);
 				const ysStackedSlots = outputSlots.slice(step.numCarry);
-				if (this.backend.dispatchBatchedScan) this.backend.dispatchBatchedScan(step.batchedParams, constSlots, initCarrySlots, xsSlots, carryOutSlots, ysStackedSlots);
-				else throw new Error("internal: preencoded-routine requires backend.dispatchBatchedScan");
+				if (this.backend.dispatchPreencodedScan) this.backend.dispatchPreencodedScan(step.preencodedParams, constSlots, initCarrySlots, xsSlots, carryOutSlots, ysStackedSlots);
+				else throw new Error("internal: preencoded-routine requires backend.dispatchPreencodedScan");
 				break;
 			}
 			default:
@@ -2219,11 +2244,6 @@ function jitCompile(backend, jaxpr) {
 			if (nativeScanExe) {
 				const pathError$1 = checkAcceptedPath("compiled-loop", acceptPath);
 				if (pathError$1) throw new Error(pathError$1);
-				reportScanPath("compiled-loop", backend.type, {
-					numConsts,
-					numCarry,
-					length
-				});
 				builder.steps.push({
 					type: "compiled-loop",
 					executable: nativeScanExe,
@@ -2240,18 +2260,13 @@ function jitCompile(backend, jaxpr) {
 				});
 				continue;
 			}
-			const batchedParams = tryPrepareBatchedScan(backend, bodyProgram, bodyJaxpr, length, numCarry, numConsts, numX, numY, eqn, reverse);
-			if (batchedParams) {
+			const preencodedParams = tryPreparePreencodedScan(backend, bodyProgram, bodyJaxpr, length, numCarry, numConsts, numX, numY, reverse);
+			if (preencodedParams) {
 				const pathError$1 = checkAcceptedPath("preencoded-routine", acceptPath);
 				if (pathError$1) throw new Error(pathError$1);
-				reportScanPath("preencoded-routine", backend.type, {
-					numConsts,
-					numCarry,
-					length
-				});
 				builder.steps.push({
 					type: "preencoded-routine",
-					batchedParams,
+					preencodedParams,
 					length,
 					numCarry,
 					numConsts,
@@ -2269,11 +2284,6 @@ function jitCompile(backend, jaxpr) {
 			const extraInfo = backend.type === "webgpu" ? `${dispatchCount} GPU dispatch${dispatchCount !== 1 ? "es" : ""} per iteration` : void 0;
 			const pathError = checkAcceptedPath("fallback", acceptPath, extraInfo);
 			if (pathError) throw new Error(pathError);
-			reportScanPath("fallback", backend.type, {
-				numConsts,
-				numCarry,
-				length
-			});
 			builder.steps.push({
 				type: "scan",
 				bodyProgram,
@@ -2288,7 +2298,8 @@ function jitCompile(backend, jaxpr) {
 				initCarry: initCarryIds,
 				xs: xsIds,
 				xsAvals,
-				outputs
+				outputs,
+				preallocateY: params.preallocateY ?? false
 			});
 			continue;
 		}
@@ -2576,6 +2587,9 @@ const jitRules = {
 	}),
 	[Primitive.Shrink]: reshapeJit((st, { slice }) => st.shrink(slice)),
 	[Primitive.Pad]: reshapeJit((st, { width }) => st.pad(width)),
+	[Primitive.DynamicUpdateSlice]: (_args, _as, _params) => {
+		throw new Error("jit: dynamic_update_slice is not implemented");
+	},
 	[Primitive.Sort]: routineNoJit(),
 	[Primitive.Argsort]: routineNoJit(),
 	[Primitive.TriangularSolve]: routineNoJit(),
@@ -2749,33 +2763,32 @@ function getScanBufferSizes(bodyJaxpr, numConsts, numCarry, numX) {
 	};
 }
 /**
-* Try to prepare a batched scan for routine bodies (matmul, conv, etc.).
-* Returns the PreparedBatchedScan params if possible, null otherwise.
+* Try to prepare a preencoded scan for routine bodies (matmul, conv, etc.).
+* Returns the PreparedPreencodedScan params if possible, null otherwise.
 *
-* Batched scan is only supported when:
+* Preencoded scan is only supported when:
 * 1. Backend is WebGPU
 * 2. Body program contains exactly one execute step with a Routine (not Kernel)
-* 3. MVP: No constants support
-* 4. MVP: numCarry === numY (carry and output are the same)
+* 3. numCarry === numY (carry and output are the same)
 */
-function tryPrepareBatchedScan(backend, bodyProgram, bodyJaxpr, length, numCarry, numConsts, numX, numY, eqn, reverse) {
+function tryPreparePreencodedScan(backend, bodyProgram, bodyJaxpr, length, numCarry, numConsts, numX, numY, reverse) {
 	if (backend.type !== "webgpu") {
-		if (DEBUG >= 2) console.log("Batched scan: skipped, unsupported backend");
+		if (DEBUG >= 2) console.log("Preencoded scan: skipped, unsupported backend");
 		return null;
 	}
 	const executeSteps = bodyProgram.steps.filter((s) => s.type === "execute");
 	if (executeSteps.length !== 1) {
-		if (DEBUG >= 2) console.log(`Batched scan: skipped, ${executeSteps.length} execute steps (need exactly 1)`);
+		if (DEBUG >= 2) console.log(`Preencoded scan: skipped, ${executeSteps.length} execute steps (need exactly 1)`);
 		return null;
 	}
 	const execStep = executeSteps[0];
 	if (!(execStep.source instanceof Routine)) {
-		if (DEBUG >= 2) console.log("Batched scan: skipped, not a Routine");
+		if (DEBUG >= 2) console.log("Preencoded scan: skipped, not a Routine");
 		return null;
 	}
 	const bodyRoutine = execStep.source;
 	if (numCarry !== numY) {
-		if (DEBUG >= 2) console.log(`Batched scan: skipped, numCarry=${numCarry} !== numY=${numY}`);
+		if (DEBUG >= 2) console.log(`Preencoded scan: skipped, numCarry=${numCarry} !== numY=${numY}`);
 		return null;
 	}
 	const carryAvals = bodyJaxpr.inBinders.slice(numConsts, numConsts + numCarry).map((v) => v.aval);
@@ -2784,21 +2797,21 @@ function tryPrepareBatchedScan(backend, bodyProgram, bodyJaxpr, length, numCarry
 	const xsElemStrides = xAvals.map((a) => a.size);
 	const ysElemStrides = carryAvals.map((a) => a.size);
 	if (!backend.prepareRoutineSync) {
-		if (DEBUG >= 2) console.log("Batched scan: skipped, backend has no prepareRoutineSync");
+		if (DEBUG >= 2) console.log("Preencoded scan: skipped, backend has no prepareRoutineSync");
 		return null;
 	}
 	let bodyRoutineExe;
 	try {
 		bodyRoutineExe = backend.prepareRoutineSync(bodyRoutine);
 	} catch (e$1) {
-		if (DEBUG >= 2) console.warn("Batched scan: prepareRoutineSync failed:", e$1);
+		if (DEBUG >= 2) console.warn("Preencoded scan: prepareRoutineSync failed:", e$1);
 		return null;
 	}
-	if (!backend.prepareBatchedScan) {
-		if (DEBUG >= 2) console.log("Batched scan: skipped, backend has no prepareBatchedScan");
+	if (!backend.preparePreencodedScan) {
+		if (DEBUG >= 2) console.log("Preencoded scan: skipped, backend has no preparePreencodedScan");
 		return null;
 	}
-	const batchedScanParams = {
+	const preencodedScanParams = {
 		length,
 		carrySizes,
 		xsElemStrides,
@@ -2813,13 +2826,13 @@ function tryPrepareBatchedScan(backend, bodyProgram, bodyJaxpr, length, numCarry
 		routineOutputJitIds: execStep.outputs
 	};
 	try {
-		const prepared = backend.prepareBatchedScan(batchedScanParams);
+		const prepared = backend.preparePreencodedScan(preencodedScanParams);
 		if (prepared) {
-			if (DEBUG >= 1) console.log(`Batched scan: SUCCESS! Using WebGPU batched scan for ${bodyRoutine.name}`);
+			if (DEBUG >= 1) console.log(`Preencoded scan: SUCCESS! Using WebGPU preencoded scan for ${bodyRoutine.name}`);
 		}
 		return prepared;
 	} catch (e$1) {
-		if (DEBUG >= 2) console.warn("Batched scan preparation failed:", e$1);
+		if (DEBUG >= 2) console.warn("Preencoded scan preparation failed:", e$1);
 		return null;
 	}
 }
@@ -3031,10 +3044,6 @@ function tryPrepareWasmNativeScan(backend, bodyProgram, bodyJaxpr, executeSteps,
 		const routineNames = [...usedRoutines].map((r) => Routines[r]);
 		console.log(`[wasm-scan] Analyzing body: ${executeSteps.length} execute steps, numCarry=${numCarry}, numY=${numY}` + (routineNames.length > 0 ? `, routines: ${routineNames.join(", ")}` : ""));
 	}
-	reportScanBodySteps(executeSteps.length, "wasm", {
-		numCarry,
-		numY
-	});
 	const numInputs = numConsts + numCarry + numX;
 	const { constSizes, carrySizes, xsStrides, ysStrides } = getScanBufferSizes(bodyJaxpr, numConsts, numCarry, numX);
 	const slotToInternal = /* @__PURE__ */ new Map();
@@ -3913,6 +3922,15 @@ var Array$1 = class Array$1 extends Tracer {
 		if (this.size !== 1) throw new Error(`item() can only be called on arrays of size 1`);
 		return this.dataSync()[0];
 	}
+	/**
+	* Convenience accessor for index/update-like usage: `arr.at(i).set(src)`.
+	* Currently supports a single `axis=0` offset and integer index. Returns
+	* a new array where the slice at `index` along axis 0 is replaced by `src`.
+	*/
+	at(index) {
+		const that = this;
+		return { set: (src) => dynamicUpdateSlice(that, src, index) };
+	}
 	/** @private Internal plumbing method for Array / Tracer ops. */
 	static _implRules() {
 		return {
@@ -4100,6 +4118,79 @@ var Array$1 = class Array$1 extends Tracer {
 			[Primitive.Pad]([x], { width }) {
 				return [x.#reshape(x.#st.pad(width))];
 			},
+			[Primitive.DynamicUpdateSlice]([dst, src], { offset, axis }) {
+				const dstShape = dst.shape;
+				const srcShape = src.shape;
+				if (dstShape.length === srcShape.length) {
+					for (let i = 0; i < dstShape.length; i++) {
+						if (i === axis) continue;
+						if (dstShape[i] !== srcShape[i]) throw new Error("dynamicUpdateSlice: dst and src must match on non-updated axes");
+					}
+					if (offset + srcShape[axis] > dstShape[axis]) throw new Error("dynamicUpdateSlice: offset + src.shape[axis] out of bounds");
+					const innerBefore = prod(dstShape.slice(axis + 1));
+					const outerBefore = prod(dstShape.slice(0, axis));
+					const dstData = dst.dataSync();
+					const srcData = src.dataSync();
+					for (let out = 0; out < outerBefore; out++) for (let i = 0; i < srcShape[axis]; i++) {
+						const srcStart = (out * srcShape[axis] + i) * innerBefore;
+						const dstStart = (out * dstShape[axis] + offset + i) * innerBefore;
+						dstData.set(srcData.subarray(srcStart, srcStart + innerBefore), dstStart);
+					}
+					return [array(dstData, {
+						shape: dstShape,
+						dtype: dst.dtype,
+						device: dst.device
+					})];
+				}
+				if (axis === 0 && dstShape.length === srcShape.length + 1) {
+					for (let i = 0; i < srcShape.length; i++) if (dstShape[i + 1] !== srcShape[i]) throw new Error("dynamicUpdateSlice: dst and src must match on non-updated axes (stacked mode)");
+					if (offset + 1 > dstShape[0]) throw new Error("dynamicUpdateSlice: offset out of bounds for stacked dst");
+					if (dst.device === "webgpu" && src.device === "webgpu") {
+						const dstSlot = dst._realizeSource();
+						const srcSlot = src._realizeSource();
+						const innerSizeBytes = prod(srcShape) * byteWidth(dst.dtype);
+						const dstOffsetBytes = offset * innerSizeBytes;
+						const backend = getBackend("webgpu");
+						const canBufferCopy = dstOffsetBytes % 4 === 0 && innerSizeBytes % 4 === 0;
+						if (backend.copyBufferToBuffer && canBufferCopy) {
+							backend.copyBufferToBuffer(srcSlot, 0, dstSlot, dstOffsetBytes, innerSizeBytes);
+							backend.incRef(dstSlot);
+							return [new Array$1({
+								source: dstSlot,
+								st: ShapeTracker.fromShape(dstShape),
+								dtype: dst.dtype,
+								weakType: dst.weakType,
+								backend: getBackend(dst.device),
+								committed: true,
+								pending: []
+							})];
+						} else if (backend.copyBufferWithShader) {
+							backend.copyBufferWithShader(srcSlot, 0, dstSlot, dstOffsetBytes, innerSizeBytes);
+							backend.incRef(dstSlot);
+							return [new Array$1({
+								source: dstSlot,
+								st: ShapeTracker.fromShape(dstShape),
+								dtype: dst.dtype,
+								weakType: dst.weakType,
+								backend: getBackend(dst.device),
+								committed: true,
+								pending: []
+							})];
+						}
+					}
+					const dstData = dst.dataSync();
+					const srcData = src.dataSync();
+					const innerSize = prod(srcShape);
+					const dstStart = offset * innerSize;
+					dstData.set(srcData, dstStart);
+					return [array(dstData, {
+						shape: dstShape,
+						dtype: dst.dtype,
+						device: dst.device
+					})];
+				}
+				throw new Error("dynamicUpdateSlice: unsupported dst/src shapes for update");
+			},
 			[Primitive.Sort]: Array$1.#routine(Primitive.Sort),
 			[Primitive.Argsort]: Array$1.#routine(Primitive.Argsort),
 			[Primitive.TriangularSolve]: Array$1.#routine(Primitive.TriangularSolve),
@@ -4110,7 +4201,7 @@ var Array$1 = class Array$1 extends Tracer {
 				const { backend, committed } = Array$1.#computeBackend("jit", args);
 				args = args.map((ar) => ar._putSync(backend));
 				const jp = jitCompile(backend, jaxpr);
-				const scanRunner = (bodyProgram, _backend, bodyJaxpr, length, numCarry, _numConsts, _numX, numY, reverse, constSlots, initCarrySlots, xsSlots, xsAvals, _outputSlots) => {
+				const scanRunner = (bodyProgram, _backend, bodyJaxpr, length, numCarry, _numConsts, _numX, numY, reverse, constSlots, initCarrySlots, xsSlots, xsAvals, preallocateY, outputSlots) => {
 					const carryAvals = bodyJaxpr.inBinders.slice(constSlots.length, constSlots.length + numCarry).map((v) => v.aval);
 					const constSlotsRealized = constSlots;
 					const xs = xsSlots.map((slot, i) => new Array$1({
@@ -4141,9 +4232,11 @@ var Array$1 = class Array$1 extends Tracer {
 						committed,
 						pending: []
 					}));
-					const ySlices = [];
-					for (let j = 0; j < numY; j++) ySlices.push([]);
 					const bodyOutAvals = bodyJaxpr.outs.map((v) => v.aval);
+					const canPreallocateY = preallocateY && numY > 0 && outputSlots.length === numCarry + numY && (backend.copyBufferToBuffer || backend.copyBufferWithShader);
+					const yStrideBytes = bodyOutAvals.slice(numCarry).map((aval) => prod(aval.shape) * byteWidth(aval.dtype));
+					const ySlices = [];
+					if (!canPreallocateY) for (let j = 0; j < numY; j++) ySlices.push([]);
 					for (let i = 0; i < length; i++) {
 						const xSlice = xs.map((x, xIdx) => x.ref.#reshape(xSliceSts[xIdx][i]));
 						const carrySlots = carry.map((c) => c._realizeSource());
@@ -4180,7 +4273,19 @@ var Array$1 = class Array$1 extends Tracer {
 						});
 						const newCarry = outArrays.slice(0, numCarry);
 						const ySlice = outArrays.slice(numCarry);
-						for (let j = 0; j < numY; j++) ySlices[j].push(ySlice[j]);
+						if (canPreallocateY) {
+							const writeIndex = reverse ? length - 1 - i : i;
+							for (let j = 0; j < numY; j++) {
+								const sizeBytes = yStrideBytes[j];
+								if (sizeBytes <= 0) continue;
+								const dstOffsetBytes = writeIndex * sizeBytes;
+								const ySlot = ySlice[j]._realizeSource();
+								const dstSlot = outputSlots[numCarry + j];
+								const canBufferCopy = dstOffsetBytes % 4 === 0 && sizeBytes % 4 === 0;
+								if (backend.copyBufferToBuffer && canBufferCopy) backend.copyBufferToBuffer(ySlot, 0, dstSlot, dstOffsetBytes, sizeBytes);
+								else if (backend.copyBufferWithShader) backend.copyBufferWithShader(ySlot, 0, dstSlot, dstOffsetBytes, sizeBytes);
+							}
+						} else for (let j = 0; j < numY; j++) ySlices[j].push(ySlice[j]);
 						if (i > 0) {
 							const oldCarrySlots = new Set(carry.map((c) => c._realizeSource()));
 							for (const y of ySlice) {
@@ -4190,8 +4295,10 @@ var Array$1 = class Array$1 extends Tracer {
 							carry.forEach((c) => c.dispose());
 						}
 						carry = newCarry;
+						if (canPreallocateY) ySlice.forEach((y) => y.dispose());
 					}
-					const stackedYs = ySlices.map((slices) => {
+					let stackedYs = [];
+					if (!canPreallocateY) stackedYs = ySlices.map((slices) => {
 						const reshaped = slices.map((s) => {
 							const expanded = s.ref.#reshape(s.#st.reshape([1, ...s.shape]));
 							s.dispose();
@@ -4212,12 +4319,17 @@ var Array$1 = class Array$1 extends Tracer {
 						return stacked;
 					});
 					const carryOutSlots = carry.map((c) => c._realizeSource());
-					const yOutSlots = stackedYs.map((y) => y._realizeSource());
+					const yOutSlots = canPreallocateY ? outputSlots.slice(numCarry) : stackedYs.map((y) => y._realizeSource());
 					const carryPending = carry.flatMap((c) => c.#pending);
 					const ysPending = stackedYs.flatMap((y) => y.#pending);
 					const finalPending = [...carryPending, ...ysPending];
+					const outputs$1 = [...carryOutSlots, ...yOutSlots];
+					if (outputSlots.length > 0) {
+						const outputSet = new Set(outputs$1);
+						for (const slot of outputSlots) if (!outputSet.has(slot)) backend.decRef(slot);
+					}
 					return {
-						outputs: [...carryOutSlots, ...yOutSlots],
+						outputs: outputs$1,
 						pending: finalPending
 					};
 				};
@@ -5194,6 +5306,9 @@ const jvpRules = {
 		if (x.dtype === dtype) return [[x], [dx]];
 		dx.dispose();
 		return [[bitcast(x.ref, dtype)], [zerosLike$1(x)]];
+	},
+	[Primitive.DynamicUpdateSlice]([dst, src], [ddst, dsrc], { offset, axis }) {
+		throw new Error("JVP: dynamic_update_slice is not implemented");
 	},
 	[Primitive.Sin]([x], [dx]) {
 		return [[sin$1(x.ref)], [cos$1(x).mul(dx)]];
@@ -8775,24 +8890,24 @@ function triangularSolve(a, b, { leftSide = false, lower = false, transposeA = f
 */
 function scan(f, init$1, xs, options) {
 	const opts = options ?? {};
-	const { length: lengthOpt, reverse = false, acceptPath, checkpoint } = opts;
+	const { length: lengthOpt, reverse = false, acceptPath, checkpoint, preallocateY = true } = opts;
 	const xsIsNull = xs === null;
 	const [initFlat, initTreedef] = flatten(init$1);
 	const [xsFlat, xsTreedef] = xsIsNull ? [[], null] : flatten(xs);
 	const n = lengthOpt ?? (xsFlat.length > 0 ? xsFlat[0].shape[0] : 0);
-	if (n === 0) throw new Error(xsIsNull ? "scan: length option is required when xs is null" : "scan: cannot determine length from empty inputs");
 	const carryAvals = initFlat.map((arr) => ShapedArray.fromAval(getAval(arr)));
 	const xSliceAvals = xsFlat.map((arr) => {
 		const aval = getAval(arr);
 		return new ShapedArray(aval.shape.slice(1), aval.dtype, aval.weakType);
 	});
+	let yTreedef_;
 	const flatF = (carryFlat, xSliceFlat) => {
 		const carry = unflatten(initTreedef, carryFlat);
 		const xSlice = xsIsNull ? xs : unflatten(xsTreedef, xSliceFlat);
 		const [newCarry, y] = f(carry, xSlice);
 		const [newCarryFlat] = flatten(newCarry);
-		const [yFlat, yTreedef$1] = flatten(y);
-		flatF._yTreedef = yTreedef$1;
+		const [yFlat, yTreedef] = flatten(y);
+		yTreedef_ = yTreedef;
 		return [newCarryFlat, yFlat];
 	};
 	const traceFn = (...args) => {
@@ -8806,6 +8921,22 @@ function scan(f, init$1, xs, options) {
 	const { jaxpr: closedJaxpr, treedef: _outTreedef } = makeJaxpr$1(traceFn)(...traceAvals);
 	const jaxpr = closedJaxpr.jaxpr;
 	const consts = closedJaxpr.consts;
+	if (n === 0) {
+		if (xsIsNull && lengthOpt === void 0) throw new Error("scan: length option is required when xs is null");
+		const finalCarryFlat = initFlat.map((arr) => arr.ref);
+		const numCarry$1 = initFlat.length;
+		const yOutAtoms = jaxpr.outs.slice(numCarry$1);
+		const yFlatEmpty = yOutAtoms.map((atom) => {
+			const aval = atom.aval;
+			return zeros([0, ...aval.shape], { dtype: aval.dtype });
+		});
+		const finalCarry$1 = unflatten(initTreedef, finalCarryFlat);
+		const ys$1 = yTreedef_ === JsTreeDef.none ? null : unflatten(yTreedef_, yFlatEmpty);
+		initFlat.forEach((arr) => arr.dispose());
+		xsFlat.forEach((arr) => arr.dispose());
+		closedJaxpr.dispose();
+		return [finalCarry$1, ys$1];
+	}
 	const scanArgs = [
 		...consts.map((c) => c.ref),
 		...initFlat.map((arr) => arr.ref),
@@ -8820,7 +8951,8 @@ function scan(f, init$1, xs, options) {
 		length: n,
 		reverse,
 		acceptPath,
-		checkpoint
+		checkpoint,
+		preallocateY
 	});
 	initFlat.forEach((arr) => arr.dispose());
 	xsFlat.forEach((arr) => arr.dispose());
@@ -8828,8 +8960,7 @@ function scan(f, init$1, xs, options) {
 	const carryOut = results.slice(0, numCarry);
 	const ysFlat = results.slice(numCarry);
 	const finalCarry = unflatten(initTreedef, carryOut);
-	const yTreedef = flatF._yTreedef;
-	const ys = unflatten(yTreedef, ysFlat);
+	const ys = unflatten(yTreedef_, ysFlat);
 	return [finalCarry, ys];
 }
 
@@ -9861,4 +9992,4 @@ async function devicePut(x, device) {
 }
 
 //#endregion
-export { Array$1 as Array, ClosedJaxpr, DType, Jaxpr, blockUntilReady, createAllIterationsOffsetsBuffer, defaultDevice, devicePut, devices, getBackend, grad, hessian, init, jacfwd, jacrev as jacobian, jacrev, jit, jvp, lax_exports as lax, linearize, makeJaxpr, nn_exports as nn, numpy_exports as numpy, random_exports as random, scipy_special_exports as scipySpecial, setDebug, setScanBodyStepsCallback, tree_exports as tree, valueAndGrad, vjp, vmap, wrapRoutineForScan };
+export { Array$1 as Array, ClosedJaxpr, DType, Jaxpr, blockUntilReady, createAllIterationsOffsetsBuffer, defaultDevice, devicePut, devices, dynamicUpdateSlice, getBackend, grad, hessian, init, jacfwd, jacrev as jacobian, jacrev, jit, jvp, lax_exports as lax, linearize, makeJaxpr, nn_exports as nn, numpy_exports as numpy, random_exports as random, scipy_special_exports as scipySpecial, setDebug, tree_exports as tree, valueAndGrad, vjp, vmap, wrapRoutineForScan };
