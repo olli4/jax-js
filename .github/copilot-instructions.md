@@ -1690,7 +1690,6 @@ kernel"
 | `grad(scan)` ~2× compute overhead     | Use `{ checkpoint: false }` for O(N) | All     |
 | Sort in scan body on WebGPU           | Uses JS loop (uniforms)              | WebGPU  |
 | Mixed-dtype carries on WebGPU         | Use WASM backend or same-dtype carry | WebGPU  |
-| Length-0 scans throw                  | Guard with `if (n > 0)` before scan  | All     |
 
 **WebGPU preencoded-routine requirements:** WebGPU can only use `preencoded-routine` for scan bodies
 that are:
@@ -1730,8 +1729,7 @@ conflicts with the scan offset uniform.
 i32 counter), the shader would produce incorrect results. WASM compiled-loop handles mixed dtypes
 correctly since each buffer is typed independently.
 
-**Length-0 scans:** JAX Python returns `(init, empty_ys)` for length-0 scans. jax-js throws an error
-instead. This affects edge cases where scan length is data-dependent.
+**Length-0 scans:** Supported. Returns `(init, empty_ys)` matching JAX behavior.
 
 ### Code quality notes
 
@@ -1764,7 +1762,6 @@ contributors should be aware of:
 | -------- | ------------------------------- | ------------------------------------------------------------- |
 | Medium   | Mixed-dtype WebGPU scan shader  | Per-binding dtype in `nativeScanMultiShaderSource`            |
 | Medium   | Auto-detect preallocateY        | Infer when preallocateY is beneficial without explicit opt-in |
-| Low      | Length-0 scan support           | Return `(init, empty_ys)` for JAX compat                      |
 | Low      | `lax.scatter` / `dynamic_slice` | Would enable Jaxpr-based routines                             |
 
 #### Completed: Preallocated Y stacking

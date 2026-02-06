@@ -900,7 +900,7 @@ export function jitCompile(backend: Backend, jaxpr: Jaxpr): JitProgram {
         xsAvals,
         outputs,
         // Carry forward preallocation hint from the original primitive params
-        preallocateY: (params as any).preallocateY ?? false,
+        preallocateY: params.preallocateY ?? false,
       });
       continue;
     }

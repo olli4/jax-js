@@ -760,6 +760,7 @@ export class WebGPUBackend implements Backend {
       numY,
       length,
       reverse,
+      carrySizes,
       routineInputJitIds,
       routineOutputJitIds,
     } = params;

@@ -369,12 +369,7 @@ export function scan<
   // Determine scan length from input
   const n = lengthOpt ?? (xsFlat.length > 0 ? xsFlat[0].shape[0] : 0);
 
-  // NOTE: We no longer throw early on n === 0 because we need to trace the
-  // body function to discover the Y treedef. After tracing, we'll handle the
-  // length-0 case and return (init, empty_ys) to match JAX behavior.
-  // For xs === null, we still require an explicit length option to be provided
-  // (unless it was provided and equals 0).
-  // (See: Issue: support length-0 scans for JAX compatibility)
+  // Length-0 is handled after tracing (we need Y treedef from the trace).
 
   // Get abstract values for carry and x_slice (xs with leading dim removed)
   const carryAvals = initFlat.map((arr) => ShapedArray.fromAval(getAval(arr)));
@@ -441,14 +436,8 @@ export function scan<
     const yOutAtoms = jaxpr.outs.slice(numCarry);
 
     const yFlatEmpty = yOutAtoms.map((atom) => {
-      // atom should be a Var with an aval describing the single-iteration y
-      if (atom instanceof Error)
-        throw new Error("unexpected jaxpr output atom");
-      const aval = (atom as any).aval as ShapedArray;
-      // If aval is missing or has zero leaves, create an empty scalar array
-      const yShape = aval.shape;
-      const emptyShape = [0, ...yShape];
-      return zeros(emptyShape, { dtype: aval.dtype });
+      const aval = atom.aval;
+      return zeros([0, ...aval.shape], { dtype: aval.dtype });
     });
 
     // Reconstruct pytrees

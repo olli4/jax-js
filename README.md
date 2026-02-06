@@ -142,6 +142,9 @@ const step = (carry, x) => {
 - `checkpoint?: boolean | number` — control gradient checkpointing for `grad(scan)`. Default
   (undefined/true) uses √N checkpointing (O(√N) memory, ~2× compute). A number specifies the segment
   size. `false` stores all carries (O(N) memory, no recomputation).
+- `preallocateY?: boolean` — when `true`, the scan fallback path preallocates the stacked-Y output
+  buffer and writes each iteration's Y directly, avoiding intermediate allocations from
+  concatenation.
 
 ---
 
@@ -293,8 +296,10 @@ const [dInit, dXs] = await gradLoss(init, xs);
 ## Autodiff
 
 - `grad` / JVP / VJP are supported through `scan`.
-- Current implementation stores all intermediate carries for reverse-mode (O(N) memory).
-- Roadmap: implement √N checkpointing to reduce memory to O(√N) with ~2× recompute.
+- Default: √N checkpointing — stores O(√N) intermediate carries, recomputes segments during the
+  backward pass (~2× compute, dramatically reduced memory).
+- Set `{ checkpoint: false }` to store all N carries (O(N) memory, no recomputation).
+- Set `{ checkpoint: segmentSize }` to specify the checkpoint segment size manually.
 
 ---
 
@@ -304,7 +309,8 @@ const [dInit, dXs] = await gradLoss(init, xs);
 - Primitive: `Primitive.Scan` and backend lowerings (`native-scan`, `batched-scan`, `scan`).
 - WebGPU/WASM codegen and scan-specific helpers: `src/backend/*` (see `scan-wrapper.ts`,
   `webgpu.ts`).
-- Tests: `test/lax-scan.test.ts`, `test/jit-scan-dlm.test.ts`.
+- Tests: `test/lax-scan.test.ts`, `test/jit-scan-dlm.test.ts`, `test/scan-preallocate.test.ts`,
+  `test/dynamic_update_slice.test.ts`.
 
 ---
 
