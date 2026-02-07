@@ -1770,3 +1770,67 @@ function dtyF(
       throw new UnsupportedOpError(op, dtype, "wasm");
   }
 }
+
+export function getScanRoutineInfo(routine: Routine): ScanRoutineInfo | null {
+  const routineName = routine.name as Routines;
+  const isF64 = routine.type.inputDtypes[0] === DType.Float64;
+  const dtype: "f32" | "f64" = isF64 ? "f64" : "f32";
+
+  if (routineName === Routines.Cholesky) {
+    const inputShape = routine.type.inputShapes[0];
+    const n = inputShape[inputShape.length - 1];
+    return {
+      routine: routineName,
+      exportName: "cholesky",
+      numParams: 2,
+      dtype,
+      sizeParams: [n],
+    };
+  } else if (routineName === Routines.Sort) {
+    const inputShape = routine.type.inputShapes[0];
+    const n = inputShape[inputShape.length - 1];
+    return {
+      routine: routineName,
+      exportName: "sort",
+      numParams: 2,
+      dtype,
+      sizeParams: [n],
+    };
+  } else if (routineName === Routines.TriangularSolve) {
+    const aShape = routine.type.inputShapes[0];
+    const bShape = routine.type.inputShapes[1];
+    const n = aShape[aShape.length - 1];
+    const batchRows = bShape[bShape.length - 1];
+    return {
+      routine: routineName,
+      exportName: "triangular_solve",
+      numParams: 3,
+      dtype,
+      sizeParams: [n, batchRows],
+      unitDiagonal: routine.params?.unitDiagonal ?? false,
+      lower: false,
+    };
+  } else if (routineName === Routines.LU) {
+    const inputShape = routine.type.inputShapes[0];
+    const m = inputShape[inputShape.length - 2];
+    const n = inputShape[inputShape.length - 1];
+    return {
+      routine: routineName,
+      exportName: "lu",
+      numParams: 4,
+      dtype,
+      sizeParams: [m, n],
+    };
+  } else if (routineName === Routines.Argsort) {
+    const inputShape = routine.type.inputShapes[0];
+    const n = inputShape[inputShape.length - 1];
+    return {
+      routine: routineName,
+      exportName: "argsort",
+      numParams: 4,
+      dtype,
+      sizeParams: [n],
+    };
+  }
+  return null;
+}
