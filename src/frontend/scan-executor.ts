@@ -62,8 +62,7 @@ export function executeScan(params: ExecuteScanParams): ExecuteScanResult {
     case "compiled-loop":
       return executeScanCompiledLoop(params);
     case "preencoded-routine":
-      // P4: backend.dispatchPreencodedScan()
-      throw new Error("preencoded-routine scan not yet implemented (P4)");
+      return executeScanPreencodedRoutine(params);
   }
 }
 
@@ -248,6 +247,42 @@ function executeScanCompiledLoop(params: ExecuteScanParams): ExecuteScanResult {
       ysStackedSlots,
     );
   }
+
+  return { outputs: outputSlots, pending: [] };
+}
+
+// ---------------------------------------------------------------------------
+// Preencoded-routine: WebGPU routine scan with uniform offsets (P4)
+// ---------------------------------------------------------------------------
+
+function executeScanPreencodedRoutine(
+  params: ExecuteScanParams,
+): ExecuteScanResult {
+  const {
+    backend,
+    plan,
+    numCarry,
+    numY,
+    constSlots,
+    initCarrySlots,
+    xsSlots,
+    outputSlots,
+  } = params;
+
+  if (plan.path !== "preencoded-routine") throw new Error("unreachable");
+
+  const carryOutSlots = outputSlots.slice(0, numCarry);
+  const ysStackedSlots = outputSlots.slice(numCarry, numCarry + numY);
+
+  const webgpuBackend = backend as WebGPUBackend;
+  webgpuBackend.dispatchPreencodedScan(
+    plan.preencodedParams,
+    constSlots,
+    initCarrySlots,
+    xsSlots,
+    carryOutSlots,
+    ysStackedSlots,
+  );
 
   return { outputs: outputSlots, pending: [] };
 }

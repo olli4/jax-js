@@ -31,11 +31,17 @@ import {
   calculateGrid,
   constToWgsl,
   dtypeToWgsl,
+  gridOffsetY,
   headerWgsl,
   ShaderInfo,
 } from "./webgpu/codegen";
 import { SyncReader } from "./webgpu/reader";
 import { createRoutineShader } from "./webgpu/routines";
+import {
+  createAllIterationsOffsetsBuffer,
+  type ScanBindingInfo,
+  wrapRoutineForScan,
+} from "./webgpu/scan-wrapper";
 
 interface ShaderDispatch extends ShaderInfo {
   pipeline: GPUComputePipeline; // Compiled pipeline for the shader.
@@ -71,6 +77,109 @@ export interface NativeScanMultiParams {
   reverse?: boolean;
 }
 
+// ---------------------------------------------------------------------------
+// Types for WebGPU preencoded-routine scan (P4)
+// ---------------------------------------------------------------------------
+
+/** Parameters for preencoded scan execution on WebGPU (routine body like matmul). */
+export interface PreencodedScanParams {
+  /** Number of scan iterations. */
+  length: number;
+  /** Sizes of each carry buffer in bytes. */
+  carrySizes: number[];
+  /** Strides (in ELEMENTS) along axis 0 for each xs input. */
+  xsElemStrides: number[];
+  /** Strides (in ELEMENTS) along axis 0 for each stacked y output. */
+  ysElemStrides: number[];
+  /** The prepared routine executable for the body. */
+  bodyRoutine: Executable<ShaderDispatch[]>;
+  /** Number of carry arrays. */
+  numCarry: number;
+  /** Number of xs inputs. */
+  numX: number;
+  /** Number of ys outputs. */
+  numY: number;
+  /** Number of const inputs (bound before carry). */
+  numConsts: number;
+  /** Whether to scan in reverse order. */
+  reverse?: boolean;
+  /** For each routine input binding i, the body jaxpr JitId, used to classify as const/carry/xs. */
+  routineInputJitIds: number[];
+  /** For each routine output binding i, the body output index. */
+  routineOutputJitIds: number[];
+}
+
+/** Prepared preencoded scan with wrapped shaders and offset buffer. */
+export interface PreparedPreencodedScan {
+  params: PreencodedScanParams;
+  /** Shaders with uniform offset support. */
+  wrappedShaders: ShaderDispatch[];
+  /** GPU buffer containing all iteration offsets. */
+  offsetBuffer: GPUBuffer;
+  /** Alignment of each iteration's offset data in the buffer. */
+  offsetAlignment: number;
+  /** Per-carry copy strategy for ys stacking (true = use shader copy). */
+  copyUsesShader: boolean[];
+}
+
+const COPY_WORKGROUP_SIZE = 64;
+
+const COPY_SHADER_CODE = String.raw`
+${headerWgsl}
+
+struct CopyParams {
+  srcOffset: u32,
+  dstOffset: u32,
+  size: u32,
+  _pad: u32,
+}
+
+@group(0) @binding(0) var<storage, read> src: array<u32>;
+@group(0) @binding(1) var<storage, read_write> dst: array<u32>;
+@group(1) @binding(0) var<uniform> params: CopyParams;
+
+fn byte_mask(n: u32) -> u32 {
+  if (n >= 4u) { return 0xffffffffu; }
+  return (1u << (n * 8u)) - 1u;
+}
+
+fn load_unaligned(offset: u32) -> u32 {
+  let word = offset >> 2u;
+  let shift = (offset & 3u) * 8u;
+  if (shift == 0u) {
+    return src[word];
+  }
+  let low = src[word];
+  let high = src[word + 1u];
+  return (low >> shift) | (high << (32u - shift));
+}
+
+@compute @workgroup_size(${COPY_WORKGROUP_SIZE})
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+  let gid = id.x + id.y * ${gridOffsetY}u;
+  let firstDstWord = params.dstOffset >> 2u;
+  let wordIdx = firstDstWord + gid;
+  let lastDstWord = (params.dstOffset + params.size + 3u) >> 2u;
+  if (wordIdx >= lastDstWord) { return; }
+
+  let wordByteStart = wordIdx * 4u;
+  let copyStart = max(params.dstOffset, wordByteStart);
+  let copyEnd = min(params.dstOffset + params.size, wordByteStart + 4u);
+  let nbytes = copyEnd - copyStart;
+  let srcByteOff = params.srcOffset + (copyStart - params.dstOffset);
+  let value = load_unaligned(srcByteOff);
+
+  if (nbytes == 4u) {
+    dst[wordIdx] = value;
+  } else {
+    let shift = (copyStart & 3u) * 8u;
+    let mask = byte_mask(nbytes) << shift;
+    let cur = dst[wordIdx];
+    dst[wordIdx] = (cur & ~mask) | ((value << shift) & mask);
+  }
+}
+`.trim();
+
 /** Implementation of `Backend` that uses WebGPU in browsers. */
 export class WebGPUBackend implements Backend {
   readonly type: Device = "webgpu";
@@ -90,6 +199,7 @@ export class WebGPUBackend implements Backend {
 
   #cachedShaderMap = new Map<bigint, ShaderInfo>();
   #reusableZsb: GPUBuffer;
+  #copyPipeline: GPUComputePipeline | null = null;
 
   constructor(readonly device: GPUDevice) {
     if (DEBUG >= 3 && device.adapterInfo) {
@@ -367,6 +477,415 @@ export class WebGPUBackend implements Backend {
       }
     }
     this.device.queue.submit([commandEncoder.finish()]);
+  }
+
+  // ---------------------------------------------------------------------------
+  // Preencoded-routine scan methods (P4)
+  // ---------------------------------------------------------------------------
+
+  #getCopyPipeline(): GPUComputePipeline {
+    if (this.#copyPipeline) return this.#copyPipeline;
+    const shader: ShaderInfo = {
+      code: COPY_SHADER_CODE,
+      numInputs: 1,
+      numOutputs: 1,
+      hasUniform: true,
+      passes: [{ grid: [1, 1], uniform: new Uint8Array(16) }],
+    };
+    this.#copyPipeline = this.pipelines.prepareSync(shader);
+    return this.#copyPipeline;
+  }
+
+  #encodeCopyWithShader(
+    commandEncoder: GPUCommandEncoder,
+    srcBuf: GPUBuffer,
+    srcOffset: number,
+    dstBuf: GPUBuffer,
+    dstOffset: number,
+    size: number,
+  ): GPUBuffer | null {
+    if (size <= 0) return null;
+    const firstDstWord = dstOffset >>> 2;
+    const lastDstWord = (dstOffset + size + 3) >>> 2;
+    const words = lastDstWord - firstDstWord;
+    const workgroups = Math.ceil(words / COPY_WORKGROUP_SIZE);
+    if (workgroups === 0) return null;
+
+    const [gridX, gridY] = calculateGrid(workgroups);
+    const pipeline = this.#getCopyPipeline();
+
+    const storageBindGroup = this.device.createBindGroup({
+      layout: pipeline.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: { buffer: srcBuf } },
+        { binding: 1, resource: { buffer: dstBuf } },
+      ],
+    });
+
+    const uniformBuffer = this.device.createBuffer({
+      size: 16,
+      usage: GPUBufferUsage.UNIFORM,
+      mappedAtCreation: true,
+    });
+    new Uint32Array(uniformBuffer.getMappedRange()).set([
+      srcOffset,
+      dstOffset,
+      size,
+      0,
+    ]);
+    uniformBuffer.unmap();
+
+    const uniformBindGroup = this.device.createBindGroup({
+      layout: pipeline.getBindGroupLayout(1),
+      entries: [{ binding: 0, resource: { buffer: uniformBuffer } }],
+    });
+
+    const passEncoder = commandEncoder.beginComputePass();
+    passEncoder.setPipeline(pipeline);
+    passEncoder.setBindGroup(0, storageBindGroup);
+    passEncoder.setBindGroup(1, uniformBindGroup);
+    passEncoder.dispatchWorkgroups(gridX, gridY);
+    passEncoder.end();
+
+    return uniformBuffer;
+  }
+
+  /**
+   * Returns the minimum uniform buffer offset alignment for preencoded scan.
+   */
+  getPreencodedScanAlignment(): number {
+    return this.device.limits.minUniformBufferOffsetAlignment ?? 256;
+  }
+
+  /**
+   * Prepare a preencoded scan operation for routine bodies (matmul, etc.).
+   *
+   * Wraps routine shaders with uniform-based offset bindings for xs/ys,
+   * creates the combined offsets buffer, and compiles pipelines.
+   * Returns null if the routine can't be preencoded.
+   */
+  preparePreencodedScan(
+    params: PreencodedScanParams,
+  ): PreparedPreencodedScan | null {
+    const {
+      xsElemStrides,
+      ysElemStrides,
+      bodyRoutine,
+      numConsts,
+      numCarry,
+      numX,
+      numY,
+      length,
+      reverse,
+      carrySizes,
+      routineInputJitIds,
+      routineOutputJitIds,
+    } = params;
+
+    if (!bodyRoutine || bodyRoutine.data.length === 0) {
+      if (DEBUG >= 2) console.log("Preencoded scan: invalid routine");
+      return null;
+    }
+
+    // Skip if no xs/ys need offsets
+    if (numX === 0 && numY === 0) {
+      if (DEBUG >= 2)
+        console.log("Preencoded scan: no xs/ys, skipping");
+      return null;
+    }
+
+    const scanInfo: ScanBindingInfo = {
+      numConsts,
+      numCarry,
+      routineInputJitIds,
+      routineOutputJitIds,
+    };
+
+    // Wrap each shader with scan offset support
+    const wrappedShaders: ShaderDispatch[] = [];
+    for (const shader of bodyRoutine.data) {
+      // Shaders that already use uniforms (like Sort) conflict with our offset uniform
+      if (shader.hasUniform) {
+        if (DEBUG >= 2)
+          console.log("Preencoded scan: shader already has uniform, skipping");
+        return null;
+      }
+
+      const wrapped = wrapRoutineForScan(shader, scanInfo);
+      if (!wrapped.hasUniform) {
+        if (DEBUG >= 2)
+          console.log("Preencoded scan: shader doesn't need offsets");
+        return null;
+      }
+
+      const module = this.device.createShaderModule({ code: wrapped.code });
+      const pipeline = this.device.createComputePipeline({
+        layout: "auto",
+        compute: { module, entryPoint: "main" },
+      });
+
+      wrappedShaders.push({
+        ...shader,
+        code: wrapped.code,
+        hasUniform: true,
+        pipeline,
+      });
+    }
+
+    // Create combined uniform buffer with offsets for all iterations
+    const alignment = this.getPreencodedScanAlignment();
+    const { buffer: offsetData, alignment: offsetAlignment } =
+      createAllIterationsOffsetsBuffer(
+        numX,
+        numY,
+        length,
+        xsElemStrides,
+        ysElemStrides,
+        alignment,
+        reverse,
+      );
+
+    const offsetBuffer = this.device.createBuffer({
+      size: offsetData.length,
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+      mappedAtCreation: true,
+    });
+    new Uint8Array(offsetBuffer.getMappedRange()).set(offsetData);
+    offsetBuffer.unmap();
+
+    if (DEBUG >= 1) {
+      console.log(
+        `Preencoded scan: prepared for ${length} iterations with uniform offsets`,
+      );
+    }
+
+    const copyUsesShader = carrySizes.map((size) => size % 4 !== 0);
+
+    return {
+      params,
+      wrappedShaders,
+      offsetBuffer,
+      offsetAlignment,
+      copyUsesShader,
+    };
+  }
+
+  /**
+   * Dispatch a preencoded scan with routine body.
+   *
+   * Uses ping-pong buffers for carry and uniform-based offsets for xs/ys.
+   * All iteration dispatches are encoded in a single command buffer.
+   */
+  dispatchPreencodedScan(
+    prepared: PreparedPreencodedScan,
+    constSlots: Slot[],
+    initCarrySlots: Slot[],
+    xsSlots: Slot[],
+    carryOutSlots: Slot[],
+    ysStackedSlots: Slot[],
+  ): void {
+    const {
+      params,
+      wrappedShaders,
+      offsetBuffer,
+      offsetAlignment,
+      copyUsesShader,
+    } = prepared;
+    const {
+      length,
+      carrySizes,
+      numCarry,
+      numConsts,
+      routineInputJitIds,
+      routineOutputJitIds,
+    } = params;
+
+    const constBuffers = constSlots.map((slot) => this.#getBuffer(slot).buffer);
+    const initCarryBuffers = initCarrySlots.map(
+      (slot) => this.#getBuffer(slot).buffer,
+    );
+    const xsBuffers = xsSlots.map((slot) => this.#getBuffer(slot).buffer);
+    const carryOutBuffers = carryOutSlots.map(
+      (slot) => this.#getBuffer(slot).buffer,
+    );
+    const ysStackedBuffers = ysStackedSlots.map(
+      (slot) => this.#getBuffer(slot).buffer,
+    );
+
+    // Create ping-pong buffers for carry state
+    const carryPing = carrySizes.map((size) =>
+      this.#createBuffer(Math.max(size, 4)),
+    );
+    const carryPong = carrySizes.map((size) =>
+      this.#createBuffer(Math.max(size, 4)),
+    );
+
+    const commandEncoder = this.device.createCommandEncoder();
+    const copyUniformBuffers: GPUBuffer[] = [];
+
+    // Copy initCarry to carryPing
+    for (let i = 0; i < numCarry; i++) {
+      if (carrySizes[i] > 0) {
+        commandEncoder.copyBufferToBuffer(
+          initCarryBuffers[i],
+          0,
+          carryPing[i],
+          0,
+          carrySizes[i],
+        );
+      }
+    }
+
+    const xsStart = numConsts + numCarry;
+
+    for (const shader of wrappedShaders) {
+      const { pipeline, passes } = shader;
+
+      // Helper to create storage bind group for a ping-pong configuration
+      const createStorageBindGroup = (
+        readCarry: GPUBuffer[],
+        writeCarry: GPUBuffer[],
+      ): GPUBindGroup => {
+        const entries: GPUBindGroupEntry[] = [];
+        let binding = 0;
+
+        // Input bindings: classify by scan buffer role
+        for (let i = 0; i < routineInputJitIds.length; i++) {
+          const jitId = routineInputJitIds[i];
+          let buffer: GPUBuffer;
+
+          if (jitId < numConsts) {
+            buffer = constBuffers[jitId];
+          } else if (jitId < xsStart) {
+            const carryIdx = jitId - numConsts;
+            buffer = readCarry[carryIdx];
+          } else {
+            const xIdx = jitId - xsStart;
+            buffer = xsBuffers[xIdx];
+          }
+
+          entries.push({ binding: binding++, resource: { buffer } });
+        }
+
+        // Output bindings: in passthrough pattern, all go to carry (write)
+        for (let i = 0; i < routineOutputJitIds.length; i++) {
+          const buffer = writeCarry[i];
+          if (!buffer) {
+            throw new Error(
+              `Preencoded scan: routine output ${i} has no carry buffer ` +
+                `(writeCarry.length=${writeCarry.length})`,
+            );
+          }
+          entries.push({ binding: binding++, resource: { buffer } });
+        }
+
+        return this.device.createBindGroup({
+          layout: pipeline.getBindGroupLayout(0),
+          entries,
+        });
+      };
+
+      const pingBindGroup = createStorageBindGroup(carryPing, carryPong);
+      const pongBindGroup = createStorageBindGroup(carryPong, carryPing);
+
+      // Create per-iteration uniform bind groups for offset data
+      const uniformBindGroups: GPUBindGroup[] = [];
+      for (let iter = 0; iter < length; iter++) {
+        const iterOffset = iter * offsetAlignment;
+        uniformBindGroups.push(
+          this.device.createBindGroup({
+            layout: pipeline.getBindGroupLayout(1),
+            entries: [
+              {
+                binding: 0,
+                resource: {
+                  buffer: offsetBuffer,
+                  offset: iterOffset,
+                  size: offsetAlignment,
+                },
+              },
+            ],
+          }),
+        );
+      }
+
+      const filteredPasses = passes.filter(({ grid }) => prod(grid) > 0);
+
+      for (let iter = 0; iter < length; iter++) {
+        const storageBindGroup =
+          iter % 2 === 0 ? pingBindGroup : pongBindGroup;
+
+        for (const { grid } of filteredPasses) {
+          const passEncoder = commandEncoder.beginComputePass();
+          passEncoder.setPipeline(pipeline);
+          passEncoder.setBindGroup(0, storageBindGroup);
+          passEncoder.setBindGroup(1, uniformBindGroups[iter]);
+          passEncoder.dispatchWorkgroups(grid[0], grid[1]);
+          passEncoder.end();
+        }
+
+        // Copy carry → ys for this iteration (passthrough pattern)
+        const currentCarryBuffers =
+          iter % 2 === 0 ? carryPong : carryPing;
+        for (let c = 0; c < numCarry; c++) {
+          const copySize = carrySizes[c];
+          if (copySize <= 0) continue;
+          const yOffset = iter * copySize;
+          if (!copyUsesShader[c]) {
+            commandEncoder.copyBufferToBuffer(
+              currentCarryBuffers[c],
+              0,
+              ysStackedBuffers[c],
+              yOffset,
+              copySize,
+            );
+          } else {
+            const uniformBuf = this.#encodeCopyWithShader(
+              commandEncoder,
+              currentCarryBuffers[c],
+              0,
+              ysStackedBuffers[c],
+              yOffset,
+              copySize,
+            );
+            if (uniformBuf) copyUniformBuffers.push(uniformBuf);
+          }
+        }
+      }
+    }
+
+    // Copy final carry to carryOut
+    const finalCarry = length % 2 === 0 ? carryPing : carryPong;
+    for (let i = 0; i < numCarry; i++) {
+      const copySize = carrySizes[i];
+      if (copySize <= 0) continue;
+      if (!copyUsesShader[i]) {
+        commandEncoder.copyBufferToBuffer(
+          finalCarry[i],
+          0,
+          carryOutBuffers[i],
+          0,
+          copySize,
+        );
+      } else {
+        const uniformBuf = this.#encodeCopyWithShader(
+          commandEncoder,
+          finalCarry[i],
+          0,
+          carryOutBuffers[i],
+          0,
+          copySize,
+        );
+        if (uniformBuf) copyUniformBuffers.push(uniformBuf);
+      }
+    }
+
+    this.device.queue.submit([commandEncoder.finish()]);
+
+    // Clean up temporary buffers
+    for (const buf of copyUniformBuffers) buf.destroy();
+    for (const buf of [...carryPing, ...carryPong]) buf.destroy();
+    // offsetBuffer is NOT destroyed — owned by PreparedPreencodedScan for reuse
   }
 
   #getBuffer(slot: Slot): { buffer: GPUBuffer; size: number } {

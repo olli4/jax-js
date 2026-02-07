@@ -1659,7 +1659,7 @@ describe("native scan paths (P2+)", () => {
     expect(finalCarry).toBeAllclose(np.full([64], n));
   });
 
-  test.skip("routine body: matmul in native scan", () => {
+  test("routine body: matmul in native scan", () => {
     const step = (carry: np.Array, x: np.Array): [np.Array, np.Array] => {
       const newCarry = np.matmul(carry, x);
       return [newCarry.ref, newCarry];
