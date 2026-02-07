@@ -1206,10 +1206,10 @@ describe("jit(scan) DLM patterns", () => {
 });
 
 // ============================================================================
-// Scan autodiff — P5 (skipped until autodiff rules are ported)
+// Scan autodiff — P5
 // ============================================================================
 
-describe.skip("scan autodiff (P5)", () => {
+describe("scan autodiff (P5)", () => {
   beforeAll(async () => {
     const devices = await init();
     if (devices.includes("cpu")) {
