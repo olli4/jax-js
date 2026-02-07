@@ -84,6 +84,8 @@ export enum Primitive {
   Flip = "flip",
   Shrink = "shrink",
   Pad = "pad",
+  // Update a contiguous slice along an axis: dst[axis=offset:offset+len] = src
+  DynamicUpdateSlice = "dynamic_update_slice",
 
   // Routines (custom lowering)
   Sort = "sort", // sort(x, axis=-1), unstable
@@ -94,6 +96,9 @@ export enum Primitive {
 
   // JIT compilation
   Jit = "jit",
+
+  // Control flow
+  Scan = "scan",
 }
 
 interface PrimitiveParamsImpl extends Record<Primitive, Record<string, any>> {
@@ -118,8 +123,26 @@ interface PrimitiveParamsImpl extends Record<Primitive, Record<string, any>> {
   [Primitive.Flip]: { axis: number[] };
   [Primitive.Shrink]: { slice: Pair[] };
   [Primitive.Pad]: { width: Pair[] };
+  // Update a contiguous slice along a single axis: dst[axis=offset:offset+src.shape[axis]] = src
+  [Primitive.DynamicUpdateSlice]: { offset: number; axis: number };
   [Primitive.TriangularSolve]: { unitDiagonal: boolean };
   [Primitive.Jit]: { name: string; jaxpr: Jaxpr; numConsts: number };
+  [Primitive.Scan]: {
+    jaxpr: Jaxpr;
+    numCarry: number;
+    numConsts: number;
+    length: number;
+    reverse: boolean;
+    /** Accepted scan path(s). Throws if actual path is not in this list. */
+    acceptPath?: string | string[];
+    /**
+     * Control gradient checkpointing for the backward pass.
+     * - `undefined` or `true` (default): use √N checkpointing with segment size ceil(√N)
+     * - A positive integer: use that as the segment size
+     * - `false`: store all intermediate carries (O(N) memory, no recomputation)
+     */
+    checkpoint?: boolean | number;
+  };
 }
 
 /** Type of parameters taken by each primitive. */
@@ -477,6 +500,21 @@ export function pad(
     throw new Error(`Invalid pad(): expected ${nd} axes, got ${w.length}`);
   }
   return bind1(Primitive.Pad, [x], { width: w });
+}
+
+export function dynamicUpdateSlice(
+  dst: TracerValue,
+  src: TracerValue,
+  offset: number,
+  axis: number = 0,
+) {
+  offset = Math.floor(offset);
+  if (!Number.isInteger(offset) || offset < 0) {
+    throw new Error(
+      `dynamicUpdateSlice: offset must be a nonnegative integer, got ${offset}`,
+    );
+  }
+  return bind1(Primitive.DynamicUpdateSlice, [dst, src], { offset, axis });
 }
 
 export function triangularSolve(

@@ -1121,6 +1121,12 @@ export class Array extends Tracer {
           });
         });
       },
+      [Primitive.DynamicUpdateSlice]() {
+        throw new Error("DynamicUpdateSlice: not yet implemented");
+      },
+      [Primitive.Scan]() {
+        throw new Error("Scan: not yet implemented");
+      },
     };
   }
 

@@ -413,6 +413,12 @@ const vmapRules: Partial<{ [P in Primitive]: VmapRule<P> }> = {
     );
     return [outs, rep(outs.length, 0)];
   },
+  [Primitive.DynamicUpdateSlice]() {
+    throw new Error("DynamicUpdateSlice vmap: not yet implemented");
+  },
+  [Primitive.Scan]() {
+    throw new Error("Scan vmap: not yet implemented (P5)");
+  },
 };
 
 const vmapJaxprCache = new Map<Jaxpr, Map<string, ClosedJaxpr>>();
