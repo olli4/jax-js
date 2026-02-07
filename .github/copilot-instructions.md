@@ -1287,15 +1287,15 @@ the line count.
 Update this table as phases are completed. Each phase should be marked with its current status and
 any notes about deviations from the plan.
 
-| Phase                              | Status      | Notes                                                                                                                                         |
-| ---------------------------------- | ----------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
-| **P0: API + primitive + fallback** | Done        | 6 sub-commits: core primitives, lax-scan.ts, scan-plan/executor, array.ts eager, jit.ts, smoke tests. 9 scan tests pass (eager + JIT + wasm). |
-| **P1: Tests on fallback**          | Not started |                                                                                                                                               |
-| **P2: WASM compiled-loop**         | Not started |                                                                                                                                               |
-| **P3: WebGPU multi-kernel**        | Not started |                                                                                                                                               |
-| **P4: WebGPU preencoded-routine**  | Not started |                                                                                                                                               |
-| **P5: Autodiff**                   | Not started |                                                                                                                                               |
-| **P6: Cleanup**                    | Not started |                                                                                                                                               |
+| Phase                              | Status      | Notes                                                                                                                                                    |
+| ---------------------------------- | ----------- | -------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **P0: API + primitive + fallback** | Done        | 6 sub-commits: core primitives, lax-scan.ts, scan-plan/executor, array.ts eager, jit.ts, smoke tests. 9 scan tests pass (eager + JIT + wasm).            |
+| **P1: Tests on fallback**          | Done        | 86 scan tests pass (89 skipped for P2-P6). Fixed JIT pending-ops bug: input arrays' pending materialization must be flushed before JitProgram.execute(). |
+| **P2: WASM compiled-loop**         | Not started |                                                                                                                                                          |
+| **P3: WebGPU multi-kernel**        | Not started |                                                                                                                                                          |
+| **P4: WebGPU preencoded-routine**  | Not started |                                                                                                                                                          |
+| **P5: Autodiff**                   | Not started |                                                                                                                                                          |
+| **P6: Cleanup**                    | Not started |                                                                                                                                                          |
 
 Status values: `Not started` · `In progress` · `Done` · `Blocked`
 
