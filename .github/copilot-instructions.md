@@ -1292,7 +1292,7 @@ any notes about deviations from the plan.
 | **P0: API + primitive + fallback** | Done        | 6 sub-commits: core primitives, lax-scan.ts, scan-plan/executor, array.ts eager, jit.ts, smoke tests. 9 scan tests pass (eager + JIT + wasm).                |
 | **P1: Tests on fallback**          | Done        | 86 scan tests pass (89 skipped for P2-P6). Fixed JIT pending-ops bug: input arrays' pending materialization must be flushed before JitProgram.execute().     |
 | **P2: WASM compiled-loop**         | Done        | Refactored translateExp→core, codegenNativeScanGeneral, WasmBackend scan methods, wasmblr memory.copy(). Kernel-only; routine support deferred. 4 new tests. |
-| **P3: WebGPU multi-kernel**        | Not started |                                                                                                                                                              |
+| **P3: WebGPU multi-kernel**        | Done        | genScanExpressionWithRidx, nativeScanMultiShaderSource, tryPrepareWebGPUNativeScan, executor dispatch. Deno GPU scan tests.                                  |
 | **P4: WebGPU preencoded-routine**  | Not started |                                                                                                                                                              |
 | **P5: Autodiff**                   | Not started |                                                                                                                                                              |
 | **P6: Cleanup**                    | Not started |                                                                                                                                                              |

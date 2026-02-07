@@ -20,15 +20,14 @@
  * - getSlotCount() queries the backend's allocated buffer count
  */
 
-import {
-  assertEquals,
-} from "https://deno.land/std@0.224.0/assert/mod.ts";
+import { assertEquals } from "https://deno.land/std@0.224.0/assert/mod.ts";
 
 // Import jax-js from local build
 import {
   init,
   defaultDevice,
   numpy as np,
+  lax,
   jit,
   grad,
 } from "../../dist/index.js";
@@ -68,7 +67,11 @@ Deno.test({
   fn: withLeakCheck(async () => {
     const devices = await init();
     console.log("Available devices:", devices);
-    assertEquals(devices.includes("webgpu"), true, "WebGPU should be available");
+    assertEquals(
+      devices.includes("webgpu"),
+      true,
+      "WebGPU should be available",
+    );
   }),
 });
 
@@ -208,5 +211,68 @@ Deno.test({
     assertEquals(Array.from(await sumAll.data()), [21]);
     assertEquals(Array.from(await sumAxis0.data()), [5, 7, 9]);
     assertEquals(Array.from(await sumAxis1.data()), [6, 15]);
+  }),
+});
+
+// ---------------------------------------------------------------------------
+// lax.scan tests on WebGPU (P3: compiled-loop path)
+// ---------------------------------------------------------------------------
+
+Deno.test({
+  name: "lax.scan cumsum on webgpu",
+  ignore: !hasWebGPU,
+  fn: withLeakCheck(async () => {
+    const devices = await init();
+    if (!devices.includes("webgpu")) return;
+    defaultDevice("webgpu");
+
+    // cumsum: carry + x, y = carry + x
+    const f = jit((xs: np.Array) =>
+      lax.scan(
+        (carry: np.Array, x: np.Array) => {
+          const out = np.add(carry.ref, x);
+          return [out.ref, out];
+        },
+        np.array([0]),
+        xs,
+        { acceptPath: ["compiled-loop", "preencoded-routine"] },
+      ),
+    );
+    const [carry, ys] = f(np.array([[1], [2], [3], [4]]));
+    const carryData = await carry.data();
+    const ysData = await ys.data();
+    f.dispose();
+    assertEquals(Array.from(carryData), [10]);
+    assertEquals(Array.from(ysData), [1, 3, 6, 10]);
+  }),
+});
+
+Deno.test({
+  name: "lax.scan cumsum jit on webgpu",
+  ignore: !hasWebGPU,
+  fn: withLeakCheck(async () => {
+    const devices = await init();
+    if (!devices.includes("webgpu")) return;
+    defaultDevice("webgpu");
+
+    // cumsum inside jit — tests JIT-compiled scan on WebGPU
+    const f = jit((xs: np.Array) => {
+      const [carry, ys] = lax.scan(
+        (c: np.Array, x: np.Array) => {
+          const out = np.add(c.ref, x);
+          return [out.ref, out];
+        },
+        np.array([0]),
+        xs,
+        { acceptPath: ["compiled-loop", "preencoded-routine"] },
+      );
+      return [carry, ys];
+    });
+    const [carry, ys] = f(np.array([[1], [2], [3], [4], [5]]));
+    const carryData = await carry.data();
+    const ysData = await ys.data();
+    f.dispose();
+    assertEquals(Array.from(carryData), [15]);
+    assertEquals(Array.from(ysData), [1, 3, 6, 10, 15]);
   }),
 });

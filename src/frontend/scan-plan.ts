@@ -7,6 +7,11 @@
 import { byteWidth, Kernel, Reduction } from "../alu";
 import type { Backend, Executable } from "../backend";
 import type { NativeScanGeneralParams, WasmBackend } from "../backend/wasm";
+import type {
+  NativeScanMultiParams,
+  NativeScanMultiStep,
+} from "../backend/webgpu";
+import type { WebGPUBackend } from "../backend/webgpu";
 import { Routine } from "../routine";
 import { DEBUG } from "../utils";
 import type { ScanPath } from "../utils";
@@ -22,7 +27,7 @@ export type ScanPlan =
   | {
       path: "compiled-loop";
       executable: Executable;
-      params?: NativeScanGeneralParams;
+      params?: NativeScanGeneralParams | NativeScanMultiParams;
       internalSizes?: number[];
     }
   | { path: "preencoded-routine"; preencodedParams: any };
@@ -313,6 +318,184 @@ function tryPrepareWasmNativeScan(
   }
 }
 
+// ---------------------------------------------------------------------------
+// WebGPU multi-kernel native scan (P3)
+// ---------------------------------------------------------------------------
+
+/**
+ * Try to prepare a WebGPU native scan.
+ *
+ * Constraints:
+ * - numCarry === numY or numY === 0 (each carry maps 1:1 to a Y output)
+ * - No routine steps (only kernel steps)
+ * - No passthrough carry (each carry output must come from a kernel step)
+ * - No internal buffer dependencies (step inputs reference jaxpr inputs only)
+ */
+function tryPrepareWebGPUNativeScan(
+  backend: Backend,
+  bodyProgram: JitProgram,
+  bodyJaxpr: Jaxpr,
+  executeSteps: ExecuteStep[],
+  length: number,
+  numCarry: number,
+  numConsts: number,
+  numX: number,
+  numY: number,
+  reverse: boolean,
+): {
+  executable: Executable;
+  params: NativeScanMultiParams;
+} | null {
+  // Constraint: numCarry === numY or numY === 0
+  if (numY !== 0 && numCarry !== numY) {
+    if (DEBUG >= 1)
+      console.log(
+        `[webgpu-scan] skipped, numCarry=${numCarry} !== numY=${numY}`,
+      );
+    return null;
+  }
+
+  // No routine steps
+  for (const step of executeSteps) {
+    if (step.source instanceof Routine) {
+      if (DEBUG >= 1)
+        console.log(`[webgpu-scan] skipped, routine in scan body`);
+      return null;
+    }
+  }
+
+  const numInputs = numConsts + numCarry + numX;
+  const { constSizes, carrySizes, xsStrides, ysStrides } = getScanBufferSizes(
+    bodyJaxpr,
+    numConsts,
+    numCarry,
+    numX,
+  );
+
+  // Map step output JitIds to the execute step that produced them
+  const outputToStep = new Map<JitId, ExecuteStep>();
+  for (const step of executeSteps) {
+    outputToStep.set(step.outputs[0], step);
+  }
+
+  // Check carry outputs: each must be produced by an execute step (no passthrough)
+  const carryOutIds = bodyProgram.outputs.slice(0, numCarry);
+  const carryInputIds = bodyProgram.inputs.slice(
+    numConsts,
+    numConsts + numCarry,
+  );
+
+  const stepToCarryIdx = new Map<ExecuteStep, number>();
+  for (let ci = 0; ci < numCarry; ci++) {
+    const outId = carryOutIds[ci];
+    // Check passthrough
+    if (carryInputIds.includes(outId)) {
+      if (DEBUG >= 1)
+        console.log(`[webgpu-scan] skipped, carry ${ci} is passthrough`);
+      return null;
+    }
+    const step = outputToStep.get(outId);
+    if (!step) {
+      if (DEBUG >= 1)
+        console.log(
+          `[webgpu-scan] skipped, carry ${ci} not produced by execute step`,
+        );
+      return null;
+    }
+    stepToCarryIdx.set(step, ci);
+  }
+
+  // Check Y outputs: each must match the corresponding carry output (since numCarry === numY)
+  if (numY > 0) {
+    const yOutIds = bodyProgram.outputs.slice(numCarry);
+    for (let yi = 0; yi < numY; yi++) {
+      if (yOutIds[yi] !== carryOutIds[yi]) {
+        if (DEBUG >= 1)
+          console.log(
+            `[webgpu-scan] skipped, y${yi} output slot differs from carry${yi}`,
+          );
+        return null;
+      }
+    }
+  }
+
+  // Check all step inputs reference only body jaxpr inputs (no internal buffer deps)
+  for (const step of executeSteps) {
+    for (const inputId of step.inputs) {
+      if (inputId >= numInputs) {
+        if (DEBUG >= 1)
+          console.log(
+            `[webgpu-scan] skipped, step has internal dep (input ${inputId} >= ${numInputs})`,
+          );
+        return null;
+      }
+    }
+  }
+
+  // Build NativeScanMultiStep[] — ordered by carry output index
+  const orderedSteps: { carryIdx: number; step: ExecuteStep }[] = [];
+  for (const [step, carryIdx] of stepToCarryIdx) {
+    orderedSteps.push({ carryIdx, step });
+  }
+  orderedSteps.sort((a, b) => a.carryIdx - b.carryIdx);
+
+  const multiSteps: NativeScanMultiStep[] = orderedSteps.map(
+    ({ carryIdx, step }) => {
+      const source = step.source as Kernel;
+      // Reindex kernel expression gids from local args to scan buffer layout
+      const reindexMap = step.inputs;
+      const reindexedExp = source.exp.reindexGids(reindexMap);
+      const reindexedReduction = source.reduction
+        ? new Reduction(
+            source.reduction.dtype,
+            source.reduction.op,
+            source.reduction.size,
+            source.reduction.epilogue.reindexGids(reindexMap),
+          )
+        : undefined;
+      const reindexedKernel = new Kernel(
+        numInputs,
+        source.size,
+        reindexedExp,
+        reindexedReduction,
+      );
+
+      return {
+        kernel: reindexedKernel,
+        inputs: reindexMap.slice(),
+        outputCarryIdx: carryIdx,
+        outputSize: source.size,
+      };
+    },
+  );
+
+  const params: NativeScanMultiParams = {
+    length,
+    numConsts,
+    constSizes,
+    numCarry,
+    carrySizes,
+    numX,
+    xsStrides,
+    numY,
+    ysStrides,
+    steps: multiSteps,
+    reverse,
+  };
+
+  // Call backend
+  const webgpuBackend = backend as WebGPUBackend;
+  const exe = webgpuBackend.prepareNativeScanMulti(params);
+  if (!exe) return null;
+
+  if (DEBUG >= 1) {
+    console.log(
+      `[webgpu-scan] SUCCESS! Using WebGPU native scan with ${multiSteps.length} steps`,
+    );
+  }
+  return { executable: exe, params };
+}
+
 /**
  * Try to prepare a native scan executable (any backend).
  */
@@ -328,8 +511,8 @@ function tryPrepareNativeScan(
   reverse: boolean,
 ): {
   executable: Executable;
-  internalSizes: number[];
-  params?: NativeScanGeneralParams;
+  internalSizes?: number[];
+  params?: NativeScanGeneralParams | NativeScanMultiParams;
 } | null {
   const executeSteps = bodyProgram.steps.filter(
     (s) => s.type === "execute",
@@ -354,7 +537,21 @@ function tryPrepareNativeScan(
     );
   }
 
-  // P3: WebGPU multi-kernel scan will be handled here
+  if (backend.type === "webgpu") {
+    return tryPrepareWebGPUNativeScan(
+      backend,
+      bodyProgram,
+      bodyJaxpr,
+      executeSteps,
+      length,
+      numCarry,
+      numConsts,
+      numX,
+      numY,
+      reverse,
+    );
+  }
+
   if (DEBUG >= 1)
     console.log(
       `[compiled-loop] skipped, backend=${backend.type} not supported yet`,

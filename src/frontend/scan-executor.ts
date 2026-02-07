@@ -16,6 +16,7 @@ import type { Jaxpr } from "./jaxpr";
 import type { JitProgram } from "./jit";
 import type { ScanPlan } from "./scan-plan";
 import type { WasmBackend } from "../backend/wasm";
+import type { NativeScanMultiParams, WebGPUBackend } from "../backend/webgpu";
 
 // ---------------------------------------------------------------------------
 // Public interface
@@ -222,17 +223,31 @@ function executeScanCompiledLoop(params: ExecuteScanParams): ExecuteScanResult {
   const carryOutSlots = outputSlots.slice(0, numCarry);
   const ysStackedSlots = outputSlots.slice(numCarry, numCarry + numY);
 
-  // Dispatch to the backend's native scan implementation
-  const wasmBackend = backend as WasmBackend;
-  wasmBackend.dispatchNativeScanGeneral(
-    plan.executable,
-    plan.params,
-    constSlots,
-    initCarrySlots,
-    xsSlots,
-    carryOutSlots,
-    ysStackedSlots,
-  );
+  if (backend.type === "webgpu") {
+    // WebGPU native scan — no internal slots needed
+    const webgpuBackend = backend as WebGPUBackend;
+    webgpuBackend.dispatchNativeScanGeneral(
+      plan.executable,
+      plan.params as NativeScanMultiParams,
+      constSlots,
+      initCarrySlots,
+      xsSlots,
+      carryOutSlots,
+      ysStackedSlots,
+    );
+  } else {
+    // WASM native scan
+    const wasmBackend = backend as WasmBackend;
+    wasmBackend.dispatchNativeScanGeneral(
+      plan.executable,
+      plan.params as import("../backend/wasm").NativeScanGeneralParams,
+      constSlots,
+      initCarrySlots,
+      xsSlots,
+      carryOutSlots,
+      ysStackedSlots,
+    );
+  }
 
   return { outputs: outputSlots, pending: [] };
 }
