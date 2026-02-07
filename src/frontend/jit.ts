@@ -60,6 +60,11 @@ export type JitStep =
       input: JitId;
     }
   | {
+      type: "recycle";
+      input: JitId;
+      output: JitId;
+    }
+  | {
       type: "scan";
       plan: ScanPlan;
       bodyProgram: JitProgram;
@@ -77,14 +82,74 @@ export type JitStep =
       outputs: JitId[];
     };
 
+/**
+ * Pool hints computed at JIT compile time. Tells the backend which buffer
+ * sizes the program will allocate and how many bytes are live at peak, so the
+ * pool can evict stale entries and cap retained memory.
+ */
+export interface PoolHints {
+  /** Peak simultaneously-live bytes across all malloc/free/recycle steps. */
+  readonly peakBytes: number;
+  /** Set of every malloc'd byte size in the program (padded to 4-byte multiples). */
+  readonly mallocSizes: ReadonlySet<number>;
+}
+
+/** Walk JitSteps to compute peak live bytes and the set of malloc sizes. */
+function computePoolHints(steps: JitStep[]): PoolHints {
+  const mallocSizes = new Set<number>();
+  // Map JitId → padded byte size for live tracking.
+  // WebGPU pads all allocations to 4-byte multiples; use the same padding here
+  // so the budget and eviction sets match the actual GPUBuffer sizes.
+  const sizeOf = new Map<JitId, number>();
+  for (const s of steps) {
+    if (s.type === "malloc") {
+      const padded = Math.ceil(s.size / 4) * 4;
+      sizeOf.set(s.output, padded);
+      mallocSizes.add(padded);
+    }
+  }
+
+  let liveBytes = 0;
+  let peakBytes = 0;
+  const live = new Map<JitId, number>(); // JitId → padded byte size (currently live)
+
+  for (const s of steps) {
+    switch (s.type) {
+      case "malloc": {
+        const padded = sizeOf.get(s.output)!;
+        live.set(s.output, padded);
+        liveBytes += padded;
+        break;
+      }
+      case "free":
+        liveBytes -= live.get(s.input) ?? 0;
+        live.delete(s.input);
+        break;
+      case "recycle":
+        // Size stays the same, just rename.
+        live.set(s.output, live.get(s.input) ?? 0);
+        live.delete(s.input);
+        break;
+      // execute, incref, scan don't change the set of live mallocs.
+    }
+    if (liveBytes > peakBytes) peakBytes = liveBytes;
+  }
+
+  return { peakBytes, mallocSizes };
+}
+
 /** Result of compiling a Jaxpr. Can be evaluated on a series of inputs. */
 export class JitProgram {
+  readonly poolHints: PoolHints;
+
   constructor(
     readonly backend: Backend,
     readonly steps: JitStep[],
     readonly inputs: JitId[],
     readonly outputs: JitId[],
-  ) {}
+  ) {
+    this.poolHints = computePoolHints(steps);
+  }
 
   pprint(): PPrint {
     const steps: PPrint[] = this.steps.map((step) => {
@@ -112,6 +177,8 @@ export class JitProgram {
           return PPrint.pp(`incref ${step.input}`);
         case "free":
           return PPrint.pp(`free ${step.input}`);
+        case "recycle":
+          return PPrint.pp(`%${step.output} = recycle %${step.input}`);
         case "scan":
           return PPrint.pp(
             `scan [${step.plan.path}] length=${step.length} numCarry=${step.numCarry} ` +
@@ -136,6 +203,10 @@ export class JitProgram {
 
   /** Execute the JitProgram with the given inputs. */
   execute(inputs: Slot[]): { outputs: Slot[]; pending: PendingExecute[] } {
+    // Tell the backend which buffer sizes we'll need and our peak memory,
+    // so it can evict stale pool entries and cap retained bytes.
+    this.backend.configurePool?.(this.poolHints);
+
     const scope = new Map<JitId, Slot>();
     if (inputs.length !== this.inputs.length) {
       throw new TypeError(
@@ -176,6 +247,13 @@ export class JitProgram {
           const slot = scope.get(step.input)!;
           this.backend.decRef(slot);
           scope.delete(step.input);
+          break;
+        }
+        case "recycle": {
+          // Reuse the same backend Slot for a new JitId — zero backend calls.
+          const slot = scope.get(step.input)!;
+          scope.delete(step.input);
+          scope.set(step.output, slot);
           break;
         }
         case "scan": {
@@ -331,6 +409,60 @@ class JitProgramBuilder {
       type: "free",
       input: id,
     });
+  }
+
+  /**
+   * Replace consecutive free→malloc pairs of the same byte size with a single
+   * "recycle" step, reusing the same backend Slot without any alloc/free calls.
+   *
+   * This is safe because:
+   * 1. The free'd buffer's last consumer has already been scheduled
+   * 2. The malloc'd buffer hasn't been written yet (execute comes after)
+   * 3. Sizes match exactly, so no memory waste and no peak-memory increase
+   */
+  recycleBuffers(): void {
+    // Build size map: JitId → byte size for all malloc steps.
+    const mallocSizes = new Map<JitId, number>();
+    for (const s of this.steps) {
+      if (s.type === "malloc") mallocSizes.set(s.output, s.size);
+    }
+
+    let recycleCount = 0;
+
+    // Walk steps looking for free(a) immediately followed by malloc(b) where
+    // size(a) === size(b). We allow incref/free steps in between since they
+    // don't interact with the recycled buffer.
+    for (let i = 0; i < this.steps.length - 1; i++) {
+      const step = this.steps[i];
+      if (step.type !== "free") continue;
+      const freeSize = mallocSizes.get(step.input);
+      if (freeSize === undefined || freeSize === 0) continue;
+
+      // Scan forward for the next malloc of the same size, skipping only
+      // non-interfering steps (incref, free of other ids).
+      for (let j = i + 1; j < this.steps.length; j++) {
+        const next = this.steps[j];
+        if (next.type === "malloc" && next.size === freeSize) {
+          // Replace free + malloc with a recycle step.
+          this.steps.splice(i, 1, {
+            type: "recycle",
+            input: step.input,
+            output: next.output,
+          });
+          // Remove the malloc step (now at j since we replaced i).
+          this.steps.splice(j, 1);
+          recycleCount++;
+          break;
+        }
+        // Only skip past non-interfering steps.
+        if (next.type === "incref" || next.type === "free") continue;
+        break; // execute, scan, or other — stop looking
+      }
+    }
+
+    if (DEBUG >= 1 && recycleCount > 0) {
+      console.info(`jit: recycled ${recycleCount} buffer(s)`);
+    }
   }
 }
 
@@ -644,6 +776,9 @@ export function jitCompile(backend: Backend, jaxpr: Jaxpr): JitProgram {
 
   // Emit free steps after last usage of any intermediates.
   builder.insertFreeSteps(outputIds);
+
+  // Recycle same-size buffers: replace free→malloc pairs with slot reuse.
+  builder.recycleBuffers();
 
   const jp = new JitProgram(backend, builder.steps, range(0, nargs), outputIds);
   if (DEBUG >= 4) console.info(jp.toString());

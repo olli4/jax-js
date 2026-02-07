@@ -1606,7 +1606,9 @@ The `wrapRoutineForScan` function transforms routine shaders to add offset unifo
 
 **Dispatch architecture:**
 
-- Ping-pong buffers for carry (iteration n reads from one, writes to other)
+- Ping-pong buffers for carry (iteration n reads from one, writes to other). These are **transient
+  backend allocations** — created and destroyed within `dispatchPreencodedScan()`, not tracked by
+  `computePoolHints` or the buffer pool (see _Peak-memory guarantee_ for rationale).
 - Stacked ys buffers are filled by `copyBufferToBuffer` after each iteration
 - Separate uniform bind groups per iteration (dynamic offsets not supported with auto layout)
 
@@ -2010,13 +2012,14 @@ contributors should be aware of:
 
 ### Test files
 
-| File                         | Purpose                                        |
-| ---------------------------- | ---------------------------------------------- |
-| `test/lax-scan.test.ts`      | Main scan test suite (~1700 lines)             |
-| `test/scan-backends.test.ts` | Backend coverage & `copyBufferToBuffer` checks |
-| `test/scan-bench.test.ts`    | Scan benchmark tests                           |
-| `test/deno/webgpu.test.ts`   | Headless WebGPU tests via Deno                 |
-| `test/deno/scan.bench.ts`    | Deno WebGPU scan benchmarks                    |
+| File                            | Purpose                                        |
+| ------------------------------- | ---------------------------------------------- |
+| `test/lax-scan.test.ts`         | Main scan test suite (~1700 lines)             |
+| `test/scan-backends.test.ts`    | Backend coverage & `copyBufferToBuffer` checks |
+| `test/scan-bench.test.ts`       | Scan benchmark tests                           |
+| `test/deno/webgpu.test.ts`      | Headless WebGPU tests via Deno                 |
+| `test/deno/pool-memory.test.ts` | Pool peak memory guarantee (Deno WebGPU)       |
+| `test/deno/scan.bench.ts`       | Deno WebGPU scan benchmarks                    |
 
 ### Deno WebGPU test guidelines
 
@@ -2085,3 +2088,374 @@ doesn't silently regress to JS fallback.
 
 Note: Some test categories are not yet implemented (KNOWN LIMITATIONS sentinel tests, multi-kernel
 scan tests, `vmap(jit(scan))` tests).
+
+---
+
+# Part 3: Buffer Recycling & WebGPU Buffer Pool
+
+This section documents the JIT-level buffer recycling optimization and the WebGPU backend buffer
+pool — two complementary mechanisms that reduce memory allocation overhead.
+
+## Overview & Motivation
+
+GPU buffer creation (`device.createBuffer()`) and destruction (`buffer.destroy()`) are expensive
+WebGPU API calls, costing ~5–10 µs each. In JIT-compiled programs that allocate and free
+intermediate buffers of the same size, this overhead adds up. Two complementary optimizations
+address this:
+
+1. **JIT buffer recycling** — a compiler pass that replaces `free(a) → malloc(b)` pairs of the same
+   byte size with a single `recycle(a → b)` step, reusing the backend `Slot` with zero backend
+   calls.
+2. **WebGPU buffer pool** — a backend-level pool of recently-freed `GPUBuffer` objects indexed by
+   padded byte size, avoiding `createBuffer`/`destroy` cycles for same-size allocations that the JIT
+   recycler can't catch (e.g., eager mode, cross-invocation reuse).
+
+**Key insight:** These work at different levels and are complementary:
+
+- **Recycling** operates within a single JIT program execution — it eliminates allocation overhead
+  for intermediates whose lifetimes don't overlap.
+- **Pooling** operates across JIT invocations and in eager mode — it reuses buffers returned by
+  `decRef` for future `malloc` calls.
+
+### Performance impact (WebGPU, Deno wgpu-rs)
+
+Measured on Intel Core Ultra 5 125H:
+
+| Benchmark                     | Without | With    | Speedup  |
+| ----------------------------- | ------- | ------- | -------- |
+| jit chain x5 fused (4096)     | 10.5 µs | 1.7 µs  | **6.2×** |
+| jit 2-output same-size (4096) | 17.0 µs | 2.1 µs  | **8.1×** |
+| jit 3-output same-size (4096) | 23.6 µs | 2.7 µs  | **8.7×** |
+| jit 2× matmul 32×32           | 17.9 µs | 2.6 µs  | **6.9×** |
+| scan cumsum N=100 size=64     | 4.5 ms  | 77.6 µs | **58×**  |
+| scan cumsum N=500 size=256    | 4.4 ms  | 88.1 µs | **50×**  |
+| eager chain x5 (4096)         | 90.1 µs | 90.0 µs | ~1×      |
+
+The buffer pool is the dominant win — `createBuffer`/`destroy` costs dominate JIT dispatch latency.
+Multi-output programs benefit most (8–9×) because they have more `malloc`/`free` pairs. Scan gets a
+massive 50–58× boost because the scan executor allocates carry and stacked-ys buffers each
+invocation. Eager mode is unaffected because the ~80 µs `PendingExecute` dispatch overhead
+dominates.
+
+**WASM backend:** Already has a free-list allocator (`WasmAllocator`) that coalesces freed blocks,
+so the pool provides less benefit there. The JIT recycling step still helps by avoiding the
+allocator's search overhead entirely.
+
+### Peak-memory guarantee
+
+Both features preserve peak physical GPU memory:
+
+| Feature                | Peak GPU memory                                                                                                                   |
+| ---------------------- | --------------------------------------------------------------------------------------------------------------------------------- |
+| **JIT recycling**      | Unchanged or lower — replaces a `free`→`malloc` pair with a zero-cost slot rename; no new buffers are created                     |
+| **WebGPU buffer pool** | Unchanged — `configurePool()` evicts stale entries and caps retained bytes at the program's peak live bytes before each execution |
+
+The pool guarantee works because the JIT compiler computes `peakBytes` and `mallocSizes` at compile
+time (via `computePoolHints()`). Before each `JitProgram.execute()`, the backend:
+
+1. **Evicts** pool entries whose sizes aren't in `mallocSizes` (removes cross-program pollution).
+2. **Sets the byte budget** to `peakBytes` (pool can't retain more bytes than the program needs at
+   peak).
+
+During execution, pool hits drain the pool while adding to live — total stays flat. Pool misses
+create new buffers but only up to peak. After execution, freed buffers return to pool within budget.
+The result: pool + live ≤ peakBytes at all times.
+
+**Transient backend allocations (not tracked by `computePoolHints`):**
+
+Some backend dispatch methods create short-lived GPU buffers internally — notably the preencoded-
+routine scan path (`dispatchPreencodedScan`) allocates ping-pong carry buffers and copy-shader
+uniform buffers. These are **not** tracked by `computePoolHints` because:
+
+1. They have no corresponding `malloc`/`free` JitSteps — the JIT compiler never sees them.
+2. They are created and destroyed within a single synchronous dispatch call, so they never persist
+   across JS turns.
+3. They are never pooled — they're explicitly `destroy()`'d, not returned via `decRef`/`#poolPush`.
+
+These transient buffers cause a brief spike in `#gpuAllocatedBytes` during dispatch, but the counter
+returns to its prior level before the function returns. The pool budget bounds **retained** memory
+(buffers sitting idle between JIT calls), so these ephemeral internals don't affect the guarantee.
+
+In eager mode (no JitProgram), the pool uses a static fallback budget
+(`MAX_POOL_BYTES_DEFAULT = 64 MB`) since there's no compile-time peak to derive.
+
+---
+
+## JIT Buffer Recycling
+
+### JitStep type
+
+A new `"recycle"` step type was added to the `JitStep` union:
+
+```typescript
+type JitStep =
+  | { type: "malloc"; output: JitId; size: number }
+  | { type: "free"; input: JitId }
+  | { type: "recycle"; input: JitId; output: JitId };
+// ... execute, incref, scan
+```
+
+**Semantics:** `recycle(a → b)` means "reuse the backend Slot currently mapped to JitId `a` for
+JitId `b`". At execution time, this is a scope remapping with zero backend calls:
+
+```typescript
+case "recycle": {
+  const slot = scope.get(step.input)!;
+  scope.delete(step.input);
+  scope.set(step.output, slot);
+  break;
+}
+```
+
+### Compiler pass: `recycleBuffers()`
+
+The `recycleBuffers()` method on `JitProgramBuilder` runs after `insertFreeSteps()` in the JIT
+compilation pipeline:
+
+```
+jitCompile(backend, jaxpr)
+  → ... build steps (malloc, execute, ...) ...
+  → builder.insertFreeSteps(outputIds)    // emit free after last usage
+  → builder.recycleBuffers()              // replace free→malloc with recycle
+  → new JitProgram(...)
+```
+
+**Algorithm:**
+
+1. Build `mallocSizes: Map<JitId, number>` — the byte size of every malloc step.
+2. Walk steps looking for `free(a)`. For each free, scan forward for the next `malloc(b)` where
+   `size(a) === size(b)`.
+3. If found, replace the `free` step with `recycle(a → b)` and remove the `malloc` step.
+4. Only skip past non-interfering steps between the free and malloc (i.e., `incref` and other `free`
+   steps). Stop scanning at `execute`, `scan`, or other step types.
+
+**Safety invariants:**
+
+1. The freed buffer's last consumer has already been scheduled (free comes after last use).
+2. The malloc'd buffer hasn't been written yet (execute step comes after malloc).
+3. Sizes match exactly — no memory waste and no peak-memory increase.
+
+**What it catches:**
+
+| Pattern                | Example                                       | Recycle fires?                                 |
+| ---------------------- | --------------------------------------------- | ---------------------------------------------- |
+| Elementwise chain      | `x.add(1).mul(2).sub(3)`                      | Yes — intermediate freed before next allocated |
+| Multi-output same size | `[x.add(1), x.mul(2)]`                        | Yes — input freed, output allocated            |
+| Different sizes        | `x.sum()` (scalar) after `x.mul(2)` (array)   | No — sizes differ                              |
+| Cross-execute          | free after execute A, malloc before execute B | Yes, if adjacent                               |
+| Separated by execute   | free, execute, malloc                         | No — execute step breaks the scan              |
+
+**Debug logging:**
+
+```typescript
+setDebug(1); // Logs: "jit: recycled 2 buffer(s)"
+```
+
+### pprint support
+
+The `recycle` step is displayed in JIT program dumps:
+
+```
+%5 = recycle %2
+```
+
+### Key file locations
+
+| Location                        | Purpose                                  |
+| ------------------------------- | ---------------------------------------- |
+| `src/frontend/jit.ts` line ~63  | `recycle` JitStep type definition        |
+| `src/frontend/jit.ts` line ~120 | pprint case                              |
+| `src/frontend/jit.ts` line ~188 | Execution case in `JitProgram.execute()` |
+| `src/frontend/jit.ts` line ~359 | `recycleBuffers()` method                |
+| `src/frontend/jit.ts` line ~717 | Call site in `jitCompile()`              |
+
+---
+
+## WebGPU Buffer Pool
+
+### Design
+
+The pool is a `Map<number, GPUBuffer[]>` keyed by **padded byte size** (already rounded to 4-byte
+multiples). When `decRef` drops a buffer's refcount to 0, instead of calling `buffer.destroy()` it
+tries to push the buffer into the pool. When `malloc` needs a new buffer, it checks the pool first.
+
+```typescript
+class WebGPUBackend {
+  #bufferPool = new Map<number, GPUBuffer[]>();
+  static readonly MAX_POOL_PER_SIZE = 4; // max buffers per size class
+  static readonly MAX_POOL_TOTAL = 64; // max total pooled buffers
+}
+```
+
+### Pool operations
+
+**`#poolPop(paddedSize)`** — returns a pooled buffer of the given size or `null`:
+
+```typescript
+#poolPop(paddedSize: number): GPUBuffer | null {
+  const list = this.#bufferPool.get(paddedSize);
+  if (list && list.length > 0) return list.pop()!;
+  return null;
+}
+```
+
+**`#poolPush(buffer)`** — returns a buffer to the pool; returns `false` if pool is full:
+
+```typescript
+#poolPush(buffer: GPUBuffer): boolean {
+  const paddedSize = buffer.size;
+  let list = this.#bufferPool.get(paddedSize);
+  if (!list) { list = []; this.#bufferPool.set(paddedSize, list); }
+  if (list.length >= MAX_POOL_PER_SIZE) return false;
+  let total = 0;
+  for (const l of this.#bufferPool.values()) total += l.length;
+  if (total >= MAX_POOL_TOTAL) return false;
+  list.push(buffer);
+  return true;
+}
+```
+
+### Integration points
+
+**`malloc()`** — checks pool before creating:
+
+```typescript
+// With initial data:
+const pooled = this.#poolPop(paddedSize);
+if (pooled) {
+  buffer = pooled;
+  this.device.queue.writeBuffer(buffer, 0, initialData);
+}
+
+// Without initial data:
+buffer = this.#poolPop(paddedSize) ?? this.#createBuffer(paddedSize);
+```
+
+**`decRef()`** — returns to pool instead of destroying:
+
+```typescript
+if (buffer.ref === 0) {
+  this.buffers.delete(slot);
+  if (buffer.buffer !== this.#reusableZsb) {
+    if (!this.#poolPush(buffer.buffer)) {
+      buffer.buffer.destroy(); // pool full, actually destroy
+    }
+  }
+}
+```
+
+### Capacity limits
+
+| Limit                    | Value       | Rationale                                                   |
+| ------------------------ | ----------- | ----------------------------------------------------------- |
+| `MAX_POOL_PER_SIZE`      | 4           | Typical JIT programs reuse ≤4 buffers of the same size      |
+| `peakBytes` (dynamic)    | per-program | Set by `configurePool()` from JIT compile-time analysis     |
+| `MAX_POOL_BYTES_DEFAULT` | 64 MB       | Fallback budget for eager mode (no JIT peak to derive from) |
+
+When `#poolPush` would exceed the byte budget, it returns `false` and the buffer is destroyed.
+Before each JIT execution, `configurePool()` evicts stale entries and tightens the budget.
+
+### Memory accounting
+
+Pooled buffers are **not** tracked in `this.buffers` (the slot map). They're held directly as
+`GPUBuffer` objects in `#bufferPool`, with total bytes tracked in `#poolCurrentBytes`. This means:
+
+- `slotCount()` does NOT include pooled buffers (correct for leak detection).
+- Pooled buffers are effectively invisible to the rest of the system until reused.
+- `configurePool()` evicts stale entries before each JIT execution, so the pool self-cleans.
+- If the pool is dropped (e.g., backend destroyed), pooled buffers leak. This is acceptable because
+  backend destruction only happens at process exit.
+
+### WASM backend comparison
+
+The WASM backend uses `WasmAllocator`, which manages a contiguous `WebAssembly.Memory` with a
+free-list allocator that coalesces adjacent freed blocks. This provides similar reuse semantics
+without an explicit pool. The JIT recycling step still benefits WASM by skipping the allocator's
+free-list search entirely.
+
+| Aspect                      | WebGPU Pool              | WASM Allocator             |
+| --------------------------- | ------------------------ | -------------------------- |
+| Data structure              | `Map<size, GPUBuffer[]>` | Free-list with coalescing  |
+| Allocation cost (pool hit)  | Array pop (~10 ns)       | Free-list search (~50 ns)  |
+| Allocation cost (pool miss) | `createBuffer` (~5 µs)   | Expand memory (~1 µs)      |
+| Deallocation cost           | Array push (~10 ns)      | Free-list insert (~50 ns)  |
+| Cross-size reuse            | No (exact size match)    | Yes (splitting/coalescing) |
+
+---
+
+## Test Coverage
+
+### Test file
+
+[test/recycle.test.ts](test/recycle.test.ts) — 7 tests covering correctness and leak detection:
+
+| Test                                                   | What it verifies                                |
+| ------------------------------------------------------ | ----------------------------------------------- |
+| `chain of same-size operations is correct`             | Basic recycling correctness (add→mul→sub chain) |
+| `recycling preserves correctness with different sizes` | Mixed sizes (reduction changes size)            |
+| `multi-step chain does not leak slots`                 | No slot leaks with 4-step chain                 |
+| `works with grad through chained ops`                  | Recycling doesn't break autodiff                |
+| `works correctly with scan`                            | Recycling doesn't break scan                    |
+| `chained ops produce correct results on WASM`          | WASM backend correctness                        |
+| `does not leak slots on WASM`                          | WASM backend leak detection                     |
+
+### Pool peak memory test file
+
+[test/deno/pool-memory.test.ts](test/deno/pool-memory.test.ts) — 5 Deno WebGPU tests verifying the
+peak memory guarantee using `gpuAllocatedBytes()`:
+
+| Test                                                | What it verifies                                          |
+| --------------------------------------------------- | --------------------------------------------------------- |
+| `repeated JIT calls stay within peak memory`        | Pool doesn't grow across repeated same-shape calls        |
+| `multi-output JIT stays within peak memory`         | Recycling + pool stable with multi-output programs        |
+| `shape-varying JIT calls don't accumulate stale`    | `configurePool` evicts stale entries between programs     |
+| `scan cumsum stays within peak memory`              | Scan executor's alloc/free doesn't cause pool growth      |
+| `gpuAllocatedBytes tracks creates and pool returns` | Memory accounting is consistent after alloc→dispose cycle |
+
+**GPU memory tracking:**
+
+The WebGPU backend exposes `gpuAllocatedBytes()` (total bytes: live + pooled) and `slotCount()`
+(live slots only). These are WebGPU-specific methods accessed via `getBackend() as any` in Deno
+tests. The `#gpuAllocatedBytes` counter is incremented in `#createBuffer` (for storage buffers) and
+decremented at all `destroy()` call sites (pool eviction, `decRef`, preencoded-scan cleanup).
+
+### Benchmark file
+
+[test/deno/recycle.bench.ts](test/deno/recycle.bench.ts) — Deno WebGPU benchmarks:
+
+```bash
+pnpm build && deno bench --no-check --unstable-webgpu --allow-read --allow-env test/deno/recycle.bench.ts
+```
+
+Benchmarks three categories:
+
+- **JIT group:** fused chains (baseline), multi-output (recycle), matmul, chain+reduce
+- **Scan group:** cumsum N=100/500
+- **Eager group:** chain operations (pool), alloc-free cycles (pool)
+
+To A/B test, comment out `builder.recycleBuffers()` in `jit.ts` and pool usage in `webgpu.ts`,
+rebuild, and compare.
+
+---
+
+## Known Limitations & Future Work
+
+| Limitation                 | Description                                             | Possible fix                                              |
+| -------------------------- | ------------------------------------------------------- | --------------------------------------------------------- |
+| Exact-size matching only   | Recycling requires identical byte sizes                 | Allow size-class bucketing (e.g., round up to power-of-2) |
+| No cross-execute recycling | The scan stops at execute/scan steps                    | Extend analysis with liveness intervals                   |
+| Eager mode uses static cap | Without a JitProgram, pool uses a 64 MB fallback budget | Derive peak from eager op sequences if needed             |
+| Eager mode unaffected      | Pool helps alloc/free but dispatch overhead dominates   | Needs kernel batching / deferred dispatch improvements    |
+
+### Future opportunities
+
+- **Liveness-interval analysis:** Instead of scanning for adjacent `free→malloc` pairs, build a full
+  liveness interval map and assign slots via graph coloring. This would catch more recycling
+  opportunities across execute steps.
+- **Size-class bucketing:** Round buffer sizes to the nearest power-of-2 for pooling, trading ~2×
+  memory waste for much higher pool hit rates.
+- **Pool memory pressure:** Register a callback to evict pool entries when GPU memory is low (not
+  currently exposed by WebGPU API).
+- **Staging buffer pool:** The `read()` method creates and destroys staging buffers for every
+  readback. Pooling these would help workloads with frequent `.data()` calls.
+

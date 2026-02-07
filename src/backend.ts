@@ -212,6 +212,17 @@ export interface Backend {
    * on that slot to finish.
    */
   dispatch(exe: Executable, inputs: Slot[], outputs: Slot[]): void;
+
+  /**
+   * Optional: prepare the backend's buffer pool for an upcoming JitProgram
+   * execution. The pool should evict entries whose sizes aren't in
+   * `hints.mallocSizes` and cap total retained bytes at `hints.peakBytes`.
+   * This ensures physical peak memory never exceeds peak live memory.
+   */
+  configurePool?(hints: {
+    readonly peakBytes: number;
+    readonly mallocSizes: ReadonlySet<number>;
+  }): void;
 }
 
 export class Executable<T = any> {
