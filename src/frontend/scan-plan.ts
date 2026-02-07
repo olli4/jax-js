@@ -2,9 +2,10 @@
  * @file Scan plan construction — determines the execution strategy for a scan.
  */
 
-import { byteWidth, DType, Kernel, Reduction } from "../alu";
+import { byteWidth, Kernel, Reduction } from "../alu";
 import type { Backend, Executable } from "../backend";
-import type {
+import {
+  getScanRoutineInfo,
   NativeScanGeneralParams,
   ScanRoutineInfo,
   WasmBackend,
@@ -137,23 +138,17 @@ function tryPrepareWasmNativeScan(
     );
   }
 
-  // Check for unsupported routines (supported: Cholesky, Sort, TriangularSolve, LU, Argsort)
-  const supportedRoutines = new Set([
-    Routines.Cholesky,
-    Routines.Sort,
-    Routines.TriangularSolve,
-    Routines.LU,
-    Routines.Argsort,
-  ]);
-
+  // Check for unsupported routines.
+  // We delegate the check to getScanRoutineInfo in the WASM backend, which
+  // knows which routines it supports bindings for.
   for (const step of executeSteps) {
     if (step.source instanceof Routine) {
-      const routineName = step.source.name as Routines;
-      if (!supportedRoutines.has(routineName)) {
-        if (DEBUG >= 1)
+      if (!getScanRoutineInfo(step.source)) {
+        if (DEBUG >= 1) {
           console.log(
-            `[wasm-scan] skipped, unsupported routine: ${Routines[routineName]}`,
+            `[wasm-scan] skipped, unsupported routine: ${step.source.name}`,
           );
+        }
         return null;
       }
     }
@@ -225,69 +220,16 @@ function tryPrepareWasmNativeScan(
     const step = executeSteps[i];
     if (step.source instanceof Routine) {
       const routine = step.source;
-      const routineName = routine.name as Routines;
-      const isF64 = routine.type.inputDtypes[0] === DType.Float64;
-      const dtype: "f32" | "f64" = isF64 ? "f64" : "f32";
+      const info = getScanRoutineInfo(routine);
+      if (!info) {
+        throw new Error(
+          `[wasm-scan] Unexpected unsupported routine: ${routine.name}`,
+        );
+      }
 
       const routineInfoIdx = routineInfos.length;
       stepToRoutineInfoIdx.set(i, routineInfoIdx);
-
-      if (routineName === Routines.Cholesky) {
-        const inputShape = routine.type.inputShapes[0];
-        const n = inputShape[inputShape.length - 1];
-        routineInfos.push({
-          routine: routineName,
-          exportName: "cholesky",
-          numParams: 2,
-          dtype,
-          sizeParams: [n],
-        });
-      } else if (routineName === Routines.Sort) {
-        const inputShape = routine.type.inputShapes[0];
-        const n = inputShape[inputShape.length - 1];
-        routineInfos.push({
-          routine: routineName,
-          exportName: "sort",
-          numParams: 2,
-          dtype,
-          sizeParams: [n],
-        });
-      } else if (routineName === Routines.TriangularSolve) {
-        const aShape = routine.type.inputShapes[0];
-        const bShape = routine.type.inputShapes[1];
-        const n = aShape[aShape.length - 1];
-        const batchRows = bShape[bShape.length - 1];
-        routineInfos.push({
-          routine: routineName,
-          exportName: "triangular_solve",
-          numParams: 3,
-          dtype,
-          sizeParams: [n, batchRows],
-          unitDiagonal: routine.params?.unitDiagonal ?? false,
-          lower: false,
-        });
-      } else if (routineName === Routines.LU) {
-        const inputShape = routine.type.inputShapes[0];
-        const m = inputShape[inputShape.length - 2];
-        const n = inputShape[inputShape.length - 1];
-        routineInfos.push({
-          routine: routineName,
-          exportName: "lu",
-          numParams: 4,
-          dtype,
-          sizeParams: [m, n],
-        });
-      } else if (routineName === Routines.Argsort) {
-        const inputShape = routine.type.inputShapes[0];
-        const n = inputShape[inputShape.length - 1];
-        routineInfos.push({
-          routine: routineName,
-          exportName: "argsort",
-          numParams: 4,
-          dtype,
-          sizeParams: [n],
-        });
-      }
+      routineInfos.push(info);
     }
   }
 
