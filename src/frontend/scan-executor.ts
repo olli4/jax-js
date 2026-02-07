@@ -95,21 +95,11 @@ function executeScanFallback(params: ExecuteScanParams): ExecuteScanResult {
   const yOutAvals = bodyJaxpr.outs.slice(numCarry).map((v) => v.aval);
   const ysStrides = yOutAvals.map((aval) => aval.size * byteWidth(aval.dtype));
 
-  // Detect which body outputs share the same Jaxpr variable between
-  // carry_out and y_out. This is the "shared-slot protection" case.
-  const bodyCarryOutVars = bodyJaxpr.outs.slice(0, numCarry);
-  const bodyYOutVars = bodyJaxpr.outs.slice(numCarry);
-  const sharedCarryYIndices = new Set<number>();
-  for (let ci = 0; ci < numCarry; ci++) {
-    for (let yi = 0; yi < numY; yi++) {
-      if (bodyCarryOutVars[ci] === bodyYOutVars[yi]) {
-        sharedCarryYIndices.add(ci);
-      }
-    }
-  }
-
-  // Current carry slots — start with initCarry (we own these)
+  // Current carry slots — start with initCarry.
+  // IncRef so the loop can uniformly decRef old carry each iteration
+  // (initCarrySlots are borrowed from the caller who frees them separately).
   let carry = initCarrySlots.slice();
+  for (const slot of carry) backend.incRef(slot);
 
   // Y output slots from the preallocated outputs
   const ysOutputSlots = outputSlots.slice(numCarry);
@@ -144,24 +134,14 @@ function executeScanFallback(params: ExecuteScanParams): ExecuteScanResult {
     const newCarry = bodyResult.outputs.slice(0, numCarry);
     const ySlices = bodyResult.outputs.slice(numCarry);
 
-    // Ensure outputs that alias inputs stay alive after we consume inputs.
-    const outputSlotSet = new Set<Slot>([...newCarry, ...ySlices]);
-    for (const slot of [...constSlots, ...carry, ...xSlices]) {
-      if (outputSlotSet.has(slot)) backend.incRef(slot);
-    }
-
-    // Release borrowed consts and created x slice slots (we created xSlices
-    // via malloc for the fallback path, so release our ownership here).
+    // Release borrowed consts and created x slice slots.
+    // Note: JitProgram.execute() already inserts incref steps for any output
+    // that is a passthrough from an input or appears multiple times in the
+    // output list, so each output position has its own reference. No extra
+    // alias-protection incRef is needed here — the JIT's refs protect outputs
+    // from being prematurely freed by these input decRefs.
     for (const slot of constSlots) backend.decRef(slot);
     for (const slot of xSlices) backend.decRef(slot);
-
-    // Invariant 4: Shared-slot protection
-    // If a carry_out and y_out share the same slot, incRef before stacking
-    // (because stacking will copy from it, and the next iteration will
-    // overwrite the carry slot)
-    for (const ci of sharedCarryYIndices) {
-      backend.incRef(newCarry[ci]);
-    }
 
     // Invariant 3: Y stacking — copy y slices into preallocated output buffers
     for (let yi = 0; yi < numY; yi++) {
@@ -179,8 +159,11 @@ function executeScanFallback(params: ExecuteScanParams): ExecuteScanResult {
       backend.decRef(ySlices[yi]);
     }
 
-    // Invariant 2: Carry lifecycle — old carry was consumed by body.execute()
-    // (body takes ownership of inputs). The new carry is from body outputs.
+    // Invariant 2: Carry lifecycle — body.execute() borrows inputs (does not
+    // consume them). We must explicitly release old carry slots. The JIT's
+    // incref for passthrough/duplicate outputs ensures that any carry slot
+    // reappearing in newCarry has an extra ref, so this decRef is safe.
+    for (const slot of carry) backend.decRef(slot);
     carry = newCarry;
   }
 
