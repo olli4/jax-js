@@ -34,19 +34,49 @@ export interface ScanOptions {
    * Accept only specific scan implementation paths. Throws an error if the
    * actual path chosen is not in the list.
    *
+   * This is primarily useful for testing to ensure optimized code paths are used.
+   *
    * Valid paths:
    * - `"compiled-loop"` — entire scan loop compiled to native code (WASM/WebGPU)
    * - `"preencoded-routine"` — pre-encoded GPU dispatches for routine bodies (WebGPU only)
    * - `"fallback"` — JS loop calling body program per iteration
+   *
+   * @example
+   * ```ts
+   * // Accept only the compiled-loop (native) scan path
+   * lax.scan(f, init, xs, { acceptPath: "compiled-loop" });
+   *
+   * // Accept any native path (compiled-loop or preencoded-routine)
+   * lax.scan(f, init, xs, { acceptPath: ["compiled-loop", "preencoded-routine"] });
+   * ```
    */
   acceptPath?: ScanPath | ScanPath[];
 
   /**
    * Control gradient checkpointing during reverse-mode autodiff.
    *
-   * - `undefined` or `true` (default): use √N checkpointing with segment size ceil(√N)
-   * - A positive integer: use that as the segment size
-   * - `false`: store all intermediate carries (O(N) memory, no recomputation)
+   * By default, `grad(scan)` uses √N checkpointing: only O(√N) intermediate carry
+   * values are stored, and the rest are recomputed from the nearest checkpoint
+   * during the backward pass. This trades ~2× computation for O(√N) memory.
+   *
+   * - `undefined` or `true` (default): use segment size of `ceil(√N)`
+   * - A positive integer: use that as the segment size (larger = more memory, less recompute)
+   * - `false`: store all N intermediate carries (O(N) memory, no recomputation)
+   *
+   * @example
+   * ```ts
+   * // Default: √N checkpointing is used automatically
+   * const dxs = grad((xs) => {
+   *   const [carry, _] = lax.scan(step, init, xs);
+   *   return carry.sum();
+   * })(xs);
+   *
+   * // Opt out: store all carries (faster, more memory)
+   * const dxs2 = grad((xs) => {
+   *   const [carry, _] = lax.scan(step, init, xs, { checkpoint: false });
+   *   return carry.sum();
+   * })(xs);
+   * ```
    */
   checkpoint?: boolean | number;
 }
@@ -58,11 +88,249 @@ export interface ScanOptions {
  * results. It iterates over the leading axis of `xs`, threading a "carry" value
  * through each step and collecting outputs.
  *
- * @param f - Step function `(carry, x) => [newCarry, y]`
+ * ## Type Signature
+ *
+ * ```ts
+ * scan(f, init, xs) → [finalCarry, ys]
+ * scan(f, init, null, { length }) → [finalCarry, ys]  // carry-only scan
+ *
+ * // Where:
+ * // f: (carry: C, x: X | null) => [C, Y | null]  -- step function
+ * // init: C                               -- initial carry
+ * // xs: X[] | null                        -- input array or null for carry-only
+ * // finalCarry: C                         -- carry after last iteration
+ * // ys: Y[] | null                        -- stacked outputs (null if Y=null)
+ * ```
+ *
+ * ## Semantics
+ *
+ * The semantics are roughly equivalent to this JavaScript:
+ * ```ts
+ * function scan(f, init, xs) {
+ *   let carry = init;
+ *   const ys = [];
+ *   for (const x of xs) {
+ *     const [newCarry, y] = f(carry, x);
+ *     carry = newCarry;
+ *     ys.push(y);
+ *   }
+ *   return [carry, np.stack(ys)];
+ * }
+ * ```
+ *
+ * Unlike a plain JavaScript loop:
+ * - Both `xs` and `ys` can be arbitrary pytrees (nested objects/arrays)
+ * - The scan is compiled to efficient native code (WASM/WebGPU)
+ * - Supports autodiff: `grad(f)` works through scan
+ * - The carry shape/dtype must be fixed across all iterations
+ *
+ * ## Reference Counting Contract
+ *
+ * **Inputs (consumed):**
+ * - `init` and `xs` are consumed by scan (refcount decremented)
+ * - Use `.ref` if you need to keep inputs alive: `scan(f, init.ref, xs.ref)`
+ *
+ * **Body function:**
+ * - `carry` and `x` are **managed** by scan — do NOT manually dispose them
+ * - Standard consumption rules apply inside the body (same as regular functions):
+ *   - **Single use:** `np.add(carry, x)` — no `.ref` needed
+ *   - **Multiple uses:** Use `.ref` to keep alive for additional uses
+ * - Return **new** arrays for `newCarry` and `y`
+ * - For passthrough (same array in both), use `.ref`: `[result.ref, result]`
+ *
+ * **Example — multiple uses of carry:**
+ * ```ts
+ * // ✓ Works: .ref keeps carry alive, then bare carry consumed in return
+ * const step = (carry, x) => {
+ *   const newCarry = np.add(carry.ref, x);  // .ref: we'll use carry again
+ *   return [newCarry, carry];               // carry consumed here
+ * };
+ *
+ * // ✗ Fails: can't use carry in TWO separate operations after .ref
+ * const step = (carry, x) => {
+ *   const a = np.add(carry.ref, x);  // first operation
+ *   const b = np.add(a, carry);      // ERROR: second operation on carry
+ *   return [b, a.ref];
+ * };
+ * ```
+ *
+ * **Workaround:** Use pytree carries so each field can be `.ref`'d independently.
+ *
+ * **Outputs (caller owns):**
+ * - `finalCarry` and `ys` are owned by caller — dispose when done
+ *
+ * @param f - Step function `(carry, x) => [newCarry, y]` where:
+ *   - `carry` is the current state (same structure as `init`)
+ *   - `x` is a slice of `xs` along axis 0, or `null` if `xs` is null
+ *   - `newCarry` is the updated state (same structure/shape as `carry`)
+ *   - `y` is the output for this iteration, or `null` to skip output stacking
  * @param init - Initial carry value. Can be a single array or a pytree of arrays.
  * @param xs - Input sequence to scan over, or `null` for carry-only scans.
- * @param options - Scan options (length, reverse, acceptPath, checkpoint)
- * @returns `[finalCarry, ys]`
+ *   When an array/pytree, the leading axis is the scan dimension.
+ *   When `null`, you must provide `{ length }` in options.
+ * @param options - Scan options
+ * @returns `[finalCarry, ys]` where:
+ *   - `finalCarry` has the same structure as `init`
+ *   - `ys` has the same structure as `y` from `f`, with each leaf having
+ *     an additional leading axis of size `length`. If `y` is `null`, `ys` is `null`
+ *     (no memory allocated for outputs).
+ *
+ * @example Cumulative sum
+ * ```ts
+ * import { lax, numpy as np } from '@jax-js/jax';
+ *
+ * const step = (carry, x) => {
+ *   const sum = np.add(carry, x);
+ *   return [sum, sum.ref];  // .ref: sum used in both outputs
+ * };
+ *
+ * const init = np.array([0.0]);
+ * const xs = np.array([[1], [2], [3], [4], [5]]);
+ * const [final, sums] = await lax.scan(step, init, xs);
+ *
+ * console.log(await final.data());  // [15]
+ * console.log(await sums.data());   // [[1], [3], [6], [10], [15]]
+ *
+ * final.dispose();
+ * sums.dispose();
+ * ```
+ *
+ * @example Factorial via scan
+ * ```ts
+ * // Compute n! for n = 1..5
+ * const step = (carry, x) => {
+ *   const next = np.multiply(carry, x);
+ *   return [next, next.ref];
+ * };
+ *
+ * const init = np.array([1]);
+ * const xs = np.array([[1], [2], [3], [4], [5]]);
+ * const [final, factorials] = await lax.scan(step, init, xs);
+ * // factorials = [[1], [2], [6], [24], [120]]
+ * ```
+ *
+ * @example Pytree carry (multiple state variables)
+ * ```ts
+ * // Track both sum and count
+ * const step = (carry, x) => {
+ *   const newSum = np.add(carry.sum, x);
+ *   const newCount = np.add(carry.count, np.array([1]));
+ *   return [
+ *     { sum: newSum.ref, count: newCount.ref },
+ *     { sum: newSum, count: newCount }
+ *   ];
+ * };
+ *
+ * const init = { sum: np.array([0]), count: np.array([0]) };
+ * const xs = np.array([[10], [20], [30]]);
+ * const [final, history] = await lax.scan(step, init, xs);
+ * // final.sum = [60], final.count = [3]
+ * ```
+ *
+ * @example Reverse scan
+ * ```ts
+ * // Process sequence from end to beginning
+ * const [final, ys] = await lax.scan(step, init, xs, { reverse: true });
+ * ```
+ *
+ * ## jax-js Extensions
+ *
+ * These features extend JAX's scan API for TypeScript/JavaScript ergonomics:
+ *
+ * ### xs=null (carry-only scan)
+ *
+ * Pass `null` as `xs` with `{ length }` to iterate without input arrays.
+ * Useful for generators, RNG sequences, Fibonacci, or any state-only iteration.
+ * The body receives `null` as the second argument.
+ *
+ * ### Y=null (skip output stacking)
+ *
+ * Return `[newCarry, null]` from the body to skip allocating stacked outputs.
+ * Useful when you only need the final carry (e.g., Mandelbrot iteration counts).
+ * The returned `ys` will be `null`, saving memory for large iteration counts.
+ *
+ * @example xs=null: Carry-only scan
+ * ```ts
+ * // Generate a sequence without allocating input arrays
+ * const step = (carry, _x) => {
+ *   const next = np.add(carry.ref, np.array([1.0]));
+ *   return [next, carry];  // output is old carry value
+ * };
+ *
+ * const init = np.array([0.0]);
+ * const [final, ys] = await lax.scan(step, init, null, { length: 5 });
+ * // ys = [[0], [1], [2], [3], [4]], final = [5]
+ * ```
+ *
+ * @example Y=null: Skip output stacking
+ * ```ts
+ * // Only need final carry, not intermediate outputs (saves memory)
+ * const step = (carry, x) => {
+ *   const Asq = carry.A.ref.mul(carry.A);
+ *   const newA = Asq.add(x);
+ *   const newCount = carry.count.add(Asq.less(100).astype(np.int32));
+ *   return [{ A: newA, count: newCount }, null];  // null skips Y stacking
+ * };
+ *
+ * const init = { A: np.zeros([100]), count: np.zeros([100], np.int32) };
+ * const [final, ys] = await lax.scan(step, init, xs);
+ * // ys is null — no memory allocated for intermediate outputs
+ * ```
+ *
+ * @example jit(scan) - Compile the entire scan loop
+ * ```ts
+ * import { jit, lax, numpy as np } from '@jax-js/jax';
+ *
+ * // Wrap scan in jit to compile the entire loop into optimized native code.
+ * // This is the most common and efficient pattern for production use.
+ * const step = (carry, x) => {
+ *   const newCarry = np.add(carry, x);
+ *   return [newCarry, newCarry.ref];
+ * };
+ *
+ * const scanFn = jit((init, xs) => lax.scan(step, init, xs));
+ *
+ * const init = np.array([0.0]);
+ * const xs = np.array([[1.0], [2.0], [3.0]]);
+ * const [final, ys] = await scanFn(init, xs);
+ *
+ * console.log(await final.data());  // [6]
+ * scanFn.dispose();  // Free compiled program
+ * ```
+ *
+ * @example scan(jit(body)) - JIT-compile only the step function
+ * ```ts
+ * import { jit, lax, numpy as np } from '@jax-js/jax';
+ *
+ * // JIT-compile just the step function. Each iteration calls compiled code,
+ * // but the loop itself runs in JavaScript. Useful when step is expensive
+ * // but you want to inspect intermediate values or the scan body is dynamic.
+ * const step = jit((carry, x) => {
+ *   const newCarry = np.add(carry, x);
+ *   return [newCarry, newCarry.ref];
+ * });
+ *
+ * const init = np.array([0.0]);
+ * const xs = np.array([[1.0], [2.0], [3.0]]);
+ * const [final, ys] = await lax.scan(step, init, xs);
+ *
+ * console.log(await final.data());  // [6]
+ * step.dispose();  // Free compiled step function
+ * ```
+ *
+ * @example With grad for differentiation
+ * ```ts
+ * import { grad, lax, numpy as np } from '@jax-js/jax';
+ *
+ * const loss = (init, xs) => {
+ *   const [final, ys] = lax.scan(step, init, xs);
+ *   final.dispose();
+ *   return np.sum(ys);
+ * };
+ *
+ * const gradLoss = grad(loss);
+ * const [dInit, dXs] = await gradLoss(init, xs);
+ * ```
  *
  * @see {@link https://docs.jax.dev/en/latest/_autosummary/jax.lax.scan.html | JAX lax.scan}
  */
