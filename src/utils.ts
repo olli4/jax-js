@@ -18,6 +18,9 @@ export function setDebug(level: number) {
   DEBUG = level;
 }
 
+/** The execution strategy chosen for a scan loop. */
+export type ScanPath = "compiled-loop" | "preencoded-routine" | "fallback";
+
 export function assertNonNull<T>(value: T): asserts value is NonNullable<T> {}
 
 export function unzip2<T, U>(pairs: Iterable<[T, U]>): [T[], U[]] {
