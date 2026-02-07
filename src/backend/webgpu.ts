@@ -201,6 +201,35 @@ export class WebGPUBackend implements Backend {
   #reusableZsb: GPUBuffer;
   #copyPipeline: GPUComputePipeline | null = null;
 
+  /**
+   * Buffer pool: recently-freed GPUBuffers indexed by padded byte size.
+   * Avoids expensive device.createBuffer() / buffer.destroy() cycles for
+   * same-size allocations, which are very common in JIT-compiled programs.
+   *
+   * **Peak-memory guarantee:** Before each JIT execution, `configurePool()`
+   * evicts pool entries whose sizes won't be needed and caps total retained
+   * bytes at the program's peak live bytes. This ensures physical peak memory
+   * never exceeds what was already required during execution — the pool is
+   * free from a peak-memory perspective.
+   *
+   * A per-size-class cap (MAX_POOL_PER_SIZE) limits redundant same-size
+   * entries. MAX_POOL_BYTES_DEFAULT is a fallback byte budget used when
+   * no JitProgram has configured the pool yet (e.g., in eager mode).
+   */
+  #bufferPool = new Map<number, GPUBuffer[]>();
+  #poolBudgetBytes: number = 64 * 1024 * 1024; // default: 64 MB (eager mode)
+  #poolCurrentBytes: number = 0;
+  static readonly MAX_POOL_PER_SIZE = 4;
+  /** Fallback budget for eager mode (no JitProgram to derive peak from). */
+  static readonly MAX_POOL_BYTES_DEFAULT = 64 * 1024 * 1024; // 64 MB
+
+  /**
+   * Total bytes of GPU storage buffers currently allocated by jax-js
+   * (live + pooled). Incremented on createBuffer, decremented on destroy.
+   * Staging/read buffers are excluded since they're transient.
+   */
+  #gpuAllocatedBytes: number = 0;
+
   constructor(readonly device: GPUDevice) {
     if (DEBUG >= 3 && device.adapterInfo) {
       console.info(
@@ -229,6 +258,16 @@ export class WebGPUBackend implements Backend {
     });
   }
 
+  /** Number of live backend slots (excludes pooled buffers). */
+  slotCount(): number {
+    return this.buffers.size;
+  }
+
+  /** Total GPU bytes held by jax-js: live buffer bytes + pooled buffer bytes. */
+  gpuAllocatedBytes(): number {
+    return this.#gpuAllocatedBytes;
+  }
+
   malloc(size: number, initialData?: Uint8Array<ArrayBuffer>): Slot {
     let buffer: GPUBuffer;
     // All GPUBuffer must be a multiple of 4 bytes in length, to support copy
@@ -240,7 +279,20 @@ export class WebGPUBackend implements Backend {
       if (initialData.byteLength !== size) {
         throw new Error("initialData size does not match buffer size");
       }
-      if (initialData.byteLength < 4096) {
+      // Try to reuse a pooled buffer for initial data too.
+      const pooled = this.#poolPop(paddedSize);
+      if (pooled) {
+        buffer = pooled;
+        if (initialData.byteLength % 4 === 0) {
+          this.device.queue.writeBuffer(buffer, 0, initialData);
+        } else {
+          const aligned = initialData.byteLength - (initialData.byteLength % 4);
+          this.device.queue.writeBuffer(buffer, 0, initialData, 0, aligned);
+          const remainder = new Uint8Array(4);
+          remainder.set(initialData.subarray(aligned));
+          this.device.queue.writeBuffer(buffer, aligned, remainder);
+        }
+      } else if (initialData.byteLength < 4096) {
         buffer = this.#createBuffer(paddedSize, { mapped: true });
         new Uint8Array(buffer.getMappedRange(), 0, size).set(initialData);
         buffer.unmap();
@@ -259,7 +311,8 @@ export class WebGPUBackend implements Backend {
         }
       }
     } else {
-      buffer = this.#createBuffer(paddedSize);
+      // No initial data — try the pool first.
+      buffer = this.#poolPop(paddedSize) ?? this.#createBuffer(paddedSize);
     }
 
     const slot = this.nextSlot++;
@@ -279,10 +332,12 @@ export class WebGPUBackend implements Backend {
     buffer.ref--;
     if (buffer.ref === 0) {
       this.buffers.delete(slot);
-      // The GPUBuffer.destroy() method does not actually free the memory until
-      // pending work is done.
       if (buffer.buffer !== this.#reusableZsb) {
-        buffer.buffer.destroy();
+        // Try to return the buffer to the pool for reuse.
+        if (!this.#poolPush(buffer.buffer)) {
+          this.#gpuAllocatedBytes -= buffer.buffer.size;
+          buffer.buffer.destroy();
+        }
       }
     }
   }
@@ -881,7 +936,10 @@ export class WebGPUBackend implements Backend {
 
     // Clean up temporary buffers
     for (const buf of copyUniformBuffers) buf.destroy();
-    for (const buf of [...carryPing, ...carryPong]) buf.destroy();
+    for (const buf of [...carryPing, ...carryPong]) {
+      this.#gpuAllocatedBytes -= buf.size;
+      buf.destroy();
+    }
     // offsetBuffer is NOT destroyed — owned by PreparedPreencodedScan for reuse
   }
 
@@ -901,6 +959,79 @@ export class WebGPUBackend implements Backend {
    * - If `read` is true, create a staging buffer for returning data to CPU.
    *   (Call `.mapAsync()` later.)
    */
+  /** Pop a buffer of the given padded byte size from the pool, or null. */
+  #poolPop(paddedSize: number): GPUBuffer | null {
+    const list = this.#bufferPool.get(paddedSize);
+    if (list && list.length > 0) {
+      const buf = list.pop()!;
+      this.#poolCurrentBytes -= buf.size;
+      return buf;
+    }
+    return null;
+  }
+
+  /** Push a freed buffer into the pool. Returns false if pool is full. */
+  #poolPush(buffer: GPUBuffer): boolean {
+    const paddedSize = buffer.size;
+    // Per-size-class cap.
+    let list = this.#bufferPool.get(paddedSize);
+    if (!list) {
+      list = [];
+      this.#bufferPool.set(paddedSize, list);
+    }
+    if (list.length >= WebGPUBackend.MAX_POOL_PER_SIZE) return false;
+    // Byte budget cap.
+    if (this.#poolCurrentBytes + paddedSize > this.#poolBudgetBytes) {
+      return false;
+    }
+    list.push(buffer);
+    this.#poolCurrentBytes += paddedSize;
+    return true;
+  }
+
+  /**
+   * Prepare the pool for the next JitProgram execution:
+   * 1. Evict entries whose sizes aren't needed (stale cross-program buffers).
+   * 2. Set the byte budget to the program's peak live bytes.
+   *
+   * This guarantees physical peak memory ≤ peak live memory: the pool only
+   * retains buffers that will be reused, and total retained bytes can't exceed
+   * what the program already needs at its peak point.
+   */
+  configurePool(hints: {
+    readonly peakBytes: number;
+    readonly mallocSizes: ReadonlySet<number>;
+  }): void {
+    // Evict pool entries whose sizes won't be needed.
+    for (const [size, list] of this.#bufferPool) {
+      if (!hints.mallocSizes.has(size)) {
+        for (const buf of list) {
+          this.#poolCurrentBytes -= buf.size;
+          this.#gpuAllocatedBytes -= buf.size;
+          buf.destroy();
+        }
+        this.#bufferPool.delete(size);
+      }
+    }
+    // Update byte budget to this program's peak.
+    this.#poolBudgetBytes = hints.peakBytes;
+    // If current pool exceeds new budget, evict excess (LIFO per size).
+    while (this.#poolCurrentBytes > this.#poolBudgetBytes) {
+      let evicted = false;
+      for (const [size, list] of this.#bufferPool) {
+        if (list.length > 0) {
+          const buf = list.pop()!;
+          this.#poolCurrentBytes -= buf.size;
+          this.#gpuAllocatedBytes -= buf.size;
+          buf.destroy();
+          evicted = true;
+          break;
+        }
+      }
+      if (!evicted) break;
+    }
+  }
+
   #createBuffer(
     size: number,
     { mapped = false, read = false } = {},
@@ -917,6 +1048,9 @@ export class WebGPUBackend implements Backend {
           GPUBufferUsage.COPY_DST,
       mappedAtCreation: mapped,
     });
+    if (!read) {
+      this.#gpuAllocatedBytes += size;
+    }
     return buffer;
   }
 }

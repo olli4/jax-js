@@ -30,7 +30,7 @@ var __toESM = (mod$1, isNodeMode, target) => (target = mod$1 != null ? __create(
 }) : target, mod$1));
 
 //#endregion
-const require_backend = require('./backend-D_QaxnrG.cjs');
+const require_backend = require('./backend-CDK4q5jf.cjs');
 
 //#region src/frontend/convolution.ts
 /**
@@ -2509,13 +2509,51 @@ function planScan(backend, bodyProgram, bodyJaxpr, length, numCarry, numConsts, 
 
 //#endregion
 //#region src/frontend/jit.ts
+/** Walk JitSteps to compute peak live bytes and the set of malloc sizes. */
+function computePoolHints(steps) {
+	const mallocSizes = /* @__PURE__ */ new Set();
+	const sizeOf = /* @__PURE__ */ new Map();
+	for (const s of steps) if (s.type === "malloc") {
+		const padded = Math.ceil(s.size / 4) * 4;
+		sizeOf.set(s.output, padded);
+		mallocSizes.add(padded);
+	}
+	let liveBytes = 0;
+	let peakBytes = 0;
+	const live = /* @__PURE__ */ new Map();
+	for (const s of steps) {
+		switch (s.type) {
+			case "malloc": {
+				const padded = sizeOf.get(s.output);
+				live.set(s.output, padded);
+				liveBytes += padded;
+				break;
+			}
+			case "free":
+				liveBytes -= live.get(s.input) ?? 0;
+				live.delete(s.input);
+				break;
+			case "recycle":
+				live.set(s.output, live.get(s.input) ?? 0);
+				live.delete(s.input);
+				break;
+		}
+		if (liveBytes > peakBytes) peakBytes = liveBytes;
+	}
+	return {
+		peakBytes,
+		mallocSizes
+	};
+}
 /** Result of compiling a Jaxpr. Can be evaluated on a series of inputs. */
 var JitProgram = class {
+	poolHints;
 	constructor(backend, steps, inputs, outputs) {
 		this.backend = backend;
 		this.steps = steps;
 		this.inputs = inputs;
 		this.outputs = outputs;
+		this.poolHints = computePoolHints(steps);
 	}
 	pprint() {
 		const steps = this.steps.map((step) => {
@@ -2534,6 +2572,7 @@ var JitProgram = class {
 				case "malloc": return require_backend.PPrint.pp(`%${step.output} = malloc <${step.size} bytes>`);
 				case "incref": return require_backend.PPrint.pp(`incref ${step.input}`);
 				case "free": return require_backend.PPrint.pp(`free ${step.input}`);
+				case "recycle": return require_backend.PPrint.pp(`%${step.output} = recycle %${step.input}`);
 				case "scan": return require_backend.PPrint.pp(`scan [${step.plan.path}] length=${step.length} numCarry=${step.numCarry} numConsts=${step.numConsts} numX=${step.numX} numY=${step.numY}` + (step.reverse ? " reverse" : ""));
 			}
 		});
@@ -2545,6 +2584,7 @@ var JitProgram = class {
 	}
 	/** Execute the JitProgram with the given inputs. */
 	execute(inputs) {
+		this.backend.configurePool?.(this.poolHints);
 		const scope = /* @__PURE__ */ new Map();
 		if (inputs.length !== this.inputs.length) throw new TypeError(`Expected ${this.inputs.length} inputs, got ${inputs.length}`);
 		for (const [i, id] of this.inputs.entries()) scope.set(id, inputs[i]);
@@ -2571,6 +2611,12 @@ var JitProgram = class {
 				const slot = scope.get(step.input);
 				this.backend.decRef(slot);
 				scope.delete(step.input);
+				break;
+			}
+			case "recycle": {
+				const slot = scope.get(step.input);
+				scope.delete(step.input);
+				scope.set(step.output, slot);
 				break;
 			}
 			case "scan": {
@@ -2678,6 +2724,42 @@ var JitProgramBuilder = class {
 			type: "free",
 			input: id
 		});
+	}
+	/**
+	* Replace consecutive free→malloc pairs of the same byte size with a single
+	* "recycle" step, reusing the same backend Slot without any alloc/free calls.
+	*
+	* This is safe because:
+	* 1. The free'd buffer's last consumer has already been scheduled
+	* 2. The malloc'd buffer hasn't been written yet (execute comes after)
+	* 3. Sizes match exactly, so no memory waste and no peak-memory increase
+	*/
+	recycleBuffers() {
+		const mallocSizes = /* @__PURE__ */ new Map();
+		for (const s of this.steps) if (s.type === "malloc") mallocSizes.set(s.output, s.size);
+		let recycleCount = 0;
+		for (let i = 0; i < this.steps.length - 1; i++) {
+			const step = this.steps[i];
+			if (step.type !== "free") continue;
+			const freeSize = mallocSizes.get(step.input);
+			if (freeSize === void 0 || freeSize === 0) continue;
+			for (let j = i + 1; j < this.steps.length; j++) {
+				const next = this.steps[j];
+				if (next.type === "malloc" && next.size === freeSize) {
+					this.steps.splice(i, 1, {
+						type: "recycle",
+						input: step.input,
+						output: next.output
+					});
+					this.steps.splice(j, 1);
+					recycleCount++;
+					break;
+				}
+				if (next.type === "incref" || next.type === "free") continue;
+				break;
+			}
+		}
+		if (require_backend.DEBUG >= 1 && recycleCount > 0) console.info(`jit: recycled ${recycleCount} buffer(s)`);
 	}
 };
 const jitCompileCache = /* @__PURE__ */ new Map();
@@ -2859,6 +2941,7 @@ function jitCompile(backend, jaxpr) {
 	for (const outputId of outputIds) if (outputNeedsRef.has(outputId)) builder.pushIncref(outputId);
 	else outputNeedsRef.add(outputId);
 	builder.insertFreeSteps(outputIds);
+	builder.recycleBuffers();
 	const jp = new JitProgram(backend, builder.steps, require_backend.range(0, nargs), outputIds);
 	if (require_backend.DEBUG >= 4) console.info(jp.toString());
 	jitCompileCache.set(cacheKey, jp);
