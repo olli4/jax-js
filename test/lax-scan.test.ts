@@ -12,8 +12,8 @@
  * - Scan with routines in body (Cholesky, matmul, etc.)
  * - acceptPath option tests
  * - Ownership edge cases (duplicate-slot, passthrough, xs-passthrough)
- * - [P5] Autodiff tests (JVP, VJP, checkpointing, vmap) — skipped until P5
- * - [P2+] Native scan path tests — skipped until compiled-loop/preencoded available
+ * - Autodiff tests (JVP, VJP, checkpointing, vmap)
+ * - Native scan path tests (compiled-loop, preencoded-routine)
  */
 
 import {
@@ -1206,10 +1206,10 @@ describe("jit(scan) DLM patterns", () => {
 });
 
 // ============================================================================
-// Scan autodiff — P5
+// Scan autodiff
 // ============================================================================
 
-describe("scan autodiff (P5)", () => {
+describe("scan autodiff", () => {
   beforeAll(async () => {
     const devices = await init();
     if (devices.includes("cpu")) {
