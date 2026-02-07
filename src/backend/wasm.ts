@@ -30,6 +30,13 @@ import {
   wasm_sin,
   wasm_threefry2x32,
 } from "./wasm/builtins";
+import {
+  getArgsortModule,
+  getCholeskyModule,
+  getLUModule,
+  getSortModule,
+  getTriangularSolveModule,
+} from "./wasm/routine-provider";
 import { CodeGenerator } from "./wasm/wasmblr";
 
 // ---------------------------------------------------------------------------
@@ -112,12 +119,19 @@ export class WasmBackend implements Backend {
   #nextSlot: number;
   #allocator: WasmAllocator;
   #buffers: Map<Slot, WasmBuffer>;
+  /** Cache WebAssembly instances keyed by module for reuse in dispatch. */
+  #instanceCache: WeakMap<WebAssembly.Module, WebAssembly.Instance>;
 
   constructor() {
     this.#memory = new WebAssembly.Memory({ initial: 0 });
     this.#allocator = new WasmAllocator(this.#memory);
     this.#nextSlot = 1;
     this.#buffers = new Map();
+    this.#instanceCache = new WeakMap();
+  }
+
+  slotCount(): number {
+    return this.#buffers.size;
   }
 
   malloc(size: number, initialData?: Uint8Array): Slot {
@@ -209,8 +223,8 @@ export class WasmBackend implements Backend {
   }
 
   prepareRoutineSync(routine: Routine): Executable<WasmProgram> {
-    // Currently, Wasm routines fall back to the CPU reference implementation
-    // implementation. We may optimize this in the future.
+    // WASM routines use size-specialized wasmblr modules dispatched in dispatch().
+    // For non-float or unsupported routines, dispatch() falls back to CPU.
     return new Executable(routine, undefined as any);
   }
 
@@ -220,21 +234,268 @@ export class WasmBackend implements Backend {
     outputs: Slot[],
   ): void {
     if (exe.source instanceof Routine) {
+      const routine = exe.source;
+      // Determine element size from dtype (f32=4, f64=8)
+      const dtype = routine.type.inputDtypes[0];
+      const isF32 = dtype === DType.Float32;
+      const isF64 = dtype === DType.Float64;
+      if (isF32 || isF64) {
+        const elementSize: 4 | 8 = isF32 ? 4 : 8;
+        switch (routine.name) {
+          case Routines.Cholesky:
+            return this.#dispatchCholesky(
+              routine,
+              inputs,
+              outputs,
+              elementSize,
+            );
+          case Routines.TriangularSolve:
+            return this.#dispatchTriangularSolve(
+              routine,
+              inputs,
+              outputs,
+              elementSize,
+            );
+          case Routines.LU:
+            return this.#dispatchLU(routine, inputs, outputs, elementSize);
+          case Routines.Sort:
+            return this.#dispatchSort(routine, inputs, outputs, elementSize);
+          case Routines.Argsort:
+            return this.#dispatchArgsort(routine, inputs, outputs, elementSize);
+        }
+      }
+      // Fall back to CPU for non-float or unimplemented routines
       return runCpuRoutine(
-        exe.source,
+        routine,
         inputs.map((slot) => this.#getBuffer(slot)),
         outputs.map((slot) => this.#getBuffer(slot)),
       );
     }
 
-    const instance = new WebAssembly.Instance(exe.data.module, {
-      env: { memory: this.#memory },
-    });
+    // Reuse cached instance if available
+    let instance = this.#instanceCache.get(exe.data.module);
+    if (!instance) {
+      instance = new WebAssembly.Instance(exe.data.module, {
+        env: { memory: this.#memory },
+      });
+      this.#instanceCache.set(exe.data.module, instance);
+    }
     const func = instance.exports.kernel as (...args: number[]) => void;
     const ptrs = [...inputs, ...outputs].map(
       (slot) => this.#buffers.get(slot)!.ptr,
     );
     func(...ptrs);
+  }
+
+  /** Get or create a WASM instance for a size-specialized routine module. */
+  #getRoutineInstanceForModule(
+    module: WebAssembly.Module,
+  ): WebAssembly.Instance {
+    let instance = this.#instanceCache.get(module);
+    if (!instance) {
+      instance = new WebAssembly.Instance(module, {
+        env: { memory: this.#memory },
+      });
+      this.#instanceCache.set(module, instance);
+    }
+    return instance;
+  }
+
+  /** Get the size-specialized routine module for a scan routine info. */
+  #getRoutineModuleForScan(info: ScanRoutineInfo): WebAssembly.Module {
+    const { routine, dtype, sizeParams, unitDiagonal, lower } = info;
+
+    switch (routine) {
+      case Routines.Cholesky: {
+        const [n] = sizeParams;
+        return getCholeskyModule({ n, dtype });
+      }
+      case Routines.Sort: {
+        const [n] = sizeParams;
+        return getSortModule({ n, dtype });
+      }
+      case Routines.Argsort: {
+        const [n] = sizeParams;
+        return getArgsortModule({ n, dtype });
+      }
+      case Routines.TriangularSolve: {
+        const [n, batchRows] = sizeParams;
+        return getTriangularSolveModule({
+          n,
+          batchRows,
+          dtype,
+          unitDiagonal: unitDiagonal ?? false,
+          lower: lower ?? true,
+        });
+      }
+      case Routines.LU: {
+        const [m, n] = sizeParams;
+        return getLUModule({ m, n, dtype });
+      }
+      default:
+        throw new Error(`Unsupported routine for scan: ${Routines[routine]}`);
+    }
+  }
+
+  #dispatchCholesky(
+    routine: Routine,
+    inputs: Slot[],
+    outputs: Slot[],
+    elementSize: 4 | 8,
+  ): void {
+    const shape = routine.type.inputShapes[0];
+    const n = shape[shape.length - 1];
+    const batchSize = shape.slice(0, -2).reduce((a, b) => a * b, 1);
+    const dtype = elementSize === 4 ? "f32" : "f64";
+
+    const module = getCholeskyModule({ n, dtype });
+    const instance = this.#getRoutineInstanceForModule(module);
+    const func = instance.exports.cholesky_batched as (
+      i: number,
+      o: number,
+      b: number,
+    ) => void;
+    func(
+      this.#buffers.get(inputs[0])!.ptr,
+      this.#buffers.get(outputs[0])!.ptr,
+      batchSize,
+    );
+  }
+
+  #dispatchTriangularSolve(
+    routine: Routine,
+    inputs: Slot[],
+    outputs: Slot[],
+    elementSize: 4 | 8,
+  ): void {
+    const aShape = routine.type.inputShapes[0];
+    const bShape = routine.type.inputShapes[1];
+    const n = aShape[aShape.length - 1];
+    const batchRows = bShape[bShape.length - 2]; // number of rows in B
+    const numBatches = aShape.slice(0, -2).reduce((a, b) => a * b, 1);
+    const dtype = elementSize === 4 ? "f32" : "f64";
+    const unitDiagonal = routine.params?.unitDiagonal ?? false;
+    const lower = routine.params?.lower ?? false;
+
+    const module = getTriangularSolveModule({
+      n,
+      batchRows,
+      dtype,
+      unitDiagonal,
+      lower,
+    });
+    const instance = this.#getRoutineInstanceForModule(module);
+    const func = instance.exports.triangular_solve_batched as (
+      a: number,
+      b: number,
+      x: number,
+      numBatches: number,
+    ) => void;
+    func(
+      this.#buffers.get(inputs[0])!.ptr,
+      this.#buffers.get(inputs[1])!.ptr,
+      this.#buffers.get(outputs[0])!.ptr,
+      numBatches,
+    );
+  }
+
+  #dispatchLU(
+    routine: Routine,
+    inputs: Slot[],
+    outputs: Slot[],
+    elementSize: 4 | 8,
+  ): void {
+    const shape = routine.type.inputShapes[0];
+    const m = shape[shape.length - 2];
+    const n = shape[shape.length - 1];
+    const batchSize = shape.slice(0, -2).reduce((a, b) => a * b, 1);
+    const dtype = elementSize === 4 ? "f32" : "f64";
+
+    const module = getLUModule({ m, n, dtype });
+    const instance = this.#getRoutineInstanceForModule(module);
+    const func = instance.exports.lu_batched as (
+      a: number,
+      lu: number,
+      piv: number,
+      perm: number,
+      batchSize: number,
+    ) => void;
+    func(
+      this.#buffers.get(inputs[0])!.ptr,
+      this.#buffers.get(outputs[0])!.ptr,
+      this.#buffers.get(outputs[1])!.ptr,
+      this.#buffers.get(outputs[2])!.ptr,
+      batchSize,
+    );
+  }
+
+  #dispatchSort(
+    routine: Routine,
+    inputs: Slot[],
+    outputs: Slot[],
+    elementSize: 4 | 8,
+  ): void {
+    const shape = routine.type.inputShapes[0];
+    const n = shape[shape.length - 1];
+    const batchSize = shape.slice(0, -1).reduce((a, b) => a * b, 1);
+    const totalSize = n * batchSize * elementSize;
+    const dtype = elementSize === 4 ? "f32" : "f64";
+
+    // Copy input to output (sort is in-place)
+    const inBuf = this.#buffers.get(inputs[0])!;
+    const outBuf = this.#buffers.get(outputs[0])!;
+    new Uint8Array(this.#memory.buffer, outBuf.ptr, totalSize).set(
+      new Uint8Array(this.#memory.buffer, inBuf.ptr, totalSize),
+    );
+
+    // Allocate auxiliary buffer
+    const auxPtr = this.#allocator.malloc(n * elementSize);
+
+    // Call in-place sort on output buffer
+    const module = getSortModule({ n, dtype });
+    const instance = this.#getRoutineInstanceForModule(module);
+    const func = instance.exports.sort_batched as (
+      data: number,
+      aux: number,
+      batchSize: number,
+    ) => void;
+    func(outBuf.ptr, auxPtr, batchSize);
+
+    this.#allocator.free(auxPtr);
+  }
+
+  #dispatchArgsort(
+    routine: Routine,
+    inputs: Slot[],
+    outputs: Slot[],
+    elementSize: 4 | 8,
+  ): void {
+    const shape = routine.type.inputShapes[0];
+    const n = shape[shape.length - 1];
+    const batchSize = shape.slice(0, -1).reduce((a, b) => a * b, 1);
+    const dtype = elementSize === 4 ? "f32" : "f64";
+
+    // Allocate auxiliary buffers (aux uses 4 bytes for indices)
+    const auxPtr = this.#allocator.malloc(n * 4);
+
+    const module = getArgsortModule({ n, dtype });
+    const instance = this.#getRoutineInstanceForModule(module);
+    const func = instance.exports.argsort_batched as (
+      data: number,
+      out: number,
+      idx: number,
+      aux: number,
+      batchSize: number,
+    ) => void;
+    func(
+      this.#buffers.get(inputs[0])!.ptr,
+      this.#buffers.get(outputs[0])!.ptr,
+      this.#buffers.get(outputs[1])!.ptr,
+      auxPtr,
+      batchSize,
+    );
+
+    this.#allocator.free(auxPtr);
   }
 
   #getBuffer(slot: Slot): Uint8Array<ArrayBuffer> {
@@ -323,10 +584,28 @@ export class WasmBackend implements Backend {
     // aux
     if (auxBufferSize && auxBufferSize > 0) args.push(auxPtr);
 
-    // Instantiate and run
-    const imports: WebAssembly.Imports = { env: { memory: this.#memory } };
+    // Instantiate and run (reuse cached instance)
+    let instance = this.#instanceCache.get(exe.data.module);
+    if (!instance) {
+      const imports: WebAssembly.Imports = { env: { memory: this.#memory } };
 
-    const instance = new WebAssembly.Instance(exe.data.module, imports);
+      // Add routine function imports if needed (using size-specialized modules)
+      if (params.routineInfos && params.routineInfos.length > 0) {
+        const routineImports: Record<string, WebAssembly.ExportValue> = {};
+        for (const info of params.routineInfos) {
+          const routineModule = this.#getRoutineModuleForScan(info);
+          const routineInstance =
+            this.#getRoutineInstanceForModule(routineModule);
+          routineImports[info.exportName] = routineInstance.exports[
+            info.exportName
+          ] as WebAssembly.ExportValue;
+        }
+        imports.routines = routineImports;
+      }
+
+      instance = new WebAssembly.Instance(exe.data.module, imports);
+      this.#instanceCache.set(exe.data.module, instance);
+    }
     const scanFunc = instance.exports.scan as (...args: number[]) => void;
     scanFunc(...args);
 
@@ -947,6 +1226,7 @@ function codegenNativeScanGeneral(
     carryOutSources,
     yOutputSources,
     reverse,
+    routineInfos,
   } = params;
   const numInternal = internalSizes.length;
 
@@ -1067,6 +1347,20 @@ function codegenNativeScanGeneral(
   const cg = new CodeGenerator();
   cg.memory.import("env", "memory");
 
+  // Import routine functions from the "routines" module
+  const routineFuncIndices: number[] = [];
+  if (routineInfos) {
+    for (const info of routineInfos) {
+      const funcIdx = cg.importFunction(
+        "routines",
+        info.exportName,
+        rep(info.numParams, cg.i32),
+        [],
+      );
+      routineFuncIndices.push(funcIdx);
+    }
+  }
+
   // Collect all helper functions needed by kernels
   const allOps = new Set<AluOp>();
   for (const step of steps) {
@@ -1093,6 +1387,9 @@ function codegenNativeScanGeneral(
     numY +
     numInternal +
     (needsAux ? 1 : 0);
+  const auxArgIdx = needsAux
+    ? numConsts + numCarry + numX + numCarry + numY + numInternal
+    : -1;
 
   const scanFunc = cg.function(rep(numArgs, cg.i32), [], () => {
     // Local variables
@@ -1271,8 +1568,72 @@ function codegenNativeScanGeneral(
           }
           cg.end();
         }
-        // Note: Routine steps are not supported in P2 (kernel-only).
-        // Routine support will be added when routine-provider is ported.
+        // Routine step: call the imported routine function
+        if (step.source instanceof Routine) {
+          const callInfo = step.routineCallInfo!;
+          const funcIdx = routineFuncIndices[callInfo.routineInfoIdx];
+          const routineType = routineInfos![callInfo.routineInfoIdx].routine;
+
+          // Helper to push a slot pointer onto the stack
+          const pushSlotPtr = (slotIdx: number) => {
+            if (slotIdx < numConsts) {
+              cg.local.get(constsBase + slotIdx);
+            } else if (slotIdx < numConsts + numCarry) {
+              cg.local.get(carryOutBase + (slotIdx - numConsts));
+            } else if (slotIdx < numConsts + numCarry + numX) {
+              // xs input: base + dataIdx * stride
+              const xIdx = slotIdx - numConsts - numCarry;
+              cg.local.get(xsBase + xIdx);
+              cg.local.get(dataIdx);
+              cg.i32.const(xsStrides[xIdx]);
+              cg.i32.mul();
+              cg.i32.add();
+            } else {
+              // Internal buffer
+              const intIdx = slotIdx - numConsts - numCarry - numX;
+              cg.local.get(internalsBase + intIdx);
+            }
+          };
+
+          if (routineType === Routines.Cholesky) {
+            pushSlotPtr(step.inputSlots[0]); // inPtr
+            cg.local.get(internalsBase + internalIdx); // outPtr
+          } else if (routineType === Routines.Sort) {
+            // Copy input to internal buffer first (sort is in-place)
+            const sortSize = callInfo.staticParams[0];
+            const elemSize = params.elementSize ?? 4;
+            const copySize = sortSize * elemSize;
+
+            cg.local.get(internalsBase + internalIdx); // dst
+            pushSlotPtr(step.inputSlots[0]); // src
+            cg.i32.const(copySize); // len
+            cg.memory.copy();
+
+            cg.local.get(internalsBase + internalIdx); // dataPtr (in-place)
+            cg.local.get(auxArgIdx); // auxPtr
+          } else if (routineType === Routines.TriangularSolve) {
+            pushSlotPtr(step.inputSlots[0]); // aPtr
+            pushSlotPtr(step.inputSlots[1]); // bPtr
+            cg.local.get(internalsBase + internalIdx); // xPtr (output)
+          } else if (routineType === Routines.LU) {
+            const outIndices = step.outputInternalIndices!;
+            pushSlotPtr(step.inputSlots[0]); // aPtr
+            cg.local.get(internalsBase + outIndices[0]); // luPtr
+            cg.local.get(internalsBase + outIndices[1]); // pivPtr
+            cg.local.get(internalsBase + outIndices[2]); // permPtr
+          } else if (routineType === Routines.Argsort) {
+            const outIndices = step.outputInternalIndices!;
+            pushSlotPtr(step.inputSlots[0]); // dataPtr
+            cg.local.get(internalsBase + outIndices[0]); // outPtr
+            cg.local.get(internalsBase + outIndices[1]); // idxPtr
+            cg.local.get(auxArgIdx); // auxPtr
+          } else {
+            pushSlotPtr(step.inputSlots[0]);
+            cg.local.get(internalsBase + internalIdx);
+          }
+
+          cg.call(funcIdx);
+        }
       }
 
       // Step 2b: Copy Y outputs to ysStacked at iteration offset

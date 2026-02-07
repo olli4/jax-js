@@ -1,19 +1,21 @@
 /**
  * @file Scan plan construction — determines the execution strategy for a scan.
- *
- * P0: fallback-only. P2–P4 will add compiled-loop and preencoded-routine.
  */
 
-import { byteWidth, Kernel, Reduction } from "../alu";
+import { byteWidth, DType, Kernel, Reduction } from "../alu";
 import type { Backend, Executable } from "../backend";
-import type { NativeScanGeneralParams, WasmBackend } from "../backend/wasm";
+import type {
+  NativeScanGeneralParams,
+  ScanRoutineInfo,
+  WasmBackend,
+} from "../backend/wasm";
 import type {
   NativeScanMultiParams,
   NativeScanMultiStep,
   PreparedPreencodedScan,
 } from "../backend/webgpu";
 import type { WebGPUBackend } from "../backend/webgpu";
-import { Routine } from "../routine";
+import { Routine, Routines } from "../routine";
 import { DEBUG } from "../utils";
 import type { ScanPath } from "../utils";
 import type { Jaxpr } from "./jaxpr";
@@ -135,14 +137,25 @@ function tryPrepareWasmNativeScan(
     );
   }
 
-  // Check for unsupported routines
+  // Check for unsupported routines (supported: Cholesky, Sort, TriangularSolve, LU, Argsort)
+  const supportedRoutines = new Set([
+    Routines.Cholesky,
+    Routines.Sort,
+    Routines.TriangularSolve,
+    Routines.LU,
+    Routines.Argsort,
+  ]);
+
   for (const step of executeSteps) {
     if (step.source instanceof Routine) {
-      if (DEBUG >= 1)
-        console.log(
-          `[wasm-scan] skipped, routine in scan body not yet supported in P2`,
-        );
-      return null;
+      const routineName = step.source.name as Routines;
+      if (!supportedRoutines.has(routineName)) {
+        if (DEBUG >= 1)
+          console.log(
+            `[wasm-scan] skipped, unsupported routine: ${Routines[routineName]}`,
+          );
+        return null;
+      }
     }
   }
 
@@ -156,15 +169,125 @@ function tryPrepareWasmNativeScan(
   );
 
   // Build mapping from JitId (output slot) to internal buffer index
+  // Multi-output routines need multiple internal buffers
   const slotToInternal = new Map<JitId, number>();
+  const stepToInternalBase = new Map<number, number>();
   const internalSizes: number[] = [];
 
-  for (const step of executeSteps) {
+  for (let i = 0; i < executeSteps.length; i++) {
+    const step = executeSteps[i];
     const source = step.source;
+    stepToInternalBase.set(i, internalSizes.length);
+
     if (source instanceof Kernel) {
       const internalIdx = internalSizes.length;
       slotToInternal.set(step.outputs[0], internalIdx);
       internalSizes.push(source.size * byteWidth(source.dtype));
+    } else if (source instanceof Routine) {
+      // Routine: may have multiple outputs
+      for (let outIdx = 0; outIdx < step.outputs.length; outIdx++) {
+        const internalIdx = internalSizes.length;
+        slotToInternal.set(step.outputs[outIdx], internalIdx);
+        const outShape = source.type.outputShapes[outIdx];
+        const outDtype = source.type.outputDtypes[outIdx];
+        internalSizes.push(
+          outShape.reduce((a, b) => a * b, 1) * byteWidth(outDtype),
+        );
+      }
+    }
+  }
+
+  // Calculate aux buffer size for routines that need it
+  let auxBufferSize = 0;
+  let elementSize: 4 | 8 = 4;
+  for (const step of executeSteps) {
+    if (step.source instanceof Routine) {
+      const routine = step.source;
+      const dtype = routine.type.inputDtypes[0];
+      elementSize = byteWidth(dtype) as 4 | 8;
+      if (routine.name === Routines.Sort) {
+        const inputShape = routine.type.inputShapes[0];
+        const sortDim = inputShape[inputShape.length - 1];
+        auxBufferSize = Math.max(auxBufferSize, sortDim * elementSize);
+      } else if (routine.name === Routines.Argsort) {
+        const inputShape = routine.type.inputShapes[0];
+        const sortDim = inputShape[inputShape.length - 1];
+        auxBufferSize = Math.max(auxBufferSize, sortDim * 4);
+      }
+    }
+  }
+
+  // Build routineInfos array for WASM imports (size-specialized)
+  const routineInfos: ScanRoutineInfo[] = [];
+  const stepToRoutineInfoIdx = new Map<number, number>();
+
+  for (let i = 0; i < executeSteps.length; i++) {
+    const step = executeSteps[i];
+    if (step.source instanceof Routine) {
+      const routine = step.source;
+      const routineName = routine.name as Routines;
+      const isF64 = routine.type.inputDtypes[0] === DType.Float64;
+      const dtype: "f32" | "f64" = isF64 ? "f64" : "f32";
+
+      const routineInfoIdx = routineInfos.length;
+      stepToRoutineInfoIdx.set(i, routineInfoIdx);
+
+      if (routineName === Routines.Cholesky) {
+        const inputShape = routine.type.inputShapes[0];
+        const n = inputShape[inputShape.length - 1];
+        routineInfos.push({
+          routine: routineName,
+          exportName: "cholesky",
+          numParams: 2,
+          dtype,
+          sizeParams: [n],
+        });
+      } else if (routineName === Routines.Sort) {
+        const inputShape = routine.type.inputShapes[0];
+        const n = inputShape[inputShape.length - 1];
+        routineInfos.push({
+          routine: routineName,
+          exportName: "sort",
+          numParams: 2,
+          dtype,
+          sizeParams: [n],
+        });
+      } else if (routineName === Routines.TriangularSolve) {
+        const aShape = routine.type.inputShapes[0];
+        const bShape = routine.type.inputShapes[1];
+        const n = aShape[aShape.length - 1];
+        const batchRows = bShape[bShape.length - 1];
+        routineInfos.push({
+          routine: routineName,
+          exportName: "triangular_solve",
+          numParams: 3,
+          dtype,
+          sizeParams: [n, batchRows],
+          unitDiagonal: routine.params?.unitDiagonal ?? false,
+          lower: false,
+        });
+      } else if (routineName === Routines.LU) {
+        const inputShape = routine.type.inputShapes[0];
+        const m = inputShape[inputShape.length - 2];
+        const n = inputShape[inputShape.length - 1];
+        routineInfos.push({
+          routine: routineName,
+          exportName: "lu",
+          numParams: 4,
+          dtype,
+          sizeParams: [m, n],
+        });
+      } else if (routineName === Routines.Argsort) {
+        const inputShape = routine.type.inputShapes[0];
+        const n = inputShape[inputShape.length - 1];
+        routineInfos.push({
+          routine: routineName,
+          exportName: "argsort",
+          numParams: 4,
+          dtype,
+          sizeParams: [n],
+        });
+      }
     }
   }
 
@@ -172,9 +295,9 @@ function tryPrepareWasmNativeScan(
   type LocalStep = import("../backend/wasm").GeneralScanStep;
   const steps: LocalStep[] = [];
 
-  for (const step of executeSteps) {
+  for (let i = 0; i < executeSteps.length; i++) {
+    const step = executeSteps[i];
     const source = step.source;
-    if (!(source instanceof Kernel)) continue;
 
     // Map each input JitId to either a jaxpr input index or an internal buffer
     const inputSlots: number[] = [];
@@ -194,30 +317,81 @@ function tryPrepareWasmNativeScan(
       }
     }
 
-    // Reindex kernel expressions to use our inputSlots mapping
-    const reindexMap = inputSlots;
-    const reindexedExp = source.exp.reindexGids(reindexMap);
-    const reindexedReduction = source.reduction
-      ? new Reduction(
-          source.reduction.dtype,
-          source.reduction.op,
-          source.reduction.size,
-          source.reduction.epilogue.reindexGids(reindexMap),
-        )
-      : undefined;
-    const reindexedKernel = new Kernel(
-      numInputs + internalSizes.length,
-      source.size,
-      reindexedExp,
-      reindexedReduction,
-    );
+    if (source instanceof Kernel) {
+      // Reindex kernel expressions to use our inputSlots mapping
+      const reindexMap = inputSlots;
+      const reindexedExp = source.exp.reindexGids(reindexMap);
+      const reindexedReduction = source.reduction
+        ? new Reduction(
+            source.reduction.dtype,
+            source.reduction.op,
+            source.reduction.size,
+            source.reduction.epilogue.reindexGids(reindexMap),
+          )
+        : undefined;
+      const reindexedKernel = new Kernel(
+        numInputs + internalSizes.length,
+        source.size,
+        reindexedExp,
+        reindexedReduction,
+      );
 
-    const internalIdx = slotToInternal.get(step.outputs[0])!;
-    steps.push({
-      source: reindexedKernel,
-      inputSlots,
-      outputInternalIdx: internalIdx,
-    });
+      const internalBase = stepToInternalBase.get(i)!;
+      steps.push({
+        source: reindexedKernel,
+        inputSlots,
+        outputInternalIdx: internalBase,
+      });
+    } else if (source instanceof Routine) {
+      // Routine step: build routineCallInfo with static params
+      const routine = source;
+      const routineName = routine.name as Routines;
+      const routineInfoIdx = stepToRoutineInfoIdx.get(i)!;
+      const internalBase = stepToInternalBase.get(i)!;
+      const numOutputs = routine.type.outputShapes.length;
+      const outputInternalIndices: number[] = [];
+      for (let outIdx = 0; outIdx < numOutputs; outIdx++) {
+        outputInternalIndices.push(internalBase + outIdx);
+      }
+
+      // Build static params based on routine type
+      let staticParams: number[] = [];
+      if (routineName === Routines.Cholesky) {
+        const inputShape = routine.type.inputShapes[0];
+        staticParams = [inputShape[inputShape.length - 1]];
+      } else if (routineName === Routines.Sort) {
+        const inputShape = routine.type.inputShapes[0];
+        staticParams = [inputShape[inputShape.length - 1]];
+      } else if (routineName === Routines.TriangularSolve) {
+        const aShape = routine.type.inputShapes[0];
+        const bShape = routine.type.inputShapes[1];
+        const n = aShape[aShape.length - 1];
+        const batchRows = bShape[bShape.length - 1];
+        const numBatches = 1;
+        const unitDiagonal = routine.params?.unitDiagonal ? 1 : 0;
+        const lower = 0;
+        staticParams = [n, batchRows, numBatches, unitDiagonal, lower];
+      } else if (routineName === Routines.LU) {
+        const inputShape = routine.type.inputShapes[0];
+        const m = inputShape[inputShape.length - 2];
+        const n = inputShape[inputShape.length - 1];
+        staticParams = [m, n];
+      } else if (routineName === Routines.Argsort) {
+        const inputShape = routine.type.inputShapes[0];
+        staticParams = [inputShape[inputShape.length - 1]];
+      }
+
+      steps.push({
+        source,
+        inputSlots,
+        outputInternalIdx: internalBase,
+        outputInternalIndices,
+        routineCallInfo: {
+          routineInfoIdx,
+          staticParams,
+        },
+      });
+    }
   }
 
   // Determine carry output sources
@@ -298,14 +472,19 @@ function tryPrepareWasmNativeScan(
     carryOutSources,
     yOutputSources,
     reverse,
+    auxBufferSize: auxBufferSize > 0 ? auxBufferSize : undefined,
+    elementSize: auxBufferSize > 0 ? elementSize : undefined,
+    routineInfos: routineInfos.length > 0 ? routineInfos : undefined,
   };
 
   try {
     const exe = wasmBackend.prepareNativeScanGeneral(params);
     if (exe) {
       if (DEBUG >= 1) {
+        const hasRoutines = steps.some((s) => s.source instanceof Routine);
         console.log(
-          `[wasm-scan] SUCCESS! Using WASM native scan with ${steps.length} steps`,
+          `[wasm-scan] SUCCESS! Using WASM native scan with ${steps.length} steps` +
+            (hasRoutines ? " (includes routines)" : ""),
         );
       }
       return { executable: exe, internalSizes, params };
