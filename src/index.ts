@@ -25,6 +25,7 @@ export {
   type Device,
   devices,
   DType,
+  getBackend,
   Jaxpr,
   type JsTree,
   type JsTreeDef,
