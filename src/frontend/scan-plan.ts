@@ -3,7 +3,7 @@ import type { Backend, Executable } from "../backend";
 import type { NativeScanGeneralParams } from "../backend/wasm";
 import type {
   NativeScanMultiParams,
-  NativeScanParams,
+  NativeScanMultiStep,
   PreparedPreencodedScan,
 } from "../backend/webgpu";
 import { Routine, Routines } from "../routine";
@@ -249,26 +249,37 @@ function tryPrepareWebGPUNativeScan(
       reindexedReduction,
     );
 
-    const params: NativeScanParams = {
+    // Convert single kernel to multi-step format
+    const multiStep: NativeScanMultiStep = {
+      kernel: reindexedKernel,
+      inputs: reindexMap,
+      outputCarryIdx: 0,
+      outputSize: reindexedKernel.size,
+    };
+
+    const params: NativeScanMultiParams = {
       length,
       numConsts,
       constSizes,
-      carrySizes,
-      xsStrides,
-      ysStrides,
-      bodyKernel: reindexedKernel,
       numCarry,
+      carrySizes,
+      numX: xsStrides.length,
+      xsStrides,
+      numY: ysStrides.length,
+      ysStrides,
+      steps: [multiStep],
       reverse,
     };
 
-    if (!backend.prepareNativeScan) {
+    const webgpuBackend = backend as any;
+    if (!webgpuBackend.prepareNativeScanMulti) {
       if (DEBUG >= 2)
-        console.log("[webgpu-scan] backend has no prepareNativeScan");
+        console.log("[webgpu-scan] backend has no prepareNativeScanMulti");
       return null;
     }
 
     try {
-      const exe = backend.prepareNativeScan(params);
+      const exe = webgpuBackend.prepareNativeScanMulti(params);
       if (exe && DEBUG >= 1) {
         console.log(
           "[webgpu-scan] SUCCESS! Using WebGPU native scan (single kernel)",
@@ -277,7 +288,7 @@ function tryPrepareWebGPUNativeScan(
       return exe ? { executable: exe } : null;
     } catch (e) {
       if (DEBUG >= 2)
-        console.warn("[webgpu-scan] prepareNativeScan failed:", e);
+        console.warn("[webgpu-scan] prepareNativeScanMulti failed:", e);
     }
     return null;
   }

@@ -460,7 +460,7 @@ The JIT system lives in `src/frontend/jit.ts` and `src/frontend/jaxpr.ts`.
    in A-Normal Form, where every subexpression is named)
 2. **Simplification** – `jaxpr.flatten().simplify()` canonicalizes the graph
 3. **Graph splitting** – `splitGraphDataflow()` identifies "black nodes" (operations that can't be
-   fused, like reductions or routines) vs fusable elementwise ops
+   fused, like reductions, routines, or `DynamicUpdateSlice`) vs fusable elementwise ops
 4. **Kernel fusion** – Consecutive elementwise ops merge into a single `Kernel` (multi-output if
    needed)
 5. **Compilation** – `jitCompile(backend, jaxpr)` emits a `JitProgram` (list of `JitStep`s)
@@ -485,6 +485,19 @@ multi-output `Kernel`. This reduces kernel dispatch overhead for functions with 
 | `KernelOutput`                    | `alu.ts`     | `{ size, exp, reduction? }` for each kernel output |
 | `Routine`                         | `routine.ts` | Backend-specific op (sort, cholesky, etc.)         |
 
+**JitStep types:**
+
+| Type                 | Purpose                                                             |
+| -------------------- | ------------------------------------------------------------------- |
+| `execute`            | Dispatch a `Kernel` or `Routine` with inputs→outputs                |
+| `copy`               | `DynamicUpdateSlice`: clone dst buffer, patch src region(s) into it |
+| `malloc`             | Allocate a buffer                                                   |
+| `incref`             | Increment refcount on a slot                                        |
+| `free`               | Decrement refcount on a slot                                        |
+| `scan`               | JS fallback scan loop                                               |
+| `compiled-loop`      | Native WASM/WebGPU scan                                             |
+| `preencoded-routine` | Pre-encoded WebGPU routine scan                                     |
+
 **Kernel class (unified single/multi-output):**
 
 The `Kernel` class uses an `outputs: KernelOutput[]` array to support 1..N outputs:
@@ -500,6 +513,8 @@ The `Kernel` class uses an `outputs: KernelOutput[]` array to support 1..N outpu
 2. Add tracing rule in `implRules` / `jvpRules` / `transposeRules`
 3. If fusable elementwise, add ALU lowering in `jit.ts`
 4. If needs dedicated kernel, register in `routinePrimitives` and implement in `src/backend/*`
+5. If copy-like (e.g., `DynamicUpdateSlice`), handle as a special case in `jitCompile()` and add to
+   `splitGraphDataflow()` black node classification
 
 ## Common pitfalls
 
@@ -628,19 +643,19 @@ See [API Contract](#scan-reference-contract) for code examples and ownership det
 
 **Key files:**
 
-| File                                 | Role                                                          |
-| ------------------------------------ | ------------------------------------------------------------- |
-| `src/library/lax-scan.ts`            | Public API                                                    |
-| `src/frontend/core.ts`               | `Primitive.Scan` enum + params type                           |
-| `src/frontend/jaxpr.ts`              | Abstract eval rule                                            |
-| `src/frontend/array.ts`              | Scan impl rule and shared JS fallback loop/stacking helpers   |
-| `src/frontend/jit.ts`                | JIT step types: `scan`, `compiled-loop`, `preencoded-routine` |
-| `src/frontend/scan-plan.ts`          | Central scan path selection + backend preparation             |
-| `src/frontend/linearize.ts`          | JVP + transpose rules for autodiff                            |
-| `src/frontend/vmap.ts`               | Scan vmap rule (batches independent scans)                    |
-| `src/backend/wasm.ts`                | Compiled-loop codegen                                         |
-| `src/backend/webgpu.ts`              | Compiled-loop + preencoded-routine for routines               |
-| `src/backend/webgpu/scan-wrapper.ts` | WGSL shader transformer for uniform offsets                   |
+| File                                 | Role                                                                  |
+| ------------------------------------ | --------------------------------------------------------------------- |
+| `src/library/lax-scan.ts`            | Public API                                                            |
+| `src/frontend/core.ts`               | `Primitive.Scan` enum + params type                                   |
+| `src/frontend/jaxpr.ts`              | Abstract eval rule                                                    |
+| `src/frontend/array.ts`              | Scan impl rule and shared JS fallback loop/stacking helpers           |
+| `src/frontend/jit.ts`                | JIT step types: `scan`, `compiled-loop`, `preencoded-routine`, `copy` |
+| `src/frontend/scan-plan.ts`          | Central scan path selection + backend preparation                     |
+| `src/frontend/linearize.ts`          | JVP + transpose rules for autodiff                                    |
+| `src/frontend/vmap.ts`               | Scan vmap rule (batches independent scans)                            |
+| `src/backend/wasm.ts`                | Compiled-loop codegen                                                 |
+| `src/backend/webgpu.ts`              | Compiled-loop + preencoded-routine for routines                       |
+| `src/backend/webgpu/scan-wrapper.ts` | WGSL shader transformer for uniform offsets                           |
 
 ---
 
@@ -954,10 +969,11 @@ Understanding how JIT interacts with scan is crucial for performance:
 
 ```
 1. Trace body function f → bodyJaxpr
-2. JIT-compile bodyJaxpr → bodyProgram (this ALWAYS happens)
-3. Execute via scanRunner callback:
-   - compiled-loop/preencoded-routine: Single step runs entire loop
-   - fallback: JS loop calling bodyProgram.execute() per iteration
+2. JIT-compile bodyJaxpr → bodyProgram (via jitCompile in the impl rule)
+3. Execute via #runScanFallbackLoop:
+   - JS loop calling bodyProgram.execute() per iteration
+   - Carry/xSlice pending ops flushed before each body call
+   - Body pending ops flushed after each body call
 ```
 
 **With JIT wrapper:** `jit(() => lax.scan(f, init, xs))()`
@@ -977,8 +993,8 @@ is whether the **outer loop** runs natively (compiled-loop/preencoded-routine) o
 
 **Why use `jit()` wrapper:**
 
-- **Enables compiled-loop/preencoded-routine** — Without jit, scan uses `scanRunner` (JS loop). With
-  jit, the compiler can emit steps that run entirely in WASM/GPU.
+- **Enables compiled-loop/preencoded-routine** — Without jit, scan uses `#runScanFallbackLoop` (JS
+  loop). With jit, the compiler can emit steps that run entirely in WASM/GPU.
 - **Caches compilation** — `jit((xs) => scan(...))` compiles once, runs many times.
 - **Captures constants** — Closed-over arrays become constants in the compiled program.
 
@@ -1037,17 +1053,10 @@ const avalsIn = tracers.map((t) => {
 });
 ```
 
-**Execution time (array.ts):** The scan impl rule creates `.ref` copies internally before calling
-`evalJaxpr` (`src/frontend/array.ts:1414-1420`):
-
-```typescript
-const jaxprInputs = [
-  ...constViews.map((c) => c.ref),
-  ...carry.map((c) => c.ref), // Scan creates .ref
-  ...xSlice,
-];
-// evalJaxpr consumes jaxprInputs
-```
+**Execution time (array.ts):** The non-JIT `Primitive.Scan` impl uses `jitCompile(backend, jaxpr)`
+to compile the body, then calls `bodyProgram.execute()` per iteration with raw slots — the same code
+path as the JIT scanRunner. Carry and const slots are extracted via `_realizeSource()`, and their
+pending ops are explicitly flushed before execution (carry inside the loop, consts once outside).
 
 **Why this matters:** Code that works during tracing (with `jit()`) will also work at execution time
 (without `jit()`), and vice versa. A body function that double-consumes a variable will fail during
@@ -1090,12 +1099,11 @@ setDebug(2); // Shows shader/WASM code
 | numCarry ≠ numY      | "numCarry !== numY"                          | Match carry/output counts     |
 | Unsupported routine  | "unsupported routine in scan body"           | Use supported routine or WASM |
 
-### JIT step types
+### JIT step types (scan-related)
 
-| ScanPath | Meaning | Internal Step Types |
-| -------- | ------- | ------------------- |
-
-| `fallback` | JS loop with per-iteration dispatch | `scan` |
+| ScanPath   | Meaning                             | Internal Step Types |
+| ---------- | ----------------------------------- | ------------------- |
+| `fallback` | JS loop with per-iteration dispatch | `scan`              |
 
 ### Body composition types
 
@@ -1748,21 +1756,23 @@ contributors should be aware of:
   object via `(flatF as any)._yTreedef = yTreedef`. This is invisible to TypeScript and could be
   replaced with a closure variable.
 
-- **Fallback Y stacking:** The `scanRunner` in `array.ts` preallocates the final stacked-Y buffer
-  and writes each iteration's Y directly using `copyBufferToBuffer` (when 4-byte aligned) or the
-  WGSL copy shader `COPY_SHADER_CODE` (when unaligned, e.g., f16 arrays with odd element counts).
-  The WGSL copy shader indexes by destination word to avoid read-modify-write races between threads.
-  See `test/scan-preallocate.test.ts` for edge-case coverage (duplicate-slot, passthrough, reverse,
-  length-0). The preencoded scan path (`dispatchPreencodedScan`) also uses the WGSL copy shader for
-  ys stacking when carry sizes are not 4-byte aligned.
+- **Fallback Y stacking:** The `#runScanFallbackLoop` in `array.ts` handles DUS-based Y stacking
+  directly via `preallocatedYSlots` parameter and `#copySliceToBuffer`. Both the JIT-path
+  `scanRunner` callback and the non-JIT `Primitive.Scan` impl pass preallocated buffer slots; the
+  loop writes each iteration's Y using `copyBufferToBuffer` (4-byte aligned) or the WGSL copy shader
+  `COPY_SHADER_CODE` (unaligned). Both paths set `protectSharedSlots: true` to incRef shared carry/Y
+  backend slots before disposal (needed because both paths return raw slots from
+  `bodyProgram.execute()`, not `.ref`'d Arrays). See `test/scan-preallocate.test.ts` for edge-case
+  coverage (duplicate-slot, passthrough, reverse, length-0). The preencoded scan path
+  (`dispatchPreencodedScan`) also uses the WGSL copy shader for ys stacking when carry sizes are not
+  4-byte aligned.
 
 ### Future work
 
-| Priority | Feature                         | Notes                                              |
-| -------- | ------------------------------- | -------------------------------------------------- |
-| Medium   | Mixed-dtype WebGPU scan shader  | Per-binding dtype in `nativeScanMultiShaderSource` |
-| Medium   | WebGL copy for scan stacking    | Enable direct-write stacked Ys on WebGL fallback   |
-| Low      | `lax.scatter` / `dynamic_slice` | Would enable Jaxpr-based routines                  |
+| Priority | Feature                        | Notes                                              |
+| -------- | ------------------------------ | -------------------------------------------------- |
+| Medium   | Mixed-dtype WebGPU scan shader | Per-binding dtype in `nativeScanMultiShaderSource` |
+| Medium   | WebGL copy for scan stacking   | Enable direct-write stacked Ys on WebGL fallback   |
 
 #### Completed: Preallocated Y stacking
 
@@ -1774,6 +1784,41 @@ The following planned steps are now implemented:
 4. ✅ `scanRunner` direct-write path — preallocated stacked-Y output buffers.
 5. ✅ Preencoded scan (`dispatchPreencodedScan`) uses shader copy for unaligned ys stacking.
 6. ✅ Tests: passthrough, duplicate-slot, reverse, length-0 (`test/scan-preallocate.test.ts`).
+
+#### Completed: DynamicUpdateSlice in JIT
+
+7. ✅ JIT `"copy"` step type — compiles `DynamicUpdateSlice` to buffer clone + patch operations.
+8. ✅ `splitGraphDataflow()` classifies DUS as a black node (materialized inputs/outputs).
+9. ✅ Both modes supported: same-rank (axis update) and stacked (axis=0, src.ndim = dst.ndim - 1).
+10. ✅ Alignment-aware: uses `copyBufferWithShader` for unaligned copies on WebGPU.
+11. ✅ Tests: `test/dynamic_update_slice.test.ts` covers JIT same-rank, stacked, chained, non-zero
+    axis, arithmetic+DUS composition, and scalar stacked modes.
+
+#### Completed: DUS-based scan Y stacking
+
+12. ✅ `#runScanFallbackLoop` absorbs Y stacking logic — accepts `backend`, `preallocatedYSlots`,
+    and `protectSharedSlots` parameters instead of `writeY` / `onBeforeCarryDispose` callbacks.
+13. ✅ Both JIT-path `scanRunner` and non-JIT `Primitive.Scan` impl pass preallocated Y buffer slots
+    directly; two separate `writeY` closure creation sites eliminated.
+14. ✅ Shared-slot protection (`protectSharedSlots: true`) used by both JIT and non-JIT paths — both
+    now use `bodyProgram.execute()` which returns raw slots.
+15. ✅ Pending flush for Y slices handled inside the loop (required for both paths where
+    `bodyProgram.execute()` may produce arrays with pending ops).
+16. ✅ Net reduction: −33 lines in `array.ts`.
+
+#### Completed: Non-JIT body JIT-compile and JIT helpers
+
+17. ✅ Non-JIT `Primitive.Scan` impl uses `jitCompile(backend, jaxpr)` + `bodyProgram.execute()`
+    instead of `evalJaxpr()` — same code path as JIT scanRunner, kernel fusion in both paths.
+18. ✅ Carry, xSlice, and const pending ops explicitly flushed before `bodyProgram.execute()` call
+    (slots may have AluExp realization or ShapeTracker realization pending).
+19. ✅ `evalJaxpr` import removed from `array.ts` (no longer used).
+20. ✅ `ScanRunner` type converted from 14 positional params to `ScanRunnerParams` interface.
+21. ✅ `stepUsesId()` helper — exhaustive JitStep field check for `insertFreeSteps`.
+22. ✅ `JitProgram.resolveScanSlots()` — deduplicates scan/compiled-loop/preencoded-routine
+    preamble.
+23. ✅ `dispatchNativeScan` removed from `Backend` interface — unified to
+    `dispatchNativeScanGeneral`.
 
 ### WASM feature opportunities (assessed Feb 2026)
 

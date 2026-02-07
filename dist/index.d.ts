@@ -577,12 +577,8 @@ interface Backend {
   dispatch(exe: Executable, inputs: Slot[], outputs: Slot[]): void;
   /** Prepare a general native scan operation (WASM backend). */
   prepareNativeScanGeneral?(params: any): Executable | null;
-  /** Dispatch a general native scan operation (WASM backend). */
+  /** Dispatch a general native scan operation. */
   dispatchNativeScanGeneral?(exe: Executable, params: any, consts: Slot[], initCarry: Slot[], xs: Slot[], carryOut: Slot[], ysStacked: Slot[]): void;
-  /** Prepare a native scan operation (WebGPU backend). */
-  prepareNativeScan?(params: any): Executable | null;
-  /** Dispatch a native scan operation (WebGPU backend). */
-  dispatchNativeScan?(exe: Executable, consts: Slot[], initCarry: Slot[], xs: Slot[], carryOut: Slot[], ysStacked: Slot[]): void;
   /** Copy a contiguous range of bytes from src buffer to dst buffer. */
   copyBufferToBuffer?(srcSlot: Slot, srcOffset: number, dstSlot: Slot, dstOffset: number, size: number): void;
   /**

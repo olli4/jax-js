@@ -53,7 +53,7 @@ import {
   where,
 } from "./core";
 import { concatenate as coreConcatenate } from "./core";
-import { abstractEvalRules, evalJaxpr } from "./jaxpr";
+import { abstractEvalRules } from "./jaxpr";
 import { jitCompile, ScanRunner } from "./jit";
 
 const JsArray = globalThis.Array;
@@ -875,6 +875,34 @@ export class Array extends Tracer {
     };
   }
 
+  /** Copy a single Y slice buffer into a preallocated stacked output at the given offset. */
+  static #copySliceToBuffer(
+    backend: Backend,
+    srcSlot: Slot,
+    dstSlot: Slot,
+    dstOffsetBytes: number,
+    sizeBytes: number,
+  ): void {
+    const canBufferCopy = dstOffsetBytes % 4 === 0 && sizeBytes % 4 === 0;
+    if (backend.copyBufferToBuffer && canBufferCopy) {
+      backend.copyBufferToBuffer(
+        srcSlot,
+        0,
+        dstSlot,
+        dstOffsetBytes,
+        sizeBytes,
+      );
+    } else if (backend.copyBufferWithShader) {
+      backend.copyBufferWithShader(
+        srcSlot,
+        0,
+        dstSlot,
+        dstOffsetBytes,
+        sizeBytes,
+      );
+    }
+  }
+
   static #stackScanYs(ySlices: Array[][], reverse: boolean): Array[] {
     return ySlices.map((slices) => {
       const reshaped = slices.map((s) => {
@@ -907,12 +935,13 @@ export class Array extends Tracer {
     initCarry: Array[];
     bodyOutAvals: ShapedArray[];
     runBody: (carry: Array[], xSlice: Array[], iter: number) => Array[];
-    writeY?: (
-      writeIndex: number,
-      ySlice: Array[],
-      yStrideBytes: number[],
-    ) => void;
-    onBeforeCarryDispose?: (oldCarry: Array[], ySlice: Array[]) => void;
+    backend: Backend;
+    /** Preallocated Y stacked buffer slots. When provided, Y slices are written
+     *  directly via DUS-style copy (copyBufferToBuffer / copyBufferWithShader). */
+    preallocatedYSlots?: Slot[];
+    /** When true, incRef Y slots shared with old carry before disposal.
+     *  Needed in JIT path where body outputs are raw slots (not .ref'd). */
+    protectSharedSlots?: boolean;
     disposeXSlices: boolean;
   }): { carry: Array[]; ySlices: Array[][]; usedDirectWrite: boolean } {
     const {
@@ -924,18 +953,19 @@ export class Array extends Tracer {
       initCarry,
       bodyOutAvals,
       runBody,
-      writeY,
-      onBeforeCarryDispose,
+      backend,
+      preallocatedYSlots,
+      protectSharedSlots,
       disposeXSlices,
     } = params;
 
-    const canDirectWriteY = numY > 0 && !!writeY;
+    const directWrite = numY > 0 && preallocatedYSlots !== undefined;
     const yStrideBytes = bodyOutAvals
       .slice(numCarry)
       .map((aval) => prod(aval.shape) * byteWidth(aval.dtype));
 
     const ySlices: Array[][] = [];
-    if (!canDirectWriteY) {
+    if (!directWrite) {
       for (let j = 0; j < numY; j++) ySlices.push([]);
     }
 
@@ -956,17 +986,40 @@ export class Array extends Tracer {
       const newCarry = outs.slice(0, numCarry);
       const ySlice = outs.slice(numCarry);
 
-      if (canDirectWriteY) {
-        const writeIndex = reverse ? length - 1 - i : i;
-        writeY!(writeIndex, ySlice, yStrideBytes);
+      // DUS-based Y stacking: copy each Y slice into preallocated stacked buffer
+      if (directWrite) {
+        for (let j = 0; j < numY; j++) {
+          const sizeBytes = yStrideBytes[j];
+          if (sizeBytes <= 0) continue;
+          const ySlot = ySlice[j]._realizeSource();
+          // Flush pending ops to ensure Y data is computed before copy
+          for (const exe of ySlice[j].#pending) {
+            exe.prepareSync();
+            exe.submit();
+          }
+          Array.#copySliceToBuffer(
+            backend,
+            ySlot,
+            preallocatedYSlots[j],
+            dataIdx * sizeBytes,
+            sizeBytes,
+          );
+        }
       } else {
         for (let j = 0; j < numY; j++) {
           ySlices[j].push(ySlice[j]);
         }
       }
 
-      if (i > 0 && onBeforeCarryDispose) {
-        onBeforeCarryDispose(carry, ySlice);
+      // Protect shared slots: incRef Y slots that share a backend slot with
+      // old carry, preventing use-after-free when carry is disposed below.
+      if (i > 0 && protectSharedSlots) {
+        const carrySlots = new Set(carry.map((c) => c._realizeSource()));
+        for (const y of ySlice) {
+          if (carrySlots.has(y._realizeSource())) {
+            backend.incRef(y._realizeSource());
+          }
+        }
       }
 
       if (i > 0) {
@@ -974,7 +1027,7 @@ export class Array extends Tracer {
       }
       carry = newCarry;
 
-      if (canDirectWriteY) {
+      if (directWrite) {
         ySlice.forEach((y) => y.dispose());
       }
 
@@ -983,7 +1036,7 @@ export class Array extends Tracer {
       }
     }
 
-    return { carry, ySlices, usedDirectWrite: canDirectWriteY };
+    return { carry, ySlices, usedDirectWrite: directWrite };
   }
 
   //
@@ -1355,22 +1408,22 @@ export class Array extends Tracer {
         // - Object allocation inside the loop
         // The fused paths (compiled-loop, preencoded-routine) avoid this overhead entirely
         // by running the entire loop in WASM or GPU shader code.
-        const scanRunner: ScanRunner = (
+        const scanRunner: ScanRunner = ({
           bodyProgram,
-          _backend,
+          backend: _backend,
           bodyJaxpr,
           length,
           numCarry,
-          _numConsts,
-          _numX,
+          numConsts: _numConsts,
+          numX: _numX,
           numY,
           reverse,
           constSlots,
           initCarrySlots,
           xsSlots,
-          xsAvals, // xs avals passed from scan step (correct after transforms like vmap)
+          xsAvals,
           outputSlots,
-        ) => {
+        }) => {
           // Get avals from bodyJaxpr for wrapping slots
           const carryAvals = bodyJaxpr.inBinders
             .slice(constSlots.length, constSlots.length + numCarry)
@@ -1413,49 +1466,6 @@ export class Array extends Tracer {
             numY > 0 &&
             outputSlots.length === numCarry + numY &&
             (backend.copyBufferToBuffer || backend.copyBufferWithShader);
-
-          const writeY = canDirectWriteY
-            ? (writeIndex: number, ySlice: Array[], yStrideBytes: number[]) => {
-                for (let j = 0; j < numY; j++) {
-                  const sizeBytes = yStrideBytes[j];
-                  if (sizeBytes <= 0) continue;
-                  const dstOffsetBytes = writeIndex * sizeBytes;
-                  const ySlot = ySlice[j]._realizeSource();
-                  const dstSlot = outputSlots[numCarry + j];
-                  const canBufferCopy =
-                    dstOffsetBytes % 4 === 0 && sizeBytes % 4 === 0;
-                  if (backend.copyBufferToBuffer && canBufferCopy) {
-                    backend.copyBufferToBuffer(
-                      ySlot,
-                      0,
-                      dstSlot,
-                      dstOffsetBytes,
-                      sizeBytes,
-                    );
-                  } else if (backend.copyBufferWithShader) {
-                    backend.copyBufferWithShader(
-                      ySlot,
-                      0,
-                      dstSlot,
-                      dstOffsetBytes,
-                      sizeBytes,
-                    );
-                  }
-                }
-              }
-            : undefined;
-
-          const onBeforeCarryDispose = (oldCarry: Array[], ySlice: Array[]) => {
-            const oldCarrySlots = new Set(
-              oldCarry.map((c) => c._realizeSource()),
-            );
-            for (const y of ySlice) {
-              const slot = y._realizeSource();
-              if (oldCarrySlots.has(slot)) {
-                backend.incRef(slot);
-              }
-            }
-          };
 
           const runBody = (curCarry: Array[], xSlice: Array[], i: number) => {
             const carrySlots = curCarry.map((c) => c._realizeSource());
@@ -1519,8 +1529,11 @@ export class Array extends Tracer {
             initCarry: carry,
             bodyOutAvals,
             runBody,
-            writeY,
-            onBeforeCarryDispose,
+            backend,
+            preallocatedYSlots: canDirectWriteY
+              ? outputSlots.slice(numCarry)
+              : undefined,
+            protectSharedSlots: true,
             disposeXSlices: true,
           });
 
@@ -1658,48 +1671,67 @@ export class Array extends Tracer {
 
         let carry = initCarry;
 
-        const writeY = canDirectWriteY
-          ? (writeIndex: number, ySlice: Array[], yStrideBytes: number[]) => {
-              for (let j = 0; j < numY; j++) {
-                const sizeBytes = yStrideBytes[j];
-                if (sizeBytes <= 0) continue;
-                const dstOffsetBytes = writeIndex * sizeBytes;
-                const ySlot = ySlice[j]._realizeSource();
-                for (const exe of ySlice[j].#pending) {
-                  exe.prepareSync();
-                  exe.submit();
-                }
-                const dstSlot = preallocatedSlots[j];
-                const canBufferCopy =
-                  dstOffsetBytes % 4 === 0 && sizeBytes % 4 === 0;
-                if (backend.copyBufferToBuffer && canBufferCopy) {
-                  backend.copyBufferToBuffer(
-                    ySlot,
-                    0,
-                    dstSlot,
-                    dstOffsetBytes,
-                    sizeBytes,
-                  );
-                } else if (backend.copyBufferWithShader) {
-                  backend.copyBufferWithShader(
-                    ySlot,
-                    0,
-                    dstSlot,
-                    dstOffsetBytes,
-                    sizeBytes,
-                  );
-                }
-              }
-            }
-          : undefined;
+        // JIT-compile body for fused per-iteration execution (kernel fusion,
+        // fewer dispatches per iteration vs interpreted evalJaxpr).
+        const bodyProgram = jitCompile(backend, jaxpr);
+        const constSlots = constViews.map((c) => c._realizeSource());
+
+        // Flush pending ops on consts (may have AluExp realization pending)
+        for (const c of constViews) {
+          for (const exe of c.#pending) {
+            exe.prepareSync();
+            exe.submit();
+          }
+        }
 
         const runBody = (curCarry: Array[], xSlice: Array[]) => {
-          const jaxprInputs = [
-            ...constViews.map((c) => c.ref),
-            ...curCarry.map((c) => c.ref),
-            ...xSlice,
-          ];
-          return evalJaxpr(jaxpr, jaxprInputs) as Array[];
+          const carrySlots = curCarry.map((c) => c._realizeSource());
+          const xSliceSlots = xSlice.map((x) => x._realizeSource());
+
+          // Flush pending ops on carry and xSlices (may have pending from
+          // AluExp realization or ShapeTracker realize)
+          for (const c of curCarry) {
+            for (const exe of c.#pending) {
+              exe.prepareSync();
+              exe.submit();
+            }
+          }
+          for (const x of xSlice) {
+            for (const exe of x.#pending) {
+              exe.prepareSync();
+              exe.submit();
+            }
+          }
+
+          const { outputs: bodyOuts, pending } = bodyProgram.execute([
+            ...constSlots,
+            ...carrySlots,
+            ...xSliceSlots,
+          ]);
+
+          for (const exe of pending) {
+            exe.prepareSync();
+            exe.submit();
+          }
+
+          // Wrap slots as Arrays, incRef duplicate slots (passthrough pattern)
+          const seenSlots = new Set<Slot>();
+          return bodyOuts.map((slot, j) => {
+            if (seenSlots.has(slot)) {
+              backend.incRef(slot);
+            } else {
+              seenSlots.add(slot);
+            }
+            return new Array({
+              source: slot,
+              st: ShapeTracker.fromShape(bodyOutAvals[j].shape),
+              dtype: bodyOutAvals[j].dtype,
+              weakType: bodyOutAvals[j].weakType,
+              backend,
+              committed: true,
+              pending: [],
+            });
+          });
         };
 
         const loopResult = Array.#runScanFallbackLoop({
@@ -1711,7 +1743,9 @@ export class Array extends Tracer {
           initCarry: carry,
           bodyOutAvals,
           runBody,
-          writeY,
+          backend,
+          preallocatedYSlots: canDirectWriteY ? preallocatedSlots : undefined,
+          protectSharedSlots: true,
           disposeXSlices: false,
         });
 

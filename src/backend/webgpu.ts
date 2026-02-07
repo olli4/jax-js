@@ -47,28 +47,6 @@ interface ShaderDispatch extends ShaderInfo {
   pipeline: GPUComputePipeline; // Compiled pipeline for the shader.
 }
 
-/** Parameters for native scan execution on WebGPU (elementwise kernel body). */
-export interface NativeScanParams {
-  /** Number of scan iterations (length of xs along axis 0). */
-  length: number;
-  /** Number of constant arrays. */
-  numConsts: number;
-  /** Sizes of each constant buffer in bytes. */
-  constSizes: number[];
-  /** Sizes of each carry buffer in bytes. */
-  carrySizes: number[];
-  /** Strides (in bytes) along axis 0 for each xs input. */
-  xsStrides: number[];
-  /** Strides (in bytes) along axis 0 for each stacked y output. */
-  ysStrides: number[];
-  /** The body kernel to execute each iteration. */
-  bodyKernel: Kernel;
-  /** Number of carry arrays. */
-  numCarry: number;
-  /** Whether to scan in reverse order. */
-  reverse?: boolean;
-}
-
 /** Describes a single step in a multi-kernel scan body (WebGPU). */
 export interface NativeScanMultiStep {
   /** The kernel to execute. */
@@ -598,34 +576,6 @@ export class WebGPUBackend implements Backend {
   }
 
   /**
-   * Prepare a native scan operation for efficient execution.
-   * Returns null if the scan cannot be natively executed.
-   */
-  prepareNativeScan(
-    params: NativeScanParams,
-  ): Executable<ShaderDispatch[]> | null {
-    const { bodyKernel } = params;
-    if (!bodyKernel) return null;
-
-    try {
-      const shader = nativeScanShaderSource(this.device, params);
-      const pipeline = this.pipelines.prepareSync(shader);
-      const syntheticKernel = Kernel.single(
-        bodyKernel.nargs,
-        bodyKernel.size,
-        bodyKernel.exp,
-        bodyKernel.reduction,
-      );
-      return new Executable(syntheticKernel, [{ ...shader, pipeline }]);
-    } catch (e) {
-      if (DEBUG >= 2) {
-        console.warn("WebGPU native scan codegen failed:", e);
-      }
-      return null;
-    }
-  }
-
-  /**
    * Dispatch a native scan operation.
    * @param exe - The prepared native scan executable
    * @param consts - Constant buffer slots
@@ -634,8 +584,9 @@ export class WebGPUBackend implements Backend {
    * @param carryOut - Output carry buffer slots
    * @param ysStacked - Output stacked ys buffer slots
    */
-  dispatchNativeScan(
+  dispatchNativeScanGeneral(
     exe: Executable<ShaderDispatch[]>,
+    _params: any,
     consts: Slot[],
     initCarry: Slot[],
     xs: Slot[],
@@ -1563,64 +1514,6 @@ function pipelineSource(device: GPUDevice, kernel: Kernel): ShaderInfo {
     hasUniform: false,
     passes: [{ grid: [gridX, gridY] }],
   };
-}
-
-/**
- * Generate a WGSL shader for native scan with inlined body kernel.
- *
- * CRITICAL INVARIANT: This shader is only correct for per-element-independent kernels.
- * Each GPU thread i operates exclusively on carry[i] and xs[iter, i] — no cross-thread
- * communication occurs. This invariant is enforced at JIT compile time: only elementwise
- * kernels (no cross-element dependencies) qualify for native scan fusion.
- *
- * Without this invariant, the lack of global barriers between iterations would cause
- * data races. WGSL barriers are workgroup-scoped only, not global across all threads.
- *
- * This is a convenience wrapper around nativeScanMultiShaderSource for single-kernel scans.
- */
-function nativeScanShaderSource(
-  device: GPUDevice,
-  params: NativeScanParams,
-): ShaderInfo {
-  const {
-    length,
-    numConsts,
-    constSizes,
-    carrySizes,
-    xsStrides,
-    ysStrides,
-    bodyKernel,
-    numCarry,
-    reverse,
-  } = params;
-
-  // Single carry/output with matching sizes
-  if (numCarry !== 1 || ysStrides.length !== 1) {
-    throw new Error("Native scan: only single carry/output supported");
-  }
-
-  // Convert to multi-step format: single step writing to carry0
-  const step: NativeScanMultiStep = {
-    kernel: bodyKernel,
-    inputs: [], // Not used by codegen, we rely on GlobalIndex in expressions
-    outputCarryIdx: 0,
-    outputSize: bodyKernel.size,
-  };
-
-  // Delegate to the multi-kernel version
-  return nativeScanMultiShaderSource(device, {
-    length,
-    numConsts,
-    constSizes,
-    numCarry,
-    carrySizes,
-    numX: xsStrides.length,
-    xsStrides,
-    numY: ysStrides.length,
-    ysStrides,
-    steps: [step],
-    reverse,
-  });
 }
 
 /**

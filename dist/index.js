@@ -1,6 +1,6 @@
 import { __export } from "./chunk-Cl8Af3a2.js";
-import { AluExp, AluGroup, AluOp, AluVar, DEBUG, DType, FpHash, Kernel, PPrint, Reduction, Routine, Routines, ShapeTracker, accessorAluExp, accessorGlobal, assertNonNull, byteWidth, checkAxis, checkInts, deepEqual, defaultDevice, devices, dtypedArray, dtypedJsArray, generalBroadcast, getBackend, init, invertPermutation, isFloatDtype, isNumberPair, isPermutation, normalizeAxis, partitionList, prod, promoteTypes, range, recursiveFlatten, rep, runWithCache, setDebug, toposort, unravelAlu, unzip2, zip, zipn } from "./backend-8-AJ5Wdn.js";
-import { createAllIterationsOffsetsBuffer, wrapRoutineForScan } from "./scan-wrapper-BTkmgtRb.js";
+import { AluExp, AluGroup, AluOp, AluVar, DEBUG, DType, FpHash, Kernel, PPrint, Reduction, Routine, Routines, ShapeTracker, accessorAluExp, accessorGlobal, assertNonNull, byteWidth, checkAxis, checkInts, deepEqual, defaultDevice, devices, dtypedArray, dtypedJsArray, generalBroadcast, getBackend, init, invertPermutation, isFloatDtype, isNumberPair, isPermutation, normalizeAxis, partitionList, prod, promoteTypes, range, recursiveFlatten, rep, runWithCache, setDebug, toposort, unravelAlu, unzip2, zip, zipn } from "./backend-jcx7yOTe.js";
+import { createAllIterationsOffsetsBuffer, wrapRoutineForScan } from "./scan-wrapper-k8KoDl2N.js";
 
 //#region src/frontend/convolution.ts
 /**
@@ -2018,27 +2018,36 @@ function tryPrepareWebGPUNativeScan(backend, bodyProgram, bodyJaxpr, executeStep
 		const reindexedExp = kernel.exp.reindexGids(reindexMap);
 		const reindexedReduction = kernel.reduction?.reindexGids(reindexMap);
 		const reindexedKernel = Kernel.single(numInputs, kernel.size, reindexedExp, reindexedReduction);
+		const multiStep = {
+			kernel: reindexedKernel,
+			inputs: reindexMap,
+			outputCarryIdx: 0,
+			outputSize: reindexedKernel.size
+		};
 		const params$1 = {
 			length,
 			numConsts,
 			constSizes,
-			carrySizes,
-			xsStrides,
-			ysStrides,
-			bodyKernel: reindexedKernel,
 			numCarry,
+			carrySizes,
+			numX: xsStrides.length,
+			xsStrides,
+			numY: ysStrides.length,
+			ysStrides,
+			steps: [multiStep],
 			reverse
 		};
-		if (!backend.prepareNativeScan) {
-			if (DEBUG >= 2) console.log("[webgpu-scan] backend has no prepareNativeScan");
+		const webgpuBackend$1 = backend;
+		if (!webgpuBackend$1.prepareNativeScanMulti) {
+			if (DEBUG >= 2) console.log("[webgpu-scan] backend has no prepareNativeScanMulti");
 			return null;
 		}
 		try {
-			const exe = backend.prepareNativeScan(params$1);
+			const exe = webgpuBackend$1.prepareNativeScanMulti(params$1);
 			if (exe && DEBUG >= 1) console.log("[webgpu-scan] SUCCESS! Using WebGPU native scan (single kernel)");
 			return exe ? { executable: exe } : null;
 		} catch (e$1) {
-			if (DEBUG >= 2) console.warn("[webgpu-scan] prepareNativeScan failed:", e$1);
+			if (DEBUG >= 2) console.warn("[webgpu-scan] prepareNativeScanMulti failed:", e$1);
 		}
 		return null;
 	}
@@ -2518,7 +2527,7 @@ function planScan(backend, bodyProgram, bodyJaxpr, length, numCarry, numConsts, 
 //#endregion
 //#region src/frontend/jit.ts
 /** Result of compiling a Jaxpr. Can be evaluated on a series of inputs. */
-var JitProgram = class {
+var JitProgram = class JitProgram {
 	constructor(backend, steps, inputs, outputs) {
 		this.backend = backend;
 		this.steps = steps;
@@ -2540,6 +2549,7 @@ var JitProgram = class {
 				case "incref": return PPrint.pp(`incref ${step.input}`);
 				case "free": return PPrint.pp(`free ${step.input}`);
 				case "scan": return PPrint.pp(`scan length=${step.length} numCarry=${step.numCarry} numConsts=${step.numConsts}`).concat(PPrint.pp(`  consts=[${step.consts.join(", ")}] initCarry=[${step.initCarry.join(", ")}] xs=[${step.xs.join(", ")}]`)).concat(PPrint.pp(`  outputs=[${step.outputs.join(", ")}]`)).concat(PPrint.pp("  body=").concat(PPrint.pp(step.bodyJaxpr.toString()).indent(4)));
+				case "copy": return PPrint.pp(`copy %${step.dst} + %${step.src} -> %${step.output} (${step.totalBytes}B, ${step.updates.length} update${step.updates.length !== 1 ? "s" : ""})`);
 				case "compiled-loop": return PPrint.pp(`compiled-loop length=${step.length} numCarry=${step.numCarry}`).concat(PPrint.pp(`  initCarry=[${step.initCarry.join(", ")}] xs=[${step.xs.join(", ")}]`)).concat(PPrint.pp(`  outputs=[${step.outputs.join(", ")}]`));
 				case "preencoded-routine": return PPrint.pp(`preencoded-routine length=${step.length} numCarry=${step.numCarry} numConsts=${step.numConsts}`).concat(PPrint.pp(`  initCarry=[${step.initCarry.join(", ")}] xs=[${step.xs.join(", ")}]`)).concat(PPrint.pp(`  outputs=[${step.outputs.join(", ")}]`));
 			}
@@ -2549,6 +2559,23 @@ var JitProgram = class {
 	}
 	toString() {
 		return this.pprint().toString();
+	}
+	/** Flush all pending GPU/WASM operations and clear the pending array. */
+	static flushPending(pending) {
+		for (const p of pending) {
+			p.prepareSync();
+			p.submit();
+		}
+		pending.length = 0;
+	}
+	/** Resolve scan-related slot IDs from the scope map. */
+	static resolveScanSlots(step, scope) {
+		return {
+			constSlots: step.consts.map((id) => scope.get(id)),
+			initCarrySlots: step.initCarry.map((id) => scope.get(id)),
+			xsSlots: step.xs.map((id) => scope.get(id)),
+			outputSlots: step.outputs.map((id) => scope.get(id))
+		};
 	}
 	/** Execute the JitProgram with the given inputs.
 	* @param scanRunner - Optional callback to run scan steps. Required if program contains scan steps.
@@ -2582,17 +2609,23 @@ var JitProgram = class {
 				scope.delete(step.input);
 				break;
 			}
+			case "copy": {
+				JitProgram.flushPending(pending);
+				const dstSlot = scope.get(step.dst);
+				const srcSlot = scope.get(step.src);
+				const outSlot = scope.get(step.output);
+				this.backend.copyBufferToBuffer(dstSlot, 0, outSlot, 0, step.totalBytes);
+				for (const u of step.updates) {
+					const aligned = u.srcOffset % 4 === 0 && u.dstOffset % 4 === 0 && u.size % 4 === 0;
+					if (aligned || !this.backend.copyBufferWithShader) this.backend.copyBufferToBuffer(srcSlot, u.srcOffset, outSlot, u.dstOffset, u.size);
+					else this.backend.copyBufferWithShader(srcSlot, u.srcOffset, outSlot, u.dstOffset, u.size);
+				}
+				break;
+			}
 			case "scan": {
 				if (!scanRunner) throw new Error("internal: scan step requires scanRunner callback");
-				for (const p of pending) {
-					p.prepareSync();
-					p.submit();
-				}
-				pending.length = 0;
-				const constSlots = step.consts.map((id) => scope.get(id));
-				const initCarrySlots = step.initCarry.map((id) => scope.get(id));
-				const xsSlots = step.xs.map((id) => scope.get(id));
-				const outputSlots = step.outputs.map((id) => scope.get(id));
+				JitProgram.flushPending(pending);
+				const { constSlots, initCarrySlots, xsSlots, outputSlots } = JitProgram.resolveScanSlots(step, scope);
 				if (DEBUG >= 2) {
 					console.log(`[jit.scan] step.xs=${step.xs}, xsSlots=${xsSlots}`);
 					console.log(`[jit.scan] step.xsAvals=${JSON.stringify(step.xsAvals?.map((a) => ({
@@ -2603,9 +2636,24 @@ var JitProgram = class {
 						const data = this.backend.readSync(xsSlots[i]);
 						console.log(`[jit.scan] xs[${i}] data:`, new Float32Array(data.buffer));
 					}
+					console.log(`[jit.scan] Before scanRunner: outputSlots=${outputSlots}, step.outputs=${step.outputs}`);
 				}
-				if (DEBUG >= 2) console.log(`[jit.scan] Before scanRunner: outputSlots=${outputSlots}, step.outputs=${step.outputs}`);
-				const result = scanRunner(step.bodyProgram, this.backend, step.bodyJaxpr, step.length, step.numCarry, step.numConsts, step.numX, step.numY, step.reverse, constSlots, initCarrySlots, xsSlots, step.xsAvals, outputSlots);
+				const result = scanRunner({
+					bodyProgram: step.bodyProgram,
+					backend: this.backend,
+					bodyJaxpr: step.bodyJaxpr,
+					length: step.length,
+					numCarry: step.numCarry,
+					numConsts: step.numConsts,
+					numX: step.numX,
+					numY: step.numY,
+					reverse: step.reverse,
+					constSlots,
+					initCarrySlots,
+					xsSlots,
+					xsAvals: step.xsAvals,
+					outputSlots
+				});
 				if (DEBUG >= 2) console.log(`[jit.scan] After scanRunner: result.outputs=${result.outputs}`);
 				for (let i = 0; i < step.outputs.length; i++) scope.set(step.outputs[i], result.outputs[i]);
 				if (DEBUG >= 2) console.log(`[jit.scan] After scope.set: scope.get(${step.outputs[0]})=${scope.get(step.outputs[0])}`);
@@ -2613,37 +2661,21 @@ var JitProgram = class {
 				break;
 			}
 			case "compiled-loop": {
-				for (const p of pending) {
-					p.prepareSync();
-					p.submit();
-				}
-				pending.length = 0;
-				const constSlots = step.consts.map((id) => scope.get(id));
-				const initCarrySlots = step.initCarry.map((id) => scope.get(id));
-				const xsSlots = step.xs.map((id) => scope.get(id));
-				const outputSlots = step.outputs.map((id) => scope.get(id));
+				JitProgram.flushPending(pending);
+				const { constSlots, initCarrySlots, xsSlots, outputSlots } = JitProgram.resolveScanSlots(step, scope);
 				const carryOutSlots = outputSlots.slice(0, step.numCarry);
 				const ysStackedSlots = outputSlots.slice(step.numCarry);
-				if (step.generalParams) if (this.backend.dispatchNativeScanGeneral) this.backend.dispatchNativeScanGeneral(step.executable, step.generalParams, constSlots, initCarrySlots, xsSlots, carryOutSlots, ysStackedSlots);
-				else throw new Error("internal: compiled-loop requires backend.dispatchNativeScanGeneral");
-				else if (this.backend.dispatchNativeScan) this.backend.dispatchNativeScan(step.executable, constSlots, initCarrySlots, xsSlots, carryOutSlots, ysStackedSlots);
-				else throw new Error("internal: compiled-loop requires backend.dispatchNativeScan");
+				if (!this.backend.dispatchNativeScanGeneral) throw new Error("internal: compiled-loop requires backend.dispatchNativeScanGeneral");
+				this.backend.dispatchNativeScanGeneral(step.executable, step.generalParams, constSlots, initCarrySlots, xsSlots, carryOutSlots, ysStackedSlots);
 				break;
 			}
 			case "preencoded-routine": {
-				for (const p of pending) {
-					p.prepareSync();
-					p.submit();
-				}
-				pending.length = 0;
-				const constSlots = step.consts.map((id) => scope.get(id));
-				const initCarrySlots = step.initCarry.map((id) => scope.get(id));
-				const xsSlots = step.xs.map((id) => scope.get(id));
-				const outputSlots = step.outputs.map((id) => scope.get(id));
+				JitProgram.flushPending(pending);
+				const { constSlots, initCarrySlots, xsSlots, outputSlots } = JitProgram.resolveScanSlots(step, scope);
 				const carryOutSlots = outputSlots.slice(0, step.numCarry);
 				const ysStackedSlots = outputSlots.slice(step.numCarry);
-				if (this.backend.dispatchPreencodedScan) this.backend.dispatchPreencodedScan(step.preencodedParams, constSlots, initCarrySlots, xsSlots, carryOutSlots, ysStackedSlots);
-				else throw new Error("internal: preencoded-routine requires backend.dispatchPreencodedScan");
+				if (!this.backend.dispatchPreencodedScan) throw new Error("internal: preencoded-routine requires backend.dispatchPreencodedScan");
+				this.backend.dispatchPreencodedScan(step.preencodedParams, constSlots, initCarrySlots, xsSlots, carryOutSlots, ysStackedSlots);
 				break;
 			}
 			default:
@@ -2705,6 +2737,16 @@ var JitProgramBuilder = class {
 			outputs
 		});
 	}
+	pushCopy(dst, src, output, totalBytes, updates) {
+		this.steps.push({
+			type: "copy",
+			dst,
+			src,
+			output,
+			totalBytes,
+			updates
+		});
+	}
 	pushIncref(id) {
 		this.steps.push({
 			type: "incref",
@@ -2715,7 +2757,7 @@ var JitProgramBuilder = class {
 		const ids = this.steps.filter((s) => s.type === "malloc").map((s) => s.output);
 		for (const id of ids) {
 			if (outputIds.includes(id)) continue;
-			const lastUsage = this.steps.findLastIndex((s) => s.type === "execute" && (s.outputs.includes(id) || s.inputs.includes(id)) || s.type === "malloc" && s.output === id || s.type === "scan" && (s.consts.includes(id) || s.initCarry.includes(id) || s.xs.includes(id) || s.outputs.includes(id)) || s.type === "compiled-loop" && (s.consts.includes(id) || s.initCarry.includes(id) || s.xs.includes(id) || s.outputs.includes(id)) || s.type === "preencoded-routine" && (s.consts.includes(id) || s.initCarry.includes(id) || s.xs.includes(id) || s.outputs.includes(id)));
+			const lastUsage = this.steps.findLastIndex((s) => stepUsesId(s, id));
 			this.steps.splice(lastUsage + 1, 0, {
 				type: "free",
 				input: id
@@ -2729,6 +2771,19 @@ var JitProgramBuilder = class {
 		});
 	}
 };
+/** Check if a JitStep references a given JitId in any of its fields. */
+function stepUsesId(s, id) {
+	switch (s.type) {
+		case "execute": return s.outputs.includes(id) || s.inputs.includes(id);
+		case "copy": return s.dst === id || s.src === id || s.output === id;
+		case "malloc": return s.output === id;
+		case "incref":
+		case "free": return s.input === id;
+		case "scan":
+		case "compiled-loop":
+		case "preencoded-routine": return s.consts.includes(id) || s.initCarry.includes(id) || s.xs.includes(id) || s.outputs.includes(id);
+	}
+}
 const jitCompileCache = /* @__PURE__ */ new Map();
 function jitCompile(backend, jaxpr) {
 	const cacheKey = backend.type + "," + FpHash.hash(jaxpr);
@@ -2804,6 +2859,53 @@ function jitCompile(backend, jaxpr) {
 				});
 			}
 			builder.pushRoutine(routine, inputs, outputs);
+			continue;
+		}
+		if (eqn.primitive === Primitive.DynamicUpdateSlice) {
+			flushPendingKernels();
+			const params = eqn.params;
+			const { offset, axis } = params;
+			const dstInput = eqn.inputs[0];
+			const srcInput = eqn.inputs[1];
+			const getDusInput = (input) => {
+				if (input instanceof Var) {
+					const jv = ctx.get(input);
+					if (jv.type !== "imm") throw new Error("jit: dynamic_update_slice input is not materialized");
+					return jv.arg;
+				}
+				return builder.pushLit(input);
+			};
+			const dstId = getDusInput(dstInput);
+			const srcId = getDusInput(srcInput);
+			const dstAval = dstInput.aval;
+			const srcAval = srcInput.aval;
+			const elemBytes = byteWidth(dstAval.dtype);
+			const totalBytes = dstAval.size * elemBytes;
+			let updates;
+			if (dstAval.shape.length === srcAval.shape.length) {
+				const innerBefore = prod(dstAval.shape.slice(axis + 1));
+				const outerBefore = prod(dstAval.shape.slice(0, axis));
+				const chunkSize = srcAval.shape[axis] * innerBefore * elemBytes;
+				updates = [];
+				for (let out = 0; out < outerBefore; out++) updates.push({
+					srcOffset: out * srcAval.shape[axis] * innerBefore * elemBytes,
+					dstOffset: (out * dstAval.shape[axis] + offset) * innerBefore * elemBytes,
+					size: chunkSize
+				});
+			} else {
+				const innerBytes = srcAval.size * elemBytes;
+				updates = [{
+					srcOffset: 0,
+					dstOffset: offset * innerBytes,
+					size: innerBytes
+				}];
+			}
+			const outId = builder.pushBuffer(totalBytes);
+			builder.pushCopy(dstId, srcId, outId, totalBytes, updates);
+			ctx.set(eqn.outBinders[0], {
+				type: "imm",
+				arg: outId
+			});
 			continue;
 		}
 		if (eqn.primitive === Primitive.Scan) {
@@ -3172,8 +3274,8 @@ const jitRules = {
 	}),
 	[Primitive.Shrink]: reshapeJit((st, { slice }) => st.shrink(slice)),
 	[Primitive.Pad]: reshapeJit((st, { width }) => st.pad(width)),
-	[Primitive.DynamicUpdateSlice]: (_args, _as, _params) => {
-		throw new Error("jit: dynamic_update_slice is not implemented");
+	[Primitive.DynamicUpdateSlice]: () => {
+		throw new Error("internal: DynamicUpdateSlice should be handled before jitRules");
 	},
 	[Primitive.Sort]: routineNoJit(),
 	[Primitive.Argsort]: routineNoJit(),
@@ -3267,7 +3369,7 @@ function splitGraphDataflow(backend, jaxpr) {
 	const needsCleanShapePrimitives = [Primitive.Concatenate, Primitive.Pad];
 	for (let i = jaxpr.eqns.length - 1; i >= 0; i--) {
 		const eqn = jaxpr.eqns[i];
-		if (reductionEndpointEqns.has(i) || heterogeneousViewPrimitives.includes(eqn.primitive) || routinePrimitives.has(eqn.primitive) || eqn.outBinders.some((v) => blackNodes.has(v))) {
+		if (reductionEndpointEqns.has(i) || heterogeneousViewPrimitives.includes(eqn.primitive) || routinePrimitives.has(eqn.primitive) || eqn.primitive === Primitive.DynamicUpdateSlice || eqn.outBinders.some((v) => blackNodes.has(v))) {
 			for (const v of eqn.outBinders) {
 				blackNodes.add(v);
 				p1NextBlack.set(v, v);
@@ -3277,7 +3379,7 @@ function splitGraphDataflow(backend, jaxpr) {
 		const reach = /* @__PURE__ */ new Set();
 		let needsCleanOutput = false;
 		outer: for (const v of eqn.outBinders) for (const j of varToUsages.get(v) ?? []) {
-			if (needsCleanShapePrimitives.includes(jaxpr.eqns[j].primitive) || routinePrimitives.has(jaxpr.eqns[j].primitive)) {
+			if (needsCleanShapePrimitives.includes(jaxpr.eqns[j].primitive) || routinePrimitives.has(jaxpr.eqns[j].primitive) || jaxpr.eqns[j].primitive === Primitive.DynamicUpdateSlice) {
 				needsCleanOutput = true;
 				break outer;
 			}
@@ -3916,6 +4018,12 @@ var Array$1 = class Array$1 extends Tracer {
 		const that = this;
 		return { set: (src) => dynamicUpdateSlice(that, src, index) };
 	}
+	/** Copy a single Y slice buffer into a preallocated stacked output at the given offset. */
+	static #copySliceToBuffer(backend, srcSlot, dstSlot, dstOffsetBytes, sizeBytes) {
+		const canBufferCopy = dstOffsetBytes % 4 === 0 && sizeBytes % 4 === 0;
+		if (backend.copyBufferToBuffer && canBufferCopy) backend.copyBufferToBuffer(srcSlot, 0, dstSlot, dstOffsetBytes, sizeBytes);
+		else if (backend.copyBufferWithShader) backend.copyBufferWithShader(srcSlot, 0, dstSlot, dstOffsetBytes, sizeBytes);
+	}
 	static #stackScanYs(ySlices, reverse) {
 		return ySlices.map((slices) => {
 			const reshaped = slices.map((s) => {
@@ -3939,11 +4047,11 @@ var Array$1 = class Array$1 extends Tracer {
 		});
 	}
 	static #runScanFallbackLoop(params) {
-		const { length, reverse, numCarry, numY, xs, initCarry, bodyOutAvals, runBody, writeY, onBeforeCarryDispose, disposeXSlices } = params;
-		const canDirectWriteY = numY > 0 && !!writeY;
+		const { length, reverse, numCarry, numY, xs, initCarry, bodyOutAvals, runBody, backend, preallocatedYSlots, protectSharedSlots, disposeXSlices } = params;
+		const directWrite = numY > 0 && preallocatedYSlots !== void 0;
 		const yStrideBytes = bodyOutAvals.slice(numCarry).map((aval) => prod(aval.shape) * byteWidth(aval.dtype));
 		const ySlices = [];
-		if (!canDirectWriteY) for (let j = 0; j < numY; j++) ySlices.push([]);
+		if (!directWrite) for (let j = 0; j < numY; j++) ySlices.push([]);
 		let carry = initCarry;
 		for (let i = 0; i < length; i++) {
 			const dataIdx = reverse ? length - 1 - i : i;
@@ -3955,20 +4063,30 @@ var Array$1 = class Array$1 extends Tracer {
 			const outs = runBody(carry, xSlice, i);
 			const newCarry = outs.slice(0, numCarry);
 			const ySlice = outs.slice(numCarry);
-			if (canDirectWriteY) {
-				const writeIndex = reverse ? length - 1 - i : i;
-				writeY(writeIndex, ySlice, yStrideBytes);
-			} else for (let j = 0; j < numY; j++) ySlices[j].push(ySlice[j]);
-			if (i > 0 && onBeforeCarryDispose) onBeforeCarryDispose(carry, ySlice);
+			if (directWrite) for (let j = 0; j < numY; j++) {
+				const sizeBytes = yStrideBytes[j];
+				if (sizeBytes <= 0) continue;
+				const ySlot = ySlice[j]._realizeSource();
+				for (const exe of ySlice[j].#pending) {
+					exe.prepareSync();
+					exe.submit();
+				}
+				Array$1.#copySliceToBuffer(backend, ySlot, preallocatedYSlots[j], dataIdx * sizeBytes, sizeBytes);
+			}
+			else for (let j = 0; j < numY; j++) ySlices[j].push(ySlice[j]);
+			if (i > 0 && protectSharedSlots) {
+				const carrySlots = new Set(carry.map((c) => c._realizeSource()));
+				for (const y of ySlice) if (carrySlots.has(y._realizeSource())) backend.incRef(y._realizeSource());
+			}
 			if (i > 0) carry.forEach((c) => c.dispose());
 			carry = newCarry;
-			if (canDirectWriteY) ySlice.forEach((y) => y.dispose());
+			if (directWrite) ySlice.forEach((y) => y.dispose());
 			if (disposeXSlices) xSlice.forEach((x) => x.dispose());
 		}
 		return {
 			carry,
 			ySlices,
-			usedDirectWrite: canDirectWriteY
+			usedDirectWrite: directWrite
 		};
 	}
 	/** @private Internal plumbing method for Array / Tracer ops. */
@@ -4241,7 +4359,7 @@ var Array$1 = class Array$1 extends Tracer {
 				const { backend, committed } = Array$1.#computeBackend("jit", args);
 				args = args.map((ar) => ar._putSync(backend));
 				const jp = jitCompile(backend, jaxpr);
-				const scanRunner = (bodyProgram, _backend, bodyJaxpr, length, numCarry, _numConsts, _numX, numY, reverse, constSlots, initCarrySlots, xsSlots, xsAvals, outputSlots) => {
+				const scanRunner = ({ bodyProgram, backend: _backend, bodyJaxpr, length, numCarry, numConsts: _numConsts, numX: _numX, numY, reverse, constSlots, initCarrySlots, xsSlots, xsAvals, outputSlots }) => {
 					const carryAvals = bodyJaxpr.inBinders.slice(constSlots.length, constSlots.length + numCarry).map((v) => v.aval);
 					const constSlotsRealized = constSlots;
 					const xs = xsSlots.map((slot, i) => new Array$1({
@@ -4264,25 +4382,6 @@ var Array$1 = class Array$1 extends Tracer {
 					}));
 					const bodyOutAvals = bodyJaxpr.outs.map((v) => v.aval);
 					const canDirectWriteY = numY > 0 && outputSlots.length === numCarry + numY && (backend.copyBufferToBuffer || backend.copyBufferWithShader);
-					const writeY = canDirectWriteY ? (writeIndex, ySlice, yStrideBytes) => {
-						for (let j = 0; j < numY; j++) {
-							const sizeBytes = yStrideBytes[j];
-							if (sizeBytes <= 0) continue;
-							const dstOffsetBytes = writeIndex * sizeBytes;
-							const ySlot = ySlice[j]._realizeSource();
-							const dstSlot = outputSlots[numCarry + j];
-							const canBufferCopy = dstOffsetBytes % 4 === 0 && sizeBytes % 4 === 0;
-							if (backend.copyBufferToBuffer && canBufferCopy) backend.copyBufferToBuffer(ySlot, 0, dstSlot, dstOffsetBytes, sizeBytes);
-							else if (backend.copyBufferWithShader) backend.copyBufferWithShader(ySlot, 0, dstSlot, dstOffsetBytes, sizeBytes);
-						}
-					} : void 0;
-					const onBeforeCarryDispose = (oldCarry, ySlice) => {
-						const oldCarrySlots = new Set(oldCarry.map((c) => c._realizeSource()));
-						for (const y of ySlice) {
-							const slot = y._realizeSource();
-							if (oldCarrySlots.has(slot)) backend.incRef(slot);
-						}
-					};
 					const runBody = (curCarry, xSlice, i) => {
 						const carrySlots = curCarry.map((c) => c._realizeSource());
 						const xSliceSlots = xSlice.map((x) => x._realizeSource());
@@ -4325,8 +4424,9 @@ var Array$1 = class Array$1 extends Tracer {
 						initCarry: carry,
 						bodyOutAvals,
 						runBody,
-						writeY,
-						onBeforeCarryDispose,
+						backend,
+						preallocatedYSlots: canDirectWriteY ? outputSlots.slice(numCarry) : void 0,
+						protectSharedSlots: true,
 						disposeXSlices: true
 					});
 					carry = loopResult.carry;
@@ -4409,29 +4509,46 @@ var Array$1 = class Array$1 extends Tracer {
 					}
 				}
 				let carry = initCarry;
-				const writeY = canDirectWriteY ? (writeIndex, ySlice, yStrideBytes) => {
-					for (let j = 0; j < numY; j++) {
-						const sizeBytes = yStrideBytes[j];
-						if (sizeBytes <= 0) continue;
-						const dstOffsetBytes = writeIndex * sizeBytes;
-						const ySlot = ySlice[j]._realizeSource();
-						for (const exe of ySlice[j].#pending) {
-							exe.prepareSync();
-							exe.submit();
-						}
-						const dstSlot = preallocatedSlots[j];
-						const canBufferCopy = dstOffsetBytes % 4 === 0 && sizeBytes % 4 === 0;
-						if (backend.copyBufferToBuffer && canBufferCopy) backend.copyBufferToBuffer(ySlot, 0, dstSlot, dstOffsetBytes, sizeBytes);
-						else if (backend.copyBufferWithShader) backend.copyBufferWithShader(ySlot, 0, dstSlot, dstOffsetBytes, sizeBytes);
-					}
-				} : void 0;
+				const bodyProgram = jitCompile(backend, jaxpr);
+				const constSlots = constViews.map((c) => c._realizeSource());
+				for (const c of constViews) for (const exe of c.#pending) {
+					exe.prepareSync();
+					exe.submit();
+				}
 				const runBody = (curCarry, xSlice) => {
-					const jaxprInputs = [
-						...constViews.map((c) => c.ref),
-						...curCarry.map((c) => c.ref),
-						...xSlice
-					];
-					return evalJaxpr(jaxpr, jaxprInputs);
+					const carrySlots = curCarry.map((c) => c._realizeSource());
+					const xSliceSlots = xSlice.map((x) => x._realizeSource());
+					for (const c of curCarry) for (const exe of c.#pending) {
+						exe.prepareSync();
+						exe.submit();
+					}
+					for (const x of xSlice) for (const exe of x.#pending) {
+						exe.prepareSync();
+						exe.submit();
+					}
+					const { outputs: bodyOuts, pending } = bodyProgram.execute([
+						...constSlots,
+						...carrySlots,
+						...xSliceSlots
+					]);
+					for (const exe of pending) {
+						exe.prepareSync();
+						exe.submit();
+					}
+					const seenSlots = /* @__PURE__ */ new Set();
+					return bodyOuts.map((slot, j) => {
+						if (seenSlots.has(slot)) backend.incRef(slot);
+						else seenSlots.add(slot);
+						return new Array$1({
+							source: slot,
+							st: ShapeTracker.fromShape(bodyOutAvals[j].shape),
+							dtype: bodyOutAvals[j].dtype,
+							weakType: bodyOutAvals[j].weakType,
+							backend,
+							committed: true,
+							pending: []
+						});
+					});
 				};
 				const loopResult = Array$1.#runScanFallbackLoop({
 					length,
@@ -4442,7 +4559,9 @@ var Array$1 = class Array$1 extends Tracer {
 					initCarry: carry,
 					bodyOutAvals,
 					runBody,
-					writeY,
+					backend,
+					preallocatedYSlots: canDirectWriteY ? preallocatedSlots : void 0,
+					protectSharedSlots: true,
 					disposeXSlices: false
 				});
 				carry = loopResult.carry;
