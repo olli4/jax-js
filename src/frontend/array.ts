@@ -1093,15 +1093,23 @@ export class Array extends Tracer {
         const { backend, committed } = Array.#computeBackend("jit", args);
         args = args.map((ar) => ar._putSync(backend));
 
+        // Realize all input slots upfront.
+        const slots = args.map((x) => x._realizeSource());
+
+        // Flush all input pending ops to ensure data is materialized
+        // before JIT execution. This is critical for scan's fallback loop
+        // which reads slots synchronously within the JIT program.
+        for (const ar of args) {
+          for (const exe of ar.#pending) {
+            exe.prepareSync();
+            exe.submit();
+          }
+        }
+
         const jp = jitCompile(backend, jaxpr);
-        const { outputs, pending } = jp.execute(
-          args.map((x) => x._realizeSource()),
-        );
+        const { outputs, pending } = jp.execute(slots);
         for (const exe of pending) exe.updateRc(+outputs.length - 1);
 
-        const prevPending = [...new Set(args.flatMap((x) => x.#pending))];
-        for (const exe of prevPending) exe.updateRc(+outputs.length);
-        pending.splice(0, 0, ...prevPending); // Dispatch order of pending kernels is important.
         args.forEach((x) => x.dispose()); // Dispose of args after dispatch.
 
         return outputs.map((source, i) => {
