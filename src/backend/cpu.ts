@@ -64,6 +64,20 @@ export class CpuBackend implements Backend {
     return buffer.slice(start, start + count);
   }
 
+  copyBufferToBuffer(
+    src: Slot,
+    srcOffset: number,
+    dst: Slot,
+    dstOffset: number,
+    size: number,
+  ): void {
+    const srcBuf = this.#getBuffer(src);
+    const dstBuf = this.#getBuffer(dst);
+    const srcView = new Uint8Array(srcBuf.buffer, srcBuf.byteOffset + srcOffset, size);
+    const dstView = new Uint8Array(dstBuf.buffer, dstBuf.byteOffset + dstOffset, size);
+    dstView.set(srcView);
+  }
+
   async prepareKernel(kernel: Kernel): Promise<Executable<void>> {
     return this.prepareKernelSync(kernel);
   }
