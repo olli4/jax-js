@@ -276,3 +276,101 @@ Deno.test({
     assertEquals(Array.from(ysData), [1, 3, 6, 10, 15]);
   }),
 });
+// ---------------------------------------------------------------------------
+// lax.scan with matmul body — preencoded-routine path (P4)
+// ---------------------------------------------------------------------------
+
+Deno.test({
+  name: "lax.scan matmul (preencoded-routine) on webgpu",
+  ignore: !hasWebGPU,
+  fn: withLeakCheck(async () => {
+    const devices = await init();
+    if (!devices.includes("webgpu")) return;
+    defaultDevice("webgpu");
+
+    // Accumulate matrix products: carry = carry @ x for each x in xs
+    const n = 2;
+    const identity = np.eye(n); // [[1,0],[0,1]]
+
+    // xs = [[[2,0],[0,1]], [[1,0],[0,3]]]  → scale x by 2, then y by 3
+    const xs = np.array([2, 0, 0, 1, 1, 0, 0, 3]).reshape([2, n, n]);
+
+    const f = jit((initC: np.Array, xsIn: np.Array) =>
+      lax.scan(
+        (carry: np.Array, x: np.Array) => {
+          const result = np.matmul(carry.ref, x);
+          return [result.ref, result];
+        },
+        initC,
+        xsIn,
+        { acceptPath: ["preencoded-routine", "compiled-loop", "fallback"] },
+      ),
+    );
+
+    const [carry, ys] = f(identity, xs);
+    const carryData = await carry.data();
+    const ysData = await ys.data();
+    f.dispose();
+
+    // After iter 0: I @ [[2,0],[0,1]] = [[2,0],[0,1]]
+    // After iter 1: [[2,0],[0,1]] @ [[1,0],[0,3]] = [[2,0],[0,3]]
+    assertEquals(Array.from(carryData), [2, 0, 0, 3]);
+    // ys[0] = [[2,0],[0,1]], ys[1] = [[2,0],[0,3]]
+    assertEquals(Array.from(ysData), [2, 0, 0, 1, 2, 0, 0, 3]);
+  }),
+});
+
+Deno.test({
+  name: "lax.scan matmul 3 iters (preencoded-routine) on webgpu",
+  ignore: !hasWebGPU,
+  fn: withLeakCheck(async () => {
+    const devices = await init();
+    if (!devices.includes("webgpu")) return;
+    defaultDevice("webgpu");
+
+    // 3x3 matrix accumulation over 3 iterations
+    // This tests the ping-pong carry pattern more thoroughly
+    const n = 3;
+    const identity = np.eye(n);
+
+    // xs[0]: scale first row by 2
+    // xs[1]: add row0 to row1
+    // xs[2]: identity (no-op)
+    const xsData = new Float32Array([
+      2, 0, 0, 0, 1, 0, 0, 0, 1, // iter 0: diag(2,1,1)
+      1, 0, 0, 1, 1, 0, 0, 0, 1, // iter 1: shear
+      1, 0, 0, 0, 1, 0, 0, 0, 1, // iter 2: identity
+    ]);
+    const xs = np.array(xsData).reshape([3, n, n]);
+
+    const f = jit((initC: np.Array, xsIn: np.Array) =>
+      lax.scan(
+        (carry: np.Array, x: np.Array) => {
+          const out = np.matmul(carry.ref, x);
+          return [out.ref, out];
+        },
+        initC,
+        xsIn,
+        { acceptPath: ["preencoded-routine", "compiled-loop", "fallback"] },
+      ),
+    );
+
+    const [carry, ys] = f(identity, xs);
+    const carryData = await carry.data();
+    const ysData = await ys.data();
+    f.dispose();
+
+    // iter 0: I @ diag(2,1,1) = [[2,0,0],[0,1,0],[0,0,1]]
+    // iter 1: that @ shear    = [[2,0,0],[1,1,0],[0,0,1]]
+    // iter 2: that @ I        = [[2,0,0],[1,1,0],[0,0,1]]
+    assertEquals(Array.from(carryData), [2, 0, 0, 1, 1, 0, 0, 0, 1]);
+
+    // ys stacked: 3 x 3 x 3 = 27 elements
+    const expected = [
+      2, 0, 0, 0, 1, 0, 0, 0, 1, // ys[0]
+      2, 0, 0, 1, 1, 0, 0, 0, 1, // ys[1]
+      2, 0, 0, 1, 1, 0, 0, 0, 1, // ys[2]
+    ];
+    assertEquals(Array.from(ysData), expected);
+  }),
+});

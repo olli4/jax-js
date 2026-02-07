@@ -10,6 +10,7 @@ import type { NativeScanGeneralParams, WasmBackend } from "../backend/wasm";
 import type {
   NativeScanMultiParams,
   NativeScanMultiStep,
+  PreparedPreencodedScan,
 } from "../backend/webgpu";
 import type { WebGPUBackend } from "../backend/webgpu";
 import { Routine } from "../routine";
@@ -30,7 +31,7 @@ export type ScanPlan =
       params?: NativeScanGeneralParams | NativeScanMultiParams;
       internalSizes?: number[];
     }
-  | { path: "preencoded-routine"; preencodedParams: any };
+  | { path: "preencoded-routine"; preencodedParams: PreparedPreencodedScan };
 
 type ExecuteStep = Extract<JitStep, { type: "execute" }>;
 
@@ -559,6 +560,129 @@ function tryPrepareNativeScan(
   return null;
 }
 
+// ---------------------------------------------------------------------------
+// Preencoded-routine scan (P4: WebGPU routine bodies)
+// ---------------------------------------------------------------------------
+
+/**
+ * Try to prepare a preencoded scan for routine bodies (matmul, cholesky, etc.).
+ *
+ * Requirements:
+ * - WebGPU backend
+ * - Exactly 1 execute step in body that is a Routine
+ * - numCarry === numY (passthrough pattern)
+ * - Routine shader must not already use uniforms (e.g. Sort excluded)
+ */
+function tryPreparePreencodedScan(
+  backend: Backend,
+  bodyProgram: JitProgram,
+  bodyJaxpr: Jaxpr,
+  length: number,
+  numCarry: number,
+  numConsts: number,
+  numX: number,
+  numY: number,
+  reverse: boolean,
+): PreparedPreencodedScan | null {
+  if (backend.type !== "webgpu") {
+    if (DEBUG >= 2)
+      console.log("Preencoded scan: skipped, unsupported backend");
+    return null;
+  }
+
+  const executeSteps = bodyProgram.steps.filter(
+    (s) => s.type === "execute",
+  ) as ExecuteStep[];
+  if (executeSteps.length !== 1) {
+    if (DEBUG >= 2)
+      console.log(
+        `Preencoded scan: skipped, ${executeSteps.length} execute steps (need exactly 1)`,
+      );
+    return null;
+  }
+
+  const execStep = executeSteps[0];
+  if (!(execStep.source instanceof Routine)) {
+    if (DEBUG >= 2) console.log("Preencoded scan: skipped, not a Routine");
+    return null;
+  }
+
+  if (numCarry !== numY) {
+    if (DEBUG >= 2)
+      console.log(
+        `Preencoded scan: skipped, numCarry=${numCarry} !== numY=${numY}`,
+      );
+    return null;
+  }
+
+  const carryAvals = bodyJaxpr.inBinders
+    .slice(numConsts, numConsts + numCarry)
+    .map((v) => v.aval);
+  const xAvals = bodyJaxpr.inBinders
+    .slice(numConsts + numCarry)
+    .map((v) => v.aval);
+
+  const carrySizes = carryAvals.map((a) => a.size * byteWidth(a.dtype));
+  const xsElemStrides = xAvals.map((a) => a.size);
+  const ysElemStrides = carryAvals.map((a) => a.size);
+
+  if (!backend.prepareRoutineSync) {
+    if (DEBUG >= 2)
+      console.log(
+        "Preencoded scan: skipped, backend has no prepareRoutineSync",
+      );
+    return null;
+  }
+
+  let bodyRoutineExe;
+  try {
+    bodyRoutineExe = backend.prepareRoutineSync(execStep.source);
+  } catch (e) {
+    if (DEBUG >= 2)
+      console.warn("Preencoded scan: prepareRoutineSync failed:", e);
+    return null;
+  }
+
+  const webgpuBackend = backend as WebGPUBackend;
+  if (!webgpuBackend.preparePreencodedScan) {
+    if (DEBUG >= 2)
+      console.log(
+        "Preencoded scan: skipped, backend has no preparePreencodedScan",
+      );
+    return null;
+  }
+
+  const preencodedScanParams = {
+    length,
+    carrySizes,
+    xsElemStrides,
+    ysElemStrides,
+    bodyRoutine: bodyRoutineExe,
+    numCarry,
+    numX,
+    numY,
+    numConsts,
+    reverse,
+    routineInputJitIds: execStep.inputs,
+    routineOutputJitIds: execStep.outputs,
+  };
+
+  try {
+    const prepared = webgpuBackend.preparePreencodedScan(preencodedScanParams);
+    if (prepared && DEBUG >= 1) {
+      console.log(
+        `Preencoded scan: SUCCESS! Using WebGPU preencoded scan for ${execStep.source.name}`,
+      );
+    }
+    return prepared;
+  } catch (e) {
+    if (DEBUG >= 2) {
+      console.warn("Preencoded scan preparation failed:", e);
+    }
+    return null;
+  }
+}
+
 /**
  * Choose a scan execution strategy.
  *
@@ -600,7 +724,27 @@ export function planScan(
     };
   }
 
-  // P4: preencoded-routine will be tried here
+  // P4: preencoded-routine for WebGPU routine bodies
+  const preencodedResult = tryPreparePreencodedScan(
+    backend,
+    bodyProgram,
+    bodyJaxpr,
+    length,
+    numCarry,
+    numConsts,
+    numX,
+    numY,
+    reverse,
+  );
+
+  if (preencodedResult) {
+    const pathError = checkAcceptedPath("preencoded-routine", acceptPath);
+    if (pathError) throw new Error(pathError);
+    return {
+      path: "preencoded-routine",
+      preencodedParams: preencodedResult,
+    };
+  }
 
   // Fallback: JS loop
   const dispatchCount = bodyProgram.steps.filter(
