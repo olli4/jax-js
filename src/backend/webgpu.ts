@@ -589,8 +589,7 @@ export class WebGPUBackend implements Backend {
 
     // Skip if no xs/ys need offsets
     if (numX === 0 && numY === 0) {
-      if (DEBUG >= 2)
-        console.log("Preencoded scan: no xs/ys, skipping");
+      if (DEBUG >= 2) console.log("Preencoded scan: no xs/ys, skipping");
       return null;
     }
 
@@ -812,8 +811,7 @@ export class WebGPUBackend implements Backend {
       const filteredPasses = passes.filter(({ grid }) => prod(grid) > 0);
 
       for (let iter = 0; iter < length; iter++) {
-        const storageBindGroup =
-          iter % 2 === 0 ? pingBindGroup : pongBindGroup;
+        const storageBindGroup = iter % 2 === 0 ? pingBindGroup : pongBindGroup;
 
         for (const { grid } of filteredPasses) {
           const passEncoder = commandEncoder.beginComputePass();
@@ -825,8 +823,7 @@ export class WebGPUBackend implements Backend {
         }
 
         // Copy carry → ys for this iteration (passthrough pattern)
-        const currentCarryBuffers =
-          iter % 2 === 0 ? carryPong : carryPing;
+        const currentCarryBuffers = iter % 2 === 0 ? carryPong : carryPing;
         for (let c = 0; c < numCarry; c++) {
           const copySize = carrySizes[c];
           if (copySize <= 0) continue;

@@ -337,9 +337,33 @@ Deno.test({
     // xs[1]: add row0 to row1
     // xs[2]: identity (no-op)
     const xsData = new Float32Array([
-      2, 0, 0, 0, 1, 0, 0, 0, 1, // iter 0: diag(2,1,1)
-      1, 0, 0, 1, 1, 0, 0, 0, 1, // iter 1: shear
-      1, 0, 0, 0, 1, 0, 0, 0, 1, // iter 2: identity
+      2,
+      0,
+      0,
+      0,
+      1,
+      0,
+      0,
+      0,
+      1, // iter 0: diag(2,1,1)
+      1,
+      0,
+      0,
+      1,
+      1,
+      0,
+      0,
+      0,
+      1, // iter 1: shear
+      1,
+      0,
+      0,
+      0,
+      1,
+      0,
+      0,
+      0,
+      1, // iter 2: identity
     ]);
     const xs = np.array(xsData).reshape([3, n, n]);
 
@@ -367,9 +391,33 @@ Deno.test({
 
     // ys stacked: 3 x 3 x 3 = 27 elements
     const expected = [
-      2, 0, 0, 0, 1, 0, 0, 0, 1, // ys[0]
-      2, 0, 0, 1, 1, 0, 0, 0, 1, // ys[1]
-      2, 0, 0, 1, 1, 0, 0, 0, 1, // ys[2]
+      2,
+      0,
+      0,
+      0,
+      1,
+      0,
+      0,
+      0,
+      1, // ys[0]
+      2,
+      0,
+      0,
+      1,
+      1,
+      0,
+      0,
+      0,
+      1, // ys[1]
+      2,
+      0,
+      0,
+      1,
+      1,
+      0,
+      0,
+      0,
+      1, // ys[2]
     ];
     assertEquals(Array.from(ysData), expected);
   }),

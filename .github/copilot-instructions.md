@@ -899,6 +899,29 @@ The "no global barrier" limitation creates scan-specific constraints:
 WASM backend handles all these cases because it can allocate temporaries and has true sequential
 control flow. WebGPU is more restricted but faster when patterns fit.
 
+### Kalman / tree-carry path analysis (v1 = v2, no regression)
+
+Kalman-like patterns have **tree-structured carry** (e.g., `{state, covDiag}`) which flattens to
+`numCarry=2, numY=2`. The body uses `np.matmul` which lowers to `Kernel` (Mul→Reduce), **not**
+`Routine`, creating deep **internal buffer dependencies** (each matmul output feeds the next).
+
+| Backend | Path          | Why                                                                        |
+| ------- | ------------- | -------------------------------------------------------------------------- |
+| WASM    | compiled-loop | Internal deps + multi-carry fully supported via `codegenNativeScanGeneral` |
+| WebGPU  | fallback      | Internal deps rejected (no global barrier between dispatches)              |
+
+This is **identical between v1 and v2** — v1 also rejected Kalman on WebGPU at the same
+`hasInternalDeps` check. The WASM compiled-loop handles it in both versions via
+`translateExpWithGeneralScanContext` which resolves internal buffer references at codegen time, with
+separate carry buffer pointers per tree leaf (`carrySizes[]`, `carryOutSources[]`).
+
+v2's WebGPU path adds an explicit Y≠carry slot match check (`yOutIds[i] !== carryOutIds[i]`) that v1
+enforced only implicitly in the shader codegen, but internal deps alone already reject Kalman before
+that check is reached.
+
+**Deno limitation:** WebGPU fallback uses `readSync` → `SyncReader` → `OffscreenCanvas`, which is
+unavailable in Deno. Kalman WebGPU benchmarks can only run via Vitest (headful Chromium).
+
 ## How to access v1 (feat/scan) source
 
 The feat/scan branch contains the v1 implementation. **Never switch to it** — use `git show`:
@@ -909,4 +932,96 @@ git show feat/scan:src/frontend/scan-plan.ts
 git show feat/scan:src/backend/wasm.ts
 git show feat/scan:src/backend/webgpu.ts
 git diff main..feat/scan -- src/library/lax-scan.ts
+```
+
+## Scan v2 review: gaps vs feat/scan (v1)
+
+v2 is a clean architectural rewrite of v1 with a unified `ScanPlan` + `executeScan()` replacing v1's
+three separate JitStep types (`"scan"`, `"compiled-loop"`, `"preencoded-routine"`) and `ScanRunner`
+callback pattern. The autodiff stack (JVP, √N checkpointing, vmap) is **identical** between v1 and
+v2. All three execution paths (compiled-loop, preencoded-routine, fallback) are implemented and
+working for elementwise-only scan bodies.
+
+### Feature gaps to port from v1
+
+| Gap                           | Severity | What's missing                                                                                                                                                                                                                                                                                                                                         | v1 reference                                                                                                |
+| ----------------------------- | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------- |
+| WASM routine imports in scan  | Critical | `routine-provider.ts` (261 lines), `routines/` dir (7 files: cholesky, cholesky-simd, triangular-solve, lu, sort, argsort, index), `#getRoutineModuleForScan()`, `#getRoutineInstanceForModule()`, `ScanRoutineInfo` type, `auxBufferSize` in scan-plan. Without this, scan bodies with routines on WASM fall to JS fallback instead of compiled WASM. | `feat/scan:src/backend/wasm/routine-provider.ts`, `feat/scan:src/backend/wasm/routines/`                    |
+| Multi-output kernel           | Major    | `KernelOutput` interface, `Kernel.multi()`, `isMultiOutput`, `dtypeAt(i)`, `codegenWasmMultiPath`. Bodies producing multiple outputs can't fuse into one kernel dispatch.                                                                                                                                                                              | `feat/scan:src/alu.ts` (KernelOutput, Kernel class), `feat/scan:src/backend/wasm.ts` (codegenWasmMultiPath) |
+| WASM instance caching         | Moderate | `#instanceCache: WeakMap<WebAssembly.Module, WebAssembly.Instance>` avoids re-instantiating WASM modules on repeated dispatch. v2 creates fresh instances every time.                                                                                                                                                                                  | `feat/scan:src/backend/wasm.ts` L171, L314-337, L606-628                                                    |
+| WASM routine dispatch         | Moderate | Dedicated `#dispatchCholesky/Sort/LU/TriangularSolve/Argsort` methods using size-specialized wasmblr modules. v2 falls back to `runCpuRoutine` for all routines.                                                                                                                                                                                       | `feat/scan:src/backend/wasm.ts` L387-545                                                                    |
+| Error handling in plan        | Minor    | `prepareNativeScanGeneral` and `prepareNativeScanMulti` should wrap in try/catch and return null (graceful fallback) instead of throwing.                                                                                                                                                                                                              | `feat/scan:src/frontend/scan-plan.ts`                                                                       |
+| `slotCount()` on WASM backend | Minor    | Memory leak detection helper.                                                                                                                                                                                                                                                                                                                          | `feat/scan:src/backend/wasm.ts` L195                                                                        |
+
+### Missing tests (v1 had ~30 more)
+
+| Category                        | Count | Description                                               |
+| ------------------------------- | ----- | --------------------------------------------------------- |
+| WASM routine scan               | 7     | Cholesky/sort/LU/triangularSolve/argsort in compiled-loop |
+| Known-limitations path tests    | 7     | Documents which path each pattern takes per backend       |
+| Advanced vmap/grad compositions | 6     | `grad(vmap)`, `vmap(grad)`, `vmap(jit)`, equivalence      |
+| Extra JVP/checkpoint            | 4     | Different tangent values, `checkpoint: 1`                 |
+| WebGL backend                   | 2     | WebGL fallback path                                       |
+| Routine grad flow               | 1     | `grad` through mixed kernel+routine body                  |
+| makeJaxpr tracing               | 1     | Scan JVP trace                                            |
+
+### v2 improvements over v1
+
+- Unified `ScanPlan` discriminated union + `executeScan()` in dedicated `scan-executor.ts`
+- Single `type: "scan"` JitStep instead of three step types
+- Better typing (`WebGPUBackend` / `WasmBackend` casts instead of `as any`)
+- Explicit Y-carry slot match validation in WebGPU path
+- Bool dtype `(access != 0)` handling in WebGPU scan expressions
+- Buffer min-size guard `Math.max(size, 4)` for preencoded ping-pong buffers
+- New DLM pattern tests (4) and scan preallocate tests (5)
+
+### Porting priority
+
+1. **WASM routine infrastructure** — port `routine-provider.ts`, `routines/` dir, routine import
+   linking in `dispatchNativeScanGeneral`, enable routine steps in `tryPrepareWasmNativeScan`
+2. **WASM instance caching** — add `#instanceCache` WeakMap for dispatch and scan dispatch
+3. **Multi-output kernel** — port `KernelOutput`, `Kernel.multi()`, `codegenWasmMultiPath`
+4. **Error handling** — wrap plan preparation in try/catch for graceful fallback
+5. **Missing tests** — port path-documentation tests, advanced transform compositions
+
+### Benchmark results (WASM, Chromium headless, Feb 2026)
+
+All benchmarks use the `compiled-loop` path (planner auto-selects). Run with
+`pnpm vitest bench bench/scan.bench.ts`.
+
+| Pattern      | N   | Size | ops/sec |
+| ------------ | --- | ---- | ------- |
+| cumsum       | 100 | 64   | ~84K    |
+| cumsum-large | 500 | 256  | ~12K    |
+| carry-only   | 200 | 32   | ~123K   |
+| reduction    | 100 | 64   | ~74K    |
+| reverse      | 200 | 64   | ~70K    |
+| kalman       | 200 | 4    | ~70K    |
+
+### Benchmark results (WebGPU, Deno wgpu-rs, Feb 2026)
+
+Hardware GPU benchmarks via Deno's native WebGPU. Uses `compiled-loop` path. Run with
+`pnpm run bench:deno` (requires `pnpm build` first).
+
+| Pattern      | N   | Size | iter/s |
+| ------------ | --- | ---- | ------ |
+| cumsum       | 100 | 64   | ~10K   |
+| cumsum-large | 500 | 256  | ~7.6K  |
+| reverse      | 200 | 64   | ~7.7K  |
+
+Note: Kalman (tree-structured carry) requires fallback path which uses `readSync`/`OffscreenCanvas`,
+unavailable in Deno. Run Kalman WebGPU benchmarks via Vitest when headful Chromium is available.
+
+### Benchmark files
+
+| File                      | Runner | Backend     | Patterns                                          |
+| ------------------------- | ------ | ----------- | ------------------------------------------------- |
+| `bench/scan.bench.ts`     | Vitest | WASM+WebGPU | cumsum, carry-only, reduction, reverse, kalman    |
+| `test/deno/scan.bench.ts` | Deno   | WebGPU      | cumsum, reverse (compiled-loop only, no fallback) |
+
+Commands:
+
+```bash
+pnpm vitest bench bench/scan.bench.ts   # Vitest (Chromium headless, WASM + WebGPU)
+pnpm run bench:deno                     # Deno WebGPU (headless hardware GPU)
 ```
