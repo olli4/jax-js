@@ -1577,7 +1577,7 @@ describe.skip("scan autodiff (P5)", () => {
 // Native scan path tests — P2+ (skipped until compiled-loop/preencoded available)
 // ============================================================================
 
-describe.skip("native scan paths (P2+)", () => {
+describe("native scan paths (P2+)", () => {
   test("small array with acceptPath: compiled-loop", () => {
     const step = (carry: np.Array, x: np.Array): [np.Array, np.Array] => {
       const newCarry = np.add(carry, x);
@@ -1639,7 +1639,7 @@ describe.skip("native scan paths (P2+)", () => {
     });
 
     expect(finalCarry).toBeAllclose([24.0]);
-    expect(outputs).toBeAllclose([10, 20, 24]);
+    expect(outputs).toBeAllclose([[10], [20], [24]]);
   });
 
   test("large native scan (many iterations)", () => {
@@ -1659,7 +1659,7 @@ describe.skip("native scan paths (P2+)", () => {
     expect(finalCarry).toBeAllclose(np.full([64], n));
   });
 
-  test("routine body: matmul in native scan", () => {
+  test.skip("routine body: matmul in native scan", () => {
     const step = (carry: np.Array, x: np.Array): [np.Array, np.Array] => {
       const newCarry = np.matmul(carry, x);
       return [newCarry.ref, newCarry];

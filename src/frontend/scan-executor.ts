@@ -15,6 +15,7 @@ import { ShapedArray } from "./core";
 import type { Jaxpr } from "./jaxpr";
 import type { JitProgram } from "./jit";
 import type { ScanPlan } from "./scan-plan";
+import type { WasmBackend } from "../backend/wasm";
 
 // ---------------------------------------------------------------------------
 // Public interface
@@ -58,8 +59,7 @@ export function executeScan(params: ExecuteScanParams): ExecuteScanResult {
     case "fallback":
       return executeScanFallback(params);
     case "compiled-loop":
-      // P2: backend.dispatchNativeScanGeneral()
-      throw new Error("compiled-loop scan not yet implemented (P2)");
+      return executeScanCompiledLoop(params);
     case "preencoded-routine":
       // P4: backend.dispatchPreencodedScan()
       throw new Error("preencoded-routine scan not yet implemented (P4)");
@@ -77,8 +77,8 @@ function executeScanFallback(params: ExecuteScanParams): ExecuteScanResult {
     bodyJaxpr,
     length,
     numCarry,
-    numConsts,
-    numX,
+    numConsts: _numConsts,
+    numX: _numX,
     numY,
     reverse,
     constSlots,
@@ -198,6 +198,43 @@ function executeScanFallback(params: ExecuteScanParams): ExecuteScanResult {
   }
 
   return { outputs: outputSlots, pending };
+}
+
+// ---------------------------------------------------------------------------
+// Compiled-loop: WASM or WebGPU native scan
+// ---------------------------------------------------------------------------
+
+function executeScanCompiledLoop(params: ExecuteScanParams): ExecuteScanResult {
+  const {
+    backend,
+    plan,
+    numCarry,
+    numY,
+    constSlots,
+    initCarrySlots,
+    xsSlots,
+    outputSlots,
+  } = params;
+
+  if (plan.path !== "compiled-loop") throw new Error("unreachable");
+  if (!plan.params) throw new Error("compiled-loop plan missing params");
+
+  const carryOutSlots = outputSlots.slice(0, numCarry);
+  const ysStackedSlots = outputSlots.slice(numCarry, numCarry + numY);
+
+  // Dispatch to the backend's native scan implementation
+  const wasmBackend = backend as WasmBackend;
+  wasmBackend.dispatchNativeScanGeneral(
+    plan.executable,
+    plan.params,
+    constSlots,
+    initCarrySlots,
+    xsSlots,
+    carryOutSlots,
+    ysStackedSlots,
+  );
+
+  return { outputs: outputSlots, pending: [] };
 }
 
 // ---------------------------------------------------------------------------
