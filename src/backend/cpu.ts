@@ -73,8 +73,16 @@ export class CpuBackend implements Backend {
   ): void {
     const srcBuf = this.#getBuffer(src);
     const dstBuf = this.#getBuffer(dst);
-    const srcView = new Uint8Array(srcBuf.buffer, srcBuf.byteOffset + srcOffset, size);
-    const dstView = new Uint8Array(dstBuf.buffer, dstBuf.byteOffset + dstOffset, size);
+    const srcView = new Uint8Array(
+      srcBuf.buffer,
+      srcBuf.byteOffset + srcOffset,
+      size,
+    );
+    const dstView = new Uint8Array(
+      dstBuf.buffer,
+      dstBuf.byteOffset + dstOffset,
+      size,
+    );
     dstView.set(srcView);
   }
 
