@@ -794,114 +794,17 @@ The `Kernel` class uses an `outputs: KernelOutput[]` array to support 1..N outpu
 - Backends: `src/backend/webgpu/`, `src/backend/wasm/`
 - Demos: `website/src/routes/repl/`, `website/src/routes/mobileclip/`
 - Deno WebGPU tests: `test/deno/webgpu.test.ts` — headless hardware GPU testing
-- Scan tests: `test/lax-scan.test.ts` — comprehensive scan suite (~2000 lines)
+- Scan tests: `test/lax-scan.test.ts` — comprehensive scan suite (~1700 lines)
 
 ---
 
-# Part 2: Scan v2 Planning
+# Part 2: Scan Feature Reference
 
-This section tracks the scan-v2 rewrite plan. It replaces the scan-v1 (feat/scan) approach of three
-separate JIT step types with a single loop construct and unified executor.
+`lax.scan` implements sequential loops with carry state — the JAX equivalent of a for-loop that
+threads state through each iteration. It supports JIT compilation, automatic differentiation
+(`grad`, `jvp`, `vjp`), `vmap`, and native compilation on WASM and WebGPU backends.
 
-## feat/scan complexity audit
-
-feat/scan added ~8,800 lines of real source across 87 commits. This is the breakdown of where that
-complexity lives, what is essential vs crud, and what v2 should carry forward vs eliminate.
-
-### Line budget (feat/scan vs main)
-
-| Layer              | Files                                             | Lines added | Essential?                                                                                                           |
-| ------------------ | ------------------------------------------------- | ----------- | -------------------------------------------------------------------------------------------------------------------- |
-| Frontend: planner  | `scan-plan.ts` (new)                              | 1,075       | ~400 reusable (buffer sizing, path heuristics); ~675 is backend-specific param construction that belongs in backends |
-| Frontend: JIT      | `jit.ts`                                          | +700        | ~200 essential (scan compilation, body tracing); ~500 is three step types with repeated fields/pprint/execute        |
-| Frontend: array.ts | `array.ts`                                        | +550        | ~200 essential (DUS, buffer copy); ~350 is duplicate JIT-vs-eager scan loops                                         |
-| Frontend: autodiff | `linearize.ts`, `jvp.ts`, `vmap.ts`               | +1,136      | ~1,000 essential (inherent math); ~136 structural overhead                                                           |
-| Frontend: API      | `lax-scan.ts` (new)                               | 484         | ~484 all essential — cleanest layer                                                                                  |
-| Backend: WebGPU    | `webgpu.ts`, `scan-wrapper.ts`                    | +1,830      | ~1,500 essential (irreducibly backend-specific); ~330 param-passing glue                                             |
-| Backend: WASM      | `wasm.ts`, `routine-provider.ts`, `wasmblr-hl.ts` | +2,950      | ~2,400 essential (codegen, routines, wasmblr-hl); ~550 param-passing glue                                            |
-| Backend: interface | `backend.ts`                                      | +80         | ~40 essential; ~40 can collapse if executor owns dispatch                                                            |
-| Tests              | 5 files                                           | 4,463       | ~4,463 all essential — port directly                                                                                 |
-| **Total source**   |                                                   | **~8,800**  | **~6,500 essential + ~2,300 eliminable**                                                                             |
-
-### Top-7 pain points (what v2 must fix)
-
-**1. Three JIT step types with identical shapes (~500 lines of duplication)**
-
-`scan`, `compiled-loop`, and `preencoded-routine` each repeat ~12 fields (`length`, `numCarry`,
-`numConsts`, `reverse`, `consts`, `initCarry`, `xs`, `outputs`), near-identical `pprint` cases, and
-the same `execute` pattern (flushPending → resolveScanSlots → dispatch). v2 replaces all three with
-one `scan` step that holds a `ScanPlan` discriminated union, eliminating the repetition.
-
-**2. Duplicate fallback loops — JIT scanRunner vs eager Primitive.Scan (~350 lines)**
-
-`array.ts` implements the JS scan body loop twice: once as a `ScanRunner` callback for JIT-compiled
-scans, once in the `Primitive.Scan` handler for eager scans. They share slot-wrapping,
-body-execution, duplicate-slot detection, and Y-stacking logic but differ subtly in ownership (JIT
-skips dispose to preserve pending ops; eager disposes). v2 uses a single `executeScan()` function
-called from both paths.
-
-**3. Scattered pending-ops flush discipline (~7 manual flush sites)**
-
-Pending GPU commands are flushed at: JIT execute, scanRunner, fallback loop, DUS handler, and WebGPU
-dispatch functions. Missing any site causes silent data corruption. v2 flushes at exactly two
-points: before each body invocation and before reading final outputs. One policy, one place.
-
-**4. Ownership rules differ between paths (~400 lines of ad-hoc guards)**
-
-Shared-slot protection (carry ≡ Y slot), passthrough detection, duplicate-slot `incRef`, and
-preallocated-slot cleanup each live in separate code paths with subtly different semantics. v2
-centralizes all ownership invariants in the single executor, implemented once.
-
-**5. scan-plan.ts mixes analysis with backend param construction (1,075 lines)**
-
-`scan-plan.ts` classifies buffers, computes sizes, builds backend-specific params
-(`NativeScanMultiParams`, `NativeScanGeneralParams`, `PreparedPreencodedScan`), reindexes kernels,
-and dispatches to backends — all in one file. v2 splits this: buffer/stride analysis → `ScanPlan`
-construction (backend-agnostic, ~400 lines); param building → backend executor method
-(backend-specific, moves into backends).
-
-**6. Backend codegen shares no code (WASM vs WebGPU: ~4,700 lines total)**
-
-WASM generates a monolithic WebAssembly module (`codegenNativeScanGeneral`: 590 lines). WebGPU has
-three sub-paths (multi-kernel shader, pre-encoded routine, JS fallback). They share only
-`getScanBufferSizes` (12 lines). This divergence is mostly **inherent** — the backends compile to
-fundamentally different targets. v2 accepts this: the shared abstraction is the `ScanPlan`, not the
-codegen.
-
-**7. Autodiff: 580-line transpose rule with triple jaxpr construction**
-
-The transpose rule builds three jaxprs (primal-only, tangent-only, transposed- tangent), manages √N
-checkpointing, and has its own carry ownership system. This is **inherent complexity** from the math
-(JAX-Python has the same structure). v2 keeps this largely as-is; the main simplification is that
-scan is `Primitive.Scan` everywhere, no detection heuristics change.
-
-### What is and isn't eliminable
-
-| Category                                                                      | v1 lines               | v2 estimate                | Reduction         |
-| ----------------------------------------------------------------------------- | ---------------------- | -------------------------- | ----------------- |
-| Eliminable crud (duplicate step types, dual loops, scattered flush/ownership) | ~2,300                 | 0                          | **-2,300**        |
-| Backend-agnostic planner (buffer roles, sizes, strides, path selection)       | ~675 (in scan-plan.ts) | ~400 (ScanPlan)            | **-275**          |
-| Backend-specific codegen (WASM module gen, WGSL shader gen, scan-wrapper)     | ~3,900                 | ~3,500 (port with cleanup) | **-400**          |
-| Autodiff rules (JVP, transpose, vmap)                                         | ~1,136                 | ~1,100 (minor rename)      | **-36**           |
-| API + core primitives (`lax-scan.ts`, `core.ts`, `jaxpr.ts`)                  | ~600                   | ~600 (port directly)       | **0**             |
-| Tests                                                                         | 4,463                  | 4,463 (port directly)      | **0**             |
-| New unified executor                                                          | 0                      | ~300                       | **+300**          |
-| **Total**                                                                     | **~13,074**            | **~10,363**                | **-2,711 (~21%)** |
-
-The net reduction is modest (~21%) because most of the v1 complexity is **essential**: backends are
-irreducibly different, autodiff math doesn't change, and tests must be preserved. The real win is
-**structural** — one execution path instead of six, one ownership policy instead of three.
-
-## Scan v2 design (scan-v2 branch)
-
-### Goals
-
-1. One JIT step type (`scan`) with a `ScanPlan` that captures the execution strategy.
-2. One `executeScan()` function that handles ownership, flush, and dispatch for all backends.
-3. Backend-specific codegen stays in backends, called via the plan.
-4. Port v1 tests as the primary correctness gate.
-
-### Architecture: ScanPlan replaces three step types
+## Architecture overview
 
 ```
 lax.scan(f, init, xs)
@@ -912,485 +815,98 @@ Primitive.Scan → makeJaxpr(body) → bodyJaxpr
   ▼ (inside jitCompile)
 planScan(backend, bodyProgram, bodyJaxpr, ...) → ScanPlan
   │
-  ├─ { path: "compiled-loop", executable }      ← WASM compiled module or WebGPU multi-kernel shader
-  ├─ { path: "preencoded-routine", prepared }    ← WebGPU uniform-offset routine scan
-  └─ { path: "fallback" }                        ← JS loop calling bodyProgram.execute() per iteration
+  ├─ { path: "compiled-loop" }       ← WASM compiled module or WebGPU multi-kernel shader
+  ├─ { path: "preencoded-routine" }  ← WebGPU uniform-offset routine scan
+  └─ { path: "fallback" }            ← JS loop calling bodyProgram.execute() per iteration
   │
   ▼
-JitStep { type: "scan", plan: ScanPlan, consts, initCarry, xs, outputs, ... }
+JitStep { type: "scan", plan: ScanPlan, ... }
   │
   ▼ (inside JitProgram.execute)
 executeScan(backend, step)
   ├─ flush pending ops on all inputs (ONE policy)
   ├─ preallocate Y stacked buffers if direct-write eligible
-  ├─ dispatch based on plan.path (compiled-loop | preencoded-routine | fallback)
-  ├─ manage carry lifecycle, shared-slot guards, duplicate-slot incRef (ONE place)
+  ├─ dispatch based on plan.path
+  ├─ manage carry lifecycle, shared-slot guards, duplicate-slot incRef
   └─ return carry + stacked ys
 ```
 
-Key difference from v1: the planner produces a data structure (`ScanPlan`), not a JIT step type. The
-executor interprets it. This eliminates the three parallel step type definitions, three pprint
-cases, and three execute branches.
+The planner produces a `ScanPlan` data structure; the executor interprets it. This gives one
+execution path for all backends, one ownership policy, and one flush discipline.
 
-### What does NOT change from v1
+## Key files
 
-These pieces port with minimal modification:
+| File                                 | Purpose                                                   |
+| ------------------------------------ | --------------------------------------------------------- |
+| `src/library/lax-scan.ts`            | Public `lax.scan()` API, tree handling, tracing           |
+| `src/frontend/scan-plan.ts`          | `ScanPlan` type, `planScan()`, path selection heuristics  |
+| `src/frontend/scan-executor.ts`      | `executeScan()` — unified scan loop for all backends      |
+| `src/frontend/core.ts`               | `Primitive.Scan`, `DynamicUpdateSlice`                    |
+| `src/frontend/jaxpr.ts`              | Abstract eval rules for Scan and DUS                      |
+| `src/frontend/jit.ts`                | Scan JitStep, `Primitive.Scan` case in `jitCompile()`     |
+| `src/frontend/array.ts`              | Eager `Primitive.Scan` impl, `copySliceToBuffer`          |
+| `src/frontend/jvp.ts`                | Scan JVP rule (wrapper jaxpr for input/output reordering) |
+| `src/frontend/linearize.ts`          | Scan transpose rule (√N checkpointing), partial eval      |
+| `src/frontend/vmap.ts`               | Scan vmap rule (batch axis management)                    |
+| `src/backend/wasm.ts`                | WASM compiled-loop scan codegen                           |
+| `src/backend/webgpu.ts`              | WebGPU multi-kernel + preencoded-routine scan             |
+| `src/backend/webgpu/scan-wrapper.ts` | WGSL shader transformer for preencoded scan               |
+| `test/lax-scan.test.ts`              | Comprehensive scan test suite (~1700 lines)               |
+| `test/deno/webgpu.test.ts`           | Deno WebGPU scan tests (cumsum, matmul)                   |
 
-- **`lax-scan.ts`** — public API, tree handling, tracing. Port directly.
-- **`core.ts` / `jaxpr.ts`** — `Primitive.Scan`, `DynamicUpdateSlice`, abstract eval. Port directly.
-- **Autodiff** — JVP rule (`jvp.ts`), transpose rule with √N checkpointing (`linearize.ts`), vmap
-  rule (`vmap.ts`). Port directly, rename as needed.
-- **Backend codegen** — WASM `codegenNativeScanGeneral` + routine-provider + wasmblr-hl, WebGPU
-  `nativeScanMultiShaderSource` + scan-wrapper + preencoded dispatch. Port from feat/scan with
-  cleanup.
-- **Tests** — all 4,463 lines. Port directly — they are the main asset.
+## Execution paths
 
-### What changes from v1
+| Path                   | Backend | When chosen                                             | How it works                                               |
+| ---------------------- | ------- | ------------------------------------------------------- | ---------------------------------------------------------- |
+| **compiled-loop**      | WASM    | Elementwise body, no routines, numCarry == numY         | Generates a single WebAssembly module for the full loop    |
+| **compiled-loop**      | WebGPU  | Elementwise body, no routines, numCarry == numY         | Generates WGSL shader dispatched once per iteration        |
+| **preencoded-routine** | WebGPU  | Body contains routines (sort, cholesky, matmul)         | Pre-encodes routine commands, replays with uniform offsets |
+| **fallback**           | All     | Complex bodies, internal buffer deps, unsupported cases | JS loop calling `bodyProgram.execute()` per iteration      |
 
-| v1 pattern                                                                    | v2 replacement                                                                       | Impact                                                                    |
-| ----------------------------------------------------------------------------- | ------------------------------------------------------------------------------------ | ------------------------------------------------------------------------- |
-| Three `JitStep` union members (`scan`, `compiled-loop`, `preencoded-routine`) | One `JitStep` member (`scan`) with `plan: ScanPlan`                                  | -200 lines JIT type defs, -150 lines pprint, -150 lines execute branching |
-| Dual scan loop in `array.ts` (`ScanRunner` + `Primitive.Scan`)                | Single `executeScan()` extracted to `scan-executor.ts`                               | -350 lines, one ownership policy                                          |
-| 7 manual flush sites                                                          | 2 flush calls in `executeScan()` (before body, before output read)                   | eliminates a class of silent bugs                                         |
-| `scan-plan.ts` builds backend params                                          | `planScan()` returns `ScanPlan` (data only); backends call their own prep            | -275 lines, cleaner separation                                            |
-| `Backend` interface gains 6 optional scan methods                             | 2-3 methods: `prepareScan?(plan)`, `dispatchScan?(prepared, slots)`, `copyBuffer?()` | simpler interface                                                         |
+## Autodiff
 
-### Dropped: memref / index_map IR layer
+- **JVP**: Creates a wrapper jaxpr that reorders inputs from scan layout (interleaved
+  primal/tangent) to JVP layout (all primals then all tangents). Runs a doubled scan with
+  `numCarry*2`.
+- **Transpose (VJP/grad)**: √N checkpointing by default (Griewank–Walther). Forward pass stores
+  `ceil(√N)` checkpoints, backward pass recomputes intermediate carries per segment. Supports
+  `checkpoint: false` (O(N) memory) and `checkpoint: number` (custom segment size).
+- **Vmap**: Moves batch to axis 0 for carry/consts, axis 1 for xs (after scan length axis), vmaps
+  the body, then moves ys batch back to axis 0.
 
-The original v2 plan proposed `src/ir/memref.ts` and `src/ir/index_map.ts` for explicit view/stride
-semantics. After auditing v1, this is **over-engineering for the current need**: scan bodies access
-data at `base + i * stride`, which is a `{buffer, byteOffset, byteStride}` tuple — not a
-multi-dimensional view.
+## Ownership rules
 
-The `ScanPlan` stores buffer roles (const/carry/xs/ys/internal), byte sizes, and per-iteration
-strides directly. If view-aware codegen or kernel packing becomes necessary later, memref/index_map
-can be introduced then as a refinement, not a prerequisite.
+1. **Flush before body**: Before each iteration, pending GPU commands are submitted.
+2. **Carry lifecycle**: Carry slots are owned by the loop. Non-aliased old carry slots are freed
+   after each iteration.
+3. **Y stacking**: Direct-write (preferred) preallocates full Y output buffers, copies each
+   iteration's y into the correct slice. Collect-and-stack as fallback.
+4. **Shared-slot protection**: When carry_out[i] aliases y_out[j], incRef before stacking.
+5. **xs slicing**: Iteration `i` reads at offset `i * stride` (or `(length-1-i) * stride` for
+   reverse).
 
-### How to access v1 (feat/scan) source
+## WebGPU scan constraints
 
-The feat/scan branch contains the v1 implementation. **Never switch to it** — use `git show` to read
-individual files without leaving the scan-v2 branch:
+The "no global barrier" limitation creates scan-specific constraints:
+
+| Constraint                        | Why it exists                                                | Consequence                   |
+| --------------------------------- | ------------------------------------------------------------ | ----------------------------- |
+| Per-element independence required | No cross-workgroup sync between iterations                   | Complex bodies → JS fallback  |
+| numCarry ≠ numY unsupported       | compiled-loop shader assumes 1:1 carry↔output mapping       | Falls back to JS loop         |
+| Internal buffer deps unsupported  | Shader can't allocate scratch temporaries between statements | Mandelbrot pattern → fallback |
+| Sort in scan uses preencoded      | Sort shader already uses workgroup-level sync                | Requires preencoded path      |
+
+WASM backend handles all these cases because it can allocate temporaries and has true sequential
+control flow. WebGPU is more restricted but faster when patterns fit.
+
+## How to access v1 (feat/scan) source
+
+The feat/scan branch contains the v1 implementation. **Never switch to it** — use `git show`:
 
 ```bash
-# Read a file at its feat/scan version:
 git show feat/scan:src/library/lax-scan.ts
-git show feat/scan:src/frontend/core.ts
-git show feat/scan:src/frontend/array.ts
-git show feat/scan:src/frontend/jit.ts
 git show feat/scan:src/frontend/scan-plan.ts
 git show feat/scan:src/backend/wasm.ts
 git show feat/scan:src/backend/webgpu.ts
-git show feat/scan:src/backend/webgpu/scan-wrapper.ts
-git show feat/scan:test/lax-scan.test.ts
-
-# Search for a pattern in v1:
-git show feat/scan:src/frontend/jit.ts | grep -n "Primitive.Scan"
-
-# Diff v1 against main to see only scan additions:
 git diff main..feat/scan -- src/library/lax-scan.ts
 ```
-
-### P0 detailed specification
-
-P0 delivers a working `lax.scan()` that executes via the JS fallback loop path only. No WASM
-codegen, no WebGPU shaders — just tracing, JIT compilation, and a JS loop calling
-`bodyProgram.execute()` per iteration. This establishes the correct API surface and ownership model
-that P1–P6 build on.
-
-#### P0 file manifest
-
-| File                            | Action       | Source                                                    | Description                                                              |
-| ------------------------------- | ------------ | --------------------------------------------------------- | ------------------------------------------------------------------------ |
-| `src/library/lax-scan.ts`       | Create (new) | Port from `feat/scan:src/library/lax-scan.ts` (484 lines) | Public `lax.scan()` API                                                  |
-| `src/frontend/core.ts`          | Edit         | Port additions from `feat/scan:src/frontend/core.ts`      | Add `Primitive.Scan`, `DynamicUpdateSlice`, params                       |
-| `src/frontend/jaxpr.ts`         | Edit         | Port additions from `feat/scan:src/frontend/jaxpr.ts`     | Add abstract eval rules for Scan and DUS                                 |
-| `src/frontend/jit.ts`           | Edit         | New v2 design                                             | Add `scan` JitStep (single type), Primitive.Scan case in `jitCompile()`  |
-| `src/frontend/scan-executor.ts` | Create (new) | New v2 design                                             | `executeScan()` — unified scan loop                                      |
-| `src/frontend/scan-plan.ts`     | Create (new) | Partially port from feat/scan                             | `ScanPlan` type, `planScan()` (fallback-only in P0)                      |
-| `src/frontend/array.ts`         | Edit         | Port additions from feat/scan                             | `Primitive.Scan` eager impl + `DynamicUpdateSlice`, `#copySliceToBuffer` |
-| `src/library/lax.ts`            | Edit         | —                                                         | Wire `scan` export                                                       |
-| `src/index.ts`                  | Edit         | —                                                         | Export `ScanPath`, `setScanBodyStepsCallback`                            |
-
-#### P0 data flow (end-to-end)
-
-```
-User calls lax.scan(f, init, xs, { length?, reverse? })
-  │
-  ▼ lax-scan.ts: scan()
-1. tree.flatten(init) → [initFlat, carryTreeDef]
-2. tree.flatten(xs)   → [xsFlat, xsTreeDef]
-3. Determine scan length from xs shapes (or explicit length param)
-4. Build flatF: (carry, xSlice) → { carry, y }
-   - Unflattens carry via carryTreeDef, xSlice via xsTreeDef
-   - Calls user's f(carry, xSlice)
-   - Flattens results back
-5. traceFn = (carryAvals, xAvals) → flatF(carryAvals, xAvals)
-6. bodyJaxpr = makeJaxpr(traceFn)(...traceAvals)
-7. Handle length === 0 early return: carry = init, ys = empty
-8. bind(Primitive.Scan, [...consts, ...initFlat, ...xsFlat], {
-     jaxpr: bodyJaxpr, numCarry, numConsts, length, reverse,
-     acceptPath, checkpoint
-   })
-9. Split results → carry (first numCarry) + ys (rest)
-10. Unflatten carry via carryTreeDef, each y via yTreeDef
-  │
-  ▼ Two execution paths from bind():
-  ├─ EAGER (tracing off): Primitive.Scan impl rule in array.ts
-  │    → calls executeScan() with bodyProgram from jitCompile(bodyJaxpr)
-  │
-  └─ JIT (inside jit()): Primitive.Scan recorded in Jaxpr
-       → jitCompile() encounters Primitive.Scan
-       → calls planScan() → ScanPlan { path: "fallback" }  (P0 only)
-       → emits JitStep { type: "scan", plan, ... }
-       → JitProgram.execute() calls executeScan()
-```
-
-#### P0 types to add
-
-**In `core.ts`:**
-
-```typescript
-// Add to Primitive enum:
-Scan = "scan",
-
-// Add to PrimitiveParamsImpl:
-[Primitive.Scan]: {
-  jaxpr: Jaxpr;
-  numCarry: number;
-  numConsts: number;
-  length: number;
-  reverse: boolean;
-  acceptPath?: ScanPath | ScanPath[];
-  checkpoint?: boolean | number;
-};
-```
-
-**`DynamicUpdateSlice` function** — needed by direct-write Y stacking. Port from feat/scan
-`core.ts`. It takes `(operand, update, startIndices)` and produces an array equal to `operand`
-except for the slice starting at `startIndices` which is replaced by `update`. In jit, it lowers to
-a buffer copy step.
-
-**In `scan-plan.ts`:**
-
-```typescript
-export type ScanPath = "compiled-loop" | "preencoded-routine" | "fallback";
-
-export type ScanPlan =
-  | { path: "fallback"; extraInfo?: string }
-  | { path: "compiled-loop"; executable: Executable; params?: any }
-  | { path: "preencoded-routine"; preencodedParams: any };
-
-// P0 implementation: always returns fallback
-export function planScan(...): ScanPlan {
-  return { path: "fallback" };
-}
-```
-
-P2–P4 will populate the compiled-loop and preencoded-routine variants. The `any` types will be
-replaced with `NativeScanGeneralParams` and `PreparedPreencodedScan` when those are ported.
-
-**In `jit.ts`:**
-
-```typescript
-// ONE scan step type (replaces v1's three):
-| {
-    type: "scan";
-    plan: ScanPlan;
-    bodyProgram: JitProgram;
-    bodyJaxpr: Jaxpr;
-    length: number;
-    numCarry: number;
-    numConsts: number;
-    numX: number;
-    numY: number;
-    reverse: boolean;
-    consts: JitId[];
-    initCarry: JitId[];
-    xs: JitId[];
-    xsAvals: ShapedArray[];
-    outputs: JitId[];  // [carry_out..., stacked_ys...]
-  }
-```
-
-The `plan` field is checked at execute time. P0's plan is always `{ path: "fallback" }`, so the JIT
-execute path calls `executeScan()` with the fallback loop. P2–P4 add compiled-loop and
-preencoded-routine dispatch.
-
-#### Ownership rules (critical — v2 unification)
-
-v1's #1 bug source was divergent ownership between the eager and JIT paths. v2 enforces ONE policy
-in `executeScan()`:
-
-**Invariant 1: Flush before body.** Before each loop iteration calls `bodyProgram.execute()`, all
-pending GPU commands are submitted. This ensures carry slots and xs slices contain up-to-date data.
-
-**Invariant 2: Carry lifecycle.** Carry slots are owned by the loop. On each iteration:
-
-1. Pass carry slots to body as inputs (consume semantics — body takes ownership)
-2. Body returns new carry slots as outputs
-3. Old carry slots may alias new ones (passthrough) — detect via slot identity
-4. Non-aliased old carry slots are freed after the iteration
-
-**Invariant 3: Y stacking.** Two strategies:
-
-- **Direct-write** (preferred): Preallocate full Y output buffers, copy each iteration's y into the
-  correct slice via `copySliceToBuffer`. No concatenation.
-- **Collect-and-stack** (fallback): Collect y slices in an array, concatenate at end. Only used when
-  direct-write fails (e.g., zero-size ys).
-
-**Invariant 4: Shared-slot protection.** When carry_out[i] aliases y_out[j] (same Jaxpr variable),
-the same slot would be both reused as carry input and stacked as Y output. Protect by `incRef` on
-the shared slot before stacking.
-
-**Invariant 5: xs slicing.** For each xs input, iteration `i` reads an `xsAvals[j].size`-element
-slice at offset `i * stride` (or `(length-1-i) * stride` for reverse). The executor computes the
-byte offset and uses `backend.createView()` or similar.
-
-**Invariant 6: No dispose in JIT path.** When `executeScan()` is called from `JitProgram.execute()`,
-carry/y slots are tracked by the JIT scope — the executor must NOT dispose them. When called from
-the eager `Primitive.Scan` impl, the executor owns the slots and disposes them normally. Distinguish
-via a parameter (e.g., `disposeInputs: boolean`).
-
-#### executeScan() function signature (scan-executor.ts)
-
-```typescript
-export interface ExecuteScanParams {
-  backend: Backend;
-  plan: ScanPlan;
-  bodyProgram: JitProgram;
-  bodyJaxpr: Jaxpr;
-  length: number;
-  numCarry: number;
-  numConsts: number;
-  numX: number;
-  numY: number;
-  reverse: boolean;
-  constSlots: Slot[];
-  initCarrySlots: Slot[];
-  xsSlots: Slot[];
-  xsAvals: ShapedArray[];
-  outputSlots: Slot[]; // preallocated by JIT or eager path
-}
-
-export function executeScan(params: ExecuteScanParams): {
-  outputs: Slot[]; // [carry_out..., stacked_ys...]
-  pending: PendingExecute[];
-};
-```
-
-The function dispatches on `params.plan.path`:
-
-- `"fallback"` → JS loop (P0)
-- `"compiled-loop"` → `backend.dispatchNativeScanGeneral()` (P2/P3)
-- `"preencoded-routine"` → `backend.dispatchPreencodedScan()` (P4)
-
-#### Fallback loop pseudocode (P0 scope)
-
-```
-function executeScanFallback(params):
-  carry = params.initCarrySlots  (ref'd, not consumed)
-  ys = [][]  // numY arrays of length `length` slices
-  pending = []
-
-  for i in 0..length (reversed if params.reverse):
-    // Invariant 1: flush
-    FlushPending(pending)
-
-    // Slice xs for this iteration
-    xSlices = sliceXsAtIteration(params.xsSlots, params.xsAvals, i)
-
-    // Call body: [consts, carry, xSlices] → [newCarry, ySlices]
-    bodyInputSlots = [...params.constSlots.map(incRef), ...carry, ...xSlices]
-    { outputs, pending: newPending } = params.bodyProgram.execute(bodyInputSlots)
-    pending.push(...newPending)
-
-    newCarry = outputs.slice(0, params.numCarry)
-    ySlices = outputs.slice(params.numCarry)
-
-    // Invariant 4: shared-slot protection
-    for each shared carry/y slot: incRef
-
-    // Invariant 3: Y stacking (direct-write)
-    for j in 0..numY:
-      copySliceToBuffer(outputSlots[numCarry + j], ySlices[j], i, ysStride[j])
-
-    // Invariant 2: free old carry (skip if passthrough)
-    carry = newCarry
-
-  // Write final carry to output slots
-  for j in 0..numCarry:
-    copyToSlot(outputSlots[j], carry[j])
-
-  return { outputs: outputSlots, pending }
-```
-
-#### DynamicUpdateSlice (DUS) handling
-
-`DynamicUpdateSlice` is a primitive used by direct-write Y stacking. It copies a source slice into a
-destination buffer at a specified offset. In JIT, it compiles to a `copy` step (buffer clone +
-patch).
-
-**What to port from feat/scan:**
-
-- `DynamicUpdateSlice()` function in `core.ts`
-- Abstract eval rule in `jaxpr.ts` (output shape = operand shape)
-- JIT lowering in `jit.ts` — detect DUS in `splitGraphDataflow()` as a "black node" and emit a
-  `JitStep { type: "copy" }` step
-- Backend `copyBuffer(src, dst, srcOffset, dstOffset, size)` method
-
-**For P0**, DUS can be implemented directly using `backend.copyBuffer()` in the `executeScan()`
-fallback loop without going through the JIT copy step. The JIT path for DUS is only needed when scan
-bodies themselves contain DUS (rare).
-
-#### Commit granularity for P0
-
-P0 should be built in these sub-commits (each passing tests):
-
-1. **core + jaxpr primitives**: Add `Primitive.Scan` to enum, `PrimitiveParams`, abstract eval rule.
-   Add `DynamicUpdateSlice` primitive + eval rule. Existing tests still pass (no behavior change).
-
-2. **lax-scan.ts + lax.ts wiring**: Create `src/library/lax-scan.ts` ported from feat/scan. Add
-   `scan` to `lax.ts` exports. Add `ScanPath` export to `index.ts`. At this point `lax.scan()`
-   traces and calls `bind(Primitive.Scan, ...)`, but execution will error because no impl rule
-   exists yet.
-
-3. **scan-plan.ts + scan-executor.ts**: Create `ScanPlan` type and fallback-only `planScan()`.
-   Create `executeScan()` with the fallback loop. These are new files that nothing calls yet.
-
-4. **array.ts eager impl**: Add `Primitive.Scan` to the impl rules in `array.ts`. This calls
-   `jitCompile(bodyJaxpr)` + `executeScan()`. Now `lax.scan()` works in eager mode.
-
-5. **jit.ts compilation**: Add scan JitStep type, handle `Primitive.Scan` in `jitCompile()`, handle
-   `"scan"` step in `JitProgram.execute()`. Now `jit(f)` where `f` uses `lax.scan()` works.
-
-6. **Exports + smoke test**: Export public symbols, add a basic scan test (cumsum). Verify build +
-   check + vitest + deno all pass.
-
-### Implementation phases
-
-| Phase                              | Description                                                                                                                  | New/adapted lines | Port from v1                                                                                         | Risk                          |
-| ---------------------------------- | ---------------------------------------------------------------------------------------------------------------------------- | ----------------- | ---------------------------------------------------------------------------------------------------- | ----------------------------- |
-| **P0: API + primitive + fallback** | `lax-scan.ts`, `Primitive.Scan` in core/jaxpr, `planScan()` returning fallback-only `ScanPlan`, `executeScan()` with JS loop | ~800 new          | `lax-scan.ts` (484), `core.ts` (+50), `jaxpr.ts` (+60)                                               | Low                           |
-| **P1: Tests on fallback**          | Port all scan tests, run on JS fallback path only                                                                            | ~0 new            | 4,463 lines of tests                                                                                 | Low — tests catch regressions |
-| **P2: WASM compiled-loop**         | Port `codegenNativeScanGeneral`, `routine-provider`, wire into `planScan`                                                    | ~100 new glue     | `wasm.ts` scan codegen (~600), `routine-provider.ts` (261), `wasmblr-hl.ts` (if not already on main) | Medium — mostly mechanical    |
-| **P3: WebGPU multi-kernel**        | Port `nativeScanMultiShaderSource`, `genScanExpressionWithRidx`, wire into `planScan`                                        | ~100 new glue     | `webgpu.ts` scan functions (~600)                                                                    | Medium — WebGPU-specific      |
-| **P4: WebGPU preencoded-routine**  | Port `scan-wrapper.ts`, pre-encoded dispatch, ping-pong carry                                                                | ~50 new glue      | `scan-wrapper.ts` (386), dispatch logic (~200)                                                       | Medium — uniform offset logic |
-| **P5: Autodiff**                   | Port JVP, transpose (with √N checkpointing), vmap rules                                                                      | ~50 adaptation    | `jvp.ts` (+200), `linearize.ts` (+825), `vmap.ts` (+111)                                             | Low — mostly rename           |
-| **P6: Cleanup**                    | Delete v1 scan code from feat/scan, collapse scan-plan into planner, update docs                                             | net -1,500        | —                                                                                                    | Low — test suite validates    |
-
-**Estimated total v2 source (excluding tests): ~6,500 lines** vs v1's ~8,800. The reduction is ~26%,
-but the structural improvement (one execution path, one ownership policy) is the primary value — not
-the line count.
-
-### Progress tracker
-
-Update this table as phases are completed. Each phase should be marked with its current status and
-any notes about deviations from the plan.
-
-| Phase                              | Status      | Notes                                                                                                                                                        |
-| ---------------------------------- | ----------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| **P0: API + primitive + fallback** | Done        | 6 sub-commits: core primitives, lax-scan.ts, scan-plan/executor, array.ts eager, jit.ts, smoke tests. 9 scan tests pass (eager + JIT + wasm).                |
-| **P1: Tests on fallback**          | Done        | 86 scan tests pass (89 skipped for P2-P6). Fixed JIT pending-ops bug: input arrays' pending materialization must be flushed before JitProgram.execute().     |
-| **P2: WASM compiled-loop**         | Done        | Refactored translateExp→core, codegenNativeScanGeneral, WasmBackend scan methods, wasmblr memory.copy(). Kernel-only; routine support deferred. 4 new tests. |
-| **P3: WebGPU multi-kernel**        | Done        | genScanExpressionWithRidx, nativeScanMultiShaderSource, tryPrepareWebGPUNativeScan, executor dispatch. Deno GPU scan tests.                                  |
-| **P4: WebGPU preencoded-routine**  | Done        | scan-wrapper.ts WGSL transformer, preparePreencodedScan, dispatchPreencodedScan, ping-pong carry. 2 Deno matmul tests, 1 Vitest test unskipped.              |
-| **P5: Autodiff**                   | Done        | JVP rule (wrapper jaxpr reordering), transpose rule (√N checkpointing), vmap rule, partial eval for JVP'd scan. 16 new tests pass (1068 total).              |
-| **P6: Cleanup**                    | Not started |                                                                                                                                                              |
-
-Status values: `Not started` · `In progress` · `Done` · `Blocked`
-
-### Risks and guardrails
-
-- **Performance regression from extra indirection.** The `ScanPlan` → executor dispatch adds one
-  level vs v1's direct step execution. Profile after P2/P3 to verify no measurable overhead.
-- **WebGPU still needs three sub-paths.** The "no global barrier" hardware constraint means compiled
-  shaders, pre-encoded routines, and JS fallback are irreducibly different strategies. The v2 win is
-  that they share one executor for ownership/flush, not that they merge into one codegen path.
-- **Autodiff rules are orthogonal.** JVP/transpose/vmap operate on the Jaxpr, not the execution
-  layer. Switching from v1's step types to `ScanPlan` does not simplify the math. Budget time to
-  port but don't expect simplification.
-- **Edge cases live in the tests.** feat/scan accumulated 87 commits of fixes (length-0, reverse,
-  passthrough, shared-slot). Port tests before code to avoid re-discovering these.
-
-## Lessons learned from scan-v1 (feat/scan)
-
-- Split execution paths created duplicated ownership rules; v2 must have one executor.
-- Pending ops must be flushed before loop bodies read slots; make this a single policy.
-- WebGPU alignment limits require uniform-offset addressing for strided access.
-- Direct-write Y stacking is essential for long scans and must be part of the core plan.
-- Fallback paths must share body execution semantics with compiled paths to avoid drift.
-- `scan-plan.ts` grew to 1,075 lines because it mixed analysis with backend param construction — v2
-  should split planner (data) from backend prep (codegen).
-- The JIT-vs-eager dual loop was the #1 source of bugs: shared-slot guards, pending-op flush, and
-  dispose semantics diverged incrementally across commits.
-
-## Reusable pieces from scan-v1 (with modifications)
-
-When implementing scan-v2, check the reusable list and function-level inventory below (feat/scan)
-before writing new code.
-
-- Backend/WebGPU: WGSL copy shader for unaligned buffer copies and ping-pong carry dispatch logic in
-  [src/backend/webgpu.ts](src/backend/webgpu.ts).
-- Backend/WebGPU: Uniform-offset routine wrapper and offset buffer builder in
-  [src/backend/webgpu/scan-wrapper.ts](src/backend/webgpu/scan-wrapper.ts).
-- Backend/WebGPU: Scan-wrapper tests that validate shader rewriting in
-  [src/backend/webgpu/scan-wrapper.test.ts](src/backend/webgpu/scan-wrapper.test.ts).
-- Backend/WASM: General scan param model and routine import wiring in
-  [src/backend/wasm.ts](src/backend/wasm.ts).
-- Backend/WASM: Loop and memory helpers in
-  [src/backend/wasm/wasmblr-hl.ts](src/backend/wasm/wasmblr-hl.ts).
-- Backend/WASM: Routine modules and providers for scan bodies that call routines in
-  [src/backend/wasm/routine-provider.ts](src/backend/wasm/routine-provider.ts) and
-  [src/backend/wasm/routines](src/backend/wasm/routines).
-- Frontend: Path selection and buffer sizing helpers in
-  [src/frontend/scan-plan.ts](src/frontend/scan-plan.ts).
-- Frontend: Fallback loop, DUS-based Y stacking, and shared-slot protection in
-  [src/frontend/array.ts](src/frontend/array.ts).
-- Tests: Scan preallocate coverage in
-  [test/scan-preallocate.test.ts](test/scan-preallocate.test.ts).
-- Tests: Scan correctness and regression suite in [test/lax-scan.test.ts](test/lax-scan.test.ts) and
-  [test/jit-scan-dlm.test.ts](test/jit-scan-dlm.test.ts).
-- Tests/Deno: Leak harness and WebGPU coverage in [test/deno/harness.ts](test/deno/harness.ts) and
-  [test/deno/webgpu.test.ts](test/deno/webgpu.test.ts).
-- Tests/Deno: Preencoded routine coverage in
-  [test/deno/preencoded-scan.test.ts](test/deno/preencoded-scan.test.ts) and
-  [test/deno/preencoded-scan-integration.test.ts](test/deno/preencoded-scan-integration.test.ts).
-- Benchmarks/Deno: Scan overhead and Kalman trace benchmarks in
-  [test/deno/scan-overhead.bench.ts](test/deno/scan-overhead.bench.ts) and
-  [test/deno/dlm-kalman-trace.bench.ts](test/deno/dlm-kalman-trace.bench.ts).
-- Scripts: Unified test runner for Deno fallback in [scripts/test-all.sh](scripts/test-all.sh).
-
-### Function-level inventory (feat/scan)
-
-- src/backend/webgpu/scan-wrapper.ts: `parseBufferBindings`, `transformArrayAccesses`,
-  `wrapRoutineForScan`, `createScanOffsetsUniform`, `createAllIterationsOffsetsBuffer`,
-  `getOffsetBindings`, `generateOffsetsStruct`, `findMainBodyStart`, `generateOffsetDeclarations`.
-- src/backend/webgpu.ts (scan-specific): `dispatchNativeScanGeneral`, `prepareNativeScanMulti`,
-  `getPreencodedScanAlignment`, `preparePreencodedScan`, `dispatchPreencodedScan`,
-  `genScanExpressionWithRidx`, `nativeScanMultiShaderSource`.
-- src/backend/wasm.ts (scan-specific): `prepareNativeScanGeneral`, `dispatchNativeScanGeneral`,
-  `codegenNativeScanGeneral`, `translateExpWithGeneralScanContext`.
-- src/backend/wasm/wasmblr-hl.ts: `WasmHl` methods `forLoop`, `forLoopDown`, `whileLoop`, `ifElse`,
-  `addr`, `load`, `loadDirect`, `storeAddr`, `storeDirect`, `store`, `memcpy`, `memcpyDynamic`,
-  `index2D`, `get`, `getExpr`, `loadF32x4`, `storeAddrF32x4`, `storeDirectF32x4`, `storeF32x4`,
-  `f32x4Hsum`, `f32x4Splat`, `f64x2Hsum`, `f64x2Splat`, `const`, `sqrt`, `binOp`, `eq`, `ltS`,
-  `leS`, `forLoopUnrolled`, `simdReductionF32`, `simdReductionF64`.
-- src/backend/wasm/routine-provider.ts: `getCholeskyModule`, `getTriangularSolveModule`,
-  `getLUModule`, `getSortModule`, `getArgsortModule`, `clearRoutineCache`, `getRoutineCacheSize`,
-  plus key helpers `choleskyKey`, `triangularSolveKey`, `luKey`, `sortKey`, `argsortKey`.
-- src/frontend/scan-plan.ts: `checkAcceptedPath`, `getScanBufferSizes`, `tryPreparePreencodedScan`,
-  `tryPrepareWebGPUNativeScan`, `tryPrepareWasmNativeScan`, `tryPrepareNativeScan`, `planScan`.
-- src/frontend/array.ts (scan fallback): `Array.#stackScanYs`, `Array.#runScanFallbackLoop` and the
-  `ScanRunner`-driven loop in `Primitive.Jit` and `Primitive.Scan`.
-- test/deno/harness.ts: `getSlotCount`, `assertNoLeaks`, `withLeakCheck`, `leakCheckTest`.
-- test/scan-preallocate.test.ts: inline scan step lambdas covering preallocated Y stacking,
-  duplicate-slot Y, passthrough Y, reverse scan, length-0.
-- test/lax-scan.test.ts: helper lambdas like `cumsumScan`, `cumprodScan`, `reverseCumsumScan`,
-  `sumOfCumsum`, `cumsumWithOutputs`, `cumsumWithJitBody`, `cumsumWithSum`, plus `loss` helpers in
-  grad/vmap sections.
-- test/jit-scan-dlm.test.ts: `forwardStep` (Kalman-like), `runSmoother` (two-pass pattern) in
-  regression coverage.
-- test/deno/preencoded-scan.test.ts: `getJaxJsWebGPUDevice` (backend bootstrap), plus matmul scan
-  step lambdas.
-- test/deno/scan-overhead.bench.ts: `complexStep` benchmark body.
-- test/deno/dlm-kalman-trace.bench.ts: `forwardStep` Kalman benchmark body.

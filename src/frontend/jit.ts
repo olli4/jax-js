@@ -460,12 +460,12 @@ export function jitCompile(backend: Backend, jaxpr: Jaxpr): JitProgram {
       continue;
     }
 
-    // Handle Primitive.DynamicUpdateSlice — P0: not yet compiled in JIT.
-    // DUS is used by the scan executor directly (copySliceToBuffer).
-    // JIT compilation of standalone DUS requires a "copy" step (P2+).
+    // DynamicUpdateSlice is used by the scan executor directly (copySliceToBuffer).
+    // Standalone JIT compilation is not supported — DUS should only appear
+    // inside scan bodies.
     if (eqn.primitive === Primitive.DynamicUpdateSlice) {
       throw new Error(
-        "DynamicUpdateSlice JIT compilation not yet implemented (P2). " +
+        "DynamicUpdateSlice JIT compilation is not supported. " +
           "DUS should only appear inside scan bodies, which handle it directly.",
       );
     }
