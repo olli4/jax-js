@@ -24,6 +24,7 @@ import {
   RecursiveArray,
   recursiveFlatten,
   rep,
+  type ScanPath,
 } from "../utils";
 import {
   checkConvShape,
@@ -1245,7 +1246,10 @@ export class Array extends Tracer {
           "dynamicUpdateSlice: unsupported dst/src shapes for update",
         );
       },
-      [Primitive.Scan](args, { jaxpr, numCarry, numConsts, length, reverse }) {
+      [Primitive.Scan](
+        args,
+        { jaxpr, numCarry, numConsts, length, reverse, acceptPath },
+      ) {
         // Scan primitive: executes jaxpr in a loop, threading carry state
         // Args layout: [...consts, ...initCarry, ...xs]
         // jaxpr inputs: [...consts, ...carry, ...x_slice]
@@ -1285,6 +1289,7 @@ export class Array extends Tracer {
           numX,
           numY,
           reverse,
+          acceptPath as ScanPath | ScanPath[] | undefined,
         );
 
         // Realize all input slots and flush pending ops
