@@ -1,2 +1,9 @@
 pnpm exec lint-staged
 
+# Run the full test suite before committing to catch regressions early
+pnpm vitest run
+
+# Run Deno WebGPU tests (requires build for dist/ imports)
+pnpm run build
+pnpm run test:deno
+

@@ -16,6 +16,10 @@ export class CpuBackend implements Backend {
     this.#nextSlot = 1;
   }
 
+  slotCount(): number {
+    return this.#buffers.size;
+  }
+
   malloc(size: number, initialData?: Uint8Array): Slot {
     const buffer = new Uint8Array(size);
     if (initialData) {
@@ -62,6 +66,28 @@ export class CpuBackend implements Backend {
     if (start === undefined) start = 0;
     if (count === undefined) count = buffer.byteLength - start;
     return buffer.slice(start, start + count);
+  }
+
+  copyBufferToBuffer(
+    src: Slot,
+    srcOffset: number,
+    dst: Slot,
+    dstOffset: number,
+    size: number,
+  ): void {
+    const srcBuf = this.#getBuffer(src);
+    const dstBuf = this.#getBuffer(dst);
+    const srcView = new Uint8Array(
+      srcBuf.buffer,
+      srcBuf.byteOffset + srcOffset,
+      size,
+    );
+    const dstView = new Uint8Array(
+      dstBuf.buffer,
+      dstBuf.byteOffset + dstOffset,
+      size,
+    );
+    dstView.set(srcView);
   }
 
   async prepareKernel(kernel: Kernel): Promise<Executable<void>> {

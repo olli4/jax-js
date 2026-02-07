@@ -542,11 +542,15 @@ Cholesky but are missing other building blocks like:
 
 ## [`jax.lax` module](https://docs.jax.dev/en/latest/jax.lax.html)
 
-Only a few functions in `jax.lax` have been implemented, notably `conv_general_dilated()` for
-convolutions and `dot()` for general tensor contractions. Also, `linalg.triangular_solve()` is
-available.
+A few functions in `jax.lax` have been implemented:
 
-In the future, the library may need a rework to add support for `lax` operations, which are
+- `conv_general_dilated()` for convolutions
+- `dot()` for general tensor contractions
+- `scan()` for sequential loops with carry state (supports JIT, autodiff with √N checkpointing,
+  vmap, and native compilation on WASM/WebGPU)
+- `linalg.triangular_solve()` for triangular system solving
+
+In the future, the library may need a rework to add support for more `lax` operations, which are
 lower-level (semantics-wise, they don't do automatic type promotion). The reason why jax-js did not
 start from `lax` is because JAX is built on XLA as foundations and started with `lax` wrappers, but
 jax-js was built from scratch.
