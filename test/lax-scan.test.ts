@@ -1578,6 +1578,11 @@ describe("scan autodiff", () => {
 // ============================================================================
 
 describe("native scan paths (P2+)", () => {
+  beforeAll(async () => {
+    const devs = await init();
+    if (!devs.includes("wasm")) return; // skip if no WASM
+    defaultDevice("wasm");
+  });
   test("small array with acceptPath: compiled-loop", () => {
     const step = (carry: np.Array, x: np.Array): [np.Array, np.Array] => {
       const newCarry = np.add(carry, x);

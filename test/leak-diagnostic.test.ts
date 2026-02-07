@@ -13,17 +13,29 @@
  * expecting zero delta (all scan internals cleaned up).
  */
 import { defaultDevice, getBackend, init, lax, numpy as np } from "@jax-js/jax";
-import { beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 /** Return the number of live backend slots. */
 function slotCount(): number {
   return (getBackend() as any).slotCount();
 }
 
+let previousDevice: string | undefined;
+
 describe("scan fallback leak detection (CPU)", () => {
   beforeAll(async () => {
-    await init("cpu");
+    const devices = await init();
+    // Remember the best non-CPU device so we can restore it in afterAll
+    previousDevice = devices.includes("webgpu")
+      ? "webgpu"
+      : devices.includes("wasm")
+        ? "wasm"
+        : undefined;
     defaultDevice("cpu");
+  });
+
+  afterAll(() => {
+    if (previousDevice) defaultDevice(previousDevice as any);
   });
 
   it("cumsum body does not leak", async () => {
@@ -202,6 +214,26 @@ describe("scan fallback leak detection (CPU)", () => {
     const [carry] = lax.scan(step, initC.ref, xs.ref);
     await carry.data();
     expect(slotCount() - before).toBe(0);
+
+    xs.dispose();
+    initC.dispose();
+  });
+
+  it("acceptPath is enforced in eager mode", () => {
+    const xs = np.array([
+      [1, 2],
+      [3, 4],
+    ]);
+    const initC = np.array([10, 20]);
+
+    const step = (carry: any, x: any): [any, null] => {
+      return [np.add(carry, x), null];
+    };
+
+    // CPU only supports fallback — requesting compiled-loop should throw
+    expect(() =>
+      lax.scan(step, initC.ref, xs.ref, { acceptPath: "compiled-loop" }),
+    ).toThrow();
 
     xs.dispose();
     initC.dispose();

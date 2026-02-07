@@ -1891,27 +1891,6 @@ scan bodies (multiple independent single-output kernel steps) are handled by
 | `grad(scan)` ~2× compute overhead     | Use `{ checkpoint: false }` for O(N) | All     |
 | Sort in scan body on WebGPU           | Uses JS loop (uniforms)              | WebGPU  |
 | Mixed-dtype carries on WebGPU         | Use WASM backend or same-dtype carry | WebGPU  |
-| `acceptPath` not forwarded in eager   | Use `jit(() => lax.scan(...))()`     | All     |
-
-**Known bug: `acceptPath` not forwarded in eager `Primitive.Scan` impl**
-
-In `src/frontend/array.ts`, the eager (non-JIT) `Primitive.Scan` implementation calls `planScan()`
-but does **not** forward the `acceptPath` option from `ScanParams`. This means `acceptPath`
-constraints are silently ignored when calling `lax.scan(...)` directly (without a `jit()` wrapper).
-The JIT path (`jit(() => lax.scan(..., { acceptPath }))()`) correctly forwards `acceptPath`.
-
-**Workaround:** Wrap in `jit()` if you need `acceptPath` enforcement:
-
-```ts
-// BUG: acceptPath silently ignored in eager mode
-await lax.scan(f, init, xs, { acceptPath: "compiled-loop" });
-
-// WORKAROUND: jit wrapper forwards acceptPath correctly
-await jit(() => lax.scan(f, init, xs, { acceptPath: "compiled-loop" }))();
-```
-
-The fix requires forwarding `acceptPath` from `scanParams` to the `planScan()` call in the
-`Primitive.Scan` impl rule in `src/frontend/array.ts` (around line 1278).
 
 **WebGPU preencoded-routine requirements:** WebGPU can only use `preencoded-routine` for scan bodies
 that are:
