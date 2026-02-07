@@ -247,12 +247,13 @@ A **Slot** is jax-js's internal handle to a backend memory allocation (WASM poin
 
 ### Backend memory comparison
 
-| Aspect        | Wasm (`src/backend/wasm.ts`)              | WebGPU (`src/backend/webgpu.ts`)                      |
-| ------------- | ----------------------------------------- | ----------------------------------------------------- |
-| Allocation    | `WasmAllocator` over `WebAssembly.Memory` | `device.createBuffer()` with `GPUBufferUsage.STORAGE` |
-| Slot tracking | `Map<Slot, {ptr, size, ref}>`             | `Map<Slot, {buffer, size, ref}>`                      |
-| Sync read     | Direct memory view                        | `SyncReader` with staging buffer + `mapAsync`         |
-| Dispatch      | Instantiate Wasm module, call exported fn | `commandEncoder.dispatchWorkgroups()`, queue submit   |
+| Aspect        | Wasm (`src/backend/wasm.ts`)                | WebGPU (`src/backend/webgpu.ts`)                      |
+| ------------- | ------------------------------------------- | ----------------------------------------------------- |
+| Allocation    | `WasmAllocator` over `WebAssembly.Memory`   | `device.createBuffer()` with `GPUBufferUsage.STORAGE` |
+| Slot tracking | `Map<Slot, {ptr, size, ref}>`               | `Map<Slot, {buffer, size, ref}>`                      |
+| Buffer copy   | `Uint8Array.copyWithin` (aligned/unaligned) | `copyBufferToBuffer` (aligned) or WGSL copy shader    |
+| Sync read     | Direct memory view                          | `SyncReader` with staging buffer + `mapAsync`         |
+| Dispatch      | Instantiate Wasm module, call exported fn   | `commandEncoder.dispatchWorkgroups()`, queue submit   |
 
 ## WebGPU Backend Architecture
 
@@ -971,6 +972,20 @@ executes the body program per iteration. This works correctly but lacks optimiza
 The fallback `executeScan()` path is backend-agnostic and tested with CPU/WASM/WebGPU, so WebGL
 should work identically. To verify manually, run website demos in a WebGL-capable browser.
 
+**WASM `copyBufferToBuffer` Support:**
+
+The WASM backend implements `copyBufferToBuffer` using `Uint8Array.copyWithin` on the main WASM
+memory buffer. This allows `scan-executor.ts` to stack `xs` slices and `ys` outputs during fallback
+execution without allocating temporary TypedArrays, significantly reducing GC pressure.
+
+> **When is copyBufferToBuffer used?**  
+> WASM supports `compiled-loop` for almost all scan patterns, so the fallback path is rarely hit in
+> production. However, `copyBufferToBuffer` is critical for:
+>
+> 1.  Debugging: When fallback scan is forced (e.g., via backend capability mocking).
+> 2.  Reliability: Ensuring a working fallback exists for any future unsupported pattern.
+> 3.  Completeness: Fulfilling the `Backend` interface contract.
+
 ---
 
 ## Design Choices & Rationales
@@ -1265,6 +1280,10 @@ const [carry, ys] = await lax.scan(f, init, xs, {
   acceptPath: ["compiled-loop", "preencoded-routine"],
 });
 
+// Works identically in eager mode (no jit):
+const [carry, ys] = lax.scan(f, init, xs, { acceptPath: "compiled-loop" });
+// The primitive implementation forwards options to planScan() correctly.
+
 // Accept only a specific path
 await lax.scan(f, init, xs, { acceptPath: "compiled-loop" });
 
@@ -1399,6 +1418,17 @@ The `tryPrepareNativeScan()` dispatcher routes to backend-specific implementatio
 - **WebGPU routine body** → `tryPreparePreencodedScan()` → uses `preparePreencodedScan()`
 - **WASM (kernels + routines)** → `tryPrepareWasmNativeScan()` → uses `prepareNativeScanGeneral()`
 
+**Dynamic Routine Planning:**
+
+Instead of maintaining a hardcoded list of supported routines in `scan-plan.ts`, the planner queries
+the backend capabilities via `getScanRoutineInfo(routineName, routine)`.
+
+- If the backend returns `ScanRoutineInfo`, the routine is eligible for native compilation
+  (`compiled-loop` or `preencoded-routine`).
+- If it returns `null`, the planner falls back to the JS loop (`fallback`).
+- This allows backends to implement routine support incrementally without modifying the frontend
+  planner.
+
 ### Compiled-loop eligibility
 
 **WASM compiled-loop** (via `tryPrepareWasmNativeScan`):
@@ -1408,7 +1438,8 @@ The `tryPrepareNativeScan()` dispatcher routes to backend-specific implementatio
 - Any `numCarry`/`numY` combination
 - Y outputs can be: carry passthrough, xs passthrough, or internal buffer
 - Internal buffer dependencies between steps: **supported**
-- Supported routines: Cholesky, Sort, TriangularSolve, LU, Argsort
+- Supported routines: Dynamically queried via `getScanRoutineInfo` (currently Cholesky, Sort,
+  TriangularSolve, LU, Argsort)
 
 **WebGPU compiled-loop (single kernel)** (via `prepareNativeScanMulti` with 1 step):
 
@@ -1979,12 +2010,13 @@ contributors should be aware of:
 
 ### Test files
 
-| File                       | Purpose                            |
-| -------------------------- | ---------------------------------- |
-| `test/lax-scan.test.ts`    | Main scan test suite (~1700 lines) |
-| `test/scan-bench.test.ts`  | Scan benchmark tests               |
-| `test/deno/webgpu.test.ts` | Headless WebGPU tests via Deno     |
-| `test/deno/scan.bench.ts`  | Deno WebGPU scan benchmarks        |
+| File                         | Purpose                                        |
+| ---------------------------- | ---------------------------------------------- |
+| `test/lax-scan.test.ts`      | Main scan test suite (~1700 lines)             |
+| `test/scan-backends.test.ts` | Backend coverage & `copyBufferToBuffer` checks |
+| `test/scan-bench.test.ts`    | Scan benchmark tests                           |
+| `test/deno/webgpu.test.ts`   | Headless WebGPU tests via Deno                 |
+| `test/deno/scan.bench.ts`    | Deno WebGPU scan benchmarks                    |
 
 ### Deno WebGPU test guidelines
 
@@ -2047,6 +2079,7 @@ doesn't silently regress to JS fallback.
 | `native scan paths`         | WASM    | compiled-loop      | Verify fusion works                   |
 | `native scan > with consts` | WASM    | compiled-loop      | Constants in body                     |
 | `routine body: matmul`      | WASM    | compiled-loop      | Routine bodies via WASM imports       |
+| `backend coverage`          | All     | direct call        | Verify copyBufferToBuffer & devicePut |
 | `Cholesky in body`          | WebGPU  | preencoded-routine | Preencoded-routine with routines      |
 | `transform sandwiches`      | varies  | varies             | `jit(grad(scan))`, `vmap(grad(scan))` |
 
