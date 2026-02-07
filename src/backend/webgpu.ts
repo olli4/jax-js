@@ -177,6 +177,35 @@ export class WebGPUBackend implements Backend {
     return this.syncReader.read(buffer, start, count);
   }
 
+  copyBufferToBuffer(
+    src: Slot,
+    srcOffset: number,
+    dst: Slot,
+    dstOffset: number,
+    size: number,
+  ): void {
+    if (size === 0) return;
+    const srcBuf = this.#getBuffer(src);
+    const dstBuf = this.#getBuffer(dst);
+    // WebGPU copyBufferToBuffer requires 4-byte alignment on offsets and size.
+    // If alignment is satisfied, use the fast GPU copy path.
+    if (srcOffset % 4 === 0 && dstOffset % 4 === 0 && size % 4 === 0) {
+      const encoder = this.device.createCommandEncoder();
+      encoder.copyBufferToBuffer(
+        srcBuf.buffer,
+        srcOffset,
+        dstBuf.buffer,
+        dstOffset,
+        size,
+      );
+      this.device.queue.submit([encoder.finish()]);
+    } else {
+      // Unaligned fallback: read + write via CPU
+      const data = this.syncReader.read(srcBuf.buffer, srcOffset, size);
+      this.device.queue.writeBuffer(dstBuf.buffer, dstOffset, data);
+    }
+  }
+
   #cachedShader(kernel: Kernel): ShaderInfo {
     const cacheKey = FpHash.hash(kernel);
     let result = this.#cachedShaderMap.get(cacheKey);
