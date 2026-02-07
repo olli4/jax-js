@@ -43,7 +43,7 @@
     "format": "prettier --write .",
     "format:check": "prettier --check .",
     "lint": "eslint",
-    "prepare": "[ -d .git ] && husky || true",
+    "prepare": "husky || true",
     "test": "vitest",
     "test:all": "scripts/test-all.sh",
     "test:deno": "DENO_JOBS=1 $HOME/.deno/bin/deno test --no-check --unstable-webgpu --allow-read --allow-env test/deno/webgpu.test.ts",
