@@ -408,11 +408,176 @@ const jvpRules: { [P in Primitive]: JvpRule<P> } = {
     const [primalsOut, tangentsOut] = [outs.slice(0, n), outs.slice(n)];
     return [primalsOut, tangentsOut];
   },
-  [Primitive.DynamicUpdateSlice]() {
-    throw new Error("DynamicUpdateSlice JVP: not yet implemented");
+  [Primitive.DynamicUpdateSlice]([dst, src], [ddst, dsrc], { offset, axis }) {
+    // JVP for dynamic update slice is not implemented. Throw to avoid silent errors.
+    throw new Error("JVP: dynamic_update_slice is not implemented");
   },
-  [Primitive.Scan]() {
-    throw new Error("Scan JVP: not yet implemented (P5)");
+  [Primitive.Scan](
+    primals,
+    tangents,
+    { jaxpr, numCarry, numConsts, length, reverse, checkpoint },
+  ) {
+    // JVP of scan: run a combined scan that processes both primals and tangents.
+    //
+    // Original scan:
+    //   body: (consts, carry, x) -> (new_carry, y)
+    //   scan: (consts, init_carry, xs) -> (final_carry, ys)
+    //
+    // JVP body from jvpJaxpr expects inputs as: [all primals..., all tangents...]
+    //   i.e., [consts, carry, x, consts_dot, carry_dot, x_dot]
+    // And outputs: [primal_outs..., tangent_outs...]
+    //   i.e., [new_carry, y, new_carry_dot, y_dot]
+    //
+    // But scan feeds body as: [consts..., carry..., x...]
+    // So for JVP scan with doubled carry/xs, body receives:
+    //   [constsP, constsT, carryP, carryT, xP, xT]  (scan order)
+    //
+    // We need to reorder to match jvpJaxpr expectations:
+    //   [constsP, carryP, xP, constsT, carryT, xT]  (jvp order)
+    //
+    // Similarly for outputs, jvpJaxpr produces:
+    //   [new_carryP, yP, new_carryT, yT]  (jvp order)
+    // But scan expects:
+    //   [new_carryP, new_carryT, yP, yT]  (scan order, carry then ys)
+
+    const numX = primals.length - numConsts - numCarry;
+    const numY = jaxpr.outs.length - numCarry;
+
+    // Transform the body jaxpr to compute JVP
+    const jvpBody = jvpJaxpr(jaxpr);
+
+    // jvpBody.jaxpr.inBinders = [jvpConsts..., primals..., tangents...]
+    //   where primals = [constsP, carryP, xP] and tangents = [constsT, carryT, xT]
+    // jvpBody.consts = the actual values for jvpConsts
+    const numJvpConsts = jvpBody.consts.length;
+    const numBodyInputs = numConsts + numCarry + numX;
+
+    // Get the body input avals in JVP order (primals then tangents)
+    const jvpOrderAvals = jvpBody.jaxpr.inBinders
+      .slice(numJvpConsts)
+      .map((v) => v.aval);
+
+    // Reorder to scan order: [constsP, constsT, carryP, carryT, xP, xT]
+    const constsP_avals = jvpOrderAvals.slice(0, numConsts);
+    const carryP_avals = jvpOrderAvals.slice(numConsts, numConsts + numCarry);
+    const xP_avals = jvpOrderAvals.slice(numConsts + numCarry, numBodyInputs);
+    const constsT_avals = jvpOrderAvals.slice(
+      numBodyInputs,
+      numBodyInputs + numConsts,
+    );
+    const carryT_avals = jvpOrderAvals.slice(
+      numBodyInputs + numConsts,
+      numBodyInputs + numConsts + numCarry,
+    );
+    const xT_avals = jvpOrderAvals.slice(numBodyInputs + numConsts + numCarry);
+
+    const wrapperInAvals = [
+      ...constsP_avals,
+      ...constsT_avals,
+      ...carryP_avals,
+      ...carryT_avals,
+      ...xP_avals,
+      ...xT_avals,
+    ];
+
+    const { jaxpr: wrapperJaxpr } = makeJaxpr(
+      (...scanOrderArgs: Tracer[]): Tracer[] => {
+        // scanOrderArgs layout: [constsP, constsT, carryP, carryT, xP, xT]
+        const constsP_in = scanOrderArgs.slice(0, numConsts);
+        const constsT_in = scanOrderArgs.slice(numConsts, numConsts * 2);
+        const carryP_in = scanOrderArgs.slice(
+          numConsts * 2,
+          numConsts * 2 + numCarry,
+        );
+        const carryT_in = scanOrderArgs.slice(
+          numConsts * 2 + numCarry,
+          numConsts * 2 + numCarry * 2,
+        );
+        const xP_in = scanOrderArgs.slice(
+          numConsts * 2 + numCarry * 2,
+          numConsts * 2 + numCarry * 2 + numX,
+        );
+        const xT_in = scanOrderArgs.slice(numConsts * 2 + numCarry * 2 + numX);
+
+        // Reorder to jvp order: [constsP, carryP, xP, constsT, carryT, xT]
+        const jvpOrderArgs = [
+          ...constsP_in.map((x) => x.ref),
+          ...carryP_in.map((x) => x.ref),
+          ...xP_in.map((x) => x.ref),
+          ...constsT_in.map((x) => x.ref),
+          ...carryT_in.map((x) => x.ref),
+          ...xT_in.map((x) => x.ref),
+        ];
+
+        // Call the jvpBody jaxpr with jvpConsts (captured) first, then reordered body args
+        const jvpOutputs = bind(
+          Primitive.Jit,
+          [...jvpBody.consts.map((c) => c.ref), ...jvpOrderArgs],
+          {
+            jaxpr: jvpBody.jaxpr,
+            numConsts: numJvpConsts,
+            name: "jvp_body",
+          },
+        );
+
+        // jvpOutputs layout: [carryP..., yP..., carryT..., yT...]
+        // Reorder to scan output order: [carryP..., carryT..., yP..., yT...]
+        const carryP_out = jvpOutputs.slice(0, numCarry);
+        const yP_out = jvpOutputs.slice(numCarry, numCarry + numY);
+        const carryT_out = jvpOutputs.slice(
+          numCarry + numY,
+          numCarry * 2 + numY,
+        );
+        const yT_out = jvpOutputs.slice(numCarry * 2 + numY);
+
+        return [...carryP_out, ...carryT_out, ...yP_out, ...yT_out];
+      },
+    )(...wrapperInAvals);
+
+    // Original args: consts (numConsts), carry (numCarry), xs (numX)
+    const constsP = primals.slice(0, numConsts);
+    const carryP = primals.slice(numConsts, numConsts + numCarry);
+    const xsP = primals.slice(numConsts + numCarry);
+
+    const constsT = tangents.slice(0, numConsts);
+    const carryT = tangents.slice(numConsts, numConsts + numCarry);
+    const xsT = tangents.slice(numConsts + numCarry);
+
+    // Build scan args in scan order:
+    // [wrapperConsts..., constsP, constsT, carryP, carryT, xsP, xsT]
+    const scanArgsJvp = [
+      ...wrapperJaxpr.consts.map((c) => c.ref),
+      ...constsP.map((c) => c.ref),
+      ...constsT.map((c) => c.ref),
+      ...carryP.map((c) => c.ref),
+      ...carryT.map((c) => c.ref),
+      ...xsP.map((x) => x.ref),
+      ...xsT.map((x) => x.ref),
+    ];
+
+    const results = bind(Primitive.Scan, scanArgsJvp, {
+      jaxpr: wrapperJaxpr.jaxpr,
+      numCarry: numCarry * 2,
+      numConsts: wrapperJaxpr.consts.length + numConsts * 2,
+      length,
+      reverse,
+      checkpoint,
+    });
+
+    // Dispose the wrapper jaxpr (not cached)
+    // Note: jvpBody is cached via jvpJaxprCache, so we don't dispose it
+    wrapperJaxpr.dispose();
+
+    // Results layout from wrapper: [carryP..., carryT..., yP..., yT...]
+    const carryOutP = results.slice(0, numCarry);
+    const carryOutT = results.slice(numCarry, numCarry * 2);
+    const ysP = results.slice(numCarry * 2, numCarry * 2 + numY);
+    const ysT = results.slice(numCarry * 2 + numY);
+
+    const primalsOut = [...carryOutP, ...ysP];
+    const tangentsOut = [...carryOutT, ...ysT];
+
+    return [primalsOut, tangentsOut];
   },
 };
 

@@ -1294,7 +1294,7 @@ any notes about deviations from the plan.
 | **P2: WASM compiled-loop**         | Done        | Refactored translateExp→core, codegenNativeScanGeneral, WasmBackend scan methods, wasmblr memory.copy(). Kernel-only; routine support deferred. 4 new tests. |
 | **P3: WebGPU multi-kernel**        | Done        | genScanExpressionWithRidx, nativeScanMultiShaderSource, tryPrepareWebGPUNativeScan, executor dispatch. Deno GPU scan tests.                                  |
 | **P4: WebGPU preencoded-routine**  | Done        | scan-wrapper.ts WGSL transformer, preparePreencodedScan, dispatchPreencodedScan, ping-pong carry. 2 Deno matmul tests, 1 Vitest test unskipped.              |
-| **P5: Autodiff**                   | Not started |                                                                                                                                                              |
+| **P5: Autodiff**                   | Done        | JVP rule (wrapper jaxpr reordering), transpose rule (√N checkpointing), vmap rule, partial eval for JVP'd scan. 16 new tests pass (1068 total).              |
 | **P6: Cleanup**                    | Not started |                                                                                                                                                              |
 
 Status values: `Not started` · `In progress` · `Done` · `Blocked`
