@@ -144,6 +144,17 @@ function executeScanFallback(params: ExecuteScanParams): ExecuteScanResult {
     const newCarry = bodyResult.outputs.slice(0, numCarry);
     const ySlices = bodyResult.outputs.slice(numCarry);
 
+    // Ensure outputs that alias inputs stay alive after we consume inputs.
+    const outputSlotSet = new Set<Slot>([...newCarry, ...ySlices]);
+    for (const slot of [...constSlots, ...carry, ...xSlices]) {
+      if (outputSlotSet.has(slot)) backend.incRef(slot);
+    }
+
+    // Release borrowed consts and created x slice slots (we created xSlices
+    // via malloc for the fallback path, so release our ownership here).
+    for (const slot of constSlots) backend.decRef(slot);
+    for (const slot of xSlices) backend.decRef(slot);
+
     // Invariant 4: Shared-slot protection
     // If a carry_out and y_out share the same slot, incRef before stacking
     // (because stacking will copy from it, and the next iteration will
