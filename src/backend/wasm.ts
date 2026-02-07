@@ -15,7 +15,7 @@ import {
   SlotError,
   UnsupportedOpError,
 } from "../backend";
-import { Routine, runCpuRoutine } from "../routine";
+import { Routine, Routines, runCpuRoutine } from "../routine";
 import { tuneNullopt } from "../tuner";
 import { DEBUG, FpHash, mapSetUnion, rep, runWithCache } from "../utils";
 import { WasmAllocator } from "./wasm/allocator";
@@ -32,6 +32,10 @@ import {
 } from "./wasm/builtins";
 import { CodeGenerator } from "./wasm/wasmblr";
 
+// ---------------------------------------------------------------------------
+// Types
+// ---------------------------------------------------------------------------
+
 interface WasmBuffer {
   ptr: number;
   size: number;
@@ -40,6 +44,61 @@ interface WasmBuffer {
 
 interface WasmProgram {
   module: WebAssembly.Module;
+}
+
+/** A single step in the native scan body (after analysis). */
+export interface GeneralScanStep {
+  source: Kernel | Routine;
+  inputSlots: number[];
+  outputInternalIdx: number;
+  outputInternalIndices?: number[];
+  routineCallInfo?: {
+    routineInfoIdx: number;
+    staticParams: number[];
+  };
+}
+
+/** Where a carry output comes from. */
+export type CarryOutputSource =
+  | { type: "passthrough"; carryIdx: number }
+  | { type: "internal"; internalIdx: number };
+
+/** Where a Y output comes from. */
+export type YOutputSource =
+  | { type: "passthrough"; carryIdx: number }
+  | { type: "xs-passthrough"; xsIdx: number }
+  | { type: "internal"; internalIdx: number };
+
+/** Routine info for WASM imports in scan codegen. */
+export interface ScanRoutineInfo {
+  routine: Routines;
+  exportName: string;
+  numParams: number;
+  dtype: "f32" | "f64";
+  sizeParams: number[];
+  unitDiagonal?: boolean;
+  lower?: boolean;
+}
+
+/** Parameters for the general native scan codegen. */
+export interface NativeScanGeneralParams {
+  length: number;
+  numConsts: number;
+  constSizes: number[];
+  numCarry: number;
+  carrySizes: number[];
+  numX: number;
+  xsStrides: number[];
+  numY: number;
+  ysStrides: number[];
+  internalSizes: number[];
+  steps: GeneralScanStep[];
+  carryOutSources: CarryOutputSource[];
+  yOutputSources: YOutputSource[];
+  reverse: boolean;
+  auxBufferSize?: number;
+  elementSize?: 4 | 8;
+  routineInfos?: ScanRoutineInfo[];
 }
 
 const moduleCache = new Map<string, WebAssembly.Module>();
@@ -119,8 +178,16 @@ export class WasmBackend implements Backend {
   ): void {
     const srcBuf = this.#getBuffer(src);
     const dstBuf = this.#getBuffer(dst);
-    const srcView = new Uint8Array(srcBuf.buffer, srcBuf.byteOffset + srcOffset, size);
-    const dstView = new Uint8Array(dstBuf.buffer, dstBuf.byteOffset + dstOffset, size);
+    const srcView = new Uint8Array(
+      srcBuf.buffer,
+      srcBuf.byteOffset + srcOffset,
+      size,
+    );
+    const dstView = new Uint8Array(
+      dstBuf.buffer,
+      dstBuf.byteOffset + dstOffset,
+      size,
+    );
     dstView.set(srcView);
   }
 
@@ -175,6 +242,125 @@ export class WasmBackend implements Backend {
     if (!buffer) throw new SlotError(slot);
     return new Uint8Array(this.#memory.buffer, buffer.ptr, buffer.size);
   }
+
+  #getPtr(slot: Slot): number {
+    const buffer = this.#buffers.get(slot);
+    if (!buffer) throw new SlotError(slot);
+    return buffer.ptr;
+  }
+
+  /**
+   * Prepare a native scan WASM module from the given params.
+   * Returns an Executable whose data is a WasmProgram.
+   */
+  prepareNativeScanGeneral(
+    params: NativeScanGeneralParams,
+  ): Executable<WasmProgram> {
+    const bytes = codegenNativeScanGeneral(params);
+    const module = new WebAssembly.Module(bytes);
+    return new Executable(null as any, { module });
+  }
+
+  /**
+   * Dispatch a native scan, executing the compiled WASM loop.
+   *
+   * Slots layout:
+   *   [...consts, ...carryIn, ...xs, ...carryOut, ...ysStacked]
+   * where carryOut and ysStacked are preallocated output buffers.
+   */
+  dispatchNativeScanGeneral(
+    exe: Executable<WasmProgram>,
+    params: NativeScanGeneralParams,
+    constSlots: Slot[],
+    carryInSlots: Slot[],
+    xsSlots: Slot[],
+    carryOutSlots: Slot[],
+    ysStackedSlots: Slot[],
+  ): void {
+    const { internalSizes, auxBufferSize } = params;
+
+    // Allocate internal scratch buffers
+    const internalPtrs: number[] = [];
+    for (const size of internalSizes) {
+      internalPtrs.push(this.#allocator.malloc(size));
+    }
+
+    // Allocate aux buffer if needed (for sort/argsort)
+    let auxPtr = 0;
+    if (auxBufferSize && auxBufferSize > 0) {
+      auxPtr = this.#allocator.malloc(auxBufferSize);
+    }
+
+    // Copy carryIn to carryOut (initial carry values)
+    const { carrySizes } = params;
+    for (let c = 0; c < params.numCarry; c++) {
+      const srcBuf = this.#getBuffer(carryInSlots[c]);
+      const dstBuf = this.#getBuffer(carryOutSlots[c]);
+      dstBuf.set(srcBuf.subarray(0, carrySizes[c]));
+    }
+
+    // Build args: [consts, carryOut, xs, carryOut, ysStacked, internals, aux?]
+    // The scan function arguments are:
+    //   [...consts (numConsts), ...carryIn (numCarry), ...xs (numX),
+    //    ...carryOut (numCarry), ...ysStacked (numY), ...internals (numInternal), aux?]
+    // BUT carryIn is also carryOut in this layout (the codegen copies carryIn to carryOut
+    // at step 1, so we pass carryOut pointers for both carryIn and carryOut positions).
+    const args: number[] = [];
+
+    // consts
+    for (const slot of constSlots) args.push(this.#getPtr(slot));
+    // carryIn (we pass carryOut ptrs here — codegen step 1 copies carryIn→carryOut first,
+    // but we already copied above, so carryOut IS the working carry buffer)
+    for (const slot of carryOutSlots) args.push(this.#getPtr(slot));
+    // xs
+    for (const slot of xsSlots) args.push(this.#getPtr(slot));
+    // carryOut (same ptrs as carryIn above — the scan reads/writes to carryOut)
+    for (const slot of carryOutSlots) args.push(this.#getPtr(slot));
+    // ysStacked
+    for (const slot of ysStackedSlots) args.push(this.#getPtr(slot));
+    // internals
+    args.push(...internalPtrs);
+    // aux
+    if (auxBufferSize && auxBufferSize > 0) args.push(auxPtr);
+
+    // Instantiate and run
+    const imports: WebAssembly.Imports = { env: { memory: this.#memory } };
+
+    const instance = new WebAssembly.Instance(exe.data.module, imports);
+    const scanFunc = instance.exports.scan as (...args: number[]) => void;
+    scanFunc(...args);
+
+    // Free scratch buffers
+    for (const ptr of internalPtrs) this.#allocator.free(ptr);
+    if (auxPtr) this.#allocator.free(auxPtr);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Shared WASM helper function imports
+// ---------------------------------------------------------------------------
+
+/**
+ * Import WASM helper functions (sin, cos, exp, etc.) needed by a set of AluOps.
+ * Shared by regular kernel codegen and scan codegen.
+ */
+function importWasmHelperFuncs(
+  cg: CodeGenerator,
+  ops: Set<AluOp> | Map<AluOp, Set<DType>>,
+): Record<string, number> {
+  const funcs: Record<string, number> = {};
+  const hasOp = (op: AluOp) => (ops instanceof Map ? ops.has(op) : ops.has(op));
+  if (hasOp(AluOp.Sin)) funcs.sin = wasm_sin(cg);
+  if (hasOp(AluOp.Cos)) funcs.cos = wasm_cos(cg);
+  if (hasOp(AluOp.Asin)) funcs.asin = wasm_asin(cg);
+  if (hasOp(AluOp.Atan)) funcs.atan = wasm_atan(cg);
+  if (hasOp(AluOp.Exp) || hasOp(AluOp.Erf) || hasOp(AluOp.Erfc))
+    funcs.exp = wasm_exp(cg);
+  if (hasOp(AluOp.Log)) funcs.log = wasm_log(cg);
+  if (hasOp(AluOp.Erf)) funcs.erf = wasm_erf(cg, funcs.exp);
+  if (hasOp(AluOp.Erfc)) funcs.erfc = wasm_erfc(cg, funcs.exp);
+  if (hasOp(AluOp.Threefry2x32)) funcs.threefry2x32 = wasm_threefry2x32(cg);
+  return funcs;
 }
 
 function codegenWasm(kernel: Kernel): Uint8Array<ArrayBuffer> {
@@ -192,22 +378,7 @@ function codegenWasm(kernel: Kernel): Uint8Array<ArrayBuffer> {
     tune.exp.distinctOps(),
     tune.epilogue?.distinctOps(),
   );
-  const funcs: Record<string, number> = {};
-  if (distinctOps.has(AluOp.Sin)) funcs.sin = wasm_sin(cg);
-  if (distinctOps.has(AluOp.Cos)) funcs.cos = wasm_cos(cg);
-  if (distinctOps.has(AluOp.Asin)) funcs.asin = wasm_asin(cg);
-  if (distinctOps.has(AluOp.Atan)) funcs.atan = wasm_atan(cg);
-  if (
-    distinctOps.has(AluOp.Exp) ||
-    distinctOps.has(AluOp.Erf) ||
-    distinctOps.has(AluOp.Erfc)
-  )
-    funcs.exp = wasm_exp(cg);
-  if (distinctOps.has(AluOp.Log)) funcs.log = wasm_log(cg);
-  if (distinctOps.has(AluOp.Erf)) funcs.erf = wasm_erf(cg, funcs.exp);
-  if (distinctOps.has(AluOp.Erfc)) funcs.erfc = wasm_erfc(cg, funcs.exp);
-  if (distinctOps.has(AluOp.Threefry2x32))
-    funcs.threefry2x32 = wasm_threefry2x32(cg);
+  const funcs = importWasmHelperFuncs(cg, distinctOps);
 
   const kernelFunc = cg.function(rep(kernel.nargs + 1, cg.i32), [], () => {
     const gidx = cg.local.declare(cg.i32);
@@ -320,26 +491,58 @@ function codegenWasm(kernel: Kernel): Uint8Array<ArrayBuffer> {
   return cg.finish();
 }
 
-function translateExp(
+// ---------------------------------------------------------------------------
+// Unified AluExp translation
+// ---------------------------------------------------------------------------
+
+/**
+ * Context for translating AluExp to WASM.
+ * The handleGlobalIndex callback is called to emit code that loads a value
+ * from a buffer. After it returns, the value should be on the WASM stack.
+ */
+interface TranslateExpContext {
+  /** Get the value of a variable (e.g., "gidx", "ridx", "acc") */
+  getVariable: (name: string) => number | undefined;
+  /** Emit code to handle GlobalIndex. Should leave the loaded value on stack. */
+  handleGlobalIndex: (
+    cg: CodeGenerator,
+    gen: (e: AluExp) => void,
+    gid: number,
+    len: number,
+    indexExp: AluExp,
+    dtype: DType,
+  ) => void;
+}
+
+/**
+ * Translate an AluExp tree to WASM code.
+ *
+ * This is the core expression translation shared by regular kernels and scan.
+ * The context provides callbacks for variable resolution and GlobalIndex handling.
+ */
+function translateExpCore(
   cg: CodeGenerator,
   funcs: Record<string, number>,
   exp: AluExp,
-  ctx: Record<string, number>,
-) {
+  ctx: TranslateExpContext,
+): void {
   const references = new Map<AluExp, number>();
   const seen = new Set<AluExp>();
-  const countReferences = (exp: AluExp) => {
-    references.set(exp, (references.get(exp) ?? 0) + 1);
-    if (!seen.has(exp)) {
-      seen.add(exp);
-      for (const src of exp.src) countReferences(src);
+  const countReferences = (e: AluExp) => {
+    references.set(e, (references.get(e) ?? 0) + 1);
+    if (!seen.has(e)) {
+      seen.add(e);
+      for (const src of e.src) countReferences(src);
     }
   };
 
   const expContext = new Map<AluExp, number>();
-  const gen = (exp: AluExp) => {
-    if (expContext.has(exp)) return cg.local.get(expContext.get(exp)!);
-    const { op, src, dtype, arg } = exp;
+  const gen = (e: AluExp): void => {
+    if (expContext.has(e)) {
+      cg.local.get(expContext.get(e)!);
+      return;
+    }
+    const { op, src, dtype, arg } = e;
 
     // Some of these cases early `return` to force-inline them (no local.set).
     if (AluGroup.Binary.has(op) || AluGroup.Compare.has(op)) {
@@ -510,12 +713,43 @@ function translateExp(
     } else if (op === AluOp.Const) {
       return dty(cg, op, dtype).const(arg as number);
     } else if (op === AluOp.Special) {
-      return cg.local.get(ctx[arg[0] as string]);
+      const resolved = ctx.getVariable(arg[0] as string);
+      if (resolved === undefined) throw new Error(`unknown special: ${arg[0]}`);
+      return cg.local.get(resolved);
     } else if (op === AluOp.Variable) {
-      return cg.local.get(ctx[arg as string]);
-    } else if (op === AluOp.GlobalIndex) {
+      const resolved = ctx.getVariable(arg as string);
+      if (resolved === undefined) throw new Error(`unknown variable: ${arg}`);
+      return cg.local.get(resolved);
+    } else if (op === AluOp.GlobalIndex || op === AluOp.GlobalView) {
       const [gid, len] = arg as [number, number];
-      gen(src[0]);
+      ctx.handleGlobalIndex(cg, gen, gid, len, src[0], dtype);
+    } else throw new UnsupportedOpError(op, dtype, "wasm");
+
+    if ((references.get(e) ?? 0) > 1) {
+      const local = cg.local.declare(dty(cg, op, dtype));
+      cg.local.tee(local);
+      expContext.set(e, local);
+    }
+  };
+
+  countReferences(exp);
+  gen(exp);
+}
+
+/**
+ * Translate an AluExp to WASM code for a regular kernel.
+ * This is a thin wrapper around translateExpCore with kernel-specific GlobalIndex handling.
+ */
+function translateExp(
+  cg: CodeGenerator,
+  funcs: Record<string, number>,
+  exp: AluExp,
+  ctx: Record<string, number>,
+) {
+  translateExpCore(cg, funcs, exp, {
+    getVariable: (name) => ctx[name],
+    handleGlobalIndex: (cg, gen, gid, len, indexExp, dtype) => {
+      gen(indexExp);
 
       // If value is out-of-bounds, just set it to be zero.
       // This extra bounds-check is needed in Wasm because otherwise we will get
@@ -523,26 +757,628 @@ function translateExp(
       const local = cg.local.declare(cg.i32);
       cg.local.tee(local);
       cg.i32.const(0);
-      (cg.local.get(local), cg.i32.const(len), cg.i32.lt_u());
+      cg.local.get(local);
+      cg.i32.const(len);
+      cg.i32.lt_u();
       cg.select();
 
       cg.i32.const(byteWidth(dtype));
       cg.i32.mul();
       cg.local.get(gid); // base offset of array
       cg.i32.add();
-      dty(cg, op, dtype).load(Math.log2(byteWidth(dtype)));
-    } else throw new UnsupportedOpError(op, dtype, "wasm");
-
-    if ((references.get(exp) ?? 0) > 1) {
-      const local = cg.local.declare(dty(cg, op, dtype));
-      cg.local.tee(local);
-      expContext.set(exp, local);
-    }
-  };
-
-  countReferences(exp);
-  gen(exp);
+      dty(cg, AluOp.GlobalIndex, dtype).load(Math.log2(byteWidth(dtype)));
+    },
+  });
 }
+
+// ---------------------------------------------------------------------------
+// Reduction accumulate helper (shared by kernel and scan codegen)
+// ---------------------------------------------------------------------------
+
+function codegenReductionAccumulate(
+  cg: CodeGenerator,
+  re: { op: AluOp; dtype: DType; size: number; identity: number },
+  acc: number,
+): void {
+  if (re.op === AluOp.Add) {
+    cg.local.get(acc);
+    if (re.dtype === DType.Bool) cg.i32.or();
+    else dty(cg, re.op, re.dtype).add();
+  } else if (re.op === AluOp.Mul) {
+    cg.local.get(acc);
+    if (re.dtype === DType.Bool) cg.i32.and();
+    else dty(cg, re.op, re.dtype).mul();
+  } else if (re.op === AluOp.Min || re.op === AluOp.Max) {
+    if (isFloatDtype(re.dtype)) {
+      cg.local.get(acc);
+      if (re.op === AluOp.Min) dtyF(cg, re.op, re.dtype).min();
+      else dtyF(cg, re.op, re.dtype).max();
+    } else if ([DType.Int32, DType.Uint32, DType.Bool].includes(re.dtype)) {
+      // WASM has no i32.min/max, so emulate with select
+      const local = cg.local.declare(cg.i32);
+      cg.local.tee(local);
+      cg.local.get(acc);
+      cg.local.get(local);
+      cg.local.get(acc);
+      if (re.op === AluOp.Min) {
+        if (re.dtype === DType.Int32) cg.i32.lt_s();
+        else cg.i32.lt_u();
+      } else {
+        if (re.dtype === DType.Int32) cg.i32.gt_s();
+        else cg.i32.gt_u();
+      }
+      cg.select();
+    } else {
+      throw new Error(`invalid reduction min/max over ${re.dtype}`);
+    }
+  } else {
+    throw new Error(`invalid wasm reduction op: ${re.op}`);
+  }
+  cg.local.set(acc);
+}
+
+// ---------------------------------------------------------------------------
+// tuneNulloptExp helper for scan (size-specific tuning without full Kernel)
+// ---------------------------------------------------------------------------
+
+function _tuneNulloptExp(exp: AluExp, size: number): AluExp {
+  const gidx = AluExp.special(DType.Int32, "gidx", size);
+  return exp.substitute({ gidx }).rewriteGlobalViews().simplify();
+}
+
+// ---------------------------------------------------------------------------
+// General scan context for WASM expression translation
+// ---------------------------------------------------------------------------
+
+/** Context for general scan expression translation. */
+interface GeneralScanContext {
+  gidx: number;
+  iter: number;
+  dataIdx: number;
+  ridx: number;
+  acc?: number;
+  constsBase: number;
+  constSizes: number[];
+  numConsts: number;
+  xsBase: number;
+  xsStrides: number[];
+  carryBase: number;
+  carrySizes: number[];
+  numCarry: number;
+  internalsBase: number;
+  internalSizes: number[];
+  numInternal: number;
+  /** Total number of jaxpr inputs (consts + carry + xs). */
+  numInputs: number;
+}
+
+/**
+ * Translate an AluExp to WASM code within a general scan context.
+ * Thin wrapper around translateExpCore with scan-specific GlobalIndex handling.
+ */
+function translateExpWithGeneralScanContext(
+  cg: CodeGenerator,
+  funcs: Record<string, number>,
+  exp: AluExp,
+  ctx: GeneralScanContext,
+) {
+  translateExpCore(cg, funcs, exp, {
+    getVariable: (name) => {
+      if (name === "gidx") return ctx.gidx;
+      if (name === "ridx") {
+        if (ctx.ridx < 0)
+          throw new Error("ridx used but not in reduction context");
+        return ctx.ridx;
+      }
+      if (name === "acc") {
+        if (ctx.acc === undefined)
+          throw new Error("acc used but not in epilogue context");
+        return ctx.acc;
+      }
+      return undefined;
+    },
+    handleGlobalIndex: (cg, gen, gid, _len, indexExp, dtype) => {
+      const bw = byteWidth(dtype);
+
+      if (gid < ctx.numConsts) {
+        // Constant input (no iteration offset)
+        cg.local.get(ctx.constsBase + gid);
+      } else if (gid < ctx.numConsts + ctx.numCarry) {
+        // Carry input (read from carryOut which has current carry values)
+        const carryIdx = gid - ctx.numConsts;
+        cg.local.get(ctx.carryBase + carryIdx);
+      } else if (gid < ctx.numInputs) {
+        // X input with iteration offset (use dataIdx for reverse support)
+        const xIdx = gid - ctx.numConsts - ctx.numCarry;
+        cg.local.get(ctx.xsBase + xIdx);
+        cg.local.get(ctx.dataIdx);
+        cg.i32.const(ctx.xsStrides[xIdx]);
+        cg.i32.mul();
+        cg.i32.add();
+      } else {
+        // Internal buffer (result from previous step)
+        const internalIdx = gid - ctx.numInputs;
+        cg.local.get(ctx.internalsBase + internalIdx);
+      }
+
+      // Add element index offset
+      gen(indexExp);
+      cg.i32.const(bw);
+      cg.i32.mul();
+      cg.i32.add();
+
+      // Load the value
+      dty(cg, AluOp.GlobalIndex, dtype).load(Math.log2(bw));
+    },
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Native scan codegen (WASM)
+// ---------------------------------------------------------------------------
+
+/**
+ * Generate a complete WASM module for a native scan loop.
+ *
+ * The generated module exports a single `scan` function that:
+ * 1. Copies carryIn to carryOut (working buffer)
+ * 2. Loops over iterations, executing body steps (kernels) per iteration
+ * 3. Copies Y outputs to ysStacked at iteration offset
+ * 4. Updates carry from internal buffers
+ *
+ * Function arguments:
+ *   [...consts, ...carryIn, ...xs, ...carryOut, ...ysStacked, ...internals, aux?]
+ */
+function codegenNativeScanGeneral(
+  params: NativeScanGeneralParams,
+): Uint8Array<ArrayBuffer> {
+  const {
+    length,
+    numConsts,
+    constSizes,
+    numCarry,
+    carrySizes,
+    numX,
+    xsStrides,
+    numY,
+    ysStrides,
+    internalSizes,
+    steps,
+    carryOutSources,
+    yOutputSources,
+    reverse,
+  } = params;
+  const numInternal = internalSizes.length;
+
+  // ---- Direct-write optimization analysis ----
+  // Checks if internal buffers can write directly to carryOut/ysStacked.
+  const numInputs = numConsts + numCarry + numX;
+
+  function collectCarryReads(exp: AluExp): Set<number> {
+    const result = new Set<number>();
+    exp.fold((e: AluExp) => {
+      if (e.op === AluOp.GlobalIndex || e.op === AluOp.GlobalView) {
+        const gid = (e.arg as number[])[0];
+        if (gid >= numConsts && gid < numConsts + numCarry) {
+          result.add(gid - numConsts);
+        }
+      }
+    });
+    return result;
+  }
+
+  const internalReadByStep = new Set<number>();
+  for (const step of steps) {
+    for (const slotIdx of step.inputSlots) {
+      if (slotIdx >= numInputs) {
+        internalReadByStep.add(slotIdx - numInputs);
+      }
+    }
+  }
+
+  const stepCarryReads: Set<number>[] = [];
+  for (const step of steps) {
+    const reads = new Set<number>();
+    if (step.source instanceof Kernel) {
+      // Single-output kernel: check exp and epilogue
+      for (const c of collectCarryReads(step.source.exp)) reads.add(c);
+      if (step.source.reduction?.epilogue) {
+        for (const c of collectCarryReads(step.source.reduction.epilogue))
+          reads.add(c);
+      }
+    }
+    stepCarryReads.push(reads);
+  }
+
+  const internalToCarry = new Map<number, number>();
+  for (let c = 0; c < numCarry; c++) {
+    const src = carryOutSources[c];
+    if (src.type === "internal") {
+      internalToCarry.set(src.internalIdx, c);
+    }
+  }
+
+  const internalToY = new Map<number, number>();
+  for (let y = 0; y < numY; y++) {
+    const src = yOutputSources[y];
+    if (src.type === "internal") {
+      internalToY.set(src.internalIdx, y);
+    }
+  }
+
+  const yPassthroughCarries = new Set<number>();
+  for (let y = 0; y < numY; y++) {
+    const src = yOutputSources[y];
+    if (src.type === "passthrough") {
+      yPassthroughCarries.add(src.carryIdx);
+    }
+  }
+
+  interface DirectWrite {
+    carryIdx: number;
+    yIdx?: number;
+  }
+  const directWriteMap = new Map<number, DirectWrite>();
+
+  for (let stepIdx = 0; stepIdx < steps.length; stepIdx++) {
+    const step = steps[stepIdx];
+    if (step.source instanceof Kernel) {
+      if (step.source.reduction) continue; // no reduction allowed for direct-write
+
+      const indices = [step.outputInternalIdx];
+
+      for (const intIdx of indices) {
+        if (!internalToCarry.has(intIdx)) continue;
+        if (internalReadByStep.has(intIdx)) continue;
+
+        const carryIdx = internalToCarry.get(intIdx)!;
+        if (yPassthroughCarries.has(carryIdx)) continue;
+
+        let laterStepReadsCarry = false;
+        for (let s = stepIdx + 1; s < steps.length; s++) {
+          if (stepCarryReads[s].has(carryIdx)) {
+            laterStepReadsCarry = true;
+            break;
+          }
+        }
+        if (laterStepReadsCarry) continue;
+
+        const dw: DirectWrite = { carryIdx };
+        if (internalToY.has(intIdx)) {
+          dw.yIdx = internalToY.get(intIdx)!;
+        }
+        directWriteMap.set(intIdx, dw);
+      }
+    }
+  }
+
+  if (DEBUG >= 2 && directWriteMap.size > 0) {
+    console.log(
+      `[wasm-scan] direct-write optimization: ${directWriteMap.size} internal buffers redirected`,
+      [...directWriteMap.entries()].map(([intIdx, dw]) => ({
+        intIdx,
+        carryIdx: dw.carryIdx,
+        yIdx: dw.yIdx,
+      })),
+    );
+  }
+
+  // ---- Code generation ----
+  const cg = new CodeGenerator();
+  cg.memory.import("env", "memory");
+
+  // Collect all helper functions needed by kernels
+  const allOps = new Set<AluOp>();
+  for (const step of steps) {
+    if (step.source instanceof Kernel) {
+      const tune = tuneNullopt(step.source);
+      for (const op of tune.exp.distinctOps().keys()) allOps.add(op);
+      if (tune.epilogue) {
+        for (const op of tune.epilogue.distinctOps().keys()) allOps.add(op);
+      }
+    }
+  }
+
+  const funcs = importWasmHelperFuncs(cg, allOps);
+
+  // Function arguments layout:
+  // [...consts (numConsts), ...carryIn (numCarry), ...xs (numX),
+  //  ...carryOut (numCarry), ...ysStacked (numY), ...internals (numInternal), aux?]
+  const needsAux = (params.auxBufferSize ?? 0) > 0;
+  const numArgs =
+    numConsts +
+    numCarry +
+    numX +
+    numCarry +
+    numY +
+    numInternal +
+    (needsAux ? 1 : 0);
+
+  const scanFunc = cg.function(rep(numArgs, cg.i32), [], () => {
+    // Local variables
+    const iter = cg.local.declare(cg.i32);
+    const gidx = cg.local.declare(cg.i32);
+    const dataIdx = cg.local.declare(cg.i32);
+
+    // Argument indices
+    const constsBase = 0;
+    const carryInBase = numConsts;
+    const xsBase = numConsts + numCarry;
+    const carryOutBase = numConsts + numCarry + numX;
+    const ysStackedBase = numConsts + numCarry + numX + numCarry;
+    const internalsBase = numConsts + numCarry + numX + numCarry + numY;
+
+    // Step 1: Copy carryIn to carryOut (working buffer)
+    for (let c = 0; c < numCarry; c++) {
+      const size = carrySizes[c];
+      cg.local.get(carryOutBase + c);
+      cg.local.get(carryInBase + c);
+      cg.i32.const(size);
+      cg.memory.copy();
+    }
+
+    // Step 2: Main scan loop
+    cg.i32.const(0);
+    cg.local.set(iter);
+
+    const makeScanContext = (): GeneralScanContext => ({
+      gidx,
+      iter,
+      dataIdx,
+      ridx: -1,
+      constsBase,
+      constSizes,
+      numConsts,
+      xsBase,
+      xsStrides,
+      carryBase: carryOutBase,
+      carrySizes,
+      numCarry,
+      internalsBase,
+      internalSizes,
+      numInternal,
+      numInputs: numConsts + numCarry + numX,
+    });
+
+    cg.loop(cg.void);
+    {
+      cg.block(cg.void);
+      cg.local.get(iter);
+      cg.i32.const(length);
+      cg.i32.ge_u();
+      cg.br_if(0);
+
+      // Compute dataIdx = reverse ? (length - 1 - iter) : iter
+      if (reverse) {
+        cg.i32.const(length - 1);
+        cg.local.get(iter);
+        cg.i32.sub();
+        cg.local.set(dataIdx);
+      } else {
+        cg.local.get(iter);
+        cg.local.set(dataIdx);
+      }
+
+      // Step 2a: Execute each step (Kernel), writing to internal buffers
+      for (let stepIdx = 0; stepIdx < steps.length; stepIdx++) {
+        const step = steps[stepIdx];
+        const internalIdx = step.outputInternalIdx;
+
+        if (step.source instanceof Kernel) {
+          // Single-output Kernel step
+          const kernel = step.source;
+          const tune = tuneNullopt(kernel);
+          const re = kernel.reduction;
+          const dw = directWriteMap.get(internalIdx);
+          const bw = byteWidth(kernel.dtype);
+          const storeAlign = Math.log2(bw);
+          const needsDualStore = dw && dw.yIdx !== undefined;
+
+          cg.i32.const(0);
+          cg.local.set(gidx);
+          cg.loop(cg.void);
+          {
+            cg.block(cg.void);
+            cg.local.get(gidx);
+            cg.i32.const(kernel.size);
+            cg.i32.ge_u();
+            cg.br_if(0);
+
+            // Compute primary output address
+            if (dw) {
+              cg.local.get(carryOutBase + dw.carryIdx);
+            } else {
+              cg.local.get(internalsBase + internalIdx);
+            }
+            cg.local.get(gidx);
+            cg.i32.const(bw);
+            cg.i32.mul();
+            cg.i32.add();
+
+            const scanCtx = makeScanContext();
+
+            if (re) {
+              const acc = cg.local.declare(dty(cg, null, kernel.exp.dtype));
+              dty(cg, null, kernel.exp.dtype).const(re.identity);
+              cg.local.set(acc);
+
+              const ridx = cg.local.declare(cg.i32);
+              cg.i32.const(0);
+              cg.local.set(ridx);
+              scanCtx.ridx = ridx;
+
+              cg.loop(cg.void);
+              {
+                cg.block(cg.void);
+                cg.local.get(ridx);
+                cg.i32.const(re.size);
+                cg.i32.ge_u();
+                cg.br_if(0);
+
+                translateExpWithGeneralScanContext(
+                  cg,
+                  funcs,
+                  tune.exp,
+                  scanCtx,
+                );
+                codegenReductionAccumulate(cg, re, acc);
+
+                cg.local.get(ridx);
+                cg.i32.const(1);
+                cg.i32.add();
+                cg.local.set(ridx);
+
+                cg.br(1);
+                cg.end();
+              }
+              cg.end();
+
+              translateExpWithGeneralScanContext(cg, funcs, tune.epilogue!, {
+                ...scanCtx,
+                acc,
+              });
+            } else {
+              translateExpWithGeneralScanContext(cg, funcs, tune.exp, scanCtx);
+            }
+
+            if (needsDualStore) {
+              const tmpVal = cg.local.declare(dty(cg, null, kernel.dtype));
+              cg.local.tee(tmpVal);
+              dty(cg, null, kernel.dtype).store(storeAlign);
+              // Store to ysStacked
+              cg.local.get(ysStackedBase + dw!.yIdx!);
+              cg.local.get(dataIdx);
+              cg.i32.const(ysStrides[dw!.yIdx!]);
+              cg.i32.mul();
+              cg.i32.add();
+              cg.local.get(gidx);
+              cg.i32.const(bw);
+              cg.i32.mul();
+              cg.i32.add();
+              cg.local.get(tmpVal);
+              dty(cg, null, kernel.dtype).store(storeAlign);
+            } else {
+              dty(cg, null, kernel.dtype).store(storeAlign);
+            }
+
+            // gidx++
+            cg.local.get(gidx);
+            cg.i32.const(1);
+            cg.i32.add();
+            cg.local.set(gidx);
+            cg.br(1);
+            cg.end();
+          }
+          cg.end();
+        }
+        // Note: Routine steps are not supported in P2 (kernel-only).
+        // Routine support will be added when routine-provider is ported.
+      }
+
+      // Step 2b: Copy Y outputs to ysStacked at iteration offset
+      // NOTE: Must run BEFORE carry update (2c) so passthrough reads OLD carry values
+      for (let y = 0; y < numY; y++) {
+        const source = yOutputSources[y];
+
+        // Skip if this Y output was already direct-written by the kernel
+        if (
+          source.type === "internal" &&
+          directWriteMap.has(source.internalIdx) &&
+          directWriteMap.get(source.internalIdx)!.yIdx === y
+        ) {
+          continue;
+        }
+
+        const yStride = ysStrides[y];
+
+        if (source.type === "passthrough") {
+          const srcArgIdx = carryOutBase + source.carryIdx;
+          const size = carrySizes[source.carryIdx];
+          // dst = ysStacked[y] + dataIdx * yStride
+          cg.local.get(ysStackedBase + y);
+          cg.local.get(dataIdx);
+          cg.i32.const(yStride);
+          cg.i32.mul();
+          cg.i32.add();
+          cg.local.get(srcArgIdx);
+          cg.i32.const(size);
+          cg.memory.copy();
+        } else if (source.type === "xs-passthrough") {
+          const xsPassthroughIdx = source.xsIdx;
+          const size = xsStrides[xsPassthroughIdx];
+          // dst = ysStacked[y] + dataIdx * yStride
+          cg.local.get(ysStackedBase + y);
+          cg.local.get(dataIdx);
+          cg.i32.const(yStride);
+          cg.i32.mul();
+          cg.i32.add();
+          // src = xs[xsIdx] + dataIdx * xsStrides[xsIdx]
+          cg.local.get(xsBase + xsPassthroughIdx);
+          cg.local.get(dataIdx);
+          cg.i32.const(xsStrides[xsPassthroughIdx]);
+          cg.i32.mul();
+          cg.i32.add();
+          cg.i32.const(size);
+          cg.memory.copy();
+        } else {
+          // internal
+          const srcArgIdx = internalsBase + source.internalIdx;
+          const size = internalSizes[source.internalIdx];
+          // dst = ysStacked[y] + dataIdx * yStride
+          cg.local.get(ysStackedBase + y);
+          cg.local.get(dataIdx);
+          cg.i32.const(yStride);
+          cg.i32.mul();
+          cg.i32.add();
+          cg.local.get(srcArgIdx);
+          cg.i32.const(size);
+          cg.memory.copy();
+        }
+      }
+
+      // Step 2c: Copy carry outputs from internal buffers to carryOut
+      for (let c = 0; c < numCarry; c++) {
+        const source = carryOutSources[c];
+
+        // Skip if this carry output was already direct-written
+        if (
+          source.type === "internal" &&
+          directWriteMap.has(source.internalIdx)
+        ) {
+          continue;
+        }
+
+        const size = carrySizes[c];
+        const srcLocal =
+          source.type === "passthrough"
+            ? carryInBase + source.carryIdx
+            : internalsBase + source.internalIdx;
+
+        cg.local.get(carryOutBase + c);
+        cg.local.get(srcLocal);
+        cg.i32.const(size);
+        cg.memory.copy();
+      }
+
+      // iter++
+      cg.local.get(iter);
+      cg.i32.const(1);
+      cg.i32.add();
+      cg.local.set(iter);
+
+      cg.br(1);
+      cg.end();
+    }
+    cg.end();
+  });
+
+  cg.export(scanFunc, "scan");
+  return cg.finish();
+}
+
+// ---------------------------------------------------------------------------
+// Type helpers
+// ---------------------------------------------------------------------------
 
 function dty(cg: CodeGenerator, op: AluOp | null, dtype: DType) {
   switch (dtype) {
