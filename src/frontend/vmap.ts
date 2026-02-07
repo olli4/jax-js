@@ -416,8 +416,92 @@ const vmapRules: Partial<{ [P in Primitive]: VmapRule<P> }> = {
   [Primitive.DynamicUpdateSlice]() {
     throw new Error("DynamicUpdateSlice vmap: not yet implemented");
   },
-  [Primitive.Scan]() {
-    throw new Error("Scan vmap: not yet implemented (P5)");
+  [Primitive.Scan](
+    axisSize,
+    args,
+    dims,
+    { jaxpr, numCarry, numConsts, length, reverse },
+  ) {
+    // vmap of scan: batch over independent scans
+    //
+    // Scan args layout: [...consts, ...initCarry, ...xs]
+    // Body takes: [...consts, ...carry, ...x_slice] -> [...new_carry, ...y]
+    //
+    // Move all batch dimensions to consistent positions:
+    // - consts: batch at axis 0
+    // - carry: batch at axis 0
+    // - xs: batch at axis 1 (axis 0 is scan length)
+    // Then vmap the body to handle the batch dimension.
+
+    const numX = args.length - numConsts - numCarry;
+    const numY = jaxpr.outs.length - numCarry;
+
+    // Split args
+    const consts = args.slice(0, numConsts);
+    const initCarry = args.slice(numConsts, numConsts + numCarry);
+    const xs = args.slice(numConsts + numCarry);
+
+    const constDims = dims.slice(0, numConsts);
+    const carryDims = dims.slice(numConsts, numConsts + numCarry);
+    const xsDims = dims.slice(numConsts + numCarry);
+
+    // Move batch dims to consistent positions
+    const movedConsts = consts.map((c, i) =>
+      moveBatchAxis(axisSize, constDims[i], 0, c),
+    );
+    const movedCarry = initCarry.map((c, i) =>
+      moveBatchAxis(axisSize, carryDims[i], 0, c),
+    );
+    // For xs, move batch to axis 1 (after the length axis)
+    const movedXs = xs.map((x, i) => {
+      if (xsDims[i] === null) {
+        // Not mapped - broadcast batch dim at axis 1
+        const newShape = [x.shape[0], axisSize, ...x.shape.slice(1)];
+        return broadcast(x, newShape, [1]);
+      } else if (xsDims[i] === 0) {
+        // Batch at axis 0, need it at axis 1 (after length)
+        return moveaxis(x, 0, 1);
+      } else {
+        // Batch at some other axis - move to axis 1
+        return moveBatchAxis(axisSize, xsDims[i], 1, x);
+      }
+    });
+
+    // Body dims: all at axis 0 (consts, carry, x_slice all have batch at axis 0)
+    const bodyDims: (number | null)[] = [
+      ...rep(numConsts, 0),
+      ...rep(numCarry, 0),
+      ...rep(numX, 0),
+    ];
+
+    // Create vmapped body jaxpr
+    const vmappedBody = vmapJaxpr(jaxpr, axisSize, bodyDims);
+
+    // Build scan args with moved arrays
+    const scanArgs = [
+      ...vmappedBody.consts.map((c) => c.ref),
+      ...movedConsts,
+      ...movedCarry,
+      ...movedXs,
+    ];
+
+    // Run the scan
+    const results = bind(Primitive.Scan, scanArgs, {
+      jaxpr: vmappedBody.jaxpr,
+      numCarry,
+      numConsts: vmappedBody.consts.length,
+      length,
+      reverse,
+    });
+
+    // Results: carry has batch at axis 0, ys has batch at axis 1
+    // Move ys batch from axis 1 to axis 0
+    const carryOut = results.slice(0, numCarry);
+    const ysOut = results.slice(numCarry);
+
+    const movedYs = ysOut.map((y) => moveaxis(y, 1, 0));
+
+    return [[...carryOut, ...movedYs], rep(numCarry + numY, 0)];
   },
 };
 
