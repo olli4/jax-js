@@ -10,10 +10,10 @@
 
 import { byteWidth } from "../alu";
 import type { Backend, Slot } from "../backend";
+import type { PendingExecute } from "./array";
 import { ShapedArray } from "./core";
 import type { Jaxpr } from "./jaxpr";
 import type { JitProgram } from "./jit";
-import type { PendingExecute } from "./array";
 import type { ScanPlan } from "./scan-plan";
 
 // ---------------------------------------------------------------------------
@@ -89,15 +89,11 @@ function executeScanFallback(params: ExecuteScanParams): ExecuteScanResult {
   } = params;
 
   // Compute per-xs byte strides (size of one iteration's slice)
-  const xsStrides = xsAvals.map(
-    (aval) => aval.size * byteWidth(aval.dtype),
-  );
+  const xsStrides = xsAvals.map((aval) => aval.size * byteWidth(aval.dtype));
 
   // Compute per-y byte strides from body jaxpr outputs
   const yOutAvals = bodyJaxpr.outs.slice(numCarry).map((v) => v.aval);
-  const ysStrides = yOutAvals.map(
-    (aval) => aval.size * byteWidth(aval.dtype),
-  );
+  const ysStrides = yOutAvals.map((aval) => aval.size * byteWidth(aval.dtype));
 
   // Detect which body outputs share the same Jaxpr variable between
   // carry_out and y_out. This is the "shared-slot protection" case.
@@ -128,13 +124,7 @@ function executeScanFallback(params: ExecuteScanParams): ExecuteScanResult {
     flushPending(pending);
 
     // Slice xs for this iteration
-    const xSlices = sliceXsAtIteration(
-      backend,
-      xsSlots,
-      xsStrides,
-      xsAvals,
-      i,
-    );
+    const xSlices = sliceXsAtIteration(backend, xsSlots, xsStrides, xsAvals, i);
 
     // IncRef consts so body can consume them
     for (const slot of constSlots) backend.incRef(slot);
@@ -146,6 +136,10 @@ function executeScanFallback(params: ExecuteScanParams): ExecuteScanResult {
     // Execute body
     const bodyResult = bodyProgram.execute(bodyInputs);
     pending.push(...bodyResult.pending);
+
+    // Flush pending ops from body execution before reading output slots
+    // (the body's kernels must be dispatched before we can copy from them)
+    flushPending(pending);
 
     const newCarry = bodyResult.outputs.slice(0, numCarry);
     const ySlices = bodyResult.outputs.slice(numCarry);
@@ -192,7 +186,14 @@ function executeScanFallback(params: ExecuteScanParams): ExecuteScanResult {
     // Copy carry data into the preallocated output slot
     const carrySize =
       bodyJaxpr.outs[ci].aval.size * byteWidth(bodyJaxpr.outs[ci].aval.dtype);
-    copySliceToBuffer(backend, carryOutputSlots[ci], carry[ci], 0, carrySize, 0);
+    copySliceToBuffer(
+      backend,
+      carryOutputSlots[ci],
+      carry[ci],
+      0,
+      0,
+      carrySize,
+    );
     backend.decRef(carry[ci]);
   }
 
