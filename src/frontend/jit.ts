@@ -777,6 +777,16 @@ const jitRules: { [P in Primitive]: JitRule<P> } = {
       "internal: Jit should have been flattened before JIT compilation",
     );
   },
+  [Primitive.DynamicUpdateSlice]() {
+    throw new Error(
+      "internal: DynamicUpdateSlice is handled specially in jitCompile",
+    );
+  },
+  [Primitive.Scan]() {
+    throw new Error(
+      "internal: Scan is handled specially in jitCompile, not via jitRules",
+    );
+  },
 };
 
 /** Determines how to split the Jaxpr into kernels via dataflow analysis. */

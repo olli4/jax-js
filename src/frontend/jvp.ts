@@ -408,6 +408,12 @@ const jvpRules: { [P in Primitive]: JvpRule<P> } = {
     const [primalsOut, tangentsOut] = [outs.slice(0, n), outs.slice(n)];
     return [primalsOut, tangentsOut];
   },
+  [Primitive.DynamicUpdateSlice]() {
+    throw new Error("DynamicUpdateSlice JVP: not yet implemented");
+  },
+  [Primitive.Scan]() {
+    throw new Error("Scan JVP: not yet implemented (P5)");
+  },
 };
 
 const jvpJaxprCache = new Map<Jaxpr, ClosedJaxpr>();
