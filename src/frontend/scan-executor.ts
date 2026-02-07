@@ -4,8 +4,6 @@
  * This replaces v1's dual loop (eager Primitive.Scan + JIT scanRunner) with one
  * function that handles ownership, flush, and dispatch for all backends and all
  * plan paths (fallback, compiled-loop, preencoded-routine).
- *
- * P0: only the fallback path is implemented.
  */
 
 import { byteWidth } from "../alu";
