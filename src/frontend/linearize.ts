@@ -909,6 +909,12 @@ const transposeRules: Partial<{ [P in Primitive]: TransposeRule<P> }> = {
     let i = 0;
     return undefPrimals.map((isUndef) => (isUndef ? outs[i++] : null));
   },
+  [Primitive.DynamicUpdateSlice]() {
+    throw new Error("DynamicUpdateSlice transpose: not yet implemented");
+  },
+  [Primitive.Scan]() {
+    throw new Error("Scan transpose: not yet implemented (P5)");
+  },
 };
 
 const transposeJaxprCache = new Map<Jaxpr, Map<string, ClosedJaxpr>>();

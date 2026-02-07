@@ -943,6 +943,32 @@ export const abstractEvalRules: { [P in Primitive]: AbstractEvalRule<P> } = {
     const newShape = x.shape.map((dim, i) => dim + width[i][0] + width[i][1]);
     return [new ShapedArray(newShape, x.dtype, x.weakType)];
   },
+  [Primitive.DynamicUpdateSlice]([dst, src], { offset, axis }) {
+    if (!(dst instanceof ShapedArray) || !(src instanceof ShapedArray)) {
+      throw new TypeError("dynamicUpdateSlice expects shaped array inputs");
+    }
+    const dstShape = dst.shape;
+    const srcShape = src.shape;
+    if (dstShape.length === srcShape.length) {
+      for (let i = 0; i < dstShape.length; i++) {
+        if (i === axis) continue;
+        if (dstShape[i] !== srcShape[i])
+          throw new TypeError("dynamicUpdateSlice: shape mismatch");
+      }
+      if (offset + srcShape[axis] > dstShape[axis])
+        throw new TypeError("dynamicUpdateSlice: out of bounds");
+    } else if (axis === 0 && dstShape.length === srcShape.length + 1) {
+      for (let i = 0; i < srcShape.length; i++) {
+        if (dstShape[i + 1] !== srcShape[i])
+          throw new TypeError("dynamicUpdateSlice: stacked shape mismatch");
+      }
+      if (offset + 1 > dstShape[0])
+        throw new TypeError("dynamicUpdateSlice: stacked out of bounds");
+    } else {
+      throw new TypeError("dynamicUpdateSlice: unsupported shapes");
+    }
+    return [new ShapedArray(dst.shape, dst.dtype, dst.weakType)];
+  },
   [Primitive.Sort]([x]) {
     if (x.ndim === 0) throw new TypeError("sort: requires at least 1D input");
     return [ShapedArray.fromAval(x)];
@@ -1006,6 +1032,33 @@ export const abstractEvalRules: { [P in Primitive]: AbstractEvalRule<P> } = {
       }
     }
     return outTypes;
+  },
+  [Primitive.Scan](args, { jaxpr, numCarry, numConsts, length, reverse: _ }) {
+    // Args: [...consts, ...initCarry, ...xs]
+    // jaxpr inputs: [...consts, ...carry, ...x_slice]
+    // jaxpr outputs: [...newCarry, ...y_slice]
+    // Note: reverse doesn't affect output shapes
+    const numX = args.length - numConsts - numCarry;
+    const { outTypes } = typecheckJaxpr(jaxpr);
+
+    // Validate input types match jaxpr expectations
+    if (jaxpr.inBinders.length !== numConsts + numCarry + numX) {
+      throw new TypeError(
+        `Scan jaxpr expects ${jaxpr.inBinders.length} inputs, got ${numConsts + numCarry + numX}`,
+      );
+    }
+
+    // Return types: [...carryOut, ...ys]
+    // carryOut shapes match initCarry shapes
+    // ys shapes are [length, ...y_slice_shape]
+    const carryOutTypes = outTypes.slice(0, numCarry);
+    const ySliceTypes = outTypes.slice(numCarry);
+
+    const yTypes = ySliceTypes.map((t) => {
+      return new ShapedArray([length, ...t.shape], t.dtype, t.weakType);
+    });
+
+    return [...carryOutTypes, ...yTypes];
   },
 };
 
