@@ -761,6 +761,11 @@ class ShaderPipelineCache {
   }
 
   async prepare(shader: ShaderInfo): Promise<GPUComputePipeline> {
+    // Deno's WebGPU (wgpu-rs) doesn't support createComputePipelineAsync
+    // reliably. Fall back to synchronous pipeline creation.
+    // @ts-expect-error Deno global
+    if (typeof Deno !== "undefined") return this.prepareSync(shader);
+
     const existingPipeline = this.cache.get(shader.code);
     if (existingPipeline) return existingPipeline;
 
@@ -810,7 +815,10 @@ class ShaderPipelineCache {
     }
 
     const shaderModule = this.device.createShaderModule({ code: shader.code });
-    this.device.pushErrorScope("validation");
+    // Deno's wgpu-rs doesn't support pushErrorScope/popErrorScope reliably.
+    // @ts-expect-error Deno global
+    const hasScopeApi = typeof Deno === "undefined";
+    if (hasScopeApi) this.device.pushErrorScope("validation");
     const pipeline = this.device.createComputePipeline({
       layout: this.#getLayout(shader),
       compute: {
@@ -818,15 +826,17 @@ class ShaderPipelineCache {
         entryPoint: "main",
       },
     });
-    this.device.popErrorScope().then(async (scope) => {
-      // This happens asynchronously, so we can't throw here. But shader syntax
-      // validation errors should never occur in correct code. Any issues here
-      // reflect bugs in jax-js.
-      if (scope !== null) {
-        const emsg = await compileError(shaderModule, scope, shader.code);
-        console.error(emsg);
-      }
-    });
+    if (hasScopeApi) {
+      this.device.popErrorScope().then(async (scope) => {
+        // This happens asynchronously, so we can't throw here. But shader syntax
+        // validation errors should never occur in correct code. Any issues here
+        // reflect bugs in jax-js.
+        if (scope !== null) {
+          const emsg = await compileError(shaderModule, scope, shader.code);
+          console.error(emsg);
+        }
+      });
+    }
     this.cache.set(shader.code, pipeline);
     return pipeline;
   }
