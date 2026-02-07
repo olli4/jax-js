@@ -16,6 +16,10 @@ export class CpuBackend implements Backend {
     this.#nextSlot = 1;
   }
 
+  slotCount(): number {
+    return this.#buffers.size;
+  }
+
   malloc(size: number, initialData?: Uint8Array): Slot {
     const buffer = new Uint8Array(size);
     if (initialData) {
