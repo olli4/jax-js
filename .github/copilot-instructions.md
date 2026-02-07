@@ -315,7 +315,7 @@ linear index.
 The 256-byte `minStorageBufferOffsetAlignment` means you can't bind a buffer at arbitrary offsets.
 For scan with strides like 48 bytes (a 4×3 f32 matrix), buffer offsets fail. jax-js solves this with
 **uniform-based offsets**: bind the entire buffer, pass the element offset as a uniform variable.
-The scan-v2 preencoded-routine path will use this technique (see Part 2).
+The scan preencoded-routine path uses this technique (see Part 2).
 
 ### Features exploited
 
@@ -329,7 +329,7 @@ The scan-v2 preencoded-routine path will use this technique (see Part 2).
 | **Command batching**        | Multiple dispatches encoded before single queue.submit()         | `PendingExecute` in webgpu.ts      |
 | **WGSL copy shader**        | Byte-level buffer copy when `copyBufferToBuffer` alignment fails | `COPY_SHADER_CODE` in webgpu.ts    |
 
-**Scan will additionally use** (implemented in v2):
+**Scan additionally uses:**
 
 | Feature               | How scan uses it                                        | v1 reference location                   |
 | --------------------- | ------------------------------------------------------- | --------------------------------------- |
@@ -407,7 +407,7 @@ The "no global barrier" limitation creates scan-specific constraints documented 
 | Per-element independence required | No cross-workgroup sync between iterations                   | Complex bodies → JS fallback  |
 | numCarry ≠ numY unsupported       | compiled-loop shader assumes 1:1 carry↔output mapping       | Falls back to JS loop         |
 | Internal buffer deps unsupported  | Shader can't allocate scratch temporaries between statements | Mandelbrot pattern → fallback |
-| Sort in scan uses fallback        | Sort shader already uses uniforms (offset conflict)          | Uniform buffer contention     |
+| Sort in scan uses preencoded      | Sort shader already uses workgroup-level sync                | Requires preencoded path      |
 
 WASM backend handles all these cases because it can allocate temporaries and has true sequential
 control flow. WebGPU is more restricted but faster when patterns fit.
@@ -455,8 +455,8 @@ Understanding this structure is essential for adding scan codegen paths.
 | `codegenWasmSinglePath()`       | Single-output kernel (supports reduction)           |
 | `codegenWasmMultiPath()`        | Multi-output kernel (no reduction)                  |
 
-Scan v2 will add `translateExpWithGeneralScanContext()` (const/carry/xs/internal classification) and
-`codegenNativeScanGeneral()` (full scan loop codegen) — these are ported from feat/scan.
+Scan adds `translateExpWithGeneralScanContext()` (const/carry/xs/internal classification) and
+`codegenNativeScanGeneral()` (full scan loop codegen).
 
 **WebGPU Backend:**
 
@@ -467,8 +467,8 @@ Scan v2 will add `translateExpWithGeneralScanContext()` (const/carry/xs/internal
 | `gen()` in `pipelineSource` | CSE (common subexpression elimination) + special cases  |
 | `createShaderEmitter()`     | Returns `{emit, pushIndent, popIndent, getCode}` helper |
 
-Scan v2 will add `genScanExpressionWithRidx` (scan-specific GlobalIndex + inline generation) and
-`nativeScanMultiShaderSource()` (full scan shader) — ported from feat/scan.
+Scan adds `genScanExpressionWithRidx` (scan-specific GlobalIndex + inline generation) and
+`nativeScanMultiShaderSource()` (full scan shader).
 
 **Backend Interface:**
 
@@ -549,7 +549,7 @@ SIMD is automatically selected for Cholesky when `dtype === "f32" && n >= 32`.
 
 **Calling routines from scan loops:** Scan modules use WASM imports to call routines from separate
 wasmblr modules. This avoids code duplication (each routine is 1-3KB) while keeping the entire loop
-in native code. See `codegenNativeScanGeneral()` in `src/backend/wasm.ts` on feat/scan.
+in native code. See `codegenNativeScanGeneral()` in `src/backend/wasm.ts`.
 
 ### Autodiff of routines
 
@@ -699,16 +699,14 @@ multi-output `Kernel`. This reduces kernel dispatch overhead for functions with 
 
 **JitStep types:**
 
-| Type                 | Purpose                                                             |
-| -------------------- | ------------------------------------------------------------------- |
-| `execute`            | Dispatch a `Kernel` or `Routine` with inputs→outputs                |
-| `copy`               | `DynamicUpdateSlice`: clone dst buffer, patch src region(s) into it |
-| `malloc`             | Allocate a buffer                                                   |
-| `incref`             | Increment refcount on a slot                                        |
-| `free`               | Decrement refcount on a slot                                        |
-| `scan`               | JS fallback scan loop                                               |
-| `compiled-loop`      | Native WASM/WebGPU scan                                             |
-| `preencoded-routine` | Pre-encoded WebGPU routine scan                                     |
+| Type      | Purpose                                                                 |
+| --------- | ----------------------------------------------------------------------- |
+| `execute` | Dispatch a `Kernel` or `Routine` with inputs→outputs                    |
+| `copy`    | `DynamicUpdateSlice`: clone dst buffer, patch src region(s) into it     |
+| `malloc`  | Allocate a buffer                                                       |
+| `incref`  | Increment refcount on a slot                                            |
+| `free`    | Decrement refcount on a slot                                            |
+| `scan`    | Scan loop (fallback, compiled-loop, or preencoded-routine via ScanPlan) |
 
 **Kernel class (unified single/multi-output):**
 
@@ -944,14 +942,14 @@ working for elementwise-only scan bodies.
 
 ### Feature gaps to port from v1
 
-| Gap                           | Severity | What's missing                                                                                                                                                                                                                                                                                                                                         | v1 reference                                                                                                |
-| ----------------------------- | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------- |
-| WASM routine imports in scan  | Critical | `routine-provider.ts` (261 lines), `routines/` dir (7 files: cholesky, cholesky-simd, triangular-solve, lu, sort, argsort, index), `#getRoutineModuleForScan()`, `#getRoutineInstanceForModule()`, `ScanRoutineInfo` type, `auxBufferSize` in scan-plan. Without this, scan bodies with routines on WASM fall to JS fallback instead of compiled WASM. | `feat/scan:src/backend/wasm/routine-provider.ts`, `feat/scan:src/backend/wasm/routines/`                    |
-| Multi-output kernel           | Major    | `KernelOutput` interface, `Kernel.multi()`, `isMultiOutput`, `dtypeAt(i)`, `codegenWasmMultiPath`. Bodies producing multiple outputs can't fuse into one kernel dispatch.                                                                                                                                                                              | `feat/scan:src/alu.ts` (KernelOutput, Kernel class), `feat/scan:src/backend/wasm.ts` (codegenWasmMultiPath) |
-| WASM instance caching         | Moderate | `#instanceCache: WeakMap<WebAssembly.Module, WebAssembly.Instance>` avoids re-instantiating WASM modules on repeated dispatch. v2 creates fresh instances every time.                                                                                                                                                                                  | `feat/scan:src/backend/wasm.ts` L171, L314-337, L606-628                                                    |
-| WASM routine dispatch         | Moderate | Dedicated `#dispatchCholesky/Sort/LU/TriangularSolve/Argsort` methods using size-specialized wasmblr modules. v2 falls back to `runCpuRoutine` for all routines.                                                                                                                                                                                       | `feat/scan:src/backend/wasm.ts` L387-545                                                                    |
-| Error handling in plan        | Minor    | `prepareNativeScanGeneral` and `prepareNativeScanMulti` should wrap in try/catch and return null (graceful fallback) instead of throwing.                                                                                                                                                                                                              | `feat/scan:src/frontend/scan-plan.ts`                                                                       |
-| `slotCount()` on WASM backend | Minor    | Memory leak detection helper.                                                                                                                                                                                                                                                                                                                          | `feat/scan:src/backend/wasm.ts` L195                                                                        |
+| Gap                           | Severity | Status       | Notes                                                                                                                                                                                                                            |
+| ----------------------------- | -------- | ------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| WASM routine imports in scan  | Critical | **Done**     | `routine-provider.ts`, `routines/` dir (7 files), `wasmblr-hl.ts`, F64x2 SIMD class, `#getRoutineModuleForScan()`, `#getRoutineInstanceForModule()`, routine codegen in scan loop, routine support in `tryPrepareWasmNativeScan` |
+| Multi-output kernel           | Major    | Not started  | `KernelOutput` interface, `Kernel.multi()`, `isMultiOutput`, `dtypeAt(i)`, `codegenWasmMultiPath`. Bodies producing multiple outputs can't fuse into one kernel dispatch.                                                        |
+| WASM instance caching         | Moderate | **Done**     | `#instanceCache: WeakMap<WebAssembly.Module, WebAssembly.Instance>` in `dispatch()` and `dispatchNativeScanGeneral()`                                                                                                            |
+| WASM routine dispatch         | Moderate | **Done**     | `#dispatchCholesky/Sort/LU/TriangularSolve/Argsort` methods using size-specialized wasmblr modules. Falls back to CPU for non-float or unimplemented routines.                                                                   |
+| Error handling in plan        | Minor    | Already done | `try/catch` with `return null` already present in v2                                                                                                                                                                             |
+| `slotCount()` on WASM backend | Minor    | **Done**     | Returns `this.#buffers.size`                                                                                                                                                                                                     |
 
 ### Missing tests (v1 had ~30 more)
 
@@ -977,11 +975,11 @@ working for elementwise-only scan bodies.
 
 ### Porting priority
 
-1. **WASM routine infrastructure** — port `routine-provider.ts`, `routines/` dir, routine import
-   linking in `dispatchNativeScanGeneral`, enable routine steps in `tryPrepareWasmNativeScan`
-2. **WASM instance caching** — add `#instanceCache` WeakMap for dispatch and scan dispatch
+1. ~~**WASM routine infrastructure**~~ — **Done**. Ported `routine-provider.ts`, `routines/` dir,
+   `wasmblr-hl.ts`, F64x2 SIMD, routine import linking, scan-plan routine support.
+2. ~~**WASM instance caching**~~ — **Done**. Added `#instanceCache` WeakMap.
 3. **Multi-output kernel** — port `KernelOutput`, `Kernel.multi()`, `codegenWasmMultiPath`
-4. **Error handling** — wrap plan preparation in try/catch for graceful fallback
+4. ~~**Error handling**~~ — Already present in v2.
 5. **Missing tests** — port path-documentation tests, advanced transform compositions
 
 ### Benchmark results (WASM, Chromium headless, Feb 2026)
