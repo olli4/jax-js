@@ -105,6 +105,10 @@ export const makeJaxpr = jaxprModule.makeJaxpr as unknown as <
  * - `staticArgnums`: An array of argument indices to treat as static
  *   (compile-time constant). These arguments must be hashable, won't be traced,
  *   and different values will trigger recompilation.
+ * - `validateRefs`: When `true` (default), validates that the function body
+ *   uses `.ref` correctly for eager-mode compatibility.  Tracing always
+ *   succeeds; validation runs afterwards and reports every missing or extra
+ *   `.ref` with an actionable error message.  Set to `false` to skip.
  * - `device`: The device to place the computation on. If not specified, the
  *   computation will be placed on the default device.
  */

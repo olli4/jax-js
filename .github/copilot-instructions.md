@@ -2459,3 +2459,141 @@ rebuild, and compare.
 - **Staging buffer pool:** The `read()` method creates and destroys staging buffers for every
   readback. Pooling these would help workloads with frequent `.data()` calls.
 
+---
+
+# Part 4: Always-AutoRef Tracing & Ref Validation
+
+Tracing **never crashes** on missing `.ref` — the JaxprTrace's `processPrimitive` does not consume
+input tracers. Instead, `jit()` validates `.ref` discipline after tracing and reports actionable
+errors about what would go wrong in eager mode.
+
+## Overview & Motivation
+
+jax-js uses explicit ownership / move semantics for arrays: every operation **consumes** its inputs
+(refcount −1), and reusing an array requires `.ref` (refcount +1). This is essential for predictable
+GPU memory, but it made `jit()` bodies fragile — a missing `.ref` would crash during tracing with a
+cryptic `UseAfterFreeError`.
+
+The fix has two parts:
+
+1. **Always-autoRef tracing**: `JaxprTrace.processPrimitive` never calls `t.dispose()` on input
+   tracers. Tracing always succeeds, regardless of `.ref` usage. The Jaxpr graph is built correctly
+   from tracer identity, not from refcount state.
+2. **Post-trace validation**: After tracing, `validateRefCounts()` checks whether the user's `.ref`
+   calls match the actual variable usage in the Jaxpr. Mismatches produce clear error messages
+   explaining what would break in eager mode and how to fix it.
+
+```ts
+// No .ref needed inside jit — tracing always works:
+const step = jit((A, B, V, X, Y) => {
+  const Asq = A.mul(A);
+  const Bsq = B.mul(B);
+  V = V.add(Asq.add(Bsq).less(100).astype(np.float32));
+  const A2 = np.clip(Asq.sub(Bsq).add(X), -50, 50);
+  const B2 = np.clip(A.mul(B).mul(2).add(Y), -50, 50);
+  return [A2, B2, V];
+});
+// But validation warns: "A used 5 times, needs 4 .ref calls"
+```
+
+## Design
+
+### How tracing works (always-autoRef)
+
+The Jaxpr SSA graph records exactly which variables are used and how many times.
+`JaxprTrace.processPrimitive` adds equations to the graph using `builder.getVar(tracer)` — which
+maps tracer identity to Var, regardless of refcount. Since `processPrimitive` never disposes
+tracers, they can be used freely in multiple operations.
+
+At execution time, `evalJaxpr` computes `usageCount` from the graph and auto-refs values the correct
+number of times. `jitCompile` emits precise `malloc`/`free`/`recycle` steps based on the graph
+structure. The result: **identical compiled programs** whether the user wrote `.ref` or not.
+
+### How validation works
+
+After tracing, `validateRefCounts()` compares each variable's user `.ref` count against its usage
+count in the Jaxpr:
+
+- **`_userRefCalls`** on each `JaxprTracer`: incremented by `.ref`, decremented by `.dispose()`.
+  Only counts user-level refs — system-internal refs (from transforms, scan ownership transfer,
+  const lifting) are excluded.
+- **`usageCount`**: how many times the Var appears as an equation input or output.
+- **Rule**: `1 + _userRefCalls` should equal `usageCount` for correct eager-mode behavior.
+
+Validation is **automatically skipped** when transforms (JVP, vmap, linearize) are involved, because
+transforms alter both usage patterns and ref counts in ways that can't be reliably tracked.
+
+### Key implementation details
+
+| Mechanism                               | Purpose                                                            |
+| --------------------------------------- | ------------------------------------------------------------------ |
+| `processPrimitive` skips `dispose()`    | Tracing never crashes on missing .ref                              |
+| `_userRefCalls` on JaxprTracer          | Tracks user .ref calls (excludes system refs)                      |
+| `.dispose()` decrements `_userRefCalls` | Makes library `.ref/.dispose` pairs (scan) invisible to validation |
+| `isUnderTransform(level)`               | Detects JVP/vmap/linearize traces above JaxprTrace                 |
+| `builder._hadTransform`                 | Skips validation when transforms alter the Jaxpr                   |
+| `isTransform` on MainTrace              | Marks JVP/vmap/PartialEval traces for detection                    |
+
+### Key files
+
+| File                        | Change                                                             |
+| --------------------------- | ------------------------------------------------------------------ |
+| `src/frontend/jaxpr.ts`     | Always-autoRef processPrimitive, \_userRefCalls, validateRefCounts |
+| `src/frontend/core.ts`      | `isUnderTransform()`, `isTransform` on MainTrace                   |
+| `src/frontend/jvp.ts`       | `main.isTransform = true` on JVPTrace                              |
+| `src/frontend/vmap.ts`      | `main.isTransform = true` on BatchTrace                            |
+| `src/frontend/linearize.ts` | `main.isTransform = true` on PartialEvalTrace                      |
+| `test/autoref.test.ts`      | 26 tests covering validation, transforms, scan                     |
+
+## API
+
+### `validateRefs` option
+
+```ts
+const f = jit(fn); // validates by default
+const f = jit(fn, { validateRefs: false }); // disable validation
+```
+
+Validation is automatically disabled when:
+
+- `jit` is called under transforms (inputs are non-Array tracers)
+- The body uses transforms internally (JVP/vmap sets `_hadTransform`)
+- Internal callers pass `{ validateRefs: false }` (jvp.ts, linearize.ts, vmap.ts, lax-scan.ts)
+
+### Error messages
+
+```
+jit: ref validation failed — the function body has incorrect .ref usage
+that would cause issues in eager mode:
+
+argument 0 (float32[3]): used 3 times but has 0 .ref calls (need 2).
+  Add 2x .ref.  Uses:
+    1. mul(a, a)
+    2. add(b, a)
+    3. output[0]
+
+result of mul(a, b) → c (float32[3]): has 2 .ref calls but is only used 1 time
+(need 0). Remove 2x .ref (would leak in eager mode).
+```
+
+## Test Coverage
+
+`test/autoref.test.ts` — 26 tests:
+
+| Category                  | Tests | What they verify                             |
+| ------------------------- | ----- | -------------------------------------------- |
+| Correct .ref usage passes | 11    | Various patterns that should pass validation |
+| Missing .ref detected     | 5     | Validation catches under-ref'd variables     |
+| Extra .ref detected       | 2     | Validation catches over-ref'd variables      |
+| validateRefs: false       | 1     | Opt-out works                                |
+| With grad                 | 3     | Gradients compose correctly                  |
+| With scan                 | 2     | Scan inside jit works                        |
+| Edge cases                | 2     | Unused inputs, scalar inputs                 |
+
+## Known Limitations
+
+| Limitation                              | Description                                                    |
+| --------------------------------------- | -------------------------------------------------------------- |
+| No validation under transforms          | When JVP/vmap/grad is involved, validation is silently skipped |
+| No eager-mode validation                | Validation only runs during `jit` tracing, not in eager mode   |
+| `.dispose()` inside jit body undetected | Explicit `.dispose()` followed by re-use won't be caught       |

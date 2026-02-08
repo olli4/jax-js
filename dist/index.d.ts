@@ -705,6 +705,13 @@ declare class ClosedJaxpr {
 /** @inline */
 type JitOpts = {
   staticArgnums?: number[];
+  /**
+   * When true, validate that the function body uses `.ref` correctly for
+   * eager-mode compatibility.  Tracing always succeeds; validation runs
+   * afterwards and reports every missing / extra `.ref` with an actionable
+   * error message.  Default: true when called via `jit()`.
+   */
+  validateRefs?: boolean;
 };
 //#endregion
 //#region src/frontend/core.d.ts
@@ -881,6 +888,8 @@ type MainTrace = {
   level: number;
   traceType: new (main: MainTrace) => Trace;
   globalData: any | null;
+  /** True for transform traces (JVP, vmap) that alter .ref usage patterns. */
+  isTransform?: boolean;
 };
 /**
  * Push an interpreter onto the trace stack. Use this like:
@@ -3070,6 +3079,10 @@ declare const makeJaxpr: <F extends (...args: any[]) => JsTree<Array>>(f: F) => 
  * - `staticArgnums`: An array of argument indices to treat as static
  *   (compile-time constant). These arguments must be hashable, won't be traced,
  *   and different values will trigger recompilation.
+ * - `validateRefs`: When `true` (default), validates that the function body
+ *   uses `.ref` correctly for eager-mode compatibility.  Tracing always
+ *   succeeds; validation runs afterwards and reports every missing or extra
+ *   `.ref` with an actionable error message.  Set to `false` to skip.
  * - `device`: The device to place the computation on. If not specified, the
  *   computation will be placed on the default device.
  */
