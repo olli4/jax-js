@@ -1234,6 +1234,14 @@ var VarPrinter = class {
 };
 const INTERNAL_FRAME_RE = /[\\/]src[\\/](frontend|library|backend)[\\/]|[\\/]src[\\/](alu|routine|shape|tree|utils|index|polyfills|tuner|pprint|backend)\.|[\\/](dist|node_modules)[\\/]/;
 /**
+* When true, `captureStackTrace` is called in `.ref` and `processPrimitive`
+* to record source locations for ref-validation error messages.  Off by
+* default — turned on only when a ref-count mismatch is detected and the
+* function is re-traced to produce an actionable error.
+*/
+let _captureLocations = false;
+const _hasCaptureStackTrace = typeof Error.captureStackTrace === "function";
+/**
 * Parse a V8 stack trace to find the first user-level frame
 * (i.e. not inside jax-js internals). Returns "file:line:col" or undefined.
 */
@@ -1529,7 +1537,7 @@ var JaxprTracer = class extends Tracer {
 		if (isUnderTransform(this._trace.main.level)) this._trace.builder._hadTransform = true;
 		else {
 			this._userRefCalls++;
-			if (typeof Error.captureStackTrace === "function") {
+			if (_captureLocations && _hasCaptureStackTrace) {
 				const holder = {};
 				Error.captureStackTrace(holder);
 				const loc = parseUserFrame(holder.stack);
@@ -1581,7 +1589,7 @@ var JaxprTrace = class extends Trace {
 		const avalsOut = abstractEvalRules[primitive](avalsIn, params);
 		const outTracers = avalsOut.map((aval) => this.builder.newTracer(this, aval));
 		const eqn = new JaxprEqn(primitive, tracers.map((t) => this.builder.getVar(t)), params, outTracers.map((t) => this.builder.addVar(t)));
-		if (typeof Error.captureStackTrace === "function") {
+		if (_captureLocations && _hasCaptureStackTrace) {
 			const holder = {};
 			Error.captureStackTrace(holder);
 			eqn._userLoc = parseUserFrame(holder.stack);
@@ -1877,10 +1885,14 @@ function joinIdx(n, a, b, argnums) {
 * Tracers with effective rc === 1 and usageCount === 0 are "discarded
 * intermediates" (e.g. one branch of `random.split`) and are silently skipped.
 *
-* Throws a single error listing every mismatch with actionable fix instructions.
+* Returns `true` when all ref counts are correct (or validation was skipped
+* because transforms were active).  Returns `false` when mismatches exist.
+* When `throwOnError` is true (default), a `false` result throws an error
+* instead of returning — use `throwOnError: false` for the fast first-pass
+* check that determines whether a re-trace with source locations is needed.
 */
-function validateRefCounts(builder, tracersIn, tracersOut) {
-	if (builder._hadTransform) return;
+function validateRefCounts(builder, tracersIn, tracersOut, throwOnError = true) {
+	if (builder._hadTransform) return true;
 	const usageCount = /* @__PURE__ */ new Map();
 	for (const eqn of builder.eqns) for (const v of eqn.inputs) if (v instanceof Var) usageCount.set(v, (usageCount.get(v) ?? 0) + 1);
 	const outVars = tracersOut.map((t) => builder.getVar(t));
@@ -1932,7 +1944,11 @@ function validateRefCounts(builder, tracersIn, tracersOut) {
 			errors.push(`${source}: has ${userRefs} .ref call${userRefs !== 1 ? "s" : ""} but is ${usedStr} (need ${needed}). Remove ${extra}x .ref (would leak memory).${refLocStr}`);
 		}
 	}
-	if (errors.length > 0) throw new Error(`jit: ref validation failed — the function body has incorrect .ref usage:\n\n` + errors.join("\n\n"));
+	if (errors.length > 0) {
+		if (!throwOnError) return false;
+		throw new Error(`jit: ref validation failed — the function body has incorrect .ref usage:\n\n` + errors.join("\n\n"));
+	}
+	return true;
 }
 function makeJaxpr$1(f, opts) {
 	return (...argsIn) => {
@@ -1951,7 +1967,19 @@ function makeJaxpr$1(f, opts) {
 			const tracersIn = avalsIn.map((aval) => trace$1.newArg(typeof aval === "object" ? aval : pureArray(aval)));
 			const outs = fFlat(...tracersIn);
 			const tracersOut = outs.map((out) => fullRaise(trace$1, out));
-			if (opts?.validateRefs !== false) validateRefCounts(builder, tracersIn, tracersOut);
+			if (opts?.validateRefs !== false) if (_captureLocations) validateRefCounts(builder, tracersIn, tracersOut, true);
+			else {
+				const ok = validateRefCounts(builder, tracersIn, tracersOut, false);
+				if (!ok) {
+					_captureLocations = true;
+					try {
+						makeJaxpr$1(f, opts)(...argsIn);
+					} finally {
+						_captureLocations = false;
+					}
+					throw new Error("jit: ref validation failed (re-trace did not reproduce)");
+				}
+			}
 			const jaxpr = builder.build(tracersIn, tracersOut);
 			if (outTree.value === void 0) throw new Error("outTree was not set in makeJaxpr");
 			return {
