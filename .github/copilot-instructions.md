@@ -2523,18 +2523,39 @@ count in the Jaxpr:
 Validation is **automatically skipped** when transforms (JVP, vmap, linearize) are involved, because
 transforms alter both usage patterns and ref counts in ways that can't be reliably tracked.
 
+### Lazy source-location capture
+
+`Error.captureStackTrace` is expensive (~34µs per call under tsx with source maps, ~0.7µs in
+production). Since a typical `jit`-traced function triggers ~100-300 captures (one per `.ref` call
+and one per `processPrimitive`), this adds ~3-10ms overhead under tsx.
+
+**Solution: two-pass validation.** The module-level `_captureLocations` flag (default `false`)
+guards both `captureStackTrace` call sites. On the normal (no-error) path:
+
+1. **First trace**: `_captureLocations = false` — no captures, `_userRefCalls` still counted (cheap)
+2. **`validateRefCounts(throwOnError=false)`** — detects mismatches via counts alone, returns
+   `false`
+3. If no errors → proceed with the compiled program (zero capture overhead)
+4. If errors found → set `_captureLocations = true`, **re-trace** the same function, validate again
+   with `throwOnError=true` — now error messages include `file:line:col` for every use and `.ref`
+
+This makes the happy path (correct `.ref` usage) as fast as pre-autoref code, while preserving full
+diagnostic quality when errors occur.
+
 ### Key implementation details
 
-| Mechanism                               | Purpose                                                            |
-| --------------------------------------- | ------------------------------------------------------------------ |
-| `processPrimitive` skips `dispose()`    | Tracing never crashes on missing .ref                              |
-| `_userRefCalls` on JaxprTracer          | Tracks user .ref calls (excludes system refs)                      |
-| `_userRefLocs: string[]` on JaxprTracer | Stores `file:line:col` of each `.ref` call (V8 only)              |
-| `.dispose()` decrements `_userRefCalls` | Makes library `.ref/.dispose` pairs (scan) invisible to validation |
-| `parseUserFrame(stack)`                 | Extracts first non-internal `file:line:col` from V8 stack trace    |
-| `isUnderTransform(level)`               | Detects JVP/vmap/linearize traces above JaxprTrace                 |
-| `builder._hadTransform`                 | Skips validation when transforms alter the Jaxpr                   |
-| `isTransform` on MainTrace              | Marks JVP/vmap/PartialEval traces for detection                    |
+| Mechanism                               | Purpose                                                             |
+| --------------------------------------- | ------------------------------------------------------------------- |
+| `processPrimitive` skips `dispose()`    | Tracing never crashes on missing .ref                               |
+| `_captureLocations` module flag         | Guards `captureStackTrace`; off by default, on only during re-trace |
+| `_hasCaptureStackTrace` module const    | Hoisted `typeof Error.captureStackTrace` check (evaluated once)     |
+| `_userRefCalls` on JaxprTracer          | Tracks user .ref calls (excludes system refs)                       |
+| `_userRefLocs: string[]` on JaxprTracer | Stores `file:line:col` of each `.ref` call (only when capturing)    |
+| `.dispose()` decrements `_userRefCalls` | Makes library `.ref/.dispose` pairs (scan) invisible to validation  |
+| `parseUserFrame(stack)`                 | Extracts first non-internal `file:line:col` from V8 stack trace     |
+| `isUnderTransform(level)`               | Detects JVP/vmap/linearize traces above JaxprTrace                  |
+| `builder._hadTransform`                 | Skips validation when transforms alter the Jaxpr                    |
+| `isTransform` on MainTrace              | Marks JVP/vmap/PartialEval traces for detection                     |
 
 ### Key files
 
@@ -2564,8 +2585,8 @@ Validation is automatically disabled when:
 
 ### Error messages
 
-Validation errors include source locations as `file:line:col` (V8 only), which are clickable in
-VS Code terminals:
+Validation errors include source locations as `file:line:col` (V8 only), which are clickable in VS
+Code terminals:
 
 ```
 jit: ref validation failed — the function body has incorrect .ref usage:
