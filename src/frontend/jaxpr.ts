@@ -134,6 +134,16 @@ const INTERNAL_FRAME_RE =
   /[\\/]src[\\/](frontend|library|backend)[\\/]|[\\/]src[\\/](alu|routine|shape|tree|utils|index|polyfills|tuner|pprint|backend)\.|[\\/](dist|node_modules)[\\/]/;
 
 /**
+ * When true, `captureStackTrace` is called in `.ref` and `processPrimitive`
+ * to record source locations for ref-validation error messages.  Off by
+ * default — turned on only when a ref-count mismatch is detected and the
+ * function is re-traced to produce an actionable error.
+ */
+let _captureLocations = false;
+
+const _hasCaptureStackTrace = typeof Error.captureStackTrace === "function";
+
+/**
  * Parse a V8 stack trace to find the first user-level frame
  * (i.e. not inside jax-js internals). Returns "file:line:col" or undefined.
  */
@@ -143,8 +153,7 @@ function parseUserFrame(stack: string | undefined): string | undefined {
     if (!line.includes(" at ")) continue;
     if (INTERNAL_FRAME_RE.test(line)) continue;
     const m =
-      line.match(/\((.+):(\d+):(\d+)\)/) ??
-      line.match(/at (.+):(\d+):(\d+)/);
+      line.match(/\((.+):(\d+):(\d+)\)/) ?? line.match(/at (.+):(\d+):(\d+)/);
     if (m) {
       const file = m[1].replace(/^.*[\\/]/, ""); // last path component
       return `${file}:${m[2]}:${m[3]}`;
@@ -625,7 +634,7 @@ class JaxprTracer extends Tracer {
       (this._trace as JaxprTrace).builder._hadTransform = true;
     } else {
       this._userRefCalls++;
-      if (typeof Error.captureStackTrace === "function") {
+      if (_captureLocations && _hasCaptureStackTrace) {
         const holder: { stack?: string } = {};
         Error.captureStackTrace(holder);
         const loc = parseUserFrame(holder.stack);
@@ -711,7 +720,7 @@ class JaxprTrace extends Trace {
       outTracers.map((t) => this.builder.addVar(t)),
     );
     // Capture source location for ref validation diagnostics (V8 only).
-    if (typeof Error.captureStackTrace === "function") {
+    if (_captureLocations && _hasCaptureStackTrace) {
       const holder: { stack?: string } = {};
       Error.captureStackTrace(holder);
       eqn._userLoc = parseUserFrame(holder.stack);
@@ -1183,18 +1192,23 @@ export type JitOpts = {
  * Tracers with effective rc === 1 and usageCount === 0 are "discarded
  * intermediates" (e.g. one branch of `random.split`) and are silently skipped.
  *
- * Throws a single error listing every mismatch with actionable fix instructions.
+ * Returns `true` when all ref counts are correct (or validation was skipped
+ * because transforms were active).  Returns `false` when mismatches exist.
+ * When `throwOnError` is true (default), a `false` result throws an error
+ * instead of returning — use `throwOnError: false` for the fast first-pass
+ * check that determines whether a re-trace with source locations is needed.
  */
 function validateRefCounts(
   builder: JaxprBuilder,
   tracersIn: JaxprTracer[],
   tracersOut: JaxprTracer[],
-): void {
+  throwOnError = true,
+): boolean {
   // When transforms (JVP, vmap, etc.) were active during tracing, they alter
   // both usage counts (adding derivative equations) and .ref calls (JVP rules
   // call .ref on primals). These effects don't balance, making validation
   // unreliable. Skip in this case.
-  if (builder._hadTransform) return;
+  if (builder._hadTransform) return true;
 
   // Build usage count: how many times each Var appears as an eqn input or output.
   const usageCount = new Map<Var, number>();
@@ -1312,11 +1326,13 @@ function validateRefCounts(
   }
 
   if (errors.length > 0) {
+    if (!throwOnError) return false;
     throw new Error(
       `jit: ref validation failed — the function body has incorrect .ref usage:\n\n` +
         errors.join("\n\n"),
     );
   }
+  return true;
 }
 
 export function makeJaxpr(
@@ -1348,7 +1364,28 @@ export function makeJaxpr(
     );
 
     if (opts?.validateRefs !== false) {
-      validateRefCounts(builder, tracersIn, tracersOut);
+      if (_captureLocations) {
+        // Re-trace pass: source locations have been captured — throw with
+        // full diagnostics.
+        validateRefCounts(builder, tracersIn, tracersOut, true);
+      } else {
+        // Fast first pass: check ref counts without source locations.
+        const ok = validateRefCounts(builder, tracersIn, tracersOut, false);
+        if (!ok) {
+          // Re-trace with source-location capture enabled so the error
+          // message includes file:line:col for every use and .ref call.
+          _captureLocations = true;
+          try {
+            makeJaxpr(f, opts)(...argsIn);
+          } finally {
+            _captureLocations = false;
+          }
+          // If re-trace didn't throw (shouldn't happen), throw generic.
+          throw new Error(
+            "jit: ref validation failed (re-trace did not reproduce)",
+          );
+        }
+      }
     }
 
     const jaxpr = builder.build(tracersIn, tracersOut);
