@@ -2529,7 +2529,9 @@ transforms alter both usage patterns and ref counts in ways that can't be reliab
 | --------------------------------------- | ------------------------------------------------------------------ |
 | `processPrimitive` skips `dispose()`    | Tracing never crashes on missing .ref                              |
 | `_userRefCalls` on JaxprTracer          | Tracks user .ref calls (excludes system refs)                      |
+| `_userRefLocs: string[]` on JaxprTracer | Stores `file:line:col` of each `.ref` call (V8 only)              |
 | `.dispose()` decrements `_userRefCalls` | Makes library `.ref/.dispose` pairs (scan) invisible to validation |
+| `parseUserFrame(stack)`                 | Extracts first non-internal `file:line:col` from V8 stack trace    |
 | `isUnderTransform(level)`               | Detects JVP/vmap/linearize traces above JaxprTrace                 |
 | `builder._hadTransform`                 | Skips validation when transforms alter the Jaxpr                   |
 | `isTransform` on MainTrace              | Marks JVP/vmap/PartialEval traces for detection                    |
