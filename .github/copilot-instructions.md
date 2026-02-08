@@ -2562,18 +2562,20 @@ Validation is automatically disabled when:
 
 ### Error messages
 
+Validation errors include source locations (V8 only) pointing to the user code that triggered each
+operation:
+
 ```
-jit: ref validation failed — the function body has incorrect .ref usage
-that would cause issues in eager mode:
+jit: ref validation failed — the function body has incorrect .ref usage:
 
 argument 0 (float32[3]): used 3 times but has 0 .ref calls (need 2).
   Add 2x .ref.  Uses:
-    1. mul(a, a)
-    2. add(b, a)
+    1. mul(a, a)  ← model.ts:12
+    2. add(b, a)  ← model.ts:13
     3. output[0]
 
-result of mul(a, b) → c (float32[3]): has 2 .ref calls but is only used 1 time
-(need 0). Remove 2x .ref (would leak in eager mode).
+result of mul(a, b) → c (float32[3]) at model.ts:12: has 2 .ref calls but is
+only used 1 time (need 0). Remove 2x .ref (would leak memory).
 ```
 
 ## Test Coverage
