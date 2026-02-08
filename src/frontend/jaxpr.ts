@@ -1270,17 +1270,22 @@ function validateRefCounts(
     if (rc < used) {
       const missing = used - rc;
       const uses = describeUses(v);
+      // Annotate: every use except the last needs .ref.
+      const annotated = uses.map((u, i) =>
+        i < uses.length - 1 ? `${u}  ← use .ref here` : `${u}  ← last use (consumed)`,
+      );
       errors.push(
         `${source}: used ${used} time${used > 1 ? "s" : ""} but has ` +
           `${userRefs} .ref call${userRefs !== 1 ? "s" : ""} (need ${needed}).\n` +
-          `  Add ${missing}x .ref.  Uses:\n` +
-          uses.map((u, i) => `    ${i + 1}. ${u}`).join("\n"),
+          `  Add ${missing}x .ref — every use except the last needs .ref:\n` +
+          annotated.map((u, i) => `    ${i + 1}. ${u}`).join("\n"),
       );
     } else {
       const extra = userRefs - needed;
+      const usedStr = used === 0 ? "never used" : `only used ${used} time${used > 1 ? "s" : ""}`;
       errors.push(
         `${source}: has ${userRefs} .ref call${userRefs !== 1 ? "s" : ""} ` +
-          `but is only used ${used} time${used > 1 ? "s" : ""} ` +
+          `but is ${usedStr} ` +
           `(need ${needed}). Remove ${extra}x .ref (would leak memory).`,
       );
     }

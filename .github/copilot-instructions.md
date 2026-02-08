@@ -2569,10 +2569,10 @@ operation:
 jit: ref validation failed — the function body has incorrect .ref usage:
 
 argument 0 (float32[3]): used 3 times but has 0 .ref calls (need 2).
-  Add 2x .ref.  Uses:
-    1. mul(a, a)  ← model.ts:12
-    2. add(b, a)  ← model.ts:13
-    3. output[0]
+  Add 2x .ref — every use except the last needs .ref:
+    1. mul(a, a)  ← model.ts:12  ← use .ref here
+    2. add(b, a)  ← model.ts:13  ← use .ref here
+    3. output[0]                  ← last use (consumed)
 
 result of mul(a, b) → c (float32[3]) at model.ts:12: has 2 .ref calls but is
 only used 1 time (need 0). Remove 2x .ref (would leak memory).
