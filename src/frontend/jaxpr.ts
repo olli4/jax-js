@@ -129,8 +129,33 @@ class VarPrinter {
   }
 }
 
+// Match paths inside jax-js internals (source tree or installed package).
+const INTERNAL_FRAME_RE =
+  /[\\/]src[\\/](frontend|library|backend)[\\/]|[\\/]src[\\/](alu|routine|shape|tree|utils|index|polyfills|tuner|pprint|backend)\.|[\\/](dist|node_modules)[\\/]/;
+
+/**
+ * Parse a V8 stack trace to find the first user-level frame
+ * (i.e. not inside jax-js internals). Returns "filename:line" or undefined.
+ */
+function parseUserFrame(stack: string | undefined): string | undefined {
+  if (!stack) return undefined;
+  for (const line of stack.split("\n")) {
+    if (!line.includes(" at ")) continue;
+    if (INTERNAL_FRAME_RE.test(line)) continue;
+    const m =
+      line.match(/\((.+):(\d+):\d+\)/) ?? line.match(/at (.+):(\d+):\d+/);
+    if (m) {
+      const file = m[1].replace(/^.*[\\/]/, ""); // last path component
+      return `${file}:${m[2]}`;
+    }
+  }
+  return undefined;
+}
+
 /** A single statement / binding in a Jaxpr, in ANF form. */
 export class JaxprEqn {
+  /** Source location of user code that triggered this equation (V8 only). */
+  _userLoc?: string;
   constructor(
     readonly primitive: Primitive,
     readonly inputs: Atom[],
@@ -670,14 +695,19 @@ class JaxprTrace extends Trace {
     const outTracers = avalsOut.map((aval) =>
       this.builder.newTracer(this, aval),
     );
-    this.builder.addEqn(
-      new JaxprEqn(
-        primitive,
-        tracers.map((t) => this.builder.getVar(t)),
-        params,
-        outTracers.map((t) => this.builder.addVar(t)),
-      ),
+    const eqn = new JaxprEqn(
+      primitive,
+      tracers.map((t) => this.builder.getVar(t)),
+      params,
+      outTracers.map((t) => this.builder.addVar(t)),
     );
+    // Capture source location for ref validation diagnostics (V8 only).
+    if (typeof Error.captureStackTrace === "function") {
+      const holder: { stack?: string } = {};
+      Error.captureStackTrace(holder);
+      eqn._userLoc = parseUserFrame(holder.stack);
+    }
+    this.builder.addEqn(eqn);
     return outTracers;
   }
 
@@ -1187,7 +1217,8 @@ function validateRefCounts(
           const inputs = eqn.inputs
             .map((x) => (x instanceof Var ? vp.name(x) : String(x.value)))
             .join(", ");
-          return `result of ${eqn.primitive}(${inputs}) → ${vp.name(v)} (${dtype}${shape})`;
+          const loc = eqn._userLoc ? ` at ${eqn._userLoc}` : "";
+          return `result of ${eqn.primitive}(${inputs}) → ${vp.name(v)} (${dtype}${shape})${loc}`;
         }
       }
     }
@@ -1203,7 +1234,8 @@ function validateRefCounts(
           const inputs = eqn.inputs
             .map((x) => (x instanceof Var ? vp.name(x) : String(x.value)))
             .join(", ");
-          uses.push(`${eqn.primitive}(${inputs})`);
+          const loc = eqn._userLoc ? `  ← ${eqn._userLoc}` : "";
+          uses.push(`${eqn.primitive}(${inputs})${loc}`);
         }
       }
     }
@@ -1249,15 +1281,14 @@ function validateRefCounts(
       errors.push(
         `${source}: has ${userRefs} .ref call${userRefs !== 1 ? "s" : ""} ` +
           `but is only used ${used} time${used > 1 ? "s" : ""} ` +
-          `(need ${needed}). Remove ${extra}x .ref (would leak in eager mode).`,
+          `(need ${needed}). Remove ${extra}x .ref (would leak memory).`,
       );
     }
   }
 
   if (errors.length > 0) {
     throw new Error(
-      `jit: ref validation failed — the function body has incorrect .ref usage ` +
-        `that would cause issues in eager mode:\n\n` +
+      `jit: ref validation failed — the function body has incorrect .ref usage:\n\n` +
         errors.join("\n\n"),
     );
   }
