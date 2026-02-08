@@ -135,7 +135,7 @@ const INTERNAL_FRAME_RE =
 
 /**
  * Parse a V8 stack trace to find the first user-level frame
- * (i.e. not inside jax-js internals). Returns "filename:line" or undefined.
+ * (i.e. not inside jax-js internals). Returns "file:line:col" or undefined.
  */
 function parseUserFrame(stack: string | undefined): string | undefined {
   if (!stack) return undefined;
@@ -143,10 +143,11 @@ function parseUserFrame(stack: string | undefined): string | undefined {
     if (!line.includes(" at ")) continue;
     if (INTERNAL_FRAME_RE.test(line)) continue;
     const m =
-      line.match(/\((.+):(\d+):\d+\)/) ?? line.match(/at (.+):(\d+):\d+/);
+      line.match(/\((.+):(\d+):(\d+)\)/) ??
+      line.match(/at (.+):(\d+):(\d+)/);
     if (m) {
       const file = m[1].replace(/^.*[\\/]/, ""); // last path component
-      return `${file}:${m[2]}`;
+      return `${file}:${m[2]}:${m[3]}`;
     }
   }
   return undefined;
@@ -598,6 +599,8 @@ class JaxprTracer extends Tracer {
    * validation only checks the user's ref discipline.
    */
   _userRefCalls: number = 0;
+  /** Source locations of user .ref calls (for "remove .ref" diagnostics). */
+  _userRefLocs: string[] = [];
 
   constructor(
     trace: Trace,
@@ -622,6 +625,12 @@ class JaxprTracer extends Tracer {
       (this._trace as JaxprTrace).builder._hadTransform = true;
     } else {
       this._userRefCalls++;
+      if (typeof Error.captureStackTrace === "function") {
+        const holder: { stack?: string } = {};
+        Error.captureStackTrace(holder);
+        const loc = parseUserFrame(holder.stack);
+        if (loc) this._userRefLocs.push(loc);
+      }
     }
     return this;
   }
@@ -1272,7 +1281,9 @@ function validateRefCounts(
       const uses = describeUses(v);
       // Annotate: every use except the last needs .ref.
       const annotated = uses.map((u, i) =>
-        i < uses.length - 1 ? `${u}  ← use .ref here` : `${u}  ← last use (consumed)`,
+        i < uses.length - 1
+          ? `${u}  ← use .ref here`
+          : `${u}  ← last use (consumed)`,
       );
       errors.push(
         `${source}: used ${used} time${used > 1 ? "s" : ""} but has ` +
@@ -1282,11 +1293,20 @@ function validateRefCounts(
       );
     } else {
       const extra = userRefs - needed;
-      const usedStr = used === 0 ? "never used" : `only used ${used} time${used > 1 ? "s" : ""}`;
+      const usedStr =
+        used === 0
+          ? "never used"
+          : `only used ${used} time${used > 1 ? "s" : ""}`;
+      // Show where .ref was called so the user knows which to remove.
+      const refLocs = tracer._userRefLocs;
+      const refLocStr =
+        refLocs.length > 0
+          ? "\n" + refLocs.map((l) => `    - .ref at ${l}`).join("\n")
+          : "";
       errors.push(
         `${source}: has ${userRefs} .ref call${userRefs !== 1 ? "s" : ""} ` +
           `but is ${usedStr} ` +
-          `(need ${needed}). Remove ${extra}x .ref (would leak memory).`,
+          `(need ${needed}). Remove ${extra}x .ref (would leak memory).${refLocStr}`,
       );
     }
   }

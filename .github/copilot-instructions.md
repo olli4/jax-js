@@ -2562,20 +2562,22 @@ Validation is automatically disabled when:
 
 ### Error messages
 
-Validation errors include source locations (V8 only) pointing to the user code that triggered each
-operation:
+Validation errors include source locations as `file:line:col` (V8 only), which are clickable in
+VS Code terminals:
 
 ```
 jit: ref validation failed — the function body has incorrect .ref usage:
 
 argument 0 (float32[3]): used 3 times but has 0 .ref calls (need 2).
   Add 2x .ref — every use except the last needs .ref:
-    1. mul(a, a)  ← model.ts:12  ← use .ref here
-    2. add(b, a)  ← model.ts:13  ← use .ref here
-    3. output[0]                  ← last use (consumed)
+    1. mul(a, a)  ← model.ts:12:15  ← use .ref here
+    2. add(b, a)  ← model.ts:13:15  ← use .ref here
+    3. output[0]  ← last use (consumed)
 
-result of mul(a, b) → c (float32[3]) at model.ts:12: has 2 .ref calls but is
+result of mul(a, b) → c (float32[3]) at model.ts:12:15: has 2 .ref calls but is
 only used 1 time (need 0). Remove 2x .ref (would leak memory).
+    - .ref at model.ts:14:22
+    - .ref at model.ts:15:22
 ```
 
 ## Test Coverage
