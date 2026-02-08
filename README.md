@@ -43,6 +43,23 @@ way to get started on a blank HTML page.
 </script>
 ```
 
+## Examples
+
+Cool things that the community has made with jax-js:
+
+- [**tanh.xyz**: Interactive ML visualizations](https://tanh.xyz/)
+
+And some more demos on the official website.
+
+- [Training neural networks on MNIST](https://jax-js.com/mnist)
+- [Voice cloning: Kyutai Pocket TTS](https://jax-js.com/tts)
+- [CLIP embeddings for books in-browser](https://jax-js.com/mobileclip)
+- [Object detection: DETR ResNet-50 (ONNX)](https://jax-js.com/detr-resnet-50)
+- [In-browser REPL](https://jax-js.com/repl)
+- [Matmul benchmark](https://jax-js.com/bench/matmul)
+- [Conv2d benchmark](https://jax-js.com/bench/conv2d)
+- [Mandelbrot set](https://jax-js.com/mandelbrot)
+
 ## Feature comparison
 
 Here's a quick, high-level comparison with other popular web ML runtimes:
@@ -337,19 +354,6 @@ well as unique optimizations such as FlashAttention variants.
 
 That's all for this short tutorial. Please see the generated
 [API reference](https://jax-js.com/docs) for detailed documentation.
-
-## Examples
-
-If you make something cool with jax-js, don't be a stranger! We can feature it here.
-
-- [Training neural networks on MNIST](https://jax-js.com/mnist)
-- [Voice cloning: Kyutai Pocket TTS](https://jax-js.com/tts)
-- [CLIP embeddings for books in-browser](https://jax-js.com/mobileclip)
-- [Object detection: DETR ResNet-50 (ONNX)](https://jax-js.com/detr-resnet-50)
-- [In-browser REPL](https://jax-js.com/repl)
-- [Matmul benchmark](https://jax-js.com/bench/matmul)
-- [Conv2d benchmark](https://jax-js.com/bench/conv2d)
-- [Mandelbrot set](https://jax-js.com/mandelbrot)
 
 ## Development
 
