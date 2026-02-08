@@ -532,6 +532,7 @@ const jvpRules: { [P in Primitive]: JvpRule<P> } = {
 
         return [...carryP_out, ...carryT_out, ...yP_out, ...yT_out];
       },
+      { validateRefs: false },
     )(...wrapperInAvals);
 
     // Original args: consts (numConsts), carry (numCarry), xs (numX)
@@ -599,6 +600,7 @@ function jvpJaxpr(jaxpr: Jaxpr): ClosedJaxpr {
   const { jaxpr: newJaxpr } = makeJaxpr(
     (primals: Tracer[], tangents: Tracer[]) =>
       jvpFlat(jaxprAsFun(jaxpr), primals, tangents),
+    { validateRefs: false },
   )(inAvals, inAvals);
 
   jvpJaxprCache.set(jaxpr, newJaxpr);
@@ -611,6 +613,7 @@ function jvpFlat(
   tangents: TracerValue[],
 ): [Tracer[], Tracer[]] {
   using main = newMain(JVPTrace);
+  main.isTransform = true;
   const trace = new JVPTrace(main);
   const tracersIn = zip(primals, tangents).map(
     ([x, t]) => new JVPTracer(trace, pureArray(x), pureArray(t)),

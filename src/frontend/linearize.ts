@@ -96,6 +96,7 @@ function partialEvalFlat(
   pvalsIn: PartialVal[],
 ): { jaxpr: ClosedJaxpr; pvalsOut: PartialVal[] } {
   const main = newMain(PartialEvalTrace);
+  main.isTransform = true;
   const trace = new PartialEvalTrace(main);
   const tracersIn = pvalsIn.map((pval) => trace.newArg(pval));
   const unknownTracersIn = tracersIn
@@ -1270,6 +1271,7 @@ const transposeRules: Partial<{ [P in Primitive]: TransposeRule<P> }> = {
           outs[i].dispose();
         return [...primalCarryOuts, ...primalYOuts];
       },
+      { validateRefs: false },
     )(...forwardInTypes);
 
     // Helper: run one forward step
@@ -1395,6 +1397,7 @@ const transposeRules: Partial<{ [P in Primitive]: TransposeRule<P> }> = {
 
         return tangentOuts;
       },
+      { validateRefs: false },
     )(...tangentBodyInAvals);
 
     // Transpose the tangent-only body
@@ -1639,6 +1642,7 @@ function transposeJaxpr(jaxpr: Jaxpr, undefPrimals: boolean[]): ClosedJaxpr {
       }
       return evalJaxprTransposed(jaxpr, args, cotangents);
     },
+    { validateRefs: false },
   )(forwardInTypes, outTypes);
   typecheckJaxpr(newJaxpr.jaxpr); // sanity check
 

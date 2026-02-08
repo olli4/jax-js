@@ -528,8 +528,9 @@ function vmapJaxpr(
     shape.splice(dims[i], 0, axisSize); // Insert the mapped axis into the shape.
     return new ShapedArray(shape, v.aval.dtype, v.aval.weakType);
   });
-  const { jaxpr: newJaxpr } = makeJaxpr((args: Tracer[]) =>
-    vmapFlat(jaxprAsFun(jaxpr), dims, args),
+  const { jaxpr: newJaxpr } = makeJaxpr(
+    (args: Tracer[]) => vmapFlat(jaxprAsFun(jaxpr), dims, args),
+    { validateRefs: false },
   )(inAvals);
 
   if (!vmapJaxprCache.has(jaxpr)) vmapJaxprCache.set(jaxpr, new Map());
@@ -566,6 +567,7 @@ function vmapFlat(
   let valsOut: Tracer[], bdimsOut: (number | null)[];
   {
     using main = newMain(BatchTrace, axisSize);
+    main.isTransform = true;
     const trace = new BatchTrace(main);
     const tracersIn = args.map((x, i) =>
       inAxes[i] === null

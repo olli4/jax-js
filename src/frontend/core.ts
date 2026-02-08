@@ -583,6 +583,8 @@ type MainTrace = {
   level: number;
   traceType: new (main: MainTrace) => Trace; // Concrete Trace subclass.
   globalData: any | null;
+  /** True for transform traces (JVP, vmap) that alter .ref usage patterns. */
+  isTransform?: boolean;
 };
 
 const traceStack: MainTrace[] = []; // Global trace stack, mutable
@@ -623,6 +625,18 @@ export function newDynamic(main: MainTrace): Disposable {
 
 export function currentTraceLevel(): number {
   return traceStack[traceStack.length - 1].level;
+}
+
+/**
+ * Check if any transform trace (JVP, vmap) is active above the given level.
+ * Used by JaxprTracer to distinguish user .ref calls from system .ref calls
+ * made by transform machinery.
+ */
+export function isUnderTransform(level: number): boolean {
+  for (let i = level + 1; i < traceStack.length; i++) {
+    if (traceStack[i].isTransform) return true;
+  }
+  return false;
 }
 
 export type TracerValue = Tracer | number | boolean;

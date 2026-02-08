@@ -400,9 +400,9 @@ export function scan<
   const traceAvals = [...carryAvals, ...xSliceAvals];
 
   // Trace to get jaxpr
-  const { jaxpr: closedJaxpr, treedef: _outTreedef } = makeJaxpr(traceFn)(
-    ...traceAvals,
-  );
+  const { jaxpr: closedJaxpr, treedef: _outTreedef } = makeJaxpr(traceFn, {
+    validateRefs: false,
+  })(...traceAvals);
   const jaxpr = closedJaxpr.jaxpr;
   const consts = closedJaxpr.consts;
 

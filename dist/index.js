@@ -678,6 +678,15 @@ function newDynamic(main) {
 function currentTraceLevel() {
 	return traceStack[traceStack.length - 1].level;
 }
+/**
+* Check if any transform trace (JVP, vmap) is active above the given level.
+* Used by JaxprTracer to distinguish user .ref calls from system .ref calls
+* made by transform machinery.
+*/
+function isUnderTransform(level) {
+	for (let i = level + 1; i < traceStack.length; i++) if (traceStack[i].isTransform) return true;
+	return false;
+}
 var Trace = class {
 	constructor(main) {
 		this.main = main;
@@ -1478,6 +1487,12 @@ var ClosedJaxpr = class ClosedJaxpr {
 /** Tracer that records its operations to dynamically construct a Jaxpr. */
 var JaxprTracer = class extends Tracer {
 	#rc;
+	/**
+	* Number of `.ref` calls attributable to user code. System-internal refs
+	* (e.g. const-lifting in inner makeJaxpr traces) are excluded so that
+	* validation only checks the user's ref discipline.
+	*/
+	_userRefCalls = 0;
 	constructor(trace$1, aval) {
 		super(trace$1);
 		this.aval = aval;
@@ -1489,11 +1504,18 @@ var JaxprTracer = class extends Tracer {
 	get ref() {
 		if (this.#rc <= 0) throw new UseAfterFreeError(this);
 		this.#rc++;
+		if (isUnderTransform(this._trace.main.level)) this._trace.builder._hadTransform = true;
+		else this._userRefCalls++;
 		return this;
 	}
 	dispose() {
 		if (this.#rc <= 0) throw new UseAfterFreeError(this);
 		this.#rc--;
+		if (this._userRefCalls > 0 && !isUnderTransform(this._trace.main.level)) this._userRefCalls--;
+	}
+	/** Number of live references the user holds (1 + .ref count − .dispose count). */
+	get refCount() {
+		return this.#rc;
 	}
 	trackLiftedConstant() {
 		this.#rc++;
@@ -1514,20 +1536,18 @@ var JaxprTrace = class extends Trace {
 		let tracer = this.builder.constTracers.get(val);
 		if (tracer === void 0) {
 			tracer = this.builder.newTracer(this, ShapedArray.fromAval(getAval(val)));
+			if (val instanceof JaxprTracer) {
+				val.ref;
+				if (val._userRefCalls > 0) val._userRefCalls--;
+			}
 			this.builder.addConst(tracer, val);
-		} else {
-			val.dispose();
-			tracer.trackLiftedConstant();
-		}
+		} else tracer.trackLiftedConstant();
 		return tracer;
 	}
 	pure = this.getOrMakeConstTracer;
 	lift = this.getOrMakeConstTracer;
 	processPrimitive(primitive, tracers, params) {
-		const avalsIn = tracers.map((t) => {
-			t.dispose();
-			return t.aval;
-		});
+		const avalsIn = tracers.map((t) => t.aval);
 		const avalsOut = abstractEvalRules[primitive](avalsIn, params);
 		const outTracers = avalsOut.map((aval) => this.builder.newTracer(this, aval));
 		this.builder.addEqn(new JaxprEqn(primitive, tracers.map((t) => this.builder.getVar(t)), params, outTracers.map((t) => this.builder.addVar(t))));
@@ -1544,6 +1564,12 @@ var JaxprBuilder = class {
 	constTracers = /* @__PURE__ */ new Map();
 	constVals = /* @__PURE__ */ new Map();
 	tracers = [];
+	/**
+	* Set to true when a transform trace (JVP, vmap, etc.) was active above
+	* this JaxprTrace during tracing. When true, .ref validation is skipped
+	* because transforms alter usage patterns internally.
+	*/
+	_hadTransform = false;
 	newTracer(trace$1, aval) {
 		const tracer = new JaxprTracer(trace$1, aval);
 		this.tracers.push(tracer);
@@ -1804,6 +1830,68 @@ function joinIdx(n, a, b, argnums) {
 	else result.push(b[bi++]);
 	return result;
 }
+/**
+* Validate that the user's .ref usage matches the actual usage count in the
+* traced Jaxpr.  Since tracing never consumes tracers (always-autoRef), we
+* track user .ref calls via `_userRefCalls` on each JaxprTracer.  The effective
+* user refcount is `1 + _userRefCalls`.  The usage count is how many times
+* the corresponding Var appears as an equation input or output.  For correct
+* eager execution these must be equal.
+*
+* Tracers with effective rc === 1 and usageCount === 0 are "discarded
+* intermediates" (e.g. one branch of `random.split`) and are silently skipped.
+*
+* Throws a single error listing every mismatch with actionable fix instructions.
+*/
+function validateRefCounts(builder, tracersIn, tracersOut) {
+	if (builder._hadTransform) return;
+	const usageCount = /* @__PURE__ */ new Map();
+	for (const eqn of builder.eqns) for (const v of eqn.inputs) if (v instanceof Var) usageCount.set(v, (usageCount.get(v) ?? 0) + 1);
+	const outVars = tracersOut.map((t) => builder.getVar(t));
+	for (const v of outVars) usageCount.set(v, (usageCount.get(v) ?? 0) + 1);
+	const constTracerSet = new Set(builder.constTracers.values());
+	const vp = new VarPrinter();
+	const describeSource = (v, argIdx) => {
+		const dtype = v.aval.dtype;
+		const shape$1 = `[${v.aval.shape.join(",")}]`;
+		if (argIdx !== null) return `argument ${argIdx} (${dtype}${shape$1})`;
+		for (const eqn of builder.eqns) for (const outV of eqn.outBinders) if (outV === v) {
+			const inputs = eqn.inputs.map((x) => x instanceof Var ? vp.name(x) : String(x.value)).join(", ");
+			return `result of ${eqn.primitive}(${inputs}) → ${vp.name(v)} (${dtype}${shape$1})`;
+		}
+		return `${vp.name(v)} (${dtype}${shape$1})`;
+	};
+	const describeUses = (v) => {
+		const uses = [];
+		for (const eqn of builder.eqns) for (const inp of eqn.inputs) if (inp === v) {
+			const inputs = eqn.inputs.map((x) => x instanceof Var ? vp.name(x) : String(x.value)).join(", ");
+			uses.push(`${eqn.primitive}(${inputs})`);
+		}
+		for (let i = 0; i < outVars.length; i++) if (outVars[i] === v) uses.push(`output[${i}]`);
+		return uses;
+	};
+	const errors = [];
+	for (const [tracer, v] of builder.tracerToVar) {
+		if (constTracerSet.has(tracer)) continue;
+		const rc = 1 + tracer._userRefCalls;
+		const used = usageCount.get(v) ?? 0;
+		if (rc === used) continue;
+		if (rc === 1 && used === 0) continue;
+		const argIdx = tracersIn.indexOf(tracer);
+		const source = describeSource(v, argIdx >= 0 ? argIdx : null);
+		const userRefs = rc - 1;
+		const needed = Math.max(0, used - 1);
+		if (rc < used) {
+			const missing = used - rc;
+			const uses = describeUses(v);
+			errors.push(`${source}: used ${used} time${used > 1 ? "s" : ""} but has ${userRefs} .ref call${userRefs !== 1 ? "s" : ""} (need ${needed}).\n  Add ${missing}x .ref.  Uses:\n` + uses.map((u, i) => `    ${i + 1}. ${u}`).join("\n"));
+		} else {
+			const extra = userRefs - needed;
+			errors.push(`${source}: has ${userRefs} .ref call${userRefs !== 1 ? "s" : ""} but is only used ${used} time${used > 1 ? "s" : ""} (need ${needed}). Remove ${extra}x .ref (would leak in eager mode).`);
+		}
+	}
+	if (errors.length > 0) throw new Error("jit: ref validation failed — the function body has incorrect .ref usage that would cause issues in eager mode:\n\n" + errors.join("\n\n"));
+}
 function makeJaxpr$1(f, opts) {
 	return (...argsIn) => {
 		try {
@@ -1821,6 +1909,7 @@ function makeJaxpr$1(f, opts) {
 			const tracersIn = avalsIn.map((aval) => trace$1.newArg(typeof aval === "object" ? aval : pureArray(aval)));
 			const outs = fFlat(...tracersIn);
 			const tracersOut = outs.map((out) => fullRaise(trace$1, out));
+			if (opts?.validateRefs !== false) validateRefCounts(builder, tracersIn, tracersOut);
 			const jaxpr = builder.build(tracersIn, tracersOut);
 			if (outTree.value === void 0) throw new Error("outTree was not set in makeJaxpr");
 			return {
@@ -1843,7 +1932,14 @@ function jit$1(f, opts) {
 		const avalsInFlat = argsFlat.map((x) => ShapedArray.fromAval(getAval(x)));
 		const avalsIn = unflatten(inTree, avalsInFlat);
 		const jaxprArgs = joinIdx(args.length, staticArgs, avalsIn, staticArgnums);
-		const { jaxpr, treedef: outTree } = runWithCache(cache, jaxprArgs, () => makeJaxpr$1(f, opts)(...jaxprArgs));
+		const { jaxpr, treedef: outTree } = runWithCache(cache, jaxprArgs, () => {
+			const underTransform = argsFlat.some((x) => x instanceof Tracer && !(x instanceof Array$1));
+			const traceOpts = underTransform && opts?.validateRefs !== false ? {
+				...opts,
+				validateRefs: false
+			} : opts;
+			return makeJaxpr$1(f, traceOpts)(...jaxprArgs);
+		});
 		const outs = bind(Primitive.Jit, [...jaxpr.consts.map((c) => c.ref), ...argsFlat], {
 			name: f.name || "closure",
 			jaxpr: jaxpr.jaxpr,
@@ -4931,7 +5027,7 @@ function vmapJaxpr(jaxpr, axisSize, dims) {
 		shape$1.splice(dims[i], 0, axisSize);
 		return new ShapedArray(shape$1, v.aval.dtype, v.aval.weakType);
 	});
-	const { jaxpr: newJaxpr } = makeJaxpr$1((args) => vmapFlat(jaxprAsFun(jaxpr), dims, args))(inAvals);
+	const { jaxpr: newJaxpr } = makeJaxpr$1((args) => vmapFlat(jaxprAsFun(jaxpr), dims, args), { validateRefs: false })(inAvals);
 	if (!vmapJaxprCache.has(jaxpr)) vmapJaxprCache.set(jaxpr, /* @__PURE__ */ new Map());
 	vmapJaxprCache.get(jaxpr).set(cacheKey, newJaxpr);
 	return newJaxpr;
@@ -4950,6 +5046,7 @@ function vmapFlat(f, inAxes, args) {
 	try {
 		var _usingCtx$1 = _usingCtx();
 		const main = _usingCtx$1.u(newMain(BatchTrace, axisSize));
+		main.isTransform = true;
 		const trace$1 = new BatchTrace(main);
 		const tracersIn = args.map((x, i) => inAxes[i] === null ? pureArray(x) : new BatchTracer(trace$1, pureArray(x), inAxes[i]));
 		const outs = f(...tracersIn);
@@ -5305,7 +5402,7 @@ const jvpRules = {
 				...yP_out,
 				...yT_out
 			];
-		})(...wrapperInAvals);
+		}, { validateRefs: false })(...wrapperInAvals);
 		const constsP = primals.slice(0, numConsts);
 		const carryP = primals.slice(numConsts, numConsts + numCarry);
 		const xsP = primals.slice(numConsts + numCarry);
@@ -5343,7 +5440,7 @@ const jvpJaxprCache = /* @__PURE__ */ new Map();
 function jvpJaxpr(jaxpr) {
 	if (jvpJaxprCache.has(jaxpr)) return jvpJaxprCache.get(jaxpr);
 	const inAvals = jaxpr.inBinders.map((v) => v.aval);
-	const { jaxpr: newJaxpr } = makeJaxpr$1((primals, tangents) => jvpFlat(jaxprAsFun(jaxpr), primals, tangents))(inAvals, inAvals);
+	const { jaxpr: newJaxpr } = makeJaxpr$1((primals, tangents) => jvpFlat(jaxprAsFun(jaxpr), primals, tangents), { validateRefs: false })(inAvals, inAvals);
 	jvpJaxprCache.set(jaxpr, newJaxpr);
 	return newJaxpr;
 }
@@ -5351,6 +5448,7 @@ function jvpFlat(f, primals, tangents) {
 	try {
 		var _usingCtx$1 = _usingCtx();
 		const main = _usingCtx$1.u(newMain(JVPTrace));
+		main.isTransform = true;
 		const trace$1 = new JVPTrace(main);
 		const tracersIn = zip(primals, tangents).map(([x, t]) => new JVPTracer(trace$1, pureArray(x), pureArray(t)));
 		const outs = f(...tracersIn);
@@ -5419,6 +5517,7 @@ var PartialVal = class PartialVal {
 };
 function partialEvalFlat(f, pvalsIn) {
 	const main = newMain(PartialEvalTrace);
+	main.isTransform = true;
 	const trace$1 = new PartialEvalTrace(main);
 	const tracersIn = pvalsIn.map((pval) => trace$1.newArg(pval));
 	const unknownTracersIn = tracersIn.filter((t) => !t.pval.isKnown).map((t) => t.ref);
@@ -6100,7 +6199,7 @@ const transposeRules = {
 			for (let i = numPrimalCarry; i < numCarry; i++) outs[i].dispose();
 			for (let i = numCarry + Math.floor(numY / 2); i < outs.length; i++) outs[i].dispose();
 			return [...primalCarryOuts, ...primalYOuts];
-		})(...forwardInTypes);
+		}, { validateRefs: false })(...forwardInTypes);
 		const runOneForwardStep = (iter, carry) => {
 			const dataIdx = reverse ? length - 1 - iter : iter;
 			const xSlices = [];
@@ -6155,7 +6254,7 @@ const transposeRules = {
 			for (let i = 0; i < numPrimalCarry; i++) fullOuts[i].dispose();
 			for (let i = numCarry; i < numCarry + numPrimalY; i++) fullOuts[i].dispose();
 			return tangentOuts;
-		})(...tangentBodyInAvals);
+		}, { validateRefs: false })(...tangentBodyInAvals);
 		const tangentBodyUndefPrimals = [...Array(tangentBody.jaxpr.inBinders.length - (numTangentConsts + numTangentCarry + numTangentX)).fill(false), ...Array(numTangentConsts + numTangentCarry + numTangentX).fill(true)];
 		const transposedBody = transposeJaxpr(tangentBody.jaxpr, tangentBodyUndefPrimals);
 		const ctCarryAll = cts.slice(0, numCarry);
@@ -6281,7 +6380,7 @@ function transposeJaxpr(jaxpr, undefPrimals) {
 		for (let i = 0; i < undefPrimals.length; i++) if (undefPrimals[i]) args.push(new UndefPrimal(inTypes[i]));
 		else args.push(forwardIn[forwardInIdx++]);
 		return evalJaxprTransposed(jaxpr, args, cotangents);
-	})(forwardInTypes, outTypes);
+	}, { validateRefs: false })(forwardInTypes, outTypes);
 	typecheckJaxpr(newJaxpr.jaxpr);
 	if (!transposeJaxprCache.has(jaxpr)) transposeJaxprCache.set(jaxpr, /* @__PURE__ */ new Map());
 	transposeJaxprCache.get(jaxpr).set(cacheKey, newJaxpr);
@@ -7951,7 +8050,7 @@ function absolute(x) {
 /** Return an element-wise indication of sign of the input. */
 function sign(x) {
 	x = fudgeArray(x);
-	return where(notEqual(x.ref, 0), where(less(x.ref, 0), -1, 1), 0);
+	return where(notEqual(x.ref, 0), where(less(x, 0), -1, 1), 0);
 }
 /** @function Return element-wise positive values of the input (no-op). */
 const positive = fudgeArray;
@@ -8716,7 +8815,7 @@ function scan(f, init$1, xs, options) {
 		return [...newCarryFlat, ...yFlat];
 	};
 	const traceAvals = [...carryAvals, ...xSliceAvals];
-	const { jaxpr: closedJaxpr, treedef: _outTreedef } = makeJaxpr$1(traceFn)(...traceAvals);
+	const { jaxpr: closedJaxpr, treedef: _outTreedef } = makeJaxpr$1(traceFn, { validateRefs: false })(...traceAvals);
 	const jaxpr = closedJaxpr.jaxpr;
 	const consts = closedJaxpr.consts;
 	if (n === 0) {
@@ -9190,7 +9289,7 @@ const gelu = jit$1(function gelu$1(x, opts) {
 	if (opts?.approximate ?? true) {
 		const SQRT_2_OVER_PI = Math.sqrt(2 / Math.PI);
 		return x.ref.mul(.5).mul(tanh(x.ref.mul(x.ref.mul(x).mul(.044715).add(1)).mul(SQRT_2_OVER_PI)).add(1));
-	} else return x.ref.mul(.5).mul(erfc$1(negative(x.ref.mul(Math.SQRT1_2))));
+	} else return x.ref.mul(.5).mul(erfc$1(negative(x.mul(Math.SQRT1_2))));
 }, { staticArgnums: [1] });
 /**
 * Gated linear unit (GLU) activation function.
@@ -9704,6 +9803,10 @@ const makeJaxpr = makeJaxpr$1;
 * - `staticArgnums`: An array of argument indices to treat as static
 *   (compile-time constant). These arguments must be hashable, won't be traced,
 *   and different values will trigger recompilation.
+* - `validateRefs`: When `true` (default), validates that the function body
+*   uses `.ref` correctly for eager-mode compatibility.  Tracing always
+*   succeeds; validation runs afterwards and reports every missing or extra
+*   `.ref` with an actionable error message.  Set to `false` to skip.
 * - `device`: The device to place the computation on. If not specified, the
 *   computation will be placed on the default device.
 */
