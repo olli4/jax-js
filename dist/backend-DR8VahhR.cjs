@@ -1,3 +1,4 @@
+
 //#region src/pprint.ts
 /** General class for pretty-printing expressions with indentation. */
 var PPrint = class PPrint {
@@ -1312,6 +1313,10 @@ var Reduction = class {
 		this.epilogue = epilogue;
 		if (!AluGroup.Reduce.has(op)) throw new TypeError(`Unsupported reduction: ${op}`);
 		this.epilogue = epilogue.simplify();
+		if (this.dtype === DType.Float16 && this.op === AluOp.Add) {
+			this.epilogue = this.epilogue.substitute({ acc: AluExp.cast(this.dtype, AluVar.acc(DType.Float32)) });
+			this.dtype = DType.Float32;
+		}
 	}
 	hash(state) {
 		state.update(this.dtype).update(this.op).update(this.size).update(this.epilogue);
@@ -1479,9 +1484,14 @@ var Routine = class {
 };
 /** One of the valid `Routine` that can be dispatched to backend. */
 let Routines = /* @__PURE__ */ function(Routines$1) {
-	/** Stable sorting algorithm along the last axis. */
+	/**
+	* Sort along the last axis.
+	*
+	* This may be _unstable_ but it often doesn't matter, sorting numbers is
+	* bitwise unique up to signed zeros and NaNs.
+	*/
 	Routines$1["Sort"] = "Sort";
-	/** Returns `int32` indices of the stably sorted array. */
+	/** Stable sorting, returns `int32` indices and values of the sorted array. */
 	Routines$1["Argsort"] = "Argsort";
 	/**
 	* Solve a triangular system of equations.
@@ -1545,7 +1555,13 @@ function runArgsort(type, [x], [y, yi]) {
 		const out = y.subarray(offset, offset + n);
 		const outi = yi.subarray(offset, offset + n);
 		for (let i = 0; i < n; i++) outi[i] = i;
-		outi.sort((a, b) => ar[a] - ar[b]);
+		outi.sort((a, b) => {
+			const x$1 = ar[a];
+			const y$1 = ar[b];
+			if (isNaN(x$1)) return isNaN(y$1) ? 0 : 1;
+			if (isNaN(y$1)) return -1;
+			return x$1 === y$1 ? 0 : x$1 < y$1 ? -1 : 1;
+		});
 		for (let i = 0; i < n; i++) out[i] = ar[outi[i]];
 	}
 }
@@ -2255,11 +2271,15 @@ var TuneDims = class {
 };
 /** Tuning step that does not apply any optimization. */
 function tuneNullopt(kernel) {
+	let exp = kernel.exp;
 	const vars = {};
 	vars.gidx = AluExp.special(DType.Int32, "gidx", kernel.size);
-	if (kernel.reduction) vars.ridx = AluExp.special(DType.Int32, "ridx", kernel.reduction.size);
+	if (kernel.reduction) {
+		vars.ridx = AluExp.special(DType.Int32, "ridx", kernel.reduction.size);
+		if (exp.dtype !== kernel.reduction.dtype) exp = AluExp.cast(kernel.reduction.dtype, exp);
+	}
 	return {
-		exp: kernel.exp.substitute(vars).rewriteGlobalViews().simplify(),
+		exp: exp.substitute(vars).rewriteGlobalViews().simplify(),
 		epilogue: kernel.reduction?.epilogue.substitute({ gidx: vars.gidx }).rewriteGlobalViews().simplify(),
 		outputIdxExp: vars.gidx,
 		threadCount: kernel.size,
@@ -2268,8 +2288,9 @@ function tuneNullopt(kernel) {
 }
 /** Tuning for WebGPU kernels. */
 function tuneWebgpu(kernel) {
-	const { exp, reduction } = kernel;
+	const reduction = kernel.reduction;
 	if (!reduction) return tuneNullopt(kernel);
+	const exp = AluExp.cast(reduction.dtype, kernel.exp);
 	const globalIndexes = exp.collect((exp$1) => exp$1.op === AluOp.GlobalIndex);
 	if (globalIndexes.length > 0) {
 		if (DEBUG >= 4) console.info("Tuning: Found GlobalIndex ops, skipping opt.");
@@ -2321,7 +2342,7 @@ function tuneWebgpu(kernel) {
 	if (!/Mobi|Android/i.test(navigator.userAgent) && dim.reduce < dim.unroll && (prod(dim.st.shape.slice(dim.unroll)) <= 4 || dim.unroll === dim.upcast && prod(dim.st.shape.slice(dim.upcast)) < 64)) {
 		const s = dim.st.shape[dim.unroll - 1];
 		if (0 < s && s <= 32) dim.applyUnroll(dim.reduce, s);
-		else for (const splits of [8, 4]) if (s % splits === 0) {
+		else for (const splits of [4, 2]) if (s % splits === 0) {
 			dim.applyUnroll(dim.unroll - 1, splits);
 			break;
 		}
@@ -3346,11 +3367,11 @@ var CodeGenerator = class {
 		this._emit(27);
 	}
 	/** Import a JavaScript function; returns its index. */
-	importFunction(module, name, inputTypes, outputTypes) {
+	importFunction(module$1, name, inputTypes, outputTypes) {
 		if (this.#functions.length > 0) throw new Error("function imports must precede defining functions");
 		const idx = this.#importedFunctions.length;
 		this.#importedFunctions.push({
-			module,
+			module: module$1,
 			name,
 			inputTypes,
 			outputTypes
@@ -5803,10 +5824,10 @@ var ModuleLRUCache = class {
 		}
 		return void 0;
 	}
-	set(key, module) {
+	set(key, module$1) {
 		if (this.#cache.size >= this.#maxSize && !this.#cache.has(key)) this.#evictLRU();
 		this.#cache.set(key, {
-			module,
+			module: module$1,
 			lastAccess: ++this.#accessCounter
 		});
 	}
@@ -5852,14 +5873,14 @@ function argsortKey(params) {
 */
 function getCholeskyModule(params) {
 	const key = choleskyKey(params);
-	let module = moduleCache$1.get(key);
-	if (!module) {
+	let module$1 = moduleCache$1.get(key);
+	if (!module$1) {
 		const useSIMD = params.dtype === "f32" && params.n >= 32;
 		const bytes = useSIMD ? buildCholeskySimdModule(params.n) : buildCholeskyModuleSized(params.n, params.dtype);
-		module = new WebAssembly.Module(bytes);
-		moduleCache$1.set(key, module);
+		module$1 = new WebAssembly.Module(bytes);
+		moduleCache$1.set(key, module$1);
 	}
-	return module;
+	return module$1;
 }
 /**
 * Get a size-specialized TriangularSolve module.
@@ -5867,13 +5888,13 @@ function getCholeskyModule(params) {
 */
 function getTriangularSolveModule(params) {
 	const key = triangularSolveKey(params);
-	let module = moduleCache$1.get(key);
-	if (!module) {
+	let module$1 = moduleCache$1.get(key);
+	if (!module$1) {
 		const bytes = buildTriangularSolveModuleSized(params.n, params.batchRows, params.dtype, params.unitDiagonal, params.lower);
-		module = new WebAssembly.Module(bytes);
-		moduleCache$1.set(key, module);
+		module$1 = new WebAssembly.Module(bytes);
+		moduleCache$1.set(key, module$1);
 	}
-	return module;
+	return module$1;
 }
 /**
 * Get a size-specialized LU module.
@@ -5881,13 +5902,13 @@ function getTriangularSolveModule(params) {
 */
 function getLUModule(params) {
 	const key = luKey(params);
-	let module = moduleCache$1.get(key);
-	if (!module) {
+	let module$1 = moduleCache$1.get(key);
+	if (!module$1) {
 		const bytes = buildLUModuleSized(params.m, params.n, params.dtype);
-		module = new WebAssembly.Module(bytes);
-		moduleCache$1.set(key, module);
+		module$1 = new WebAssembly.Module(bytes);
+		moduleCache$1.set(key, module$1);
 	}
-	return module;
+	return module$1;
 }
 /**
 * Get a size-specialized Sort module.
@@ -5895,13 +5916,13 @@ function getLUModule(params) {
 */
 function getSortModule(params) {
 	const key = sortKey(params);
-	let module = moduleCache$1.get(key);
-	if (!module) {
+	let module$1 = moduleCache$1.get(key);
+	if (!module$1) {
 		const bytes = buildSortModuleSized(params.n, params.dtype);
-		module = new WebAssembly.Module(bytes);
-		moduleCache$1.set(key, module);
+		module$1 = new WebAssembly.Module(bytes);
+		moduleCache$1.set(key, module$1);
 	}
-	return module;
+	return module$1;
 }
 /**
 * Get a size-specialized Argsort module.
@@ -5909,13 +5930,13 @@ function getSortModule(params) {
 */
 function getArgsortModule(params) {
 	const key = argsortKey(params);
-	let module = moduleCache$1.get(key);
-	if (!module) {
+	let module$1 = moduleCache$1.get(key);
+	if (!module$1) {
 		const bytes = buildArgsortModuleSized(params.n, params.dtype);
-		module = new WebAssembly.Module(bytes);
-		moduleCache$1.set(key, module);
+		module$1 = new WebAssembly.Module(bytes);
+		moduleCache$1.set(key, module$1);
 	}
-	return module;
+	return module$1;
 }
 
 //#endregion
@@ -5990,11 +6011,11 @@ var WasmBackend = class {
 	}
 	prepareKernelSync(kernel) {
 		const kernelHash = FpHash.hash(kernel);
-		const module = runWithCache(moduleCache, kernelHash.toString(), () => {
+		const module$1 = runWithCache(moduleCache, kernelHash.toString(), () => {
 			const bytes = codegenWasm(kernel);
 			return new WebAssembly.Module(bytes);
 		});
-		return new Executable(kernel, { module });
+		return new Executable(kernel, { module: module$1 });
 	}
 	async prepareRoutine(routine) {
 		return this.prepareRoutineSync(routine);
@@ -6030,11 +6051,11 @@ var WasmBackend = class {
 		func(...ptrs);
 	}
 	/** Get or create a WASM instance for a size-specialized routine module. */
-	#getRoutineInstanceForModule(module) {
-		let instance = this.#instanceCache.get(module);
+	#getRoutineInstanceForModule(module$1) {
+		let instance = this.#instanceCache.get(module$1);
 		if (!instance) {
-			instance = new WebAssembly.Instance(module, { env: { memory: this.#memory } });
-			this.#instanceCache.set(module, instance);
+			instance = new WebAssembly.Instance(module$1, { env: { memory: this.#memory } });
+			this.#instanceCache.set(module$1, instance);
 		}
 		return instance;
 	}
@@ -6089,11 +6110,11 @@ var WasmBackend = class {
 		const n = shape[shape.length - 1];
 		const batchSize = shape.slice(0, -2).reduce((a, b) => a * b, 1);
 		const dtype = elementSize === 4 ? "f32" : "f64";
-		const module = getCholeskyModule({
+		const module$1 = getCholeskyModule({
 			n,
 			dtype
 		});
-		const instance = this.#getRoutineInstanceForModule(module);
+		const instance = this.#getRoutineInstanceForModule(module$1);
 		const func = instance.exports.cholesky_batched;
 		func(this.#buffers.get(inputs[0]).ptr, this.#buffers.get(outputs[0]).ptr, batchSize);
 	}
@@ -6106,14 +6127,14 @@ var WasmBackend = class {
 		const dtype = elementSize === 4 ? "f32" : "f64";
 		const unitDiagonal = routine.params?.unitDiagonal ?? false;
 		const lower = routine.params?.lower ?? false;
-		const module = getTriangularSolveModule({
+		const module$1 = getTriangularSolveModule({
 			n,
 			batchRows,
 			dtype,
 			unitDiagonal,
 			lower
 		});
-		const instance = this.#getRoutineInstanceForModule(module);
+		const instance = this.#getRoutineInstanceForModule(module$1);
 		const func = instance.exports.triangular_solve_batched;
 		func(this.#buffers.get(inputs[0]).ptr, this.#buffers.get(inputs[1]).ptr, this.#buffers.get(outputs[0]).ptr, numBatches);
 	}
@@ -6123,12 +6144,12 @@ var WasmBackend = class {
 		const n = shape[shape.length - 1];
 		const batchSize = shape.slice(0, -2).reduce((a, b) => a * b, 1);
 		const dtype = elementSize === 4 ? "f32" : "f64";
-		const module = getLUModule({
+		const module$1 = getLUModule({
 			m,
 			n,
 			dtype
 		});
-		const instance = this.#getRoutineInstanceForModule(module);
+		const instance = this.#getRoutineInstanceForModule(module$1);
 		const func = instance.exports.lu_batched;
 		func(this.#buffers.get(inputs[0]).ptr, this.#buffers.get(outputs[0]).ptr, this.#buffers.get(outputs[1]).ptr, this.#buffers.get(outputs[2]).ptr, batchSize);
 	}
@@ -6142,11 +6163,11 @@ var WasmBackend = class {
 		const outBuf = this.#buffers.get(outputs[0]);
 		new Uint8Array(this.#memory.buffer, outBuf.ptr, totalSize).set(new Uint8Array(this.#memory.buffer, inBuf.ptr, totalSize));
 		const auxPtr = this.#allocator.malloc(n * elementSize);
-		const module = getSortModule({
+		const module$1 = getSortModule({
 			n,
 			dtype
 		});
-		const instance = this.#getRoutineInstanceForModule(module);
+		const instance = this.#getRoutineInstanceForModule(module$1);
 		const func = instance.exports.sort_batched;
 		func(outBuf.ptr, auxPtr, batchSize);
 		this.#allocator.free(auxPtr);
@@ -6157,11 +6178,11 @@ var WasmBackend = class {
 		const batchSize = shape.slice(0, -1).reduce((a, b) => a * b, 1);
 		const dtype = elementSize === 4 ? "f32" : "f64";
 		const auxPtr = this.#allocator.malloc(n * 4);
-		const module = getArgsortModule({
+		const module$1 = getArgsortModule({
 			n,
 			dtype
 		});
-		const instance = this.#getRoutineInstanceForModule(module);
+		const instance = this.#getRoutineInstanceForModule(module$1);
 		const func = instance.exports.argsort_batched;
 		func(this.#buffers.get(inputs[0]).ptr, this.#buffers.get(outputs[0]).ptr, this.#buffers.get(outputs[1]).ptr, auxPtr, batchSize);
 		this.#allocator.free(auxPtr);
@@ -6182,8 +6203,8 @@ var WasmBackend = class {
 	*/
 	prepareNativeScanGeneral(params) {
 		const bytes = codegenNativeScanGeneral(params);
-		const module = new WebAssembly.Module(bytes);
-		return new Executable(null, { module });
+		const module$1 = new WebAssembly.Module(bytes);
+		return new Executable(null, { module: module$1 });
 	}
 	/**
 	* Dispatch a native scan, executing the compiled WASM loop.
@@ -6253,7 +6274,7 @@ function importWasmHelperFuncs(cg, ops) {
 }
 function codegenWasm(kernel) {
 	const tune = tuneNullopt(kernel);
-	const re = kernel.reduction;
+	kernel.reduction;
 	if (DEBUG >= 3) console.info(`kernel.exp: ${kernel.exp}\ntune.exp: ${tune.exp}`);
 	const cg = new CodeGenerator();
 	cg.memory.import("env", "memory");
@@ -6261,84 +6282,25 @@ function codegenWasm(kernel) {
 	const funcs = importWasmHelperFuncs(cg, distinctOps);
 	const kernelFunc = cg.function(rep(kernel.nargs + 1, cg.i32), [], () => {
 		const gidx = cg.local.declare(cg.i32);
-		cg.loop(cg.void);
-		cg.block(cg.void);
-		cg.local.get(gidx);
-		cg.i32.const(kernel.size);
-		cg.i32.ge_u();
-		cg.br_if(0);
-		cg.local.get(kernel.nargs);
-		cg.local.get(gidx);
-		cg.i32.const(byteWidth(kernel.dtype));
-		cg.i32.mul();
-		cg.i32.add();
-		if (re) {
-			const acc = cg.local.declare(dty(cg, null, kernel.exp.dtype));
-			dty(cg, null, kernel.exp.dtype).const(re.identity);
-			cg.local.set(acc);
-			const ridx = cg.local.declare(cg.i32);
-			cg.i32.const(0);
-			cg.local.set(ridx);
-			cg.loop(cg.void);
-			cg.block(cg.void);
-			cg.local.get(ridx);
-			cg.i32.const(re.size);
-			cg.i32.ge_u();
-			cg.br_if(0);
-			translateExp(cg, funcs, tune.exp, {
-				gidx,
-				ridx
-			});
-			if (re.op === AluOp.Add) {
-				cg.local.get(acc);
-				if (re.dtype === DType.Bool) cg.i32.or();
-				else dty(cg, re.op, re.dtype).add();
-			} else if (re.op === AluOp.Mul) {
-				cg.local.get(acc);
-				if (re.dtype === DType.Bool) cg.i32.and();
-				else dty(cg, re.op, re.dtype).mul();
-			} else if (re.op === AluOp.Min || re.op === AluOp.Max) if (isFloatDtype(re.dtype)) {
-				cg.local.get(acc);
-				if (re.op === AluOp.Min) dtyF(cg, re.op, re.dtype).min();
-				else dtyF(cg, re.op, re.dtype).max();
-			} else if ([
-				DType.Int32,
-				DType.Uint32,
-				DType.Bool
-			].includes(re.dtype)) {
-				const local = cg.local.declare(cg.i32);
-				cg.local.tee(local);
-				cg.local.get(acc);
-				cg.local.get(local);
-				cg.local.get(acc);
-				if (re.op === AluOp.Min) if (re.dtype === DType.Int32) cg.i32.lt_s();
-				else cg.i32.lt_u();
-				else if (re.dtype === DType.Int32) cg.i32.gt_s();
-				else cg.i32.gt_u();
-				cg.select();
-			} else throw new Error(`invalid reduction min/max over ${re.dtype}`);
-			else throw new Error(`invalid wasm reduction op: ${re.op}`);
-			cg.local.set(acc);
-			cg.local.get(ridx);
-			cg.i32.const(1);
-			cg.i32.add();
-			cg.local.set(ridx);
-			cg.br(1);
-			cg.end();
-			cg.end();
-			translateExp(cg, funcs, tune.epilogue, {
-				acc,
-				gidx
-			});
-		} else translateExp(cg, funcs, tune.exp, { gidx });
-		dty(cg, null, kernel.dtype).store(Math.log2(byteWidth(kernel.dtype)));
-		cg.local.get(gidx);
-		cg.i32.const(1);
-		cg.i32.add();
-		cg.local.set(gidx);
-		cg.br(1);
-		cg.end();
-		cg.end();
+		emitKernelBody({
+			cg,
+			funcs,
+			kernel,
+			gidx,
+			emitOutputAddr: () => {
+				cg.local.get(kernel.nargs);
+				cg.local.get(gidx);
+				cg.i32.const(byteWidth(kernel.dtype));
+				cg.i32.mul();
+				cg.i32.add();
+			},
+			emitExp: (exp, { ridx, acc }) => {
+				const vars = { gidx };
+				if (ridx !== void 0) vars.ridx = ridx;
+				if (acc !== void 0) vars.acc = acc;
+				translateExp(cg, funcs, exp, vars);
+			}
+		});
 	});
 	cg.export(kernelFunc, "kernel");
 	return cg.finish();
@@ -6578,6 +6540,65 @@ function codegenReductionAccumulate(cg, re, acc) {
 	cg.local.set(acc);
 }
 /**
+* Emit the inner per-element loop for a single-output kernel.
+*
+* Shared between `codegenWasm()` (regular kernels) and
+* `codegenNativeScanGeneral()` (scan kernel steps). Callers inject
+* backend-specific behavior via three callbacks:
+*
+* - `emitOutputAddr`: push the store address for element [gidx] onto the stack
+* - `emitExp`: translate an expression, leaving result on stack
+* - `emitStore`: (optional) custom store logic; default is a simple typed store
+*/
+function emitKernelBody(opts) {
+	const { cg, funcs, kernel, gidx, emitOutputAddr, emitExp, emitStore } = opts;
+	const tune = tuneNullopt(kernel);
+	const re = kernel.reduction;
+	const storeAlign = Math.log2(byteWidth(kernel.dtype));
+	cg.i32.const(0);
+	cg.local.set(gidx);
+	cg.loop(cg.void);
+	cg.block(cg.void);
+	cg.local.get(gidx);
+	cg.i32.const(kernel.size);
+	cg.i32.ge_u();
+	cg.br_if(0);
+	emitOutputAddr();
+	if (re) {
+		const acc = cg.local.declare(dty(cg, null, kernel.exp.dtype));
+		dty(cg, null, kernel.exp.dtype).const(re.identity);
+		cg.local.set(acc);
+		const ridx = cg.local.declare(cg.i32);
+		cg.i32.const(0);
+		cg.local.set(ridx);
+		cg.loop(cg.void);
+		cg.block(cg.void);
+		cg.local.get(ridx);
+		cg.i32.const(re.size);
+		cg.i32.ge_u();
+		cg.br_if(0);
+		emitExp(tune.exp, { ridx });
+		codegenReductionAccumulate(cg, re, acc);
+		cg.local.get(ridx);
+		cg.i32.const(1);
+		cg.i32.add();
+		cg.local.set(ridx);
+		cg.br(1);
+		cg.end();
+		cg.end();
+		emitExp(tune.epilogue, { acc });
+	} else emitExp(tune.exp, {});
+	if (emitStore) emitStore();
+	else dty(cg, null, kernel.dtype).store(storeAlign);
+	cg.local.get(gidx);
+	cg.i32.const(1);
+	cg.i32.add();
+	cg.local.set(gidx);
+	cg.br(1);
+	cg.end();
+	cg.end();
+}
+/**
 * Translate an AluExp to WASM code within a general scan context.
 * Thin wrapper around translateExpCore with scan-specific GlobalIndex handling.
 */
@@ -6774,57 +6795,30 @@ function codegenNativeScanGeneral(params) {
 			const internalIdx = step.outputInternalIdx;
 			if (step.source instanceof Kernel) {
 				const kernel = step.source;
-				const tune = tuneNullopt(kernel);
-				const re = kernel.reduction;
 				const dw = directWriteMap.get(internalIdx);
 				const bw = byteWidth(kernel.dtype);
-				const storeAlign = Math.log2(bw);
 				const needsDualStore = dw && dw.yIdx !== void 0;
-				cg.i32.const(0);
-				cg.local.set(gidx);
-				cg.loop(cg.void);
-				{
-					cg.block(cg.void);
-					cg.local.get(gidx);
-					cg.i32.const(kernel.size);
-					cg.i32.ge_u();
-					cg.br_if(0);
-					if (dw) cg.local.get(carryOutBase + dw.carryIdx);
-					else cg.local.get(internalsBase + internalIdx);
-					cg.local.get(gidx);
-					cg.i32.const(bw);
-					cg.i32.mul();
-					cg.i32.add();
-					const scanCtx = makeScanContext();
-					if (re) {
-						const acc = cg.local.declare(dty(cg, null, kernel.exp.dtype));
-						dty(cg, null, kernel.exp.dtype).const(re.identity);
-						cg.local.set(acc);
-						const ridx = cg.local.declare(cg.i32);
-						cg.i32.const(0);
-						cg.local.set(ridx);
-						scanCtx.ridx = ridx;
-						cg.loop(cg.void);
-						cg.block(cg.void);
-						cg.local.get(ridx);
-						cg.i32.const(re.size);
-						cg.i32.ge_u();
-						cg.br_if(0);
-						translateExpWithGeneralScanContext(cg, funcs, tune.exp, scanCtx);
-						codegenReductionAccumulate(cg, re, acc);
-						cg.local.get(ridx);
-						cg.i32.const(1);
+				emitKernelBody({
+					cg,
+					funcs,
+					kernel,
+					gidx,
+					emitOutputAddr: () => {
+						if (dw) cg.local.get(carryOutBase + dw.carryIdx);
+						else cg.local.get(internalsBase + internalIdx);
+						cg.local.get(gidx);
+						cg.i32.const(bw);
+						cg.i32.mul();
 						cg.i32.add();
-						cg.local.set(ridx);
-						cg.br(1);
-						cg.end();
-						cg.end();
-						translateExpWithGeneralScanContext(cg, funcs, tune.epilogue, {
-							...scanCtx,
-							acc
-						});
-					} else translateExpWithGeneralScanContext(cg, funcs, tune.exp, scanCtx);
-					if (needsDualStore) {
+					},
+					emitExp: (exp, extra) => {
+						const scanCtx = makeScanContext();
+						if (extra.ridx !== void 0) scanCtx.ridx = extra.ridx;
+						if (extra.acc !== void 0) scanCtx.acc = extra.acc;
+						translateExpWithGeneralScanContext(cg, funcs, exp, scanCtx);
+					},
+					emitStore: needsDualStore ? () => {
+						const storeAlign = Math.log2(bw);
 						const tmpVal = cg.local.declare(dty(cg, null, kernel.dtype));
 						cg.local.tee(tmpVal);
 						dty(cg, null, kernel.dtype).store(storeAlign);
@@ -6839,15 +6833,8 @@ function codegenNativeScanGeneral(params) {
 						cg.i32.add();
 						cg.local.get(tmpVal);
 						dty(cg, null, kernel.dtype).store(storeAlign);
-					} else dty(cg, null, kernel.dtype).store(storeAlign);
-					cg.local.get(gidx);
-					cg.i32.const(1);
-					cg.i32.add();
-					cg.local.set(gidx);
-					cg.br(1);
-					cg.end();
-				}
-				cg.end();
+					} : void 0
+				});
 			}
 			if (step.source instanceof Routine) {
 				const callInfo = step.routineCallInfo;
@@ -7093,7 +7080,7 @@ async function createBackend(device) {
 		if (!navigator.gpu) return null;
 		const adapter = await navigator.gpu.requestAdapter({ powerPreference: "high-performance" });
 		if (!adapter) return null;
-		const { WebGPUBackend } = await import("./webgpu-BG5y9HvY.js");
+		const { WebGPUBackend } = await Promise.resolve().then(() => require("./webgpu-B1upedPh.cjs"));
 		const importantLimits = [
 			"maxBufferSize",
 			"maxComputeInvocationsPerWorkgroup",
@@ -7131,7 +7118,7 @@ async function createBackend(device) {
 		});
 		if (!gl) return null;
 		if (!gl.getExtension("EXT_color_buffer_float")) return null;
-		const { WebGLBackend } = await import("./webgl-a05WBZbb.js");
+		const { WebGLBackend } = await Promise.resolve().then(() => require("./webgl-Da6J7W8f.cjs"));
 		return new WebGLBackend(gl);
 	} else throw new Error(`Backend not found: ${device}`);
 }
@@ -7167,4 +7154,333 @@ var UnsupportedRoutineError = class extends Error {
 };
 
 //#endregion
-export { AluExp, AluGroup, AluOp, AluVar, DEBUG, DType, Executable, FpHash, Kernel, PPrint, Reduction, Routine, Routines, ShapeTracker, SlotError, UnsupportedOpError, UnsupportedRoutineError, accessorAluExp, accessorGlobal, assertNonNull, byteWidth, checkAxis, checkInts, deepEqual, defaultDevice, devices, dtypedArray, dtypedJsArray, findPow2, generalBroadcast, getBackend, getScanRoutineInfo, init, invertPermutation, isFloatDtype, isNumberPair, isPermutation, mapSetUnion, normalizeAxis, partitionList, prod, promoteTypes, range, recursiveFlatten, rep, runWithCache, setDebug, strip1, toposort, tuneNullopt, tuneWebgpu, unravelAlu, unzip2, zip, zipn };
+Object.defineProperty(exports, 'AluExp', {
+  enumerable: true,
+  get: function () {
+    return AluExp;
+  }
+});
+Object.defineProperty(exports, 'AluGroup', {
+  enumerable: true,
+  get: function () {
+    return AluGroup;
+  }
+});
+Object.defineProperty(exports, 'AluOp', {
+  enumerable: true,
+  get: function () {
+    return AluOp;
+  }
+});
+Object.defineProperty(exports, 'AluVar', {
+  enumerable: true,
+  get: function () {
+    return AluVar;
+  }
+});
+Object.defineProperty(exports, 'DEBUG', {
+  enumerable: true,
+  get: function () {
+    return DEBUG;
+  }
+});
+Object.defineProperty(exports, 'DType', {
+  enumerable: true,
+  get: function () {
+    return DType;
+  }
+});
+Object.defineProperty(exports, 'Executable', {
+  enumerable: true,
+  get: function () {
+    return Executable;
+  }
+});
+Object.defineProperty(exports, 'FpHash', {
+  enumerable: true,
+  get: function () {
+    return FpHash;
+  }
+});
+Object.defineProperty(exports, 'Kernel', {
+  enumerable: true,
+  get: function () {
+    return Kernel;
+  }
+});
+Object.defineProperty(exports, 'PPrint', {
+  enumerable: true,
+  get: function () {
+    return PPrint;
+  }
+});
+Object.defineProperty(exports, 'Reduction', {
+  enumerable: true,
+  get: function () {
+    return Reduction;
+  }
+});
+Object.defineProperty(exports, 'Routine', {
+  enumerable: true,
+  get: function () {
+    return Routine;
+  }
+});
+Object.defineProperty(exports, 'Routines', {
+  enumerable: true,
+  get: function () {
+    return Routines;
+  }
+});
+Object.defineProperty(exports, 'ShapeTracker', {
+  enumerable: true,
+  get: function () {
+    return ShapeTracker;
+  }
+});
+Object.defineProperty(exports, 'SlotError', {
+  enumerable: true,
+  get: function () {
+    return SlotError;
+  }
+});
+Object.defineProperty(exports, 'UnsupportedOpError', {
+  enumerable: true,
+  get: function () {
+    return UnsupportedOpError;
+  }
+});
+Object.defineProperty(exports, 'UnsupportedRoutineError', {
+  enumerable: true,
+  get: function () {
+    return UnsupportedRoutineError;
+  }
+});
+Object.defineProperty(exports, 'accessorAluExp', {
+  enumerable: true,
+  get: function () {
+    return accessorAluExp;
+  }
+});
+Object.defineProperty(exports, 'accessorGlobal', {
+  enumerable: true,
+  get: function () {
+    return accessorGlobal;
+  }
+});
+Object.defineProperty(exports, 'assertNonNull', {
+  enumerable: true,
+  get: function () {
+    return assertNonNull;
+  }
+});
+Object.defineProperty(exports, 'byteWidth', {
+  enumerable: true,
+  get: function () {
+    return byteWidth;
+  }
+});
+Object.defineProperty(exports, 'checkAxis', {
+  enumerable: true,
+  get: function () {
+    return checkAxis;
+  }
+});
+Object.defineProperty(exports, 'checkInts', {
+  enumerable: true,
+  get: function () {
+    return checkInts;
+  }
+});
+Object.defineProperty(exports, 'deepEqual', {
+  enumerable: true,
+  get: function () {
+    return deepEqual;
+  }
+});
+Object.defineProperty(exports, 'defaultDevice', {
+  enumerable: true,
+  get: function () {
+    return defaultDevice;
+  }
+});
+Object.defineProperty(exports, 'devices', {
+  enumerable: true,
+  get: function () {
+    return devices;
+  }
+});
+Object.defineProperty(exports, 'dtypedArray', {
+  enumerable: true,
+  get: function () {
+    return dtypedArray;
+  }
+});
+Object.defineProperty(exports, 'dtypedJsArray', {
+  enumerable: true,
+  get: function () {
+    return dtypedJsArray;
+  }
+});
+Object.defineProperty(exports, 'findPow2', {
+  enumerable: true,
+  get: function () {
+    return findPow2;
+  }
+});
+Object.defineProperty(exports, 'generalBroadcast', {
+  enumerable: true,
+  get: function () {
+    return generalBroadcast;
+  }
+});
+Object.defineProperty(exports, 'getBackend', {
+  enumerable: true,
+  get: function () {
+    return getBackend;
+  }
+});
+Object.defineProperty(exports, 'getScanRoutineInfo', {
+  enumerable: true,
+  get: function () {
+    return getScanRoutineInfo;
+  }
+});
+Object.defineProperty(exports, 'init', {
+  enumerable: true,
+  get: function () {
+    return init;
+  }
+});
+Object.defineProperty(exports, 'invertPermutation', {
+  enumerable: true,
+  get: function () {
+    return invertPermutation;
+  }
+});
+Object.defineProperty(exports, 'isFloatDtype', {
+  enumerable: true,
+  get: function () {
+    return isFloatDtype;
+  }
+});
+Object.defineProperty(exports, 'isNumberPair', {
+  enumerable: true,
+  get: function () {
+    return isNumberPair;
+  }
+});
+Object.defineProperty(exports, 'isPermutation', {
+  enumerable: true,
+  get: function () {
+    return isPermutation;
+  }
+});
+Object.defineProperty(exports, 'mapSetUnion', {
+  enumerable: true,
+  get: function () {
+    return mapSetUnion;
+  }
+});
+Object.defineProperty(exports, 'normalizeAxis', {
+  enumerable: true,
+  get: function () {
+    return normalizeAxis;
+  }
+});
+Object.defineProperty(exports, 'partitionList', {
+  enumerable: true,
+  get: function () {
+    return partitionList;
+  }
+});
+Object.defineProperty(exports, 'prod', {
+  enumerable: true,
+  get: function () {
+    return prod;
+  }
+});
+Object.defineProperty(exports, 'promoteTypes', {
+  enumerable: true,
+  get: function () {
+    return promoteTypes;
+  }
+});
+Object.defineProperty(exports, 'range', {
+  enumerable: true,
+  get: function () {
+    return range;
+  }
+});
+Object.defineProperty(exports, 'recursiveFlatten', {
+  enumerable: true,
+  get: function () {
+    return recursiveFlatten;
+  }
+});
+Object.defineProperty(exports, 'rep', {
+  enumerable: true,
+  get: function () {
+    return rep;
+  }
+});
+Object.defineProperty(exports, 'runWithCache', {
+  enumerable: true,
+  get: function () {
+    return runWithCache;
+  }
+});
+Object.defineProperty(exports, 'setDebug', {
+  enumerable: true,
+  get: function () {
+    return setDebug;
+  }
+});
+Object.defineProperty(exports, 'strip1', {
+  enumerable: true,
+  get: function () {
+    return strip1;
+  }
+});
+Object.defineProperty(exports, 'toposort', {
+  enumerable: true,
+  get: function () {
+    return toposort;
+  }
+});
+Object.defineProperty(exports, 'tuneNullopt', {
+  enumerable: true,
+  get: function () {
+    return tuneNullopt;
+  }
+});
+Object.defineProperty(exports, 'tuneWebgpu', {
+  enumerable: true,
+  get: function () {
+    return tuneWebgpu;
+  }
+});
+Object.defineProperty(exports, 'unravelAlu', {
+  enumerable: true,
+  get: function () {
+    return unravelAlu;
+  }
+});
+Object.defineProperty(exports, 'unzip2', {
+  enumerable: true,
+  get: function () {
+    return unzip2;
+  }
+});
+Object.defineProperty(exports, 'zip', {
+  enumerable: true,
+  get: function () {
+    return zip;
+  }
+});
+Object.defineProperty(exports, 'zipn', {
+  enumerable: true,
+  get: function () {
+    return zipn;
+  }
+});

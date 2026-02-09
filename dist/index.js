@@ -1,5 +1,5 @@
 import { __export } from "./chunk-Cl8Af3a2.js";
-import { AluExp, AluGroup, AluOp, AluVar, DEBUG, DType, FpHash, Kernel, PPrint, Reduction, Routine, Routines, ShapeTracker, accessorAluExp, accessorGlobal, assertNonNull, byteWidth, checkAxis, checkInts, deepEqual, defaultDevice, devices, dtypedArray, dtypedJsArray, generalBroadcast, getBackend, getScanRoutineInfo, init, invertPermutation, isFloatDtype, isNumberPair, isPermutation, normalizeAxis, partitionList, prod, promoteTypes, range, recursiveFlatten, rep, runWithCache, setDebug, toposort, unravelAlu, unzip2, zip, zipn } from "./backend-DjY-7WFB.js";
+import { AluExp, AluGroup, AluOp, AluVar, DEBUG, DType, FpHash, Kernel, PPrint, Reduction, Routine, Routines, ShapeTracker, accessorAluExp, accessorGlobal, assertNonNull, byteWidth, checkAxis, checkInts, deepEqual, defaultDevice, devices, dtypedArray, dtypedJsArray, generalBroadcast, getBackend, getScanRoutineInfo, init, invertPermutation, isFloatDtype, isNumberPair, isPermutation, normalizeAxis, partitionList, prod, promoteTypes, range, recursiveFlatten, rep, runWithCache, setDebug, toposort, unravelAlu, unzip2, zip, zipn } from "./backend-C_OH9-qi.js";
 
 //#region src/frontend/convolution.ts
 /**
@@ -897,18 +897,25 @@ var Tracer = class Tracer {
 		return sort$1(this.transpose(perm)).transpose(invertPermutation(perm));
 	}
 	/**
-	* Return the indices that would sort an array. This may not be a stable
-	* sorting algorithm; it need not preserve order of indices in ties.
+	* Return the indices that would sort an array. Unlike `sort`, this is
+	* guaranteed to be a stable sorting algorithm; it always returns the smaller
+	* index first in event of ties.
 	*
 	* See `jax.numpy.argsort` for full docs.
 	*/
 	argsort(axis = -1) {
 		axis = checkAxis(axis, this.ndim);
-		if (axis === this.ndim - 1) return argsort$1(this)[1];
+		if (axis === this.ndim - 1) {
+			const [y$1, yi$1] = argsort$1(this);
+			y$1.dispose();
+			return yi$1;
+		}
 		const perm = range(this.ndim);
 		perm.splice(axis, 1);
 		perm.push(axis);
-		return argsort$1(this.transpose(perm))[1].transpose(invertPermutation(perm));
+		const [y, yi] = argsort$1(this.transpose(perm));
+		y.dispose();
+		return yi.transpose(invertPermutation(perm));
 	}
 	/**
 	* Slice an array along one or more axes.
@@ -4012,7 +4019,7 @@ var Array$1 = class Array$1 extends Tracer {
 			[Primitive.TriangularSolve]: Array$1.#routine(Primitive.TriangularSolve),
 			[Primitive.Cholesky]: Array$1.#routine(Primitive.Cholesky),
 			[Primitive.LU]: Array$1.#routine(Primitive.LU),
-			[Primitive.Jit](args, { jaxpr }) {
+			[Primitive.Jit](args, { jaxpr, name }) {
 				if (jaxpr.inBinders.length !== args.length) throw new Error(`jit expects ${jaxpr.inBinders.length} args, got ${args.length}`);
 				const { backend, committed } = Array$1.#computeBackend("jit", args);
 				args = args.map((ar) => ar._putSync(backend));
@@ -4223,9 +4230,7 @@ var Array$1 = class Array$1 extends Tracer {
 			committed: true
 		});
 		else {
-			const byteCount = byteWidth(this.#dtype) * this.size;
-			const buf = await this.#backend.read(this.#source, 0, byteCount);
-			const data = dtypedArray(this.dtype, buf);
+			const data = await this.data();
 			return arrayFromData(data, this.shape, {
 				dtype: this.#dtype,
 				device: backend.type
@@ -4240,9 +4245,7 @@ var Array$1 = class Array$1 extends Tracer {
 			committed: true
 		});
 		else {
-			const byteCount = byteWidth(this.#dtype) * this.size;
-			const buf = this.#backend.readSync(this.#source, 0, byteCount);
-			const data = dtypedArray(this.dtype, buf);
+			const data = this.dataSync();
 			return arrayFromData(data, this.shape, {
 				dtype: this.#dtype,
 				device: backend.type
@@ -4373,31 +4376,25 @@ function fullInternal(aval, fillValue, device) {
 		committed: device != void 0
 	});
 }
-function zerosLike$1(val, dtype) {
-	return fullLike(val, 0, dtype);
+function zerosLike$1(val, opts) {
+	return fullLike(val, 0, opts);
 }
-function onesLike$1(val, dtype) {
-	return fullLike(val, 1, dtype);
+function onesLike$1(val, opts) {
+	return fullLike(val, 1, opts);
 }
-function fullLike(val, fillValue, dtype) {
+function fullLike(val, fillValue, { dtype, shape: shape$1, device } = {}) {
 	const aval = getAval(val);
 	if (fillValue instanceof Tracer) throw new Error("numpy.fullLike() with array argument not implemented yet");
-	const sa = new ShapedArray(aval.shape, dtype ?? aval.dtype, aval.weakType);
-	return fullInternal(sa, fillValue);
+	const sa = new ShapedArray(shape$1 ?? aval.shape, dtype ?? aval.dtype, aval.weakType && dtype === void 0);
+	return fullInternal(sa, fillValue, device);
 }
 /** Return a new array of given shape and type, filled with zeros. */
-function zeros(shape$1, { dtype, device } = {}) {
-	return full(shape$1, 0, {
-		dtype,
-		device
-	});
+function zeros(shape$1, opts) {
+	return full(shape$1, 0, opts);
 }
 /** Return a new array of given shape and type, filled with ones. */
-function ones(shape$1, { dtype, device } = {}) {
-	return full(shape$1, 1, {
-		dtype,
-		device
-	});
+function ones(shape$1, opts) {
+	return full(shape$1, 1, opts);
 }
 /** Return a new array of given shape and type, filled with `fill_value`. */
 function full(shape$1, fillValue, { dtype, device } = {}) {
@@ -4597,7 +4594,7 @@ function mappedAval(batchDim, aval) {
 	return new ShapedArray(shape$1, aval.dtype, aval.weakType);
 }
 /** Move one axis to a different index. */
-function moveaxis$1(x, src, dst) {
+function moveaxis(x, src, dst) {
 	const t = pureArray(x);
 	src = checkAxis(src, t.ndim);
 	dst = checkAxis(dst, t.ndim);
@@ -4613,7 +4610,7 @@ function moveBatchAxis(axisSize, src, dst, x) {
 		targetShape.splice(dst, 0, axisSize);
 		return broadcast(x, targetShape, [dst]);
 	} else if (src === dst) return x;
-	else return moveaxis$1(x, src, dst);
+	else return moveaxis(x, src, dst);
 }
 var BatchTracer = class extends Tracer {
 	constructor(trace$1, val, batchDim) {
@@ -4883,7 +4880,7 @@ const vmapRules = {
 					...x.shape.slice(1)
 				];
 				return broadcast(x, newShape, [1]);
-			} else if (xsDims[i] === 0) return moveaxis$1(x, 0, 1);
+			} else if (xsDims[i] === 0) return moveaxis(x, 0, 1);
 			else return moveBatchAxis(axisSize, xsDims[i], 1, x);
 		});
 		const bodyDims = [
@@ -4907,7 +4904,7 @@ const vmapRules = {
 		});
 		const carryOut = results.slice(0, numCarry);
 		const ysOut = results.slice(numCarry);
-		const movedYs = ysOut.map((y) => moveaxis$1(y, 1, 0));
+		const movedYs = ysOut.map((y) => moveaxis(y, 1, 0));
 		return [[...carryOut, ...movedYs], rep(numCarry + numY, 0)];
 	}
 };
@@ -5050,7 +5047,7 @@ function batchMatmulT(a, b) {
 }
 /** Batch matrix transpose. */
 function mT(a) {
-	return moveaxis$1(a, -2, -1);
+	return moveaxis(a, -2, -1);
 }
 function sliceAxis(a, axis, p) {
 	const slices = Array(a.shape.length).fill([]);
@@ -6010,7 +6007,7 @@ const transposeRules = {
 	},
 	[Primitive.TriangularSolve]([ct], [a, b], { unitDiagonal }) {
 		if (a instanceof UndefPrimal || !(b instanceof UndefPrimal)) throw new NonlinearError(Primitive.TriangularSolve);
-		const ctB = triangularSolve$1(moveaxis$1(a, -2, -1), ct, {
+		const ctB = triangularSolve$1(moveaxis(a, -2, -1), ct, {
 			lower: true,
 			unitDiagonal
 		});
@@ -7017,7 +7014,7 @@ __export(numpy_exports, {
 	meshgrid: () => meshgrid,
 	min: () => min,
 	minimum: () => minimum,
-	moveaxis: () => moveaxis,
+	moveaxis: () => moveaxis$1,
 	multiply: () => multiply,
 	nan: () => nan,
 	nanToNum: () => nanToNum,
@@ -7157,7 +7154,7 @@ const reshape = reshape$1;
 * @function
 * Move axes of an array to new positions. Other axes retain original order.
 */
-const moveaxis = moveaxis$1;
+const moveaxis$1 = moveaxis;
 /**
 * @function
 * Add padding (zeros) to an array.
@@ -7305,9 +7302,9 @@ function cumsum(a, axis) {
 		axis = 0;
 	} else axis = checkAxis(axis, a.ndim);
 	const n = a.shape[axis];
-	a = moveaxis(a, axis, -1);
+	a = moveaxis$1(a, axis, -1);
 	a = broadcast(a, a.shape.concat(n), [-2]);
-	return moveaxis(tril(a).sum(-1), -1, axis);
+	return moveaxis$1(tril(a).sum(-1), -1, axis);
 }
 /** Reverse the elements in an array along the given axes. */
 function flip(x, axis = null) {
@@ -7469,7 +7466,7 @@ function swapaxes(a, axis1, axis2) {
 /** Transpose the last two dimensions of an array. */
 function matrixTranspose(a) {
 	if (ndim(a) < 2) throw new Error(`matrixTranspose: input array must be at least 2D`);
-	return moveaxis(a, -1, -2);
+	return moveaxis$1(a, -1, -2);
 }
 /** Return a 1-D flattened array containing the elements of the input. */
 function ravel(a) {
@@ -7623,8 +7620,9 @@ function sort(a, axis = -1) {
 	return fudgeArray(a).sort(axis);
 }
 /**
-* Return indices that would sort an array. This may be an unstable sorting
-* algorithm; it need not preserve order of indices in ties.
+* Return indices that would sort an array. Unlike `sort`, this is guaranteed to
+* be a stable sorting algorithm; it always returns the smaller index first in
+* event of ties.
 *
 * Returns an array of `int32` indices.
 *
@@ -7837,8 +7835,8 @@ function vecdot(x, y, { axis } = {}) {
 	const xaxis = checkAxis(axis ?? -1, ndim(x));
 	const yaxis = checkAxis(axis ?? -1, ndim(y));
 	if (shape(x)[xaxis] !== shape(y)[yaxis]) throw new Error(`vecdot: shapes ${JSON.stringify(shape(x))} and ${JSON.stringify(shape(y))} not aligned along axis ${axis}: ${shape(x)[xaxis]} != ${shape(y)[yaxis]}`);
-	x = moveaxis(x, xaxis, -1);
-	y = moveaxis(y, yaxis, -1);
+	x = moveaxis$1(x, xaxis, -1);
+	y = moveaxis$1(y, yaxis, -1);
 	return dot$2(x, y);
 }
 /**
@@ -8341,7 +8339,7 @@ __export(lax_linalg_exports, {
 */
 function cholesky$1(a, { upper = false } = {}) {
 	const L = cholesky$2(a);
-	return upper ? moveaxis(L, -2, -1) : L;
+	return upper ? moveaxis$1(L, -2, -1) : L;
 }
 /**
 * LU decomposition with partial pivoting.
@@ -8393,16 +8391,16 @@ function triangularSolve(a, b, { leftSide = false, lower = false, transposeA = f
 	a = fudgeArray(a);
 	b = fudgeArray(b);
 	if (!leftSide) transposeA = !transposeA;
-	else b = moveaxis(b, -2, -1);
+	else b = moveaxis$1(b, -2, -1);
 	if (transposeA) {
-		a = moveaxis(a, -2, -1);
+		a = moveaxis$1(a, -2, -1);
 		lower = !lower;
 	}
 	let x = triangularSolve$1(a, b, {
 		lower,
 		unitDiagonal
 	});
-	if (leftSide) x = moveaxis(x, -2, -1);
+	if (leftSide) x = moveaxis$1(x, -2, -1);
 	return x;
 }
 
@@ -8731,7 +8729,8 @@ __export(lax_exports, {
 	linalg: () => lax_linalg_exports,
 	reduceWindow: () => reduceWindow,
 	scan: () => scan,
-	stopGradient: () => stopGradient$1
+	stopGradient: () => stopGradient$1,
+	topK: () => topK
 });
 const JsArray = globalThis.Array;
 /**
@@ -8825,7 +8824,7 @@ function convGeneralDilated(lhs, rhs, windowStrides, padding, { lhsDilation, rhs
 		if (C_in % G !== 0) throw new Error(`featureGroupCount=${G} must divide input channels=${C_in}`);
 		if (C_out % G !== 0) throw new Error(`featureGroupCount=${G} must divide output channels=${C_out}`);
 		if (C_in / G !== C_in_per_group) throw new Error(`rhs input channels=${C_in_per_group} must equal lhs input channels / groups=${C_in / G}`);
-		const lhsGrouped = moveaxis$1(lhs.reshape([
+		const lhsGrouped = moveaxis(lhs.reshape([
 			N,
 			G,
 			C_in / G,
@@ -8845,7 +8844,7 @@ function convGeneralDilated(lhs, rhs, windowStrides, padding, { lhsDilation, rhs
 			rhsDilation
 		});
 		const ys = result.shape.slice(3);
-		return moveaxis$1(result, 0, 1).reshape([
+		return moveaxis(result, 0, 1).reshape([
 			N,
 			C_out,
 			...ys
@@ -8900,7 +8899,7 @@ function convTranspose(lhs, rhs, strides, padding, { rhsDilation, transposeKerne
 	const pads = effectiveKernel.map((k, i) => convTransposePadding(k, strides[i], typeof padding === "string" ? padding : padding[i]));
 	if (transposeKernel) {
 		rhs = flip$1(rhs, range(2, rhs.ndim));
-		rhs = moveaxis$1(rhs, 0, 1);
+		rhs = moveaxis(rhs, 0, 1);
 	}
 	return convGeneralDilated(lhs, rhs, rep(lhs.ndim - 2, 1), pads, {
 		lhsDilation: strides,
@@ -8954,6 +8953,39 @@ function erfc(x) {
 */
 function stopGradient$1(x) {
 	return stopGradient(x);
+}
+/**
+* Returns top `k` values and their indices along the specified axis of operand.
+*
+* This is a _stable_ algorithm: If two elements are equal, the lower-index
+* element appears first.
+*
+* @returns A tuple of `(values, indices)`, where `values` and `indices` have
+* the same shape as `x`, except along `axis` where they have size `k`.
+*/
+function topK(x, k, axis = -1) {
+	x = fudgeArray(x);
+	axis = checkAxis(axis, x.ndim);
+	const size$1 = x.shape[axis];
+	if (k < 0 || k > size$1) throw new Error(`topK: k must be in the range [0, ${size$1}], got ${k}`);
+	if (k === 0) {
+		const outShape = x.shape.slice();
+		outShape[axis] = 0;
+		const y$1 = zerosLike$1(x.ref, { shape: outShape });
+		const yi$1 = zerosLike$1(x, {
+			dtype: DType.Int32,
+			shape: outShape
+		});
+		return [y$1, yi$1];
+	}
+	x = flip$1(x, [axis]);
+	x = moveaxis(x, axis, -1);
+	const [y, yi] = argsort$1(x);
+	const extract = (a) => {
+		a = a.slice(...rep(a.ndim - 1, []), [-k]);
+		return flip$1(moveaxis(a, -1, axis), [axis]);
+	};
+	return [extract(y), extract(yi.neg().add(size$1 - 1))];
 }
 
 //#endregion
@@ -9432,7 +9464,9 @@ function getK01(key$1) {
 function key(seed) {
 	seed = array(seed, { dtype: DType.Uint32 });
 	if (seed.ndim !== 0) throw new Error(`key: seed must be a scalar integer, but got shape ${seed.shape} - use jax.vmap for batching.`);
-	return stack([0, seed]);
+	const key$1 = stack([0, seed]);
+	if (key$1 instanceof Array$1) key$1._realizeSource();
+	return key$1;
 }
 /** Splits a PRNG key into `num` new keys by adding a leading axis. */
 function split(key$1, num = 2) {
@@ -9510,8 +9544,9 @@ const categorical = jit$1(function categorical$1(key$1, logits, { axis = -1, sha
 		const k = shapePrefix.reduce((a, b) => a * b, 1);
 		if (k > numCategories) throw new Error(`Number of samples without replacement (${k}) cannot exceed number of categories (${numCategories}).`);
 		const noise = gumbel(key$1, logits.shape);
-		const movedLogits = moveaxis(noise.add(logits), axis, 0);
-		return argsort(movedLogits, 0).slice([-k]).reshape(shape$1);
+		const [values, indices] = topK(noise.add(logits), k, axis);
+		values.dispose();
+		return indices.reshape(shape$1);
 	}
 }, { staticArgnums: [2] });
 /**

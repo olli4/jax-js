@@ -435,9 +435,14 @@ declare class Routine {
 }
 /** One of the valid `Routine` that can be dispatched to backend. */
 declare enum Routines {
-  /** Stable sorting algorithm along the last axis. */
+  /**
+   * Sort along the last axis.
+   *
+   * This may be _unstable_ but it often doesn't matter, sorting numbers is
+   * bitwise unique up to signed zeros and NaNs.
+   */
   Sort = "Sort",
-  /** Returns `int32` indices of the stably sorted array. */
+  /** Stable sorting, returns `int32` indices and values of the sorted array. */
   Argsort = "Argsort",
   /**
    * Solve a triangular system of equations.
@@ -765,9 +770,9 @@ declare enum Primitive {
   Pad = "pad",
   DynamicUpdateSlice = "dynamic_update_slice",
   Sort = "sort",
-  // sort(x, axis=-1)
+  // sort(x, axis=-1), unstable
   Argsort = "argsort",
-  // argsort(x, axis=-1)
+  // argsort(x, axis=-1), stable
   TriangularSolve = "triangular_solve",
   // A is upper triangular, A @ X.T = B.T
   Cholesky = "cholesky",
@@ -940,7 +945,6 @@ declare abstract class Tracer {
   /**
    * Access an array by reference, incrementing the reference count.
    *
-   * jax-js handles freeing arrays by using "move" semantics, like in Rust/C++.
    * Increment the reference count of this array.
    *
    * In most code, you don't need `.ref` because operations do NOT consume
@@ -1051,8 +1055,9 @@ declare abstract class Tracer {
    */
   sort(axis?: number): this;
   /**
-   * Return the indices that would sort an array. This may not be a stable
-   * sorting algorithm; it need not preserve order of indices in ties.
+   * Return the indices that would sort an array. Unlike `sort`, this is
+   * guaranteed to be a stable sorting algorithm; it always returns the smaller
+   * index first in event of ties.
    *
    * See `jax.numpy.argsort` for full docs.
    */
@@ -1132,6 +1137,12 @@ declare class PendingExecute {
 /** @inline */
 type DTypeAndDevice = {
   dtype?: DType;
+  device?: Device;
+};
+/** @inline */
+type DTypeShapeAndDevice = {
+  dtype?: DType;
+  shape?: number[];
   device?: Device;
 };
 type ArrayConstructorArgs = {
@@ -1244,15 +1255,9 @@ declare function array(values: Array | DataArray | RecursiveArray<number> | Recu
 type ImplRule<P extends Primitive> = (tracers: Array[], params: PrimitiveParams<P>) => Array[];
 declare const implRules: { [P in Primitive]: ImplRule<P> };
 /** Return a new array of given shape and type, filled with zeros. */
-declare function zeros(shape: number[], {
-  dtype,
-  device
-}?: DTypeAndDevice): Array;
+declare function zeros(shape: number[], opts?: DTypeAndDevice): Array;
 /** Return a new array of given shape and type, filled with ones. */
-declare function ones(shape: number[], {
-  dtype,
-  device
-}?: DTypeAndDevice): Array;
+declare function ones(shape: number[], opts?: DTypeAndDevice): Array;
 /** Return a new array of given shape and type, filled with `fill_value`. */
 declare function full(shape: number[], fillValue: number | boolean | Array, {
   dtype,
@@ -1749,7 +1754,7 @@ interface ScanOptions {
  */
 declare function scan<Carry extends JsTree<Array>, X extends JsTree<Array> | null, Y extends JsTree<Array> | null>(f: (carry: Carry, x: X) => [Carry, Y], init: Carry, xs: X, options?: ScanOptions): [Carry, Y];
 declare namespace lax_d_exports {
-  export { DotDimensionNumbers, PaddingType, ScanOptions, conv, convGeneralDilated, convTranspose, convWithGeneralPadding, dot$1 as dot, erf, erfc, lax_linalg_d_exports as linalg, reduceWindow, scan, stopGradient };
+  export { DotDimensionNumbers, PaddingType, ScanOptions, conv, convGeneralDilated, convTranspose, convWithGeneralPadding, dot$1 as dot, erf, erfc, lax_linalg_d_exports as linalg, reduceWindow, scan, stopGradient, topK };
 }
 /**
  * Dimension numbers for general `dot()` primitive.
@@ -1855,6 +1860,16 @@ declare function erfc(x: ArrayLike): Array;
  * forward or reverse-mode automatic differentiation.
  */
 declare function stopGradient(x: ArrayLike): Array;
+/**
+ * Returns top `k` values and their indices along the specified axis of operand.
+ *
+ * This is a _stable_ algorithm: If two elements are equal, the lower-index
+ * element appears first.
+ *
+ * @returns A tuple of `(values, indices)`, where `values` and `indices` have
+ * the same shape as `x`, except along `axis` where they have size `k`.
+ */
+declare function topK(x: ArrayLike, k: number, axis?: number): [Array, Array];
 declare namespace numpy_fft_d_exports {
   export { ComplexPair, fft, ifft };
 }
@@ -2080,17 +2095,17 @@ declare const shape$1: (x: ArrayLike) => number[];
  * @function
  * Return an array of zeros with the same shape and type as a given array.
  */
-declare const zerosLike: (a: ArrayLike, dtype?: DType) => Array;
+declare const zerosLike: (a: ArrayLike, opts?: DTypeShapeAndDevice) => Array;
 /**
  * @function
  * Return an array of ones with the same shape and type as a given array.
  */
-declare const onesLike: (a: ArrayLike, dtype?: DType) => Array;
+declare const onesLike: (a: ArrayLike, opts?: DTypeShapeAndDevice) => Array;
 /**
  * @function
  * Return a full array with the same shape and type as a given array.
  */
-declare const fullLike: (a: ArrayLike, fillValue: number | boolean | Array, dtype?: DType) => Array;
+declare const fullLike: (a: ArrayLike, fillValue: number | boolean | Array, opts?: DTypeShapeAndDevice) => Array;
 /**
  * Return the number of elements in an array, optionally along an axis.
  * Does not consume array reference.
@@ -2279,8 +2294,9 @@ declare function trace(a: ArrayLike, offset?: number, axis1?: number, axis2?: nu
  */
 declare function sort(a: ArrayLike, axis?: number): Array;
 /**
- * Return indices that would sort an array. This may be an unstable sorting
- * algorithm; it need not preserve order of indices in ties.
+ * Return indices that would sort an array. Unlike `sort`, this is guaranteed to
+ * be a stable sorting algorithm; it always returns the smaller index first in
+ * event of ties.
  *
  * Returns an array of `int32` indices.
  *

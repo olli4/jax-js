@@ -1076,7 +1076,7 @@ export class Array extends Tracer {
       [Primitive.TriangularSolve]: Array.#routine(Primitive.TriangularSolve),
       [Primitive.Cholesky]: Array.#routine(Primitive.Cholesky),
       [Primitive.LU]: Array.#routine(Primitive.LU),
-      [Primitive.Jit](args, { jaxpr }) {
+      [Primitive.Jit](args, { jaxpr, name }) {
         if (jaxpr.inBinders.length !== args.length) {
           throw new Error(
             `jit expects ${jaxpr.inBinders.length} args, got ${args.length}`,
@@ -1084,6 +1084,7 @@ export class Array extends Tracer {
         }
 
         const { backend, committed } = Array.#computeBackend("jit", args);
+
         args = args.map((ar) => ar._putSync(backend));
 
         // Realize all input slots upfront.
@@ -1419,10 +1420,10 @@ export class Array extends Tracer {
       // Not realized yet, just dump the AluExp on the target backend.
       return this.#newArrayFrom({ backend, committed: true });
     } else {
-      // Realize the array and copy data to the new backend.
-      const byteCount = byteWidth(this.#dtype) * this.size;
-      const buf = await this.#backend.read(this.#source as Slot, 0, byteCount);
-      const data = dtypedArray(this.dtype, buf);
+      // Realize the array (handles non-contiguous ShapeTrackers) and copy data
+      // to the new backend. Using data() instead of raw read() ensures the
+      // ShapeTracker is applied, so transposed/reshaped views are linearized.
+      const data = await this.data();
       return arrayFromData(
         data,
         this.shape,
@@ -1439,10 +1440,10 @@ export class Array extends Tracer {
       // Not realized yet, just dump the AluExp on the target backend.
       return this.#newArrayFrom({ backend, committed: true });
     } else {
-      // Realize the array and copy data to the new backend.
-      const byteCount = byteWidth(this.#dtype) * this.size;
-      const buf = this.#backend.readSync(this.#source as Slot, 0, byteCount);
-      const data = dtypedArray(this.dtype, buf);
+      // Realize the array (handles non-contiguous ShapeTrackers) and copy data
+      // to the new backend. Using dataSync() instead of raw readSync() ensures
+      // the ShapeTracker is applied, so transposed/reshaped views are linearized.
+      const data = this.dataSync();
       return arrayFromData(
         data,
         this.shape,
