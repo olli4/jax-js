@@ -5,8 +5,8 @@
  * "recycle" step that reuses the backend Slot, avoiding alloc/free overhead.
  */
 import {
+  checkLeaks,
   defaultDevice,
-  getBackend,
   grad,
   init,
   jit,
@@ -14,10 +14,6 @@ import {
   numpy as np,
 } from "@jax-js/jax";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-
-function slotCount(): number {
-  return (getBackend() as any).slotCount();
-}
 
 describe("buffer recycling", () => {
   it("chain of same-size operations is correct", () => {
@@ -39,7 +35,7 @@ describe("buffer recycling", () => {
   });
 
   it("multi-step chain does not leak slots", async () => {
-    const before = slotCount();
+    checkLeaks.start();
     const f = jit((x: np.Array) => x.add(1).mul(2).sub(3).add(4));
     const x = np.array([10, 20, 30, 40]);
     const result = f(x);
@@ -47,7 +43,7 @@ describe("buffer recycling", () => {
     result.dispose();
     x.dispose();
     f.dispose();
-    expect(slotCount() - before).toBe(0);
+    expect(checkLeaks.stop().leaked).toBe(0);
   });
 
   it("works with grad through chained ops", () => {
@@ -108,7 +104,7 @@ describe("buffer recycling (WASM)", () => {
   });
 
   it("does not leak slots on WASM", async () => {
-    const before = slotCount();
+    checkLeaks.start();
     const f = jit((x: np.Array) => x.add(1).mul(2).sub(3).add(4));
     const x = np.array([10, 20, 30, 40]);
     const result = f(x);
@@ -116,6 +112,6 @@ describe("buffer recycling (WASM)", () => {
     result.dispose();
     x.dispose();
     f.dispose();
-    expect(slotCount() - before).toBe(0);
+    expect(checkLeaks.stop().leaked).toBe(0);
   });
 });

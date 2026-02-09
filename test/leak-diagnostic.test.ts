@@ -9,16 +9,10 @@
  * distinct-valued multi-element arrays to force eager allocation if you
  * need precise slot counting.
  *
- * Each test measures slotCount() before and after a scan + data read,
- * expecting zero delta (all scan internals cleaned up).
+ * Each test uses checkLeaks.start()/stop() to verify zero leaked arrays.
  */
-import { defaultDevice, getBackend, init, lax, numpy as np } from "@jax-js/jax";
+import { checkLeaks, defaultDevice, init, lax, numpy as np } from "@jax-js/jax";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-
-/** Return the number of live backend slots. */
-function slotCount(): number {
-  return (getBackend() as any).slotCount();
-}
 
 let previousDevice: string | undefined;
 
@@ -50,11 +44,11 @@ describe("scan fallback leak detection (CPU)", () => {
       return [np.add(carry, x), null];
     };
 
-    const before = slotCount();
+    checkLeaks.start();
     const [carry] = lax.scan(step, initC, xs);
     await carry.data();
     carry.dispose();
-    expect(slotCount() - before).toBe(0);
+    expect(checkLeaks.stop().leaked).toBe(0);
 
     xs.dispose();
     initC.dispose();
@@ -73,11 +67,11 @@ describe("scan fallback leak detection (CPU)", () => {
       return [np.add(np.add(carry, x), bias), null];
     };
 
-    const before = slotCount();
+    checkLeaks.start();
     const [carry] = lax.scan(step, initC, xs);
     await carry.data();
     carry.dispose();
-    expect(slotCount() - before).toBe(0);
+    expect(checkLeaks.stop().leaked).toBe(0);
 
     xs.dispose();
     initC.dispose();
@@ -99,13 +93,13 @@ describe("scan fallback leak detection (CPU)", () => {
       return [newC, newC];
     };
 
-    const before = slotCount();
+    checkLeaks.start();
     const [carry, ys] = lax.scan(step, initC, xs);
     await carry.data();
     await ys.data();
     carry.dispose();
     ys.dispose();
-    expect(slotCount() - before).toBe(0);
+    expect(checkLeaks.stop().leaked).toBe(0);
 
     xs.dispose();
     initC.dispose();
@@ -125,13 +119,13 @@ describe("scan fallback leak detection (CPU)", () => {
       return [newC, np.multiply(x, factor)];
     };
 
-    const before = slotCount();
+    checkLeaks.start();
     const [carry, ys] = lax.scan(step, initC, xs);
     await carry.data();
     await ys.data();
     carry.dispose();
     ys.dispose();
-    expect(slotCount() - before).toBe(0);
+    expect(checkLeaks.stop().leaked).toBe(0);
 
     xs.dispose();
     initC.dispose();
@@ -147,12 +141,12 @@ describe("scan fallback leak detection (CPU)", () => {
       return [newC, null];
     };
 
-    const before = slotCount();
+    checkLeaks.start();
     const [carry, ys] = lax.scan(step, initC, null, { length: 5 });
     expect(ys).toBeNull();
     await carry.data();
     carry.dispose();
-    expect(slotCount() - before).toBe(0);
+    expect(checkLeaks.stop().leaked).toBe(0);
 
     initC.dispose();
     increment.dispose();
@@ -175,7 +169,7 @@ describe("scan fallback leak detection (CPU)", () => {
       return [{ a: newA, b: newB }, np.multiply(x, yFactor)];
     };
 
-    const before = slotCount();
+    checkLeaks.start();
     const [carry, ys] = lax.scan(step, { a: initA, b: initB }, xs);
     await (carry as any).a.data();
     await (carry as any).b.data();
@@ -183,7 +177,7 @@ describe("scan fallback leak detection (CPU)", () => {
     (carry as any).a.dispose();
     (carry as any).b.dispose();
     ys.dispose();
-    expect(slotCount() - before).toBe(0);
+    expect(checkLeaks.stop().leaked).toBe(0);
 
     xs.dispose();
     initA.dispose();
@@ -206,7 +200,7 @@ describe("scan fallback leak detection (CPU)", () => {
       return [np.add(carry, x), np.multiply(x, yFactor)];
     };
 
-    const before = slotCount();
+    checkLeaks.start();
     const [carry, ys] = lax.scan(step, initC, xs, {
       reverse: true,
     });
@@ -214,7 +208,7 @@ describe("scan fallback leak detection (CPU)", () => {
     await ys.data();
     carry.dispose();
     ys.dispose();
-    expect(slotCount() - before).toBe(0);
+    expect(checkLeaks.stop().leaked).toBe(0);
 
     xs.dispose();
     initC.dispose();
@@ -230,11 +224,11 @@ describe("scan fallback leak detection (CPU)", () => {
       return [np.add(carry, x), null];
     };
 
-    const before = slotCount();
+    checkLeaks.start();
     const [carry] = lax.scan(step, initC, xs);
     await carry.data();
     carry.dispose();
-    expect(slotCount() - before).toBe(0);
+    expect(checkLeaks.stop().leaked).toBe(0);
 
     xs.dispose();
     initC.dispose();

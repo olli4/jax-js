@@ -26,51 +26,52 @@ In the tables below, we use a color legend to refer to functions in JAX:
 
 [API docs](https://jax-js.com/docs/modules/_jax-js_jax.html) for these functions.
 
-| API                  | Support | Notes                                           |
-| -------------------- | ------- | ----------------------------------------------- |
-| `config`             | ⚪️      | no separate config object                       |
-| `default_device`     | 🟢      | devices are strings; there is only 1 GPU on web |
-| `jit`                | 🟢      |                                                 |
-| `make_jaxpr`         | 🟢      |                                                 |
-| `eval_shape`         | 🟠      |                                                 |
-| `ShapeDtypeStruct`   | 🟠      |                                                 |
-| `device_put`         | 🟢      | async-only for performance                      |
-| `device_get`         | ⚪️      | no separate "host" device                       |
-| `default_backend`    | ⚪️      | XLA feature                                     |
-| `named_call`         | ⚪️      | XLA feature                                     |
-| `named_scope`        | ⚪️      | XLA feature                                     |
-| `block_until_ready`  | 🟢      |                                                 |
-| `copy_to_host_async` | ⚪️      | no separate "host" device                       |
-| `make_mesh`          | ⚪️      | device sharding                                 |
-| `set_mesh`           | ⚪️      | device sharding                                 |
-| `grad`               | 🟢      |                                                 |
-| `value_and_grad`     | 🟢      |                                                 |
-| `jacobian`           | 🟢      |                                                 |
-| `jacfwd`             | 🟢      |                                                 |
-| `jacrev`             | 🟢      |                                                 |
-| `hessian`            | 🟢      |                                                 |
-| `jvp`                | 🟢      |                                                 |
-| `linearize`          | 🟢      |                                                 |
-| `linear_transpose`   | 🟠      |                                                 |
-| `vjp`                | 🟢      |                                                 |
-| `custom_gradient`    | 🔴      | core engine feature                             |
-| `closure_convert`    | 🔴      | core engine feature                             |
-| `checkpoint`         | 🔴      | core engine feature                             |
-| `vmap`               | 🟡      | some ops do not have vmap support yet           |
-| `shard_map`          | ⚪️      | device sharding                                 |
-| `smap`               | ⚪️      | device sharding                                 |
-| `pmap`               | ⚪️      | device sharding                                 |
-| `devices`            | 🟢      | semantics differ, returns all devices           |
-| `local_devices`      | ⚪️      | device sharding                                 |
-| `process_index`      | ⚪️      | device sharding                                 |
-| `device_count`       | ⚪️      | device sharding                                 |
-| `local_device_count` | ⚪️      | device sharding                                 |
-| `process_count`      | ⚪️      | device sharding                                 |
-| `process_indices`    | ⚪️      | device sharding                                 |
-| `custom_jvp`         | 🔴      | core engine feature                             |
-| `custom_vjp`         | 🔴      | core engine feature                             |
-| `custom_batching`    | 🔴      | core engine feature                             |
-| `Array`              | 🟢      |                                                 |
+| API                  | Support | Notes                                            |
+| -------------------- | ------- | ------------------------------------------------ |
+| `config`             | ⚪️      | no separate config object                        |
+| `default_device`     | 🟢      | devices are strings; there is only 1 GPU on web  |
+| `jit`                | 🟢      |                                                  |
+| `make_jaxpr`         | 🟢      |                                                  |
+| `eval_shape`         | 🟠      |                                                  |
+| `ShapeDtypeStruct`   | 🟠      |                                                  |
+| `device_put`         | 🟢      | async-only for performance                       |
+| `device_get`         | ⚪️      | no separate "host" device                        |
+| `default_backend`    | ⚪️      | XLA feature                                      |
+| `named_call`         | ⚪️      | XLA feature                                      |
+| `named_scope`        | ⚪️      | XLA feature                                      |
+| `block_until_ready`  | 🟢      |                                                  |
+| `copy_to_host_async` | ⚪️      | no separate "host" device                        |
+| `make_mesh`          | ⚪️      | device sharding                                  |
+| `set_mesh`           | ⚪️      | device sharding                                  |
+| `grad`               | 🟢      |                                                  |
+| `value_and_grad`     | 🟢      |                                                  |
+| `jacobian`           | 🟢      |                                                  |
+| `jacfwd`             | 🟢      |                                                  |
+| `jacrev`             | 🟢      |                                                  |
+| `hessian`            | 🟢      |                                                  |
+| `jvp`                | 🟢      |                                                  |
+| `linearize`          | 🟢      |                                                  |
+| `linear_transpose`   | 🟠      |                                                  |
+| `vjp`                | 🟢      |                                                  |
+| `custom_gradient`    | 🔴      | core engine feature                              |
+| `closure_convert`    | 🔴      | core engine feature                              |
+| `checkpoint`         | 🔴      | core engine feature                              |
+| `vmap`               | 🟡      | some ops do not have vmap support yet            |
+| `shard_map`          | ⚪️      | device sharding                                  |
+| `smap`               | ⚪️      | device sharding                                  |
+| `pmap`               | ⚪️      | device sharding                                  |
+| `devices`            | 🟢      | semantics differ, returns all devices            |
+| `local_devices`      | ⚪️      | device sharding                                  |
+| `process_index`      | ⚪️      | device sharding                                  |
+| `device_count`       | ⚪️      | device sharding                                  |
+| `local_device_count` | ⚪️      | device sharding                                  |
+| `process_count`      | ⚪️      | device sharding                                  |
+| `process_indices`    | ⚪️      | device sharding                                  |
+| `custom_jvp`         | 🔴      | core engine feature                              |
+| `custom_vjp`         | 🔴      | core engine feature                              |
+| `custom_batching`    | 🔴      | core engine feature                              |
+| `Array`              | 🟢      |                                                  |
+| `checkLeaks`         | 🟢      | leak diagnostic (slot count delta + stack trace) |
 
 Array primitives need to be called with methods like `a.add(b)` / `a.mul(b)` instead of `a + b` and
 `a * b` as in Python, which has overloading.
@@ -561,15 +562,15 @@ JAX uses a [Threefry2x32](https://docs.jax.dev/en/latest/jep/263-prng.html) rand
 jax-js implements the same PRNG, with bitwise identical outputs. However, most samplers in the
 `random` module have not been implemented yet, these can be added easily.
 
-| API             | Support | Notes                         |
-| --------------- | ------- | ----------------------------- |
-| `key`           | 🟢      | only 32-bit seeding right now |
-| `key_data`      | ⚪️      | keys are just uint32 arrays   |
-| `wrap_key_data` | ⚪️      | keys are just uint32 arrays   |
-| `fold_in`       | 🟠      |                               |
-| `split`         | 🟢      | not vmappable yet             |
+| API             | Support | Notes                                        |
+| --------------- | ------- | -------------------------------------------- |
+| `key`           | 🟢      | only 32-bit seeding right now                |
+| `key_data`      | ⚪️      | keys are just uint32 arrays                  |
+| `wrap_key_data` | ⚪️      | keys are just uint32 arrays                  |
+| `fold_in`       | 🟠      |                                              |
+| `split`         | 🟢      | not vmappable yet                            |
 | `clone`         | ⚪️      | not needed — operations don't consume inputs |
-| `PRNGKey`       | ⚪️      | legacy                        |
+| `PRNGKey`       | ⚪️      | legacy                                       |
 
 **Samplers:** These are all 🟠 assuming that sampling from distributions is usually easier than
 modeling their transcendental CDFs (e.g., normal via Box-Muller).

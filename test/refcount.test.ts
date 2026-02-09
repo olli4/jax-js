@@ -1,6 +1,6 @@
 // Make sure refcount and dispose mechanics work correctly.
 
-import { grad, numpy as np } from "@jax-js/jax";
+import { checkLeaks, grad, numpy as np } from "@jax-js/jax";
 import { expect, suite, test } from "vitest";
 
 suite("refcount through grad", () => {
@@ -29,9 +29,11 @@ suite("refcount through grad", () => {
 
 suite("refCount property", () => {
   test("initial refCount is 1", () => {
+    checkLeaks.start();
     const x = np.array([1, 2, 3]);
     expect(x.refCount).toBe(1);
     x.dispose();
+    expect(checkLeaks.stop().leaked).toBe(0);
   });
 
   test("refCount increments after .ref", () => {

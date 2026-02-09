@@ -26,6 +26,7 @@ import {
   rep,
   type ScanPath,
 } from "../utils";
+import { _leakTrackingEnabled, _leakTrackingMap } from "./check-leaks";
 import {
   checkConvShape,
   pool,
@@ -201,6 +202,10 @@ export class Array extends Tracer {
     } else if (this.#source instanceof AluExp) {
       throw new Error("internal: AluExp source cannot have pending executes");
     }
+
+    if (_leakTrackingEnabled) {
+      _leakTrackingMap.set(this, new Error().stack ?? "(no stack)");
+    }
   }
 
   /** @ignore */
@@ -248,6 +253,7 @@ export class Array extends Tracer {
   dispose() {
     this.#check();
     if (--this.#rc === 0) {
+      if (_leakTrackingEnabled) _leakTrackingMap.delete(this);
       // Free any pending executables that haven't been submitted yet.
       for (const exe of this.#pending) exe.updateRc(-1);
       // If this has an array source, free it from the backend.
@@ -1827,11 +1833,7 @@ export function tril(a: ArrayLike, k: number = 0): Array {
   }
   a = fudgeArray(a);
   const [n, m] = a.shape.slice(-2);
-  return where(
-    tri(n, m, k, { dtype: DType.Bool }),
-    a,
-    zerosLike(a),
-  ) as Array;
+  return where(tri(n, m, k, { dtype: DType.Bool }), a, zerosLike(a)) as Array;
 }
 
 /** Return the upper triangle of an array. Must be of dimension >= 2. */

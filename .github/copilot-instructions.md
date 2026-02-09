@@ -2754,9 +2754,11 @@ isn't fast enough for large buffers in eager hot paths.
 autodiff (in-place mutation invalidates the computation graph). Fundamentally incompatible with
 JAX's immutable-array design.
 
-### Recommended approach: `checkLeaks` diagnostic
+### `checkLeaks` diagnostic (implemented)
 
-Instead of runtime cleanup helpers, invest in **detection + guidance**:
+A zero-overhead leak detection tool. When active, it snapshots backend slot counts and tracks Array
+creations with stack traces. The `leaked` count uses the same `slotCount()` metric as the
+traditional manual pattern, so it exactly matches existing leak detection behavior.
 
 ```ts
 import { checkLeaks } from "@jax-js/jax";
@@ -2764,31 +2766,52 @@ import { checkLeaks } from "@jax-js/jax";
 checkLeaks.start(); // snapshot slot count + enable stack capture
 // ... user code ...
 const report = checkLeaks.stop(); // diff, report undisposed arrays with creation locations
-// "Array(float32[512,512]) created at model.ts:42 was not disposed.
-//  Wrap computation in jit() or call .dispose()."
+// report.leaked: number of leaked backend slots
+// report.details: ["float32[512,512] created at model.ts:42", ...]
+// report.summary: human-readable message with guidance
 ```
+
+**Key files:**
+
+| File                           | Purpose                                            |
+| ------------------------------ | -------------------------------------------------- |
+| `src/frontend/check-leaks.ts`  | Core module: `checkLeaks` object + `LeakReport`    |
+| `src/frontend/array.ts`        | Hooks in constructor (track) and dispose (untrack) |
+| `test/check-leaks.test.ts`     | 7 dedicated tests                                  |
+| `test/leak-diagnostic.test.ts` | 9 scan leak tests using `checkLeaks`               |
+| `test/deno/harness.ts`         | Deno `withLeakCheck()` enhanced with `checkLeaks`  |
+
+**Design:** Uses `slotCount()` from the default backend as ground truth (not a Map of tracked JS
+objects). The tracking map provides diagnostic details (array description + creation location) but
+is not used for the leak count. This avoids false positives from internal AluExp-backed arrays that
+have no backend Slot.
+
+**Limitations:**
+
+- Only tracks the default backend (matches old `slotCount()` pattern).
+- `grad()` creates internal Slot allocations that appear as leaks if wrapped — only use `checkLeaks`
+  around code that properly disposes all outputs.
+- Anonymous constants in scan/jit bodies may show in the tracking map but don't affect the
+  slot-based leak count.
 
 **Why this is better than `tidy()`:** Zero overhead in production. Educates users toward `jit()`
 rather than providing a weaker alternative. Keeps the API surface JAX-compatible.
 
-**Implementation:** ~50 lines. Module-level `_leakTracking: boolean` flag, a `Map<Array, string>`
-for creation stacks, `start()`/`stop()` toggle the flag and diff the map.
-
 ### Decision summary
 
-| Approach          | Eager memory | Buffer reuse | Footgun risk | Recommendation                  |
-| ----------------- | ------------ | ------------ | ------------ | ------------------------------- |
-| `jit()`           | Optimal      | Full         | None         | **Primary answer**              |
-| `tidy()`          | Cleanup only | None         | None         | Skip — `jit()` is better        |
-| `pipe()`          | 1 extra buf  | Pool only    | None         | Skip — too narrow               |
-| `.donate()`       | Zero-alloc   | True reuse   | High         | Defer — pool handles it         |
-| `checkLeaks`      | Diagnostic   | N/A          | None         | **Implement** (complements jit) |
-| In-place / `out=` | Zero-alloc   | True reuse   | Breaks model | **Never** — incompatible        |
+| Approach          | Eager memory | Buffer reuse | Footgun risk | Recommendation           |
+| ----------------- | ------------ | ------------ | ------------ | ------------------------ |
+| `jit()`           | Optimal      | Full         | None         | **Primary answer**       |
+| `tidy()`          | Cleanup only | None         | None         | Skip — `jit()` is better |
+| `pipe()`          | 1 extra buf  | Pool only    | None         | Skip — too narrow        |
+| `.donate()`       | Zero-alloc   | True reuse   | High         | Defer — pool handles it  |
+| `checkLeaks`      | Diagnostic   | N/A          | None         | **Implemented**          |
+| In-place / `out=` | Zero-alloc   | True reuse   | Breaks model | **Never** — incompatible |
 
 ## Future Work
 
 | Priority | Feature                                   | Notes                                                     |
 | -------- | ----------------------------------------- | --------------------------------------------------------- |
-| High     | `checkLeaks` diagnostic                   | Detect undisposed arrays with creation stack traces       |
+| ~~High~~ | ~~`checkLeaks` diagnostic~~               | ✅ Implemented in `src/frontend/check-leaks.ts`           |
 | Medium   | Anonymous constant leak fix               | Distinguish user-held vs anonymous consts in scan tracing |
 | Low      | `using` declaration examples in tutorials | Show `Symbol.dispose` patterns in README/demos            |

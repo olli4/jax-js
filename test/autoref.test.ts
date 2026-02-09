@@ -5,7 +5,7 @@
  * Memory is managed via explicit .dispose() or the `using` keyword.
  */
 import {
-  getBackend,
+  checkLeaks,
   grad,
   jit,
   lax,
@@ -13,10 +13,6 @@ import {
   valueAndGrad,
 } from "@jax-js/jax";
 import { describe, expect, it } from "vitest";
-
-function slotCount(): number {
-  return (getBackend() as any).slotCount();
-}
 
 describe("non-consuming ownership model", () => {
   describe("operations do not consume inputs", () => {
@@ -117,7 +113,7 @@ describe("non-consuming ownership model", () => {
 
   describe("does not leak memory", () => {
     it("multi-use input does not leak", () => {
-      const before = slotCount();
+      checkLeaks.start();
       const f = jit((x: np.Array) => x.mul(x).add(1));
       const input = np.array([2, 3, 4]);
       const result = f(input);
@@ -125,11 +121,11 @@ describe("non-consuming ownership model", () => {
       result.dispose();
       input.dispose();
       f.dispose();
-      expect(slotCount()).toBe(before);
+      expect(checkLeaks.stop().leaked).toBe(0);
     });
 
     it("unused input does not leak", () => {
-      const before = slotCount();
+      checkLeaks.start();
       const f = jit((_x: np.Array, y: np.Array) => y.mul(2));
       const x = np.array([1]);
       const y = np.array([5]);
@@ -139,7 +135,7 @@ describe("non-consuming ownership model", () => {
       x.dispose();
       y.dispose();
       f.dispose();
-      expect(slotCount()).toBe(before);
+      expect(checkLeaks.stop().leaked).toBe(0);
     });
   });
 

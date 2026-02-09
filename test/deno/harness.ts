@@ -17,7 +17,9 @@
  */
 
 import { assertEquals } from "https://deno.land/std@0.224.0/assert/mod.ts";
-import { getBackend, defaultDevice } from "../../dist/index.js";
+import { checkLeaks, getBackend, defaultDevice } from "../../dist/index.js";
+
+export { checkLeaks };
 
 /**
  * Get the current slot count from the active backend.
@@ -67,14 +69,20 @@ export function withLeakCheck(
 
   return async () => {
     const before = getSlotCount();
+    checkLeaks.start();
     try {
       await fn();
     } finally {
+      const report = checkLeaks.stop();
       const after = getSlotCount();
       const leaked = after - before;
       if (leaked > allowedLeaks) {
+        const details =
+          report.leaked > 0
+            ? `\n${report.details.map((d: string) => `  - ${d}`).join("\n")}`
+            : "";
         throw new Error(
-          `Memory leak: ${leaked} slot(s) leaked (before=${before}, after=${after}, allowed=${allowedLeaks})`,
+          `Memory leak: ${leaked} slot(s) leaked (before=${before}, after=${after}, allowed=${allowedLeaks})${details}`,
         );
       }
     }

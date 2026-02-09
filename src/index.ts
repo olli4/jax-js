@@ -1,6 +1,7 @@
 import { DType } from "./alu";
 import { defaultDevice, Device, devices, getBackend, init } from "./backend";
 import { Array, ArrayLike } from "./frontend/array";
+import { checkLeaks, type LeakReport } from "./frontend/check-leaks";
 import * as jaxprModule from "./frontend/jaxpr";
 import { ClosedJaxpr, Jaxpr, OwnedFunction } from "./frontend/jaxpr";
 import * as jvpModule from "./frontend/jvp";
@@ -21,6 +22,7 @@ import "./polyfills";
 export {
   init,
   Array,
+  checkLeaks,
   ClosedJaxpr,
   defaultDevice,
   type Device,
@@ -31,6 +33,7 @@ export {
   type JsTree,
   type JsTreeDef,
   lax,
+  type LeakReport,
   nn,
   numpy,
   type OwnedFunction,
