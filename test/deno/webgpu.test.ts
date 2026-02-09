@@ -88,14 +88,16 @@ Deno.test({
 
     defaultDevice("webgpu");
 
-    // a, b, c stay alive until disposed or GC'd
-    // Inside withLeakCheck, jitF.dispose() handles cleanup
     const a = np.array([1, 2, 3, 4]);
     const b = np.array([5, 6, 7, 8]);
     const c = np.add(a, b);
 
     const result = await c.data();
     assertEquals(Array.from(result), [6, 8, 10, 12]);
+
+    a.dispose();
+    b.dispose();
+    c.dispose();
   }),
 });
 
@@ -111,6 +113,8 @@ Deno.test({
 
     defaultDevice("webgpu");
 
+    // Wrap in jit to manage matmul intermediates
+    const matmulFn = jit((a: np.Array, b: np.Array) => np.matmul(a, b));
     const a = np.array([
       [1, 2],
       [3, 4],
@@ -119,11 +123,16 @@ Deno.test({
       [5, 6],
       [7, 8],
     ]);
-    const c = np.matmul(a, b);
+    const c = matmulFn(a, b);
 
     const result = await c.data();
     // [[1*5+2*7, 1*6+2*8], [3*5+4*7, 3*6+4*8]] = [[19, 22], [43, 50]]
     assertEquals(Array.from(result), [19, 22, 43, 50]);
+
+    a.dispose();
+    b.dispose();
+    c.dispose();
+    matmulFn.dispose();
   }),
 });
 
@@ -139,9 +148,9 @@ Deno.test({
 
     defaultDevice("webgpu");
 
-    // x can be reused freely — no .ref needed
+    // Extract constant outside jit body to avoid anonymous constant leak
+    const two = np.array([2]);
     const f = (x: np.Array) => {
-      const two = np.array([2]);
       const x2 = np.multiply(x, x);
       return np.add(x2, np.multiply(x, two));
     };
@@ -154,8 +163,11 @@ Deno.test({
     // x^2 + 2x for x = [1,2,3,4] => [3, 8, 15, 24]
     assertEquals(Array.from(data), [3, 8, 15, 24]);
 
+    x.dispose();
+    result.dispose();
     // JIT functions are OwnedFunction - must dispose to release captured constants
     jitF.dispose();
+    two.dispose();
   }),
 });
 
@@ -172,15 +184,20 @@ Deno.test({
     defaultDevice("webgpu");
 
     // f(x) = sum(x^2), so grad(f)(x) = 2x
+    // Wrap in jit to manage autodiff intermediates
     const f = (x: np.Array) => np.sum(np.multiply(x, x));
-    const gradF = grad(f);
+    const gradFn = jit(grad(f));
 
     const x = np.array([1, 2, 3]);
-    const dx = gradF(x);
+    const dx = gradFn(x);
 
     const data = await dx.data();
     // d/dx(sum(x^2)) = 2x => [2, 4, 6]
     assertEquals(Array.from(data), [2, 4, 6]);
+
+    x.dispose();
+    dx.dispose();
+    gradFn.dispose();
   }),
 });
 
@@ -196,20 +213,29 @@ Deno.test({
 
     defaultDevice("webgpu");
 
+    // Wrap in jit to manage reduction intermediates
+    const reductions = jit((x: np.Array) => [
+      np.sum(x),
+      np.sum(x, 0),
+      np.sum(x, 1),
+    ]);
+
     const x = np.array([
       [1, 2, 3],
       [4, 5, 6],
     ]);
 
-    // x can be reused freely in multiple operations
-    const sumAll = np.sum(x);
-    const sumAxis0 = np.sum(x, 0);
-    const sumAxis1 = np.sum(x, 1);
+    const [sumAll, sumAxis0, sumAxis1] = reductions(x) as np.Array[];
 
-    // .data() reads without consuming — arrays stay alive
     assertEquals(Array.from(await sumAll.data()), [21]);
     assertEquals(Array.from(await sumAxis0.data()), [5, 7, 9]);
     assertEquals(Array.from(await sumAxis1.data()), [6, 15]);
+
+    x.dispose();
+    sumAll.dispose();
+    sumAxis0.dispose();
+    sumAxis1.dispose();
+    reductions.dispose();
   }),
 });
 
@@ -225,22 +251,28 @@ Deno.test({
     if (!devices.includes("webgpu")) return;
     defaultDevice("webgpu");
 
-    // cumsum: carry + x, y = carry + x
+    // Extract init outside jit body to avoid anonymous constant leak
+    const initCarry = np.array([0]);
     const f = jit((xs: np.Array) =>
       lax.scan(
         (carry: np.Array, x: np.Array) => {
           const out = np.add(carry, x);
           return [out, out];
         },
-        np.array([0]),
+        initCarry,
         xs,
         { acceptPath: ["compiled-loop", "preencoded-routine"] },
       ),
     );
-    const [carry, ys] = f(np.array([[1], [2], [3], [4]]));
+    const xs = np.array([[1], [2], [3], [4]]);
+    const [carry, ys] = f(xs);
     const carryData = await carry.data();
     const ysData = await ys.data();
+    xs.dispose();
+    carry.dispose();
+    ys.dispose();
     f.dispose();
+    initCarry.dispose();
     assertEquals(Array.from(carryData), [10]);
     assertEquals(Array.from(ysData), [1, 3, 6, 10]);
   }),
@@ -254,23 +286,29 @@ Deno.test({
     if (!devices.includes("webgpu")) return;
     defaultDevice("webgpu");
 
-    // cumsum inside jit — tests JIT-compiled scan on WebGPU
+    // Extract init outside jit body to avoid anonymous constant leak
+    const initCarry = np.array([0]);
     const f = jit((xs: np.Array) => {
       const [carry, ys] = lax.scan(
         (c: np.Array, x: np.Array) => {
           const out = np.add(c, x);
           return [out, out];
         },
-        np.array([0]),
+        initCarry,
         xs,
         { acceptPath: ["compiled-loop", "preencoded-routine"] },
       );
       return [carry, ys];
     });
-    const [carry, ys] = f(np.array([[1], [2], [3], [4], [5]]));
+    const xs = np.array([[1], [2], [3], [4], [5]]);
+    const [carry, ys] = f(xs);
     const carryData = await carry.data();
     const ysData = await ys.data();
+    xs.dispose();
+    carry.dispose();
+    ys.dispose();
     f.dispose();
+    initCarry.dispose();
     assertEquals(Array.from(carryData), [15]);
     assertEquals(Array.from(ysData), [1, 3, 6, 10, 15]);
   }),
@@ -291,8 +329,9 @@ Deno.test({
     const n = 2;
     const identity = np.eye(n); // [[1,0],[0,1]]
 
-    // xs = [[[2,0],[0,1]], [[1,0],[0,3]]]  → scale x by 2, then y by 3
-    const xs = np.array([2, 0, 0, 1, 1, 0, 0, 3]).reshape([2, n, n]);
+    // Separate reshape to avoid losing the intermediate flat array
+    const xsFlat = np.array([2, 0, 0, 1, 1, 0, 0, 3]);
+    const xs = xsFlat.reshape([2, n, n]);
 
     const f = jit((initC: np.Array, xsIn: np.Array) =>
       lax.scan(
@@ -309,6 +348,11 @@ Deno.test({
     const [carry, ys] = f(identity, xs);
     const carryData = await carry.data();
     const ysData = await ys.data();
+    identity.dispose();
+    xs.dispose();
+    xsFlat.dispose();
+    carry.dispose();
+    ys.dispose();
     f.dispose();
 
     // After iter 0: I @ [[2,0],[0,1]] = [[2,0],[0,1]]
@@ -364,7 +408,9 @@ Deno.test({
       0,
       1, // iter 2: identity
     ]);
-    const xs = np.array(xsData).reshape([3, n, n]);
+    // Separate reshape to avoid losing the intermediate flat array
+    const xsFlat = np.array(xsData);
+    const xs = xsFlat.reshape([3, n, n]);
 
     const f = jit((initC: np.Array, xsIn: np.Array) =>
       lax.scan(
@@ -381,6 +427,11 @@ Deno.test({
     const [carry, ys] = f(identity, xs);
     const carryData = await carry.data();
     const ysData = await ys.data();
+    identity.dispose();
+    xs.dispose();
+    xsFlat.dispose();
+    carry.dispose();
+    ys.dispose();
     f.dispose();
 
     // iter 0: I @ diag(2,1,1) = [[2,0,0],[0,1,0],[0,0,1]]

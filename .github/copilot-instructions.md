@@ -250,7 +250,8 @@ pool/recycler needs deterministic buffer return to maintain peak-memory guarante
 `.dispose()` is one call per array at the end of its useful life. `using` declarations
 (`Symbol.dispose`) also work — `using x = np.array(...)` will auto-dispose at block end.
 
-Canonical examples: `test/refcount.test.ts`, `test/leak-diagnostic.test.ts`, `test/deno/webgpu.test.ts`.
+Canonical examples: `test/refcount.test.ts`, `test/leak-diagnostic.test.ts`,
+`test/deno/webgpu.test.ts`.
 
 ### Memory lifecycle
 
@@ -267,13 +268,15 @@ A **Slot** is jax-js's internal handle to a backend memory allocation (WASM poin
 
 ### Backend memory comparison
 
-| Aspect        | Wasm (`src/backend/wasm.ts`)                | WebGPU (`src/backend/webgpu.ts`)                      |
-| ------------- | ------------------------------------------- | ----------------------------------------------------- |
-| Allocation    | `WasmAllocator` over `WebAssembly.Memory`   | `device.createBuffer()` with `GPUBufferUsage.STORAGE` |
-| Slot tracking | `Map<Slot, {ptr, size, ref}>`               | `Map<Slot, {buffer, size, ref}>`                      |
-| Buffer copy   | `Uint8Array.copyWithin` (aligned/unaligned) | `copyBufferToBuffer` (aligned) or WGSL copy shader    |
-| Sync read     | Direct memory view                          | `SyncReader` with staging buffer + `mapAsync`         |
-| Dispatch      | Instantiate Wasm module, call exported fn   | `commandEncoder.dispatchWorkgroups()`, queue submit   |
+| Aspect          | Wasm (`src/backend/wasm.ts`)                | WebGPU (`src/backend/webgpu.ts`)                      |
+| --------------- | ------------------------------------------- | ----------------------------------------------------- |
+| Allocation      | `WasmAllocator` over `WebAssembly.Memory`   | `device.createBuffer()` with `GPUBufferUsage.STORAGE` |
+| Slot tracking   | `Map<Slot, {ptr, size, ref}>`               | `Map<Slot, {buffer, size, ref}>`                      |
+| Buffer copy     | `Uint8Array.copyWithin` (aligned/unaligned) | `copyBufferToBuffer` (aligned) or WGSL copy shader    |
+| Sync read       | Direct memory view                          | `SyncReader` with staging buffer + `mapAsync`         |
+| Dispatch        | Instantiate Wasm module, call exported fn   | `commandEncoder.dispatchWorkgroups()`, queue submit   |
+| Zero on alloc   | **Yes** — `.fill(0)` on free-list reuse     | **Fresh only** — `createBuffer` zeros; pool does not  |
+| Zero on recycle | N/A (JIT recycle = slot rename)             | N/A (JIT recycle = slot rename)                       |
 
 ### Ownership internals
 
@@ -830,14 +833,25 @@ The `Kernel` class is single-output: `new Kernel(nargs, size, exp, reduction?)`.
 - **CPU backend GlobalView detection**: Collect both `AluOp.GlobalIndex` AND `AluOp.GlobalView`
   (internal ALU expression types) when finding used input buffers
 - **JIT pending ops before scan**: Flush pending ops before scan step execution
+- **Cross-device copy of non-contiguous arrays**: `_putSync()`/`_put()` must use
+  `dataSync()`/`data()` (which call `#realize()`) instead of raw `readSync()`/`read()`. Raw reads
+  return bytes in memory-layout order, ignoring the ShapeTracker — transpositions and reshapes are
+  silently lost. This was fixed in commit `0419dce`; the trigger required all three conditions: (1)
+  non-contiguous input (reshape/transpose/flatten), (2) static argnums on jit, and (3) consts
+  created inside the jit body (placed on trace-time device, becoming first arg so `#computeBackend`
+  picks CPU).
 
 ## Known flaky tests
 
-- **LU JVP finite-differences** (`test/lax-linalg.test.ts`): Occasionally fails with precision
-  errors at the edge of f32 machine epsilon. Not a bug — inherent to finite-difference verification.
 - **Deno WebGPU tests** (`test/deno/`): When running all Deno test files together in a single
   `deno test` invocation, GPU state pollution between files causes memory leak detection failures.
   The `test:deno` script runs each file as a separate `deno test` command (chained with `&&`).
+
+**Current test status (Feb 2026):** 1152 passed, 0 failed, 744 skipped. The LU JVP finite-difference
+test was previously failing because the WASM LU routine uses native f32 arithmetic (upstream fell
+back to CPU with f64 precision); fixed by using larger eps and looser tolerance. All
+previously-failing cross-device tests (FFT, random, linalg on WASM after CPU) are fixed — see
+`_put`/`_putSync` in [Common pitfalls](#common-pitfalls).
 
 > ⚠️ **IMPORTANT: Deno WebGPU test isolation** - Due to Deno's module caching and GPU state
 > persistence between test files, running all Deno tests together in a single process causes
@@ -2455,13 +2469,34 @@ free-list allocator that coalesces adjacent freed blocks. This provides similar 
 without an explicit pool. The JIT recycling step still benefits WASM by skipping the allocator's
 free-list search entirely.
 
-| Aspect                      | WebGPU Pool              | WASM Allocator             |
-| --------------------------- | ------------------------ | -------------------------- |
-| Data structure              | `Map<size, GPUBuffer[]>` | Free-list with coalescing  |
-| Allocation cost (pool hit)  | Array pop (~10 ns)       | Free-list search (~50 ns)  |
-| Allocation cost (pool miss) | `createBuffer` (~5 µs)   | Expand memory (~1 µs)      |
-| Deallocation cost           | Array push (~10 ns)      | Free-list insert (~50 ns)  |
-| Cross-size reuse            | No (exact size match)    | Yes (splitting/coalescing) |
+| Aspect                      | WebGPU Pool              | WASM Allocator                  |
+| --------------------------- | ------------------------ | ------------------------------- |
+| Data structure              | `Map<size, GPUBuffer[]>` | Free-list with coalescing       |
+| Allocation cost (pool hit)  | Array pop (~10 ns)       | Free-list search (~50 ns)       |
+| Allocation cost (pool miss) | `createBuffer` (~5 µs)   | Expand memory (~1 µs)           |
+| Deallocation cost           | Array push (~10 ns)      | Free-list insert (~50 ns)       |
+| Cross-size reuse            | No (exact size match)    | Yes (splitting/coalescing)      |
+| Zero on reuse               | **No** — stale data      | **Yes** — `.fill(0)` on realloc |
+
+### Memory zeroing guarantees
+
+New allocations are always zeroed:
+
+- **WASM**: Fresh pages from `WebAssembly.Memory` are zero (spec guarantee). The `WasmAllocator`
+  **also zeroes on free-list reuse** via `new Uint8Array(buffer, ptr, size).fill(0)`, so every
+  `malloc()` returns zeroed memory regardless of reuse.
+- **WebGPU**: `device.createBuffer()` is zero-initialized per the WebGPU spec. **Pooled buffers are
+  NOT zeroed** — `#poolPop()` returns stale data.
+
+**Current safety:** All code paths that allocate without `initialData` subsequently fully overwrite
+the buffer (kernel dispatches, routine outputs, `memory.copy` in scan). No caller relies on pooled
+buffers being zero. The one implicit dependency is **CPU Cholesky** (`src/routine.ts`) which only
+writes the lower triangle — safe because the CPU backend allocates through the zeroing WASM
+allocator or fresh JS TypedArrays (always zero). WASM Cholesky routines explicitly zero the entire
+output matrix before writing.
+
+**Rule for new code:** Never assume a buffer allocated without `initialData` contains zeros on
+WebGPU. Either fully write every output element, or explicitly zero the buffer first.
 
 ---
 

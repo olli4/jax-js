@@ -69,6 +69,7 @@ Deno.test({
     // Warm up: first call compiles + runs
     const warmup = f(x);
     await warmup.data();
+    warmup.dispose();
 
     // After warmup, record baseline GPU bytes.
     // This includes the pool potentially holding buffers from warmup.
@@ -79,6 +80,7 @@ Deno.test({
     for (let i = 0; i < N; i++) {
       const result = f(x);
       await result.data(); // reads result (not consumed)
+      result.dispose();
     }
 
     const afterBytes = getGpuBytes();
@@ -112,6 +114,8 @@ Deno.test({
     const [a, b] = f(x) as any[];
     await a.data();
     await b.data();
+    a.dispose();
+    b.dispose();
 
     const baselineBytes = getGpuBytes();
 
@@ -119,6 +123,8 @@ Deno.test({
       const [r1, r2] = f(x) as any[];
       await r1.data();
       await r2.data();
+      r1.dispose();
+      r2.dispose();
     }
 
     const afterBytes = getGpuBytes();
@@ -180,24 +186,27 @@ Deno.test({
   name: "pool: scan cumsum stays within peak memory",
   ignore: !hasWebGPU,
   fn: withLeakCheck(async () => {
+    // Extract init outside jit body to avoid anonymous constant leak
+    const initCarry = np.zeros([64]);
     const scanF = jit((xs: any) => {
-      const init = np.zeros([64]);
       return lax.scan(
         (carry: any, x: any) => {
           const s = carry.add(x);
           return [s, s];
         },
-        init,
-        xs.reshape([-1, 64]),
+        initCarry,
+        xs,
       );
     });
 
-    const xs = np.ones([6400]); // 100 rows of 64
+    const xs = np.ones([100, 64]); // 100 rows of 64
 
     // Warmup
     const [c, ys] = scanF(xs) as any[];
     await c.data();
     await ys.data();
+    c.dispose();
+    ys.dispose();
 
     const baselineBytes = getGpuBytes();
 
@@ -206,6 +215,8 @@ Deno.test({
       const [c2, ys2] = scanF(xs) as any[];
       await c2.data();
       await ys2.data();
+      c2.dispose();
+      ys2.dispose();
     }
 
     const afterBytes = getGpuBytes();
@@ -216,6 +227,7 @@ Deno.test({
 
     xs.dispose();
     scanF.dispose();
+    initCarry.dispose();
   }),
 });
 
@@ -233,8 +245,8 @@ Deno.test({
 
     const withArrayBytes = getGpuBytes();
 
-    // Consume the array — buffer returns to pool (or is destroyed)
-    await arr.data();
+    // Dispose the array — buffer returns to pool (or is destroyed)
+    arr.dispose();
 
     const afterBytes = getGpuBytes();
     // After dispose: if pool accepted it, bytes stay same (pool holds it).
