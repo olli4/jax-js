@@ -661,109 +661,26 @@ function codegenWasm(kernel: Kernel): Uint8Array<ArrayBuffer> {
 
   const kernelFunc = cg.function(rep(kernel.nargs + 1, cg.i32), [], () => {
     const gidx = cg.local.declare(cg.i32);
-    cg.loop(cg.void);
-    {
-      // if (gidx >= size) break;
-      cg.block(cg.void);
-      cg.local.get(gidx);
-      cg.i32.const(kernel.size);
-      cg.i32.ge_u();
-      cg.br_if(0);
 
-      // Push memory index of output onto stack (will be used at end).
-      cg.local.get(kernel.nargs); // output buffer is last argument
-      cg.local.get(gidx);
-      cg.i32.const(byteWidth(kernel.dtype));
-      cg.i32.mul();
-      cg.i32.add();
-
-      if (re) {
-        // If reduction, define accumulator and inner ridx loop.
-        const acc = cg.local.declare(dty(cg, null, kernel.exp.dtype));
-        dty(cg, null, kernel.exp.dtype).const(re.identity);
-        cg.local.set(acc);
-
-        const ridx = cg.local.declare(cg.i32);
-        cg.i32.const(0);
-        cg.local.set(ridx);
-        cg.loop(cg.void);
-        {
-          // if (ridx >= reduction.size) break;
-          cg.block(cg.void);
-          cg.local.get(ridx);
-          cg.i32.const(re.size);
-          cg.i32.ge_u();
-          cg.br_if(0);
-
-          // Translate tune.exp to expression and push onto stack.
-          translateExp(cg, funcs, tune.exp, { gidx, ridx });
-
-          // acc = reduction.evaluate(acc, exp)
-          if (re.op === AluOp.Add) {
-            cg.local.get(acc);
-            if (re.dtype === DType.Bool) cg.i32.or();
-            else dty(cg, re.op, re.dtype).add();
-          } else if (re.op === AluOp.Mul) {
-            cg.local.get(acc);
-            if (re.dtype === DType.Bool) cg.i32.and();
-            else dty(cg, re.op, re.dtype).mul();
-          } else if (re.op === AluOp.Min || re.op === AluOp.Max) {
-            if (isFloatDtype(re.dtype)) {
-              cg.local.get(acc);
-              if (re.op === AluOp.Min) dtyF(cg, re.op, re.dtype).min();
-              else dtyF(cg, re.op, re.dtype).max();
-            } else if (
-              [DType.Int32, DType.Uint32, DType.Bool].includes(re.dtype)
-            ) {
-              // Wasm has no i32.min/max, so emulate with select.
-              const local = cg.local.declare(cg.i32);
-              cg.local.tee(local);
-              cg.local.get(acc);
-              cg.local.get(local);
-              cg.local.get(acc);
-              if (re.op === AluOp.Min) {
-                if (re.dtype === DType.Int32) cg.i32.lt_s();
-                else cg.i32.lt_u();
-              } else {
-                if (re.dtype === DType.Int32) cg.i32.gt_s();
-                else cg.i32.gt_u();
-              }
-              cg.select();
-            } else
-              throw new Error(`invalid reduction min/max over ${re.dtype}`);
-          } else throw new Error(`invalid wasm reduction op: ${re.op}`);
-          cg.local.set(acc);
-
-          // ridx++
-          cg.local.get(ridx);
-          cg.i32.const(1);
-          cg.i32.add();
-          cg.local.set(ridx);
-
-          cg.br(1); // continue ridx loop
-          cg.end();
-        }
-        cg.end();
-
-        translateExp(cg, funcs, tune.epilogue!, { acc, gidx });
-      } else {
-        // Translate tune.exp to expression and push onto stack.
-        translateExp(cg, funcs, tune.exp, { gidx });
-      }
-
-      // Store value into output buffer.
-      dty(cg, null, kernel.dtype).store(Math.log2(byteWidth(kernel.dtype)));
-
-      // gidx++
-      cg.local.get(gidx);
-      cg.i32.const(1);
-      cg.i32.add();
-      cg.local.set(gidx);
-
-      cg.br(1); // continue gidx loop
-      cg.end();
-    }
-    cg.end();
+    emitKernelBody({
+      cg,
+      funcs,
+      kernel,
+      gidx,
+      emitOutputAddr: () => {
+        cg.local.get(kernel.nargs); // output buffer is last argument
+        cg.local.get(gidx);
+        cg.i32.const(byteWidth(kernel.dtype));
+        cg.i32.mul();
+        cg.i32.add();
+      },
+      emitExp: (exp, { ridx, acc }) => {
+        const vars: Record<string, number> = { gidx };
+        if (ridx !== undefined) vars.ridx = ridx;
+        if (acc !== undefined) vars.acc = acc;
+        translateExp(cg, funcs, exp, vars);
+      },
+    });
   });
   cg.export(kernelFunc, "kernel");
 
@@ -1094,6 +1011,110 @@ function codegenReductionAccumulate(
     throw new Error(`invalid wasm reduction op: ${re.op}`);
   }
   cg.local.set(acc);
+}
+
+// ---------------------------------------------------------------------------
+// Shared kernel body: gidx loop + reduction + store (used by kernel & scan)
+// ---------------------------------------------------------------------------
+
+/**
+ * Emit the inner per-element loop for a single-output kernel.
+ *
+ * Shared between `codegenWasm()` (regular kernels) and
+ * `codegenNativeScanGeneral()` (scan kernel steps). Callers inject
+ * backend-specific behavior via three callbacks:
+ *
+ * - `emitOutputAddr`: push the store address for element [gidx] onto the stack
+ * - `emitExp`: translate an expression, leaving result on stack
+ * - `emitStore`: (optional) custom store logic; default is a simple typed store
+ */
+function emitKernelBody(opts: {
+  cg: CodeGenerator;
+  funcs: Record<string, number>;
+  kernel: Kernel;
+  gidx: number;
+  /** Emit code to push the output base address for element [gidx] onto stack. */
+  emitOutputAddr: () => void;
+  /** Translate an expression (leaves result on WASM stack). */
+  emitExp: (
+    exp: AluExp,
+    extra: { ridx?: number; acc?: number },
+  ) => void;
+  /** Custom store logic. If omitted, a simple typed store is emitted. */
+  emitStore?: () => void;
+}): void {
+  const { cg, funcs, kernel, gidx, emitOutputAddr, emitExp, emitStore } = opts;
+  const tune = tuneNullopt(kernel);
+  const re = kernel.reduction;
+  const storeAlign = Math.log2(byteWidth(kernel.dtype));
+
+  cg.i32.const(0);
+  cg.local.set(gidx);
+  cg.loop(cg.void);
+  {
+    // if (gidx >= size) break;
+    cg.block(cg.void);
+    cg.local.get(gidx);
+    cg.i32.const(kernel.size);
+    cg.i32.ge_u();
+    cg.br_if(0);
+
+    // Push output address for this element.
+    emitOutputAddr();
+
+    if (re) {
+      // Reduction: accumulator + inner ridx loop.
+      const acc = cg.local.declare(dty(cg, null, kernel.exp.dtype));
+      dty(cg, null, kernel.exp.dtype).const(re.identity);
+      cg.local.set(acc);
+
+      const ridx = cg.local.declare(cg.i32);
+      cg.i32.const(0);
+      cg.local.set(ridx);
+
+      cg.loop(cg.void);
+      {
+        cg.block(cg.void);
+        cg.local.get(ridx);
+        cg.i32.const(re.size);
+        cg.i32.ge_u();
+        cg.br_if(0);
+
+        emitExp(tune.exp, { ridx });
+        codegenReductionAccumulate(cg, re, acc);
+
+        cg.local.get(ridx);
+        cg.i32.const(1);
+        cg.i32.add();
+        cg.local.set(ridx);
+
+        cg.br(1);
+        cg.end();
+      }
+      cg.end();
+
+      emitExp(tune.epilogue!, { acc });
+    } else {
+      emitExp(tune.exp, {});
+    }
+
+    // Store result.
+    if (emitStore) {
+      emitStore();
+    } else {
+      dty(cg, null, kernel.dtype).store(storeAlign);
+    }
+
+    // gidx++
+    cg.local.get(gidx);
+    cg.i32.const(1);
+    cg.i32.add();
+    cg.local.set(gidx);
+
+    cg.br(1); // continue gidx loop
+    cg.end();
+  }
+  cg.end();
 }
 
 // ---------------------------------------------------------------------------
@@ -1462,111 +1483,57 @@ function codegenNativeScanGeneral(
         const internalIdx = step.outputInternalIdx;
 
         if (step.source instanceof Kernel) {
-          // Single-output Kernel step
+          // Single-output Kernel step — delegate to shared emitKernelBody.
           const kernel = step.source;
-          const tune = tuneNullopt(kernel);
-          const re = kernel.reduction;
           const dw = directWriteMap.get(internalIdx);
           const bw = byteWidth(kernel.dtype);
-          const storeAlign = Math.log2(bw);
           const needsDualStore = dw && dw.yIdx !== undefined;
 
-          cg.i32.const(0);
-          cg.local.set(gidx);
-          cg.loop(cg.void);
-          {
-            cg.block(cg.void);
-            cg.local.get(gidx);
-            cg.i32.const(kernel.size);
-            cg.i32.ge_u();
-            cg.br_if(0);
-
-            // Compute primary output address
-            if (dw) {
-              cg.local.get(carryOutBase + dw.carryIdx);
-            } else {
-              cg.local.get(internalsBase + internalIdx);
-            }
-            cg.local.get(gidx);
-            cg.i32.const(bw);
-            cg.i32.mul();
-            cg.i32.add();
-
-            const scanCtx = makeScanContext();
-
-            if (re) {
-              const acc = cg.local.declare(dty(cg, null, kernel.exp.dtype));
-              dty(cg, null, kernel.exp.dtype).const(re.identity);
-              cg.local.set(acc);
-
-              const ridx = cg.local.declare(cg.i32);
-              cg.i32.const(0);
-              cg.local.set(ridx);
-              scanCtx.ridx = ridx;
-
-              cg.loop(cg.void);
-              {
-                cg.block(cg.void);
-                cg.local.get(ridx);
-                cg.i32.const(re.size);
-                cg.i32.ge_u();
-                cg.br_if(0);
-
-                translateExpWithGeneralScanContext(
-                  cg,
-                  funcs,
-                  tune.exp,
-                  scanCtx,
-                );
-                codegenReductionAccumulate(cg, re, acc);
-
-                cg.local.get(ridx);
-                cg.i32.const(1);
-                cg.i32.add();
-                cg.local.set(ridx);
-
-                cg.br(1);
-                cg.end();
+          emitKernelBody({
+            cg,
+            funcs,
+            kernel,
+            gidx,
+            emitOutputAddr: () => {
+              if (dw) {
+                cg.local.get(carryOutBase + dw.carryIdx);
+              } else {
+                cg.local.get(internalsBase + internalIdx);
               }
-              cg.end();
-
-              translateExpWithGeneralScanContext(cg, funcs, tune.epilogue!, {
-                ...scanCtx,
-                acc,
-              });
-            } else {
-              translateExpWithGeneralScanContext(cg, funcs, tune.exp, scanCtx);
-            }
-
-            if (needsDualStore) {
-              const tmpVal = cg.local.declare(dty(cg, null, kernel.dtype));
-              cg.local.tee(tmpVal);
-              dty(cg, null, kernel.dtype).store(storeAlign);
-              // Store to ysStacked
-              cg.local.get(ysStackedBase + dw!.yIdx!);
-              cg.local.get(dataIdx);
-              cg.i32.const(ysStrides[dw!.yIdx!]);
-              cg.i32.mul();
-              cg.i32.add();
               cg.local.get(gidx);
               cg.i32.const(bw);
               cg.i32.mul();
               cg.i32.add();
-              cg.local.get(tmpVal);
-              dty(cg, null, kernel.dtype).store(storeAlign);
-            } else {
-              dty(cg, null, kernel.dtype).store(storeAlign);
-            }
-
-            // gidx++
-            cg.local.get(gidx);
-            cg.i32.const(1);
-            cg.i32.add();
-            cg.local.set(gidx);
-            cg.br(1);
-            cg.end();
-          }
-          cg.end();
+            },
+            emitExp: (exp, extra) => {
+              const scanCtx = makeScanContext();
+              if (extra.ridx !== undefined) scanCtx.ridx = extra.ridx;
+              if (extra.acc !== undefined) scanCtx.acc = extra.acc;
+              translateExpWithGeneralScanContext(cg, funcs, exp, scanCtx);
+            },
+            emitStore: needsDualStore
+              ? () => {
+                  const storeAlign = Math.log2(bw);
+                  const tmpVal = cg.local.declare(
+                    dty(cg, null, kernel.dtype),
+                  );
+                  cg.local.tee(tmpVal);
+                  dty(cg, null, kernel.dtype).store(storeAlign);
+                  // Store to ysStacked
+                  cg.local.get(ysStackedBase + dw!.yIdx!);
+                  cg.local.get(dataIdx);
+                  cg.i32.const(ysStrides[dw!.yIdx!]);
+                  cg.i32.mul();
+                  cg.i32.add();
+                  cg.local.get(gidx);
+                  cg.i32.const(bw);
+                  cg.i32.mul();
+                  cg.i32.add();
+                  cg.local.get(tmpVal);
+                  dty(cg, null, kernel.dtype).store(storeAlign);
+                }
+              : undefined,
+          });
         }
         // Routine step: call the imported routine function
         if (step.source instanceof Routine) {

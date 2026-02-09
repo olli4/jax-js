@@ -452,10 +452,14 @@ Understanding this structure is essential for adding scan codegen paths.
 | `translateExpCore()`            | Shared core handling all `AluOp` cases              |
 | `TranslateExpContext` interface | Callbacks for `getVariable` and `handleGlobalIndex` |
 | `translateExp()`                | Wrapper with bounds-check GlobalIndex               |
+| `emitKernelBody()`              | Shared gidx loop + reduction + store for one kernel |
 | `codegenWasm()`                 | Single entry point for kernel codegen               |
 
 Scan adds `translateExpWithGeneralScanContext()` (const/carry/xs/internal classification) and
-`codegenNativeScanGeneral()` (full scan loop codegen).
+`codegenNativeScanGeneral()` (full scan loop codegen). Both `codegenWasm` and
+`codegenNativeScanGeneral` call `emitKernelBody()` for the inner per-element loop, injecting
+backend-specific behavior via callbacks for output addressing, expression translation, and store
+logic.
 
 **WebGPU Backend:**
 
@@ -1883,9 +1887,9 @@ Expression translation and shader generation share common code between regular k
 | `translateExpCore()`                   | Shared core handling all `AluOp` cases              |
 | `TranslateExpContext` interface        | Callbacks for `getVariable` and `handleGlobalIndex` |
 | `translateExp()`                       | Wrapper with bounds-check GlobalIndex               |
+| `emitKernelBody()`                     | Shared gidx loop + reduction + store for one kernel |
 | `translateExpWithGeneralScanContext()` | Wrapper with const/carry/xs/internal classification |
 | `codegenWasm()`                        | Single entry point for kernel codegen               |
-| `translateExpWithGeneralScanContext()` | Wrapper with const/carry/xs/internal classification |
 | `codegenNativeScanGeneral()`           | Full scan loop codegen with direct-write analysis   |
 
 **WebGPU Backend:**
@@ -1909,6 +1913,21 @@ backend-specific executables.
 Native scan on both WASM and WebGPU generates single-output kernel codegen per step. Multi-kernel
 scan bodies (multiple independent single-output kernel steps) are handled by
 `nativeScanMultiShaderSource()` on WebGPU and `codegenNativeScanGeneral()` on WASM.
+
+### Shared kernel body: `emitKernelBody()`
+
+The inner per-element loop (gidx iteration, reduction accumulator, store) is shared between
+`codegenWasm()` and `codegenNativeScanGeneral()` via `emitKernelBody()`. Callers inject
+backend-specific behavior through three callbacks:
+
+| Callback         | `codegenWasm` provides                        | `codegenNativeScanGeneral` provides                     |
+| ---------------- | --------------------------------------------- | ------------------------------------------------------- |
+| `emitOutputAddr` | `local.get(outputArg) + gidx * bw`             | Direct-write: `carryOut[c]`; else: `internal[idx]`       |
+| `emitExp`        | `translateExp(exp, {gidx, ridx})`              | `translateExpWithGeneralScanContext(exp, scanCtx)`        |
+| `emitStore`      | Simple typed store                             | Dual-store: primary + ysStacked (for direct-write + Y)   |
+
+The shared function handles: gidx loop structure, bounds check, reduction identity/accumulate/
+epilogue via `codegenReductionAccumulate()`, gidx increment, and loop branching.
 
 ---
 
