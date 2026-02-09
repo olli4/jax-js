@@ -2624,3 +2624,432 @@ only used 1 time (need 0). Remove 2x .ref (would leak memory).
 | No validation under transforms          | When JVP/vmap/grad is involved, validation is silently skipped |
 | No eager-mode validation                | Validation only runs during `jit` tracing, not in eager mode   |
 | `.dispose()` inside jit body undetected | Explicit `.dispose()` followed by re-use won't be caught       |
+
+---
+
+# Part 5: Non-Consuming Ownership Model
+
+> **Status:** This chapter describes the `feat/non-consuming-ops` branch. It supersedes the
+> move-semantic `.ref` patterns described throughout Parts 1–4. Once merged, the earlier parts
+> should be rewritten to reflect the new model — use this chapter as the authoritative guide.
+
+## Overview & Motivation
+
+Previously, jax-js used **move semantics**: every operation consumed its inputs (refcount −1), and
+reusing an array required `.ref` (refcount +1). This mirrored Rust-style ownership but created
+constant friction for users — forgetting a single `.ref` caused silent `UseAfterFreeError` crashes,
+and the error messages were cryptic. Every code example, tutorial, and library function was littered
+with `.ref` calls.
+
+The new model is **non-consuming operations**: calling `x.add(y)` creates a new array but leaves
+both `x` and `y` alive. Arrays are only freed when explicitly `.dispose()`'d (or when `evalJaxpr`'s
+automatic disposal triggers for intermediates). This matches the mental model of every other
+numerical library (NumPy, PyTorch, TensorFlow.js).
+
+### What changed for users
+
+**Before (move semantics):**
+
+```ts
+// Every reuse needed .ref — forget one and get UseAfterFreeError
+const f = (x: np.Array) => np.sqrt(x.ref.mul(x).sum());
+console.log(f(x.ref)); // .ref to keep x alive for next call
+console.log(grad(f)(x.ref)); // .ref again
+x.dispose(); // explicit cleanup when done
+```
+
+**After (non-consuming):**
+
+```ts
+// No .ref needed — arrays stay alive until explicitly disposed
+const f = (x: np.Array) => np.sqrt(x.mul(x).sum());
+console.log(f(x));
+console.log(grad(f)(x));
+x.dispose(); // still needed: explicit cleanup when fully done
+```
+
+### What stays the same
+
+- **`.dispose()` is still required** to free GPU/WASM memory when you're done with an array.
+  JavaScript has no reliable destructor, so explicit disposal remains necessary.
+- **`.ref` still exists** on `Array` — it increments `#rc` and returns `this`. Internal code and
+  advanced patterns can still use it. It's just never required in normal user code.
+- **`.data()` and `.dataSync()` no longer consume** — they read the buffer and return data, leaving
+  the array alive. This is a change from the old model where `.data()` consumed.
+- **JIT buffer recycling and the WebGPU buffer pool** work identically — they're compiler/backend
+  features unrelated to user-facing ownership.
+
+### Why `.dispose()` can't go away
+
+GPU buffers and WASM memory are finite resources that JavaScript's GC doesn't track. Without
+explicit disposal:
+
+1. A training loop creating arrays each step would exhaust GPU memory in seconds.
+2. `FinalizationRegistry` is too slow and unpredictable for real-time allocation patterns.
+3. The pool/recycler needs deterministic buffer return to maintain peak-memory guarantees.
+
+The tradeoff: `.dispose()` is one call per array at the end of its useful life. `.ref` was ~3–5
+calls per array per operation chain, embedded deep in arithmetic expressions. The new model is a
+large net reduction in boilerplate.
+
+## Architecture: How It Works
+
+### Layer-by-layer ownership semantics
+
+| Layer                         | Consumes inputs? | How disposal works                                          |
+| ----------------------------- | ---------------- | ----------------------------------------------------------- |
+| `EvalTrace.processPrimitive`  | **No**           | Delegates to impl rules, which create new arrays            |
+| `JaxprTrace.processPrimitive` | **No**           | Builds graph from tracer identity, never disposes tracers   |
+| `JVPTrace.processPrimitive`   | **No**           | Unpacks primals/tangents, calls JVP rule, wraps outputs     |
+| `BatchTrace.processPrimitive` | **No**           | Delegates to batching rules                                 |
+| `evalJaxpr`                   | **Auto-managed** | Counts usages from graph, disposes intermediates after last |
+| `jitCompile` / `JitProgram`   | **Auto-managed** | Emits `malloc`/`free`/`recycle` steps from graph structure  |
+| `.data()` / `.dataSync()`     | **No**           | Reads buffer, array stays alive                             |
+| `.dispose()`                  | **Yes** (manual) | Decrements `#rc`; frees backend resources at `#rc === 0`    |
+
+The key insight: **the JIT compiler and `evalJaxpr` derive lifetime information from the Jaxpr
+graph** (which variables are used how many times) rather than from user-provided `.ref` hints. This
+is both more correct and more ergonomic.
+
+### `evalJaxpr` auto-disposal (the `consumeRead` pattern)
+
+When executing a Jaxpr, `evalJaxpr` (in `src/frontend/jaxpr.ts`) pre-computes a `usageCount` for
+every `Var` — how many times it appears as an equation input or output. As each equation is
+evaluated, the count is decremented; when it hits zero **and** the variable isn't a jaxpr output,
+the array is disposed:
+
+```ts
+const consumeRead = (x: Atom) => {
+  if (x instanceof Var) {
+    const left = remainingRefs.get(x)!;
+    remainingRefs.set(x, left - 1);
+    if (left === 1 && !outputVars.has(x)) {
+      env.get(x)?.dispose();
+      env.delete(x);
+    }
+  }
+};
+```
+
+This means:
+
+- **Intermediates** (values created and fully consumed within the jaxpr) are disposed automatically.
+- **Outputs** (values returned to the caller) survive — the caller owns them.
+- **Arguments** from the caller survive — `evalJaxpr` never frees what it didn't create. (Arguments
+  that aren't used in any equation are simply never consumed.)
+
+### JIT compilation: same idea, compile-time
+
+`jitCompile` in `src/frontend/jit.ts` performs the same lifetime analysis at compile time, emitting
+explicit `malloc`, `free`, and `recycle` steps. The `insertFreeSteps()` method computes each slot's
+last-use point and inserts `free` after it. Then `recycleBuffers()` replaces adjacent `free→malloc`
+pairs of the same byte size with zero-cost `recycle` steps.
+
+At execution time, `JitProgram.execute()` runs these steps mechanically — no ref-counting at all.
+
+### JVPTracer refcounting
+
+`JVPTracer` (in `src/frontend/jvp.ts`) has its own `#rc` field. When a JVP transformation creates a
+tracer wrapping `(primal, tangent)`, the tracer starts with `#rc = 1`. `.ref` increments it,
+`.dispose()` decrements it. **Only when `#rc` hits 0** do the primal and tangent get disposed.
+
+This is necessary because JVP rules often create intermediate tracers that get passed around — the
+refcount prevents premature disposal of the underlying arrays.
+
+### PartialEvalTracer cascade (linearize.ts)
+
+`PartialEvalTracer.dispose()` cascades to two types of held values when `#rc` reaches 0:
+
+1. **Known pval values** — if the tracer holds a concrete `Array` (via `pval.isKnown`), that array
+   is disposed.
+2. **Const recipe values** — if the tracer's recipe is type `"Const"` (a lifted constant), its
+   `.val` is disposed.
+
+**Not cascaded:** `JaxprEqn.tracersIn` — the input tracers of equation recipes are NOT disposed by
+the cascade. Instead, they're handled by the graph-wide toposort cleanup in
+`partialEvalGraphToJaxpr()`. This prevents double-free when multiple equations share inputs.
+
+### Const ownership in `getOrMakeConstTracer`
+
+When tracing captures a constant (e.g., `np.array([2])` inside a `jit` body), `getOrMakeConstTracer`
+calls `val.ref` to give the `ClosedJaxpr` independent ownership of that constant. This means:
+
+- The constant's `#rc` goes from 1 (user creation) to 2 (user + `ClosedJaxpr`).
+- `ClosedJaxpr.dispose()` calls `.dispose()` on each const → `#rc` back to 1 (user's ref).
+- The user can still use the constant after the jaxpr is done.
+- If the user didn't hold a reference (anonymous inline `np.array(...)` inside a body), the user's
+  ref is the creation ref — see "Anonymous constant leak" below for the edge case.
+
+### `partialEvalGraphToJaxpr` const protection
+
+Before the graph-wide PETracer cleanup in `partialEvalGraphToJaxpr()`, constants are protected with
+an extra `.ref`:
+
+```ts
+for (const t of consts) t.ref; // Protect from PETracer cascade
+```
+
+This prevents the PETracer cascade (which disposes known values) from freeing constants that the
+returned `ClosedJaxpr` needs to own. After the cleanup, the `ClosedJaxpr` holds these refs.
+
+### `evalJaxprTransposed` arg-primal protection
+
+In `evalJaxprTransposed` (the backward pass of `grad`), the function receives argument primals that
+are owned by the caller (typically `ClosedJaxpr` consts from the forward pass). These **must not**
+be freed. An `argPrimals` set tracks which primals came from arguments vs. which were computed
+internally:
+
+```ts
+const argPrimals = new Set(jaxpr.inVars.filter((_, i) => ...));
+// At cleanup:
+for (const [v, t] of knownPrimals.entries()) {
+  if (!argPrimals.has(v)) t.dispose(); // Only dispose COMPUTED primals
+}
+```
+
+### Scan: `closedJaxpr.dispose()` for captured constants
+
+When `lax.scan` traces a body function, any constants captured in the body (via
+`getOrMakeConstTracer`) get a `.ref` for the `ClosedJaxpr`. After the scan completes execution,
+`closedJaxpr.dispose()` is called to release these refs:
+
+```ts
+// In lax-scan.ts, after scan execution:
+closedJaxpr.dispose(); // decrements ref on each const from getOrMakeConstTracer
+```
+
+This is called on both the normal path and the length-0 early-return path.
+
+## Friction Points & Edge Cases
+
+### Anonymous constants in scan bodies leak 1 slot
+
+**Problem:** If you create an anonymous `np.array(...)` inside a scan body, it leaks:
+
+```ts
+// ⚠️ LEAKS: the np.array([2, 3]) has rc=1 (creation), getOrMakeConstTracer adds rc=2,
+// closedJaxpr.dispose() drops to rc=1, but nobody holds a reference to call dispose() again
+const step = (carry, x) => {
+  return [np.add(carry, x), np.multiply(x, np.array([2, 3]))]; // anonymous const leaks!
+};
+lax.scan(step, init, xs);
+```
+
+**Workaround:** Extract anonymous constants to named variables and dispose them after the scan:
+
+```ts
+const factor = np.array([2, 3]);
+const step = (carry, x) => {
+  return [np.add(carry, x), np.multiply(x, factor)];
+};
+const [carry, ys] = lax.scan(step, init, xs);
+// ... use carry, ys ...
+carry.dispose();
+ys.dispose();
+factor.dispose(); // user explicitly frees the constant
+```
+
+**Root cause:** `getOrMakeConstTracer` does `val.ref` (rc → 2). `closedJaxpr.dispose()` drops it to
+rc=1. For user-held consts (like `factor`), the user's dispose drops it to 0. For anonymous consts,
+nobody ever calls the final dispose.
+
+**Potential fix (not yet implemented):** Track anonymous constants separately in the scan path —
+constants whose only reference is the `ClosedJaxpr` could be freed fully by `closedJaxpr.dispose()`
+without the extra `.ref`. This requires distinguishing "user-held" from "anonymous" consts at trace
+time, which is not straightforward.
+
+### `.dispose()` on scan outputs is required
+
+Scan outputs (carry and stacked ys) are owned by the caller. In the old model, `.data()` consumed
+them, so no explicit dispose was needed. Now:
+
+```ts
+const [carry, ys] = lax.scan(step, init, xs);
+await carry.data(); // reads data but does NOT free
+await ys.data(); // reads data but does NOT free
+carry.dispose(); // required!
+ys.dispose(); // required!
+```
+
+This applies to all operation outputs — `.data()` is purely a read operation now.
+
+### `tree.dispose()` removed from optax
+
+All `tree.dispose(params)` and `tree.dispose(updates)` calls were removed from `packages/optax/src/`
+(base.ts, combine.ts, transform.ts). In the old model, optimizer update functions consumed params
+and updates; now they don't. The caller is responsible for disposing params/updates when fully done
+with them.
+
+Similarly, `ipow()` in `treeUtils.ts` no longer disposes its input `a` — it just chains `.mul()`
+calls which create new arrays without touching `a`.
+
+### JIT bodies: operations don't consume, but graph-based disposal still works
+
+Inside a `jit` body, the Jaxpr graph captures exactly which values are used how many times. The
+compiler emits precise `free` steps. This means:
+
+```ts
+const f = jit((x) => {
+  const a = x.mul(x); // x used twice — graph records 2 uses
+  const b = a.add(x); // a used once, x used third time
+  return b; // b is output, not freed
+});
+// At execution: x is freed after b=a+x, a is freed after b=a+x
+```
+
+The compiled program manages all intermediates. The caller just needs to dispose `f`'s output and
+eventually `f.dispose()` to free captured constants.
+
+### The `validateRefs` option is declared but currently unused
+
+`JitOpts` has `validateRefs?: boolean` and `jit()` accepts it, but the actual validation logic from
+Part 4 (always-autoRef tracing, `validateRefCounts()`) was part of the old model. In the
+non-consuming model, ref validation is moot — there's nothing to validate because operations don't
+consume. The option exists for forward compatibility but has no effect.
+
+## Changes by File
+
+### Core runtime
+
+| File                        | What changed                                                               |
+| --------------------------- | -------------------------------------------------------------------------- |
+| `src/frontend/array.ts`     | Operations don't decrement `#rc`; `.data()`/`.dataSync()` don't consume    |
+| `src/frontend/jaxpr.ts`     | `evalJaxpr` uses `consumeRead`; `getOrMakeConstTracer` refs all consts     |
+| `src/frontend/core.ts`      | `MainTrace` gets `isTransform?: boolean` for JVP/vmap detection            |
+| `src/frontend/jvp.ts`       | `JVPTracer` has `#rc`; processPrimitive non-consuming; Mod JVP rule fixed  |
+| `src/frontend/linearize.ts` | PETracer cascade: known + Const only; `evalJaxprTransposed` argPrimals Set |
+| `src/frontend/vmap.ts`      | BatchTrace non-consuming                                                   |
+| `src/library/lax-scan.ts`   | `closedJaxpr.dispose()` on both normal and n=0 paths                       |
+| `src/library/numpy.ts`      | Removed `.ref` from internal implementations                               |
+| `src/library/nn.ts`         | Removed `.ref` from internal implementations                               |
+
+### Packages
+
+| File                                   | What changed                                              |
+| -------------------------------------- | --------------------------------------------------------- |
+| `packages/optax/src/transform.ts`      | Removed all `tree.dispose(params/updates)` (~12 calls)    |
+| `packages/optax/src/base.ts`           | Removed `tree.dispose(params)` from init/update functions |
+| `packages/optax/src/combine.ts`        | Removed `tree.dispose(params)` from chain.init/.update    |
+| `packages/optax/src/treeUtils.ts`      | `ipow()` no longer disposes input or intermediates        |
+| `packages/onnx/src/ops/elementwise.ts` | Removed `.ref` from op implementations                    |
+
+### Tests & benchmarks
+
+- **All `.ref` calls removed** from test assertions and function bodies across ~30 test files
+- **Leak tests updated** — outputs are explicitly `.dispose()`'d after `.data()`
+- **`test/leak-diagnostic.test.ts`** — anonymous inline consts extracted to named variables
+- **`test/refcount.test.ts`** — rewritten: tests now verify that `grad(f)(x)` does NOT consume `x`
+- **Scan tests** — `return [newCarry.ref, newCarry]` → `return [newCarry, newCarry]` throughout
+- **Deno WebGPU tests/benchmarks** — all `.ref` removed
+
+### Website & demos
+
+- **All `.ref` removed** from REPL examples, Mandelbrot, MNIST, MobileCLIP, TTS demos
+- **`tree.ref(params)`** → `params` in MNIST and MobileCLIP
+- **`tree.ref(model)`** → `model` in TTS inference
+
+## Possible Problems That Might Surface
+
+### 1. Memory pressure from non-disposal
+
+With the old model, forgetting `.ref` caused immediate crashes — painful but at least conspicuous.
+With the new model, forgetting `.dispose()` causes silent memory leaks. A long-running training loop
+might gradually exhaust GPU memory without any error until allocation fails.
+
+**Mitigation strategies:**
+
+- The `slotCount()` diagnostic (from `getBackend()) as any`)` can be checked before/after
+  operations.
+- `using` declarations (`Symbol.dispose`) work — `using x = np.array(...)` will auto-dispose at
+  block end.
+- Future: a diagnostic mode that logs undisposed arrays with creation stack traces.
+
+### 2. Intermediate arrays live longer than necessary in eager mode
+
+In the old consuming model, `x.add(y).mul(z)` freed `x.add(y)`'s result immediately when `.mul`
+consumed it. Now the intermediate lives until GC or explicit dispose. In eager mode (no `jit`), this
+means more live memory at any given time.
+
+In `jit` mode, this is not an issue — the compiler inserts precise `free` steps. The pool and
+recycler handle the rest.
+
+### 3. `ClosedJaxpr.dispose()` timing
+
+If `closedJaxpr.dispose()` is called too early (before execution finishes reading consts), it would
+free constants prematurely. If called too late (or not at all), constants leak. Currently it's
+called at two points in `lax-scan.ts` — immediately after scan execution and on the length-0 path.
+
+For `jit()`, the `JitProgram` owns captured constants and `jit.dispose()` frees them. The eager
+`Primitive.Scan` impl calls `closedJaxpr.dispose()` directly.
+
+### 4. PETracer cascade sensitivity
+
+The PETracer cascade in `linearize.ts` is the most delicate part of the ownership model. It cascades
+to known values and Const recipe values but NOT to JaxprEqn tracersIn. Getting this wrong causes
+either double-free (cascade too aggressively) or leaks (cascade too conservatively).
+
+The current design was arrived at by testing against the full suite including `jvp(grad(sin))`,
+`hessian`, and all scan/grad compositions. Any future change to how `PartialEvalTracer` creates
+recipes or tracks values should be tested against these cases.
+
+### 5. JVPTracer `#rc` subtlety
+
+JVPTracers start at `#rc = 1`. Each `.ref` increments, each `.dispose()` decrements. But JVP rules
+create intermediate JVPTracers that are passed around — if a rule creates a tracer, passes it to
+`bind()`, and also returns it, the refcount must be correct. The current JVP rules were all audited
+for this, but new JVP rules (for new operations) need to follow the same patterns.
+
+### 6. Mixed old/new code
+
+If any code path still assumes consuming semantics (decrementing `#rc` after passing to an
+operation), it will cause double-free bugs. The migration removed all such patterns from the
+codebase, but third-party code or future additions that copy old patterns from git history would
+break.
+
+## Testing the ownership model
+
+### Quick correctness check
+
+```bash
+pnpm build && pnpm vitest run
+```
+
+All 1130+ tests should pass. The 5 known-flaky tests (numpy-fft WASM ×3, LU JVP precision ×1, random
+categorical ×1) are unrelated to ownership.
+
+### Leak detection
+
+Use `slotCount()` before and after operations:
+
+```ts
+const before = (getBackend() as any).slotCount();
+// ... operations ...
+const after = (getBackend() as any).slotCount();
+expect(after - before).toBe(0); // no leaks
+```
+
+The `test/leak-diagnostic.test.ts` file has 9 tests covering scan leak patterns.
+
+### Transform compositions to verify
+
+These are the compositions most sensitive to ownership bugs:
+
+| Composition         | What it tests                                              |
+| ------------------- | ---------------------------------------------------------- |
+| `grad(f)(x)`        | VJP + transpose — tests evalJaxprTransposed arg protection |
+| `jvp(grad(f), ...)` | Nested JVP + PETracer — tests PETracer cascade correctness |
+| `hessian(f)(x)`     | Double differentiation — stress-tests all ownership layers |
+| `jit(grad(scan))    | Scan body tracing + grad + JIT — tests const ownership     |
+| `vmap(grad(scan))`  | All layers combined                                        |
+
+### Debugging ownership issues
+
+If a `UseAfterFreeError` or `ReferenceError` appears:
+
+1. **Identify the array** — the error includes the array's shape/dtype.
+2. **Check disposal timing** — is some code path calling `.dispose()` prematurely? Common in
+   `evalJaxprTransposed` (check `argPrimals` set) or PETracer cascade.
+3. **Check `getOrMakeConstTracer`** — is a constant being disposed before the jaxpr that uses it?
+4. **Add `console.log(slotCount())` checkpoints** around the failing code to narrow down where slots
+   are being freed.
+5. **Test with CPU backend** — CPU is simplest and has the clearest error messages.
