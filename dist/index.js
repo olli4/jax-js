@@ -1,6 +1,73 @@
 import { __export } from "./chunk-Cl8Af3a2.js";
 import { AluExp, AluGroup, AluOp, AluVar, DEBUG, DType, FpHash, Kernel, PPrint, Reduction, Routine, Routines, ShapeTracker, accessorAluExp, accessorGlobal, assertNonNull, byteWidth, checkAxis, checkInts, deepEqual, defaultDevice, devices, dtypedArray, dtypedJsArray, generalBroadcast, getBackend, getScanRoutineInfo, init, invertPermutation, isFloatDtype, isNumberPair, isPermutation, normalizeAxis, partitionList, prod, promoteTypes, range, recursiveFlatten, rep, runWithCache, setDebug, toposort, unravelAlu, unzip2, zip, zipn } from "./backend-C_OH9-qi.js";
 
+//#region src/frontend/check-leaks.ts
+/** Whether leak tracking is currently enabled. Checked in Array constructor/dispose. */
+let _leakTrackingEnabled = false;
+/** Map from live tracked Array → creation stack trace string. */
+const _leakTrackingMap = /* @__PURE__ */ new Map();
+/** Snapshot of slot counts per backend device at start. */
+const _startSlotCounts = /* @__PURE__ */ new Map();
+/** Devices to check, captured at start time. */
+const _devices = [];
+/** Get slot count from a backend (all 3 implement slotCount()). */
+function slotCount(device) {
+	return getBackend(device).slotCount();
+}
+/** Parse a stack trace to find the first user-code frame (skip jax-js internals). */
+function parseUserFrame(stack$1) {
+	const lines = stack$1.split("\n");
+	for (const line of lines) {
+		const trimmed = line.trim();
+		if (trimmed.startsWith("Error")) continue;
+		if (trimmed.includes("/src/frontend/") || trimmed.includes("/src/backend/") || trimmed.includes("/src/library/") || trimmed.includes("/src/alu") || trimmed.includes("/src/routine") || trimmed.includes("/src/shape") || trimmed.includes("/src/tree") || trimmed.includes("/src/utils") || trimmed.includes("/src/index") || trimmed.includes("/dist/") || trimmed.includes("node_modules")) continue;
+		return trimmed;
+	}
+	return lines.find((l) => l.trim().startsWith("at"))?.trim() ?? "(unknown)";
+}
+const checkLeaks = {
+	start() {
+		_leakTrackingMap.clear();
+		_startSlotCounts.clear();
+		_devices.length = 0;
+		try {
+			const device = getBackend().type;
+			const count = slotCount(device);
+			_startSlotCounts.set(device, count);
+			_devices.push(device);
+		} catch {}
+		_leakTrackingEnabled = true;
+	},
+	stop() {
+		_leakTrackingEnabled = false;
+		let leaked = 0;
+		for (const device of _devices) {
+			const before = _startSlotCounts.get(device) ?? 0;
+			const after = slotCount(device);
+			leaked += after - before;
+		}
+		const details = [];
+		for (const [arr, stack$1] of _leakTrackingMap) {
+			const desc = typeof arr.toString === "function" ? arr.toString() : "(unknown array)";
+			const frame = parseUserFrame(stack$1);
+			details.push(`${desc} created at ${frame}`);
+		}
+		_leakTrackingMap.clear();
+		_startSlotCounts.clear();
+		_devices.length = 0;
+		const summary = leaked === 0 ? "No leaks detected." : `${leaked} slot(s) leaked:\n${details.length > 0 ? details.map((d) => `  - ${d}`).join("\n") : "  (no tracked arrays — leak may be from internal allocations)"}\n\nWrap computation in jit() or call .dispose().`;
+		return {
+			leaked,
+			details,
+			summary
+		};
+	},
+	get active() {
+		return _leakTrackingEnabled;
+	}
+};
+
+//#endregion
 //#region src/frontend/convolution.ts
 /**
 * Check that the shapes and parameters passed to convolution are valid.
@@ -3363,6 +3430,7 @@ var Array$1 = class Array$1 extends Tracer {
 		this.#pendingSet = new Set(args.pending);
 		if (this.#pendingSet.size === 0) this.#pendingSet = null;
 		else if (this.#source instanceof AluExp) throw new Error("internal: AluExp source cannot have pending executes");
+		if (_leakTrackingEnabled) _leakTrackingMap.set(this, (/* @__PURE__ */ new Error()).stack ?? "(no stack)");
 	}
 	/** @ignore */
 	get aval() {
@@ -3402,6 +3470,7 @@ var Array$1 = class Array$1 extends Tracer {
 	dispose() {
 		this.#check();
 		if (--this.#rc === 0) {
+			if (_leakTrackingEnabled) _leakTrackingMap.delete(this);
 			for (const exe of this.#pending) exe.updateRc(-1);
 			if (typeof this.#source === "number") this.#backend.decRef(this.#source);
 		}
@@ -9821,4 +9890,4 @@ async function devicePut(x, device) {
 }
 
 //#endregion
-export { Array$1 as Array, ClosedJaxpr, DType, Jaxpr, blockUntilReady, defaultDevice, devicePut, devices, getBackend, grad, hessian, init, jacfwd, jacrev as jacobian, jacrev, jit, jvp, lax_exports as lax, linearize, makeJaxpr, nn_exports as nn, numpy_exports as numpy, random_exports as random, scipy_special_exports as scipySpecial, setDebug, tree_exports as tree, valueAndGrad, vjp, vmap };
+export { Array$1 as Array, ClosedJaxpr, DType, Jaxpr, blockUntilReady, checkLeaks, defaultDevice, devicePut, devices, getBackend, grad, hessian, init, jacfwd, jacrev as jacobian, jacrev, jit, jvp, lax_exports as lax, linearize, makeJaxpr, nn_exports as nn, numpy_exports as numpy, random_exports as random, scipy_special_exports as scipySpecial, setDebug, tree_exports as tree, valueAndGrad, vjp, vmap };

@@ -1342,6 +1342,31 @@ declare function logspace(start: number, stop: number, num?: number, endpoint?: 
   device
 }?: DTypeAndDevice): Array;
 //#endregion
+//#region src/frontend/check-leaks.d.ts
+interface LeakReport {
+  /** Number of leaked backend slots (delta from start). */
+  leaked: number;
+  /** Array descriptions with creation locations (best-effort from tracking map). */
+  details: string[];
+  /** Human-readable summary string. */
+  summary: string;
+}
+declare const checkLeaks: {
+  /**
+   * Start tracking array allocations. Takes a snapshot of backend slot counts
+   * and enables the creation tracking map for diagnostic details.
+   */
+  start(): void;
+  /**
+   * Stop tracking and return a report of leaked backend slots.
+   * The `leaked` count is the total slot count delta across all backends.
+   * The `details` array provides descriptions of tracked arrays still alive.
+   */
+  stop(): LeakReport;
+  /** Whether leak tracking is currently active. */
+  readonly active: boolean;
+};
+//#endregion
 //#region src/frontend/linearize.d.ts
 /** @inline */
 type GradOpts = {
@@ -3184,4 +3209,4 @@ declare function blockUntilReady<T extends JsTree<any>>(x: T): Promise<T>;
  */
 declare function devicePut<T extends JsTree<any>>(x: T, device?: Device): Promise<MapJsTree<T, number | boolean, Array>>;
 //#endregion
-export { Array, ClosedJaxpr, DType, type Device, Jaxpr, type JsTree, type JsTreeDef, type OwnedFunction, type ScanPath, blockUntilReady, defaultDevice, devicePut, devices, getBackend, grad, hessian, init, jacfwd, jacrev as jacobian, jacrev, jit, jvp, lax_d_exports as lax, linearize, makeJaxpr, nn_d_exports as nn, numpy_d_exports as numpy, random_d_exports as random, scipy_special_d_exports as scipySpecial, setDebug, tree_d_exports as tree, valueAndGrad, vjp, vmap };
+export { Array, ClosedJaxpr, DType, type Device, Jaxpr, type JsTree, type JsTreeDef, type LeakReport, type OwnedFunction, type ScanPath, blockUntilReady, checkLeaks, defaultDevice, devicePut, devices, getBackend, grad, hessian, init, jacfwd, jacrev as jacobian, jacrev, jit, jvp, lax_d_exports as lax, linearize, makeJaxpr, nn_d_exports as nn, numpy_d_exports as numpy, random_d_exports as random, scipy_special_d_exports as scipySpecial, setDebug, tree_d_exports as tree, valueAndGrad, vjp, vmap };
