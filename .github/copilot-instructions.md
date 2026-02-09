@@ -73,9 +73,10 @@ naturally.
 - **Lightweight over exhaustive** — prefer a small, composable set of primitives over a large
   surface area of specialized ops. If something can be expressed via existing primitives and `jit`,
   that's preferred over adding a new backend kernel.
-- **Explicit disposal over GC** — JavaScript has no reliable destructor, so jax-js uses explicit
-  `.dispose()` for memory management. This is a deliberate choice, not a workaround. It enables
-  predictable memory management on GPU, which is essential for real applications.
+- **Explicit disposal over GC** — operations don't consume inputs, but GPU/WASM buffers must be
+  freed explicitly via `.dispose()` when no longer needed. Inside `jit()`, the compiler manages
+  intermediate lifetimes automatically. See [Memory management](#memory-management--ownership) for
+  details.
 - **Compounding returns** — every improvement to the compiler makes _all_ operations faster, every
   new primitive gets autodiff for free, every `jit`-wrapped function gets kernel fusion
   automatically. Prioritize work that compounds.
@@ -88,7 +89,8 @@ When deciding what to work on, prefer work in this order:
 2. **API breadth** — approximate NumPy/JAX API compatibility (see `FEATURES.md` for the status
    table). The goal is that common JAX/NumPy patterns can be ported with minimal changes.
 3. **Performance** — there is significant headroom, especially in:
-   - WASM backend (SIMD, loop unrolling, multi-threading via SharedArrayBuffer).
+   - WASM backend (SIMD is used for Cholesky f32; extending to matmul/elementwise kernels and adding
+     multi-threading via SharedArrayBuffer are open opportunities).
    - Transformer inference (currently ~1/3 of raw matmul GFLOP/s).
    - Conv2d and other operations that haven't been tuned yet.
 4. **Demos and applications** — fluid simulations, neural networks, audio processing, embedding
@@ -216,6 +218,13 @@ sudo usermod -a -G render,video $USER  # then log out/in
 Operations **do not consume** their inputs. Arrays stay alive until explicitly `.dispose()`'d.
 `.data()` and `.dataSync()` read the buffer without consuming.
 
+> **Note:** The upstream jax-js repository uses **move semantics** — every operation consumes its
+> inputs (refcount −1), and reusing an array requires `.ref` (refcount +1). This fork replaces that
+> with a non-consuming model: operations leave inputs alive, and `.ref` is never needed in user
+> code. The change eliminates a major source of `UseAfterFreeError` bugs while keeping the same
+> underlying Slot-based memory system. If you encounter `.ref` patterns in upstream code or git
+> history, they are not needed here.
+
 ```ts
 // Arrays can be reused freely — no .ref needed
 function foo(x, y) {
@@ -241,7 +250,7 @@ pool/recycler needs deterministic buffer return to maintain peak-memory guarante
 `.dispose()` is one call per array at the end of its useful life. `using` declarations
 (`Symbol.dispose`) also work — `using x = np.array(...)` will auto-dispose at block end.
 
-Canonical examples: `test/refcount.test.ts`, `test/conv.test.ts`, `test/deno/webgpu.test.ts`.
+Canonical examples: `test/refcount.test.ts`, `test/leak-diagnostic.test.ts`, `test/deno/webgpu.test.ts`.
 
 ### Memory lifecycle
 

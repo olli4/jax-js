@@ -9,11 +9,11 @@
  * jax-js includes a workaround for Deno's createComputePipelineAsync bug
  * by using the synchronous createComputePipeline when running in Deno.
  *
- * jax-js Reference Counting:
- * - Arrays passed to functions are CONSUMED (refcount -1, internal dispose)
- * - .data() CONSUMES the array (reads data then disposes)
- * - Use  to KEEP an array alive for reuse
- * - Don't manually .dispose() arrays that are consumed
+ * jax-js Ownership Model:
+ * - Operations do NOT consume their inputs — arrays stay alive until .dispose()
+ * - .data() reads the buffer without consuming — array stays alive
+ * - .dispose() is required to free GPU buffers when done
+ * - Inside jit() bodies, the compiler manages intermediate lifetimes automatically
  *
  * Memory Leak Detection:
  * - Tests use withLeakCheck() to verify no GPU buffers are leaked
@@ -88,9 +88,8 @@ Deno.test({
 
     defaultDevice("webgpu");
 
-    // a and b are CONSUMED by np.add
-    // c is CONSUMED by .data()
-    // No manual dispose needed
+    // a, b, c stay alive until disposed or GC'd
+    // Inside withLeakCheck, jitF.dispose() handles cleanup
     const a = np.array([1, 2, 3, 4]);
     const b = np.array([5, 6, 7, 8]);
     const c = np.add(a, b);
@@ -140,18 +139,18 @@ Deno.test({
 
     defaultDevice("webgpu");
 
-    // x keeps x alive for second use, x keeps for third use
+    // x can be reused freely — no .ref needed
     const f = (x: np.Array) => {
       const two = np.array([2]);
-      const x2 = np.multiply(x, x); // need  on both since we use x again
-      return np.add(x2, np.multiply(x, two)); // x consumed here
+      const x2 = np.multiply(x, x);
+      return np.add(x2, np.multiply(x, two));
     };
     const jitF = jit(f);
 
     const x = np.array([1, 2, 3, 4]);
-    const result = jitF(x); // x is consumed by jitF
+    const result = jitF(x);
 
-    const data = await result.data(); // result is consumed by .data()
+    const data = await result.data();
     // x^2 + 2x for x = [1,2,3,4] => [3, 8, 15, 24]
     assertEquals(Array.from(data), [3, 8, 15, 24]);
 
@@ -177,9 +176,9 @@ Deno.test({
     const gradF = grad(f);
 
     const x = np.array([1, 2, 3]);
-    const dx = gradF(x); // x is consumed
+    const dx = gradF(x);
 
-    const data = await dx.data(); // dx is consumed by .data()
+    const data = await dx.data();
     // d/dx(sum(x^2)) = 2x => [2, 4, 6]
     assertEquals(Array.from(data), [2, 4, 6]);
   }),
@@ -202,12 +201,12 @@ Deno.test({
       [4, 5, 6],
     ]);
 
-    // Use  to keep x alive for multiple operations
+    // x can be reused freely in multiple operations
     const sumAll = np.sum(x);
     const sumAxis0 = np.sum(x, 0);
-    const sumAxis1 = np.sum(x, 1); // last use, no  needed
+    const sumAxis1 = np.sum(x, 1);
 
-    // Each .data() consumes its array
+    // .data() reads without consuming — arrays stay alive
     assertEquals(Array.from(await sumAll.data()), [21]);
     assertEquals(Array.from(await sumAxis0.data()), [5, 7, 9]);
     assertEquals(Array.from(await sumAxis1.data()), [6, 15]);

@@ -568,7 +568,7 @@ jax-js implements the same PRNG, with bitwise identical outputs. However, most s
 | `wrap_key_data` | ⚪️      | keys are just uint32 arrays   |
 | `fold_in`       | 🟠      |                               |
 | `split`         | 🟢      | not vmappable yet             |
-| `clone`         | ⚪️      | arrays are not consumed; use `.ref` to share ownership |
+| `clone`         | ⚪️      | not needed — operations don't consume inputs |
 | `PRNGKey`       | ⚪️      | legacy                        |
 
 **Samplers:** These are all 🟠 assuming that sampling from distributions is usually easier than

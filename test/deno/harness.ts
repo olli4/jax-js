@@ -5,7 +5,7 @@
  *   import { withLeakCheck, assertNoLeaks, getSlotCount } from "./harness.ts";
  *
  *   Deno.test("my test", withLeakCheck(async () => {
- *     // test code - all arrays should be consumed by end
+ *     // test code - all arrays should be disposed by end
  *   }));
  *
  * Or manually:

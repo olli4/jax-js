@@ -78,7 +78,7 @@ Deno.test({
     const N = 20;
     for (let i = 0; i < N; i++) {
       const result = f(x);
-      await result.data(); // consumes result
+      await result.data(); // reads result (not consumed)
     }
 
     const afterBytes = getGpuBytes();
