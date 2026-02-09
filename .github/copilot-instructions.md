@@ -3053,3 +3053,129 @@ If a `UseAfterFreeError` or `ReferenceError` appears:
 4. **Add `console.log(slotCount())` checkpoints** around the failing code to narrow down where slots
    are being freed.
 5. **Test with CPU backend** — CPU is simplest and has the clearest error messages.
+
+## Eager-Mode Memory Management: Design Analysis
+
+The non-consuming model creates one gap: **eager-mode intermediates are not auto-freed**. Previously
+`x.mul(y).add(z)` freed the `mul` result when `add` consumed it. Now the intermediate lives until
+explicit `.dispose()` or GC (which doesn't track GPU/WASM memory). This section documents the design
+space that was evaluated and the recommended approach.
+
+### Why `jit()` is the primary answer
+
+`jit()` already provides optimal eager memory management:
+
+| Property                   | `jit()` body                         | Eager (no jit)               |
+| -------------------------- | ------------------------------------ | ---------------------------- |
+| Intermediate lifetime      | Freed at exact last-use              | Lives until `.dispose()` / GC |
+| Peak memory                | O(max concurrent live)               | O(all intermediates)         |
+| Buffer reuse within scope  | Full `recycleBuffers()` pass         | None until pool recycles     |
+| Kernel fusion              | Yes (huge perf win)                  | None                         |
+| Pool integration           | Compile-time recycling, zero overhead | Individual dispose→pool      |
+| Caching across calls       | Trace once, run many                 | N/A                          |
+
+A chain of 10 ops on a 500MB tensor: `jit()` peaks at ~1.5GB (input + 1 recycled intermediate);
+eager peaks at ~5.5GB (input + 10 live intermediates simultaneously).
+
+The guidance for users is: **wrap your compute in `jit()`**. This is already true for performance
+(kernel fusion, dispatch overhead). Automatic memory management is just another reason.
+
+### Alternatives evaluated
+
+#### `tidy()` (TF.js-style scope cleanup)
+
+```ts
+const result = tidy(() => a.mul(2).add(3).sqrt());
+// All intermediates auto-disposed at scope exit; only result survives.
+```
+
+**Pros:** Handles any topology (multi-input, branches, pytrees), well-precedented (TF.js).
+
+**Cons:**
+- All intermediates are live simultaneously — no buffer reuse within the scope. Peak memory is the
+  same as unmanaged eager; disposal just happens at scope end instead of never.
+- Only sync — breaks at `await` boundaries.
+- Provides a weaker alternative to `jit()` that doesn't exist in JAX, adding API surface without
+  adding capability.
+- Hides bugs rather than educating users toward `jit()`.
+
+**Verdict:** Skip. `jit()` is strictly better for memory and performance. `tidy()` is a crutch for
+people who won't/can't use `jit()`, and the group that genuinely can't (dynamic control flow with
+large tensors) is small. If that pattern becomes common (e.g., RL environments), revisit.
+
+#### `pipe()` (functional chain with per-step cleanup)
+
+```ts
+const b = np.pipe(a, x => x.mul(2), x => x.add(3), x => x.sqrt());
+// Each intermediate disposed before next step — only 1 extra buffer live at a time.
+```
+
+**Pros:** Trivial implementation (~15 lines), gets peak memory down to 1 extra buffer (vs N for
+`tidy()`), zero backend changes needed.
+
+**Cons:** Only works for linear single-input→single-output chains. Multi-input patterns like
+`a.mul(b).add(a)` don't fit. Still no buffer reuse (each step allocates fresh, old goes to pool).
+
+**Verdict:** Nice ergonomic sugar but doesn't justify a public API for a narrow pattern. Users can
+write it themselves in 5 lines.
+
+#### `.donate()` (opt-in buffer transfer)
+
+```ts
+const b = a.donate().mul(2); // a is dead, buffer reused in-place for b
+```
+
+**Pros:** True zero-allocation when sizes match — the only option that actually reuses buffers
+within a single expression.
+
+**Cons:**
+- Brings back `UseAfterFreeError` risk (the exact problem the non-consuming model eliminated).
+- Requires backend changes — ops must accept a "write output into this input buffer" hint.
+- Multi-input patterns need `.ref` again: `a.ref.donate().mul(a.donate())` — old complexity returns.
+- Inside `jit()` bodies: useless (compiler already knows lifetimes). For JIT *arguments*: the pool
+  already handles it (warm pool → ~10ns pop vs ~5µs `createBuffer`).
+
+**Verdict:** Defer. Only valuable if profiling shows the pool isn't fast enough for large buffers in
+eager hot paths. Don't reintroduce the footgun that the non-consuming model eliminated.
+
+#### In-place ops `mul_()` and `out=` parameter (PyTorch/NumPy style)
+
+**Hard no.** Both require mutability, which breaks tracing (JIT can't trace side effects) and
+autodiff (in-place mutation invalidates the computation graph). Fundamentally incompatible with
+JAX's immutable-array design.
+
+### Recommended approach: `checkLeaks` diagnostic
+
+Instead of runtime cleanup helpers, invest in **detection + guidance**:
+
+```ts
+import { checkLeaks } from '@jax-js/jax';
+
+checkLeaks.start();  // snapshot slot count + enable stack capture
+// ... user code ...
+const report = checkLeaks.stop();  // diff, report undisposed arrays with creation locations
+// "Array(float32[512,512]) created at model.ts:42 was not disposed.
+//  Wrap computation in jit() or call .dispose()."
+```
+
+**Why this is better than `tidy()`:**
+- Zero overhead in production (off by default, stack capture only when enabled).
+- Educates users toward `jit()` rather than providing a weaker alternative.
+- Actually helps find bugs, whereas `tidy()` hides them.
+- Keeps the API surface JAX-compatible (no TF.js concepts).
+- The V8 stack tells users *where* arrays were created, not just *that* something leaked.
+
+**Implementation:** ~50 lines. Module-level `_leakTracking: boolean` flag, a `Map<Array, string>`
+for creation stacks, `start()`/`stop()` toggle the flag and diff the map, `parseUserFrame()` from
+the autoref infrastructure extracts `file:line:col`.
+
+### Decision summary
+
+| Approach          | Eager memory | Buffer reuse | Footgun risk | Complexity | Recommendation              |
+| ----------------- | ------------ | ------------ | ------------ | ---------- | --------------------------- |
+| `jit()`           | Optimal      | Full         | None         | Already done | **Primary answer**         |
+| `tidy()`          | Cleanup only | None         | None         | ~40 lines  | Skip — `jit()` is better    |
+| `pipe()`          | 1 extra buf  | Pool only    | None         | ~15 lines  | Skip — too narrow            |
+| `.donate()`       | Zero-alloc   | True reuse   | High         | ~100 lines | Defer — pool handles it      |
+| `checkLeaks`      | Diagnostic   | N/A          | None         | ~50 lines  | **Implement** (complements jit) |
+| In-place / `out=` | Zero-alloc   | True reuse   | Breaks model | N/A        | **Never** — incompatible     |
