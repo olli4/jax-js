@@ -29,8 +29,7 @@ export type Schedule = (count: number) => number;
 export type ScalarOrSchedule = number | Schedule;
 
 /** Simplest possible state for a transformation. */
-export function initEmptyState(params: JsTree<np.Array>) {
-  tree.dispose(params);
+export function initEmptyState(_params: JsTree<np.Array>) {
   return [];
 }
 
@@ -43,7 +42,6 @@ export function identity(): GradientTransformation {
       state: OptState,
       params?: Params,
     ): [Params, OptState] {
-      tree.dispose(params);
       return [updates, state];
     },
   };
@@ -58,7 +56,6 @@ export function setToZero(): GradientTransformation {
       state: OptState,
       params?: Params,
     ): [Params, OptState] {
-      tree.dispose(params);
       const zeros = tree.map((g: np.Array) => np.zerosLike(g), updates);
       return [zeros, state];
     },

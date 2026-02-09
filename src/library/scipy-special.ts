@@ -12,7 +12,7 @@ export { logSoftmax } from "./nn";
  * The logit function, `logit(p) = log(p / (1-p))`.
  */
 export const logit = jit(function logit(x: Array): Array {
-  return log(x.ref.div(subtract(1, x)));
+  return log(x.div(subtract(1, x)));
 });
 
 export { logsumexp } from "./nn";

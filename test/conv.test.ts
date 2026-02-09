@@ -24,7 +24,7 @@ suite.each(devices)("device:%s", (device) => {
   test("1d convolution", () => {
     const x = np.array([[[1, 2, 3, 4, 5]]]);
     const y = np.array([[[2, 0.5, -1]]]);
-    const result = lax.convGeneralDilated(x.ref, y.ref, [1], "VALID");
+    const result = lax.convGeneralDilated(x, y, [1], "VALID");
     expect(result.js()).toEqual([[[0, 1.5, 3]]]);
 
     const result2 = lax.convGeneralDilated(x, y, [1], "SAME");
@@ -34,7 +34,7 @@ suite.each(devices)("device:%s", (device) => {
   test("padding 'SAME' and 'SAME_LOWER'", () => {
     const x = np.ones([1, 1, 5]);
     const y = np.ones([1, 1, 4]);
-    const resultSame = lax.convGeneralDilated(x.ref, y.ref, [1], "SAME");
+    const resultSame = lax.convGeneralDilated(x, y, [1], "SAME");
     expect(resultSame.slice(0, 0).js()).toEqual([3, 4, 4, 3, 2]);
     const resultSameLower = lax.convGeneralDilated(x, y, [1], "SAME_LOWER");
     expect(resultSameLower.slice(0, 0).js()).toEqual([2, 3, 4, 4, 3]);
@@ -109,7 +109,7 @@ suite.each(devices)("device:%s", (device) => {
       lax.convGeneralDilated(x, y, [1], "SAME").slice(0, 0, 3);
     const x = np.array([[[1, 2, 3, 4, 5, 6, 7]]]);
     const y = np.array([[[2, 0.5, -1]]]);
-    const dx = grad(f)(x.ref, y.ref);
+    const dx = grad(f)(x, y);
     expect(dx.slice(0, 0).js()).toEqual([0, 0, 2, 0.5, -1, 0, 0]);
 
     const dy = grad((y: np.Array, x: np.Array) => f(x, y))(y, x);
@@ -127,7 +127,7 @@ suite.each(devices)("device:%s", (device) => {
         if (xDim < kDim) continue;
         const x = np.zeros([3, 1, xDim, xDim]);
         const y = np.zeros([1, 1, kDim, kDim]);
-        const dx = grad(f)(x.ref, y.ref);
+        const dx = grad(f)(x, y);
         expect(dx.shape).toEqual(x.shape);
 
         const dy = grad(g)(y, x);
@@ -142,7 +142,7 @@ suite.each(devices)("device:%s", (device) => {
       [5, 6, 7, 8],
       [9, 10, 11, 12],
     ]);
-    const result = lax.reduceWindow(x.ref, np.max, [2, 2], [1, 2]);
+    const result = lax.reduceWindow(x, np.max, [2, 2], [1, 2]);
     expect(result.js()).toEqual([
       [6, 8],
       [10, 12],
@@ -163,7 +163,7 @@ suite.each(devices)("device:%s", (device) => {
     const maxPool2x2Sum = (x: np.Array) =>
       lax.reduceWindow(x, np.max, [2, 2], [2, 2]).sum();
 
-    expect(maxPool2x2Sum(x.ref).js()).toEqual(9); // 5 + 4
+    expect(maxPool2x2Sum(x).js()).toEqual(9); // 5 + 4
     expect(grad(maxPool2x2Sum)(x).js()).toEqual([
       [0, 1, 0, 0.5],
       [0, 0, 0, 0.5],
@@ -244,7 +244,7 @@ suite.each(devices)("device:%s", (device) => {
       .reshape([3, 1, 2]); // [C_out=3, C_in/G=1, kW=2]
 
     // Forward pass check
-    const result = f(x.ref, y.ref);
+    const result = f(x, y);
     expect(result.shape).toEqual([1, 3, 4]);
     // Channel 0: [1-2, 2-3, 3-4, 4-5] = [-1, -1, -1, -1]
     // Channel 1: [2, 3, 4, 5]
@@ -259,7 +259,7 @@ suite.each(devices)("device:%s", (device) => {
 
     // Gradient w.r.t. input
     const sumF = (x: np.Array, y: np.Array) => f(x, y).sum();
-    const dx = grad(sumF)(x.ref, y.ref);
+    const dx = grad(sumF)(x, y);
     expect(dx.shape).toEqual([1, 3, 5]);
 
     // Gradient w.r.t. kernel

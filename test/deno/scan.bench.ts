@@ -42,8 +42,8 @@ await blockUntilReady(cumsumXs100);
 const cumsumJit100 = jit((xs: any) => {
   return lax.scan(
     (carry: any, x: any) => {
-      const c = carry.ref.add(x);
-      return [c.ref, c];
+      const c = carry.add(x);
+      return [c, c];
     },
     np.zeros([64]),
     xs,
@@ -52,13 +52,13 @@ const cumsumJit100 = jit((xs: any) => {
 });
 
 {
-  const [c, y] = cumsumJit100(cumsumXs100.ref);
+  const [c, y] = cumsumJit100(cumsumXs100);
   c.dispose();
   y.dispose();
 }
 
 Deno.bench("cumsum N=100 size=64", { group: "scan" }, () => {
-  const [c, y] = cumsumJit100(cumsumXs100.ref) as [any, any];
+  const [c, y] = cumsumJit100(cumsumXs100) as [any, any];
   c.dispose();
   y.dispose();
 });
@@ -71,8 +71,8 @@ await blockUntilReady(cumsumXs500);
 const cumsumJit500 = jit((xs: any) => {
   return lax.scan(
     (carry: any, x: any) => {
-      const c = carry.ref.add(x);
-      return [c.ref, c];
+      const c = carry.add(x);
+      return [c, c];
     },
     np.zeros([256]),
     xs,
@@ -81,13 +81,13 @@ const cumsumJit500 = jit((xs: any) => {
 });
 
 {
-  const [c, y] = cumsumJit500(cumsumXs500.ref);
+  const [c, y] = cumsumJit500(cumsumXs500);
   c.dispose();
   y.dispose();
 }
 
 Deno.bench("cumsum N=500 size=256", { group: "scan" }, () => {
-  const [c, y] = cumsumJit500(cumsumXs500.ref) as [any, any];
+  const [c, y] = cumsumJit500(cumsumXs500) as [any, any];
   c.dispose();
   y.dispose();
 });
@@ -100,8 +100,8 @@ await blockUntilReady(reverseXs);
 const reverseJit = jit((xs: any) => {
   return lax.scan(
     (carry: any, x: any) => {
-      const c = carry.ref.add(x);
-      return [c.ref, c];
+      const c = carry.add(x);
+      return [c, c];
     },
     np.zeros([64]),
     xs,
@@ -110,13 +110,13 @@ const reverseJit = jit((xs: any) => {
 });
 
 {
-  const [c, y] = reverseJit(reverseXs.ref);
+  const [c, y] = reverseJit(reverseXs);
   c.dispose();
   y.dispose();
 }
 
 Deno.bench("reverse N=200 size=64", { group: "scan" }, () => {
-  const [c, y] = reverseJit(reverseXs.ref) as [any, any];
+  const [c, y] = reverseJit(reverseXs) as [any, any];
   c.dispose();
   y.dispose();
 });

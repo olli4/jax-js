@@ -26,15 +26,15 @@ suite.each(devicesWithLinalg)("device:%s", (device) => {
         [2.0, 1.0],
         [1.0, 2.0],
       ]);
-      const L = lax.linalg.cholesky(x.ref);
+      const L = lax.linalg.cholesky(x);
 
       // L should be lower triangular
-      const LData = L.ref.js();
+      const LData = L.js();
       expect(LData[0][1]).toBeCloseTo(0);
       expect(LData[1][0]).not.toBe(0);
 
       // Verify: L @ L^T should equal x
-      const reconstructed = np.matmul(L.ref, L.transpose());
+      const reconstructed = np.matmul(L, L.transpose());
       expect(reconstructed).toBeAllclose(x);
     });
 
@@ -44,10 +44,10 @@ suite.each(devicesWithLinalg)("device:%s", (device) => {
         [2.0, 5.0, 3.0],
         [1.0, 3.0, 6.0],
       ]);
-      const L = lax.linalg.cholesky(x.ref);
+      const L = lax.linalg.cholesky(x);
 
       // Verify: L @ L^T should equal x
-      const reconstructed = np.matmul(L.ref, L.transpose());
+      const reconstructed = np.matmul(L, L.transpose());
       expect(reconstructed).toBeAllclose(x);
     });
 
@@ -73,10 +73,10 @@ suite.each(devicesWithLinalg)("device:%s", (device) => {
         [0.1, 0.05],
         [0.05, 0.1],
       ]);
-      const [L, dL] = jvp(lax.linalg.cholesky, [x.ref], [dx.ref]);
+      const [L, dL] = jvp(lax.linalg.cholesky, [x], [dx]);
 
       // Verify L is correct
-      expect(np.matmul(L.ref, L.ref.transpose())).toBeAllclose(x.ref);
+      expect(np.matmul(L, L.transpose())).toBeAllclose(x);
 
       // Verify dL by finite differences: (cholesky(x + eps*dx) - L) / eps ≈ dL
       const eps = 1e-4;
@@ -92,10 +92,10 @@ suite.each(devicesWithLinalg)("device:%s", (device) => {
       ]);
       // Loss: sum of squared elements of L
       const f = (x: np.Array) => {
-        x = x.ref.add(x.transpose()).mul(0.5); // Ensure symmetry
+        x = x.add(x.transpose()).mul(0.5); // Ensure symmetry
         return np.square(lax.linalg.cholesky(x)).sum();
       };
-      const dx = grad(f)(x.ref);
+      const dx = grad(f)(x);
 
       // Verify gradient by finite differences
       const eps = 1e-4;
@@ -134,11 +134,11 @@ suite.each(devicesWithLinalg)("device:%s", (device) => {
     test("P @ A = L @ U holds", () => {
       const n = 30;
       const A = random.uniform(random.key(0), [n, n]);
-      const [lu, pivots, permutation] = lax.linalg.lu(A.ref);
+      const [lu, pivots, permutation] = lax.linalg.lu(A);
 
       pivots.dispose(); // Not needed
       const P = np.eye(n).slice(permutation);
-      const L = np.tril(lu.ref, -1).add(np.eye(n));
+      const L = np.tril(lu, -1).add(np.eye(n));
       const U = np.triu(lu);
 
       const PA = np.matmul(P, A);
@@ -162,7 +162,7 @@ suite.each(devicesWithLinalg)("device:%s", (device) => {
         permutation.dispose();
         return lu;
       };
-      const [lu, dlu] = jvp(luFn, [A.ref], [dA.ref]);
+      const [lu, dlu] = jvp(luFn, [A], [dA]);
 
       // Verify dlu by finite differences
       const eps = 1e-4;
@@ -196,11 +196,11 @@ suite.each(devicesWithLinalg)("device:%s", (device) => {
       const db = np.array([[0.1], [0.2]]);
 
       const solve = (b: np.Array) =>
-        lax.linalg.triangularSolve(L.ref, b, { leftSide: true, lower: true });
-      const [x, dx] = jvp(solve, [b.ref], [db.ref]);
+        lax.linalg.triangularSolve(L, b, { leftSide: true, lower: true });
+      const [x, dx] = jvp(solve, [b], [db]);
 
       // Verify x is correct
-      expect(np.matmul(L.ref, x.ref)).toBeAllclose(b.ref);
+      expect(np.matmul(L, x)).toBeAllclose(b);
 
       // Verify dx by finite differences
       const eps = 1e-4;
@@ -223,13 +223,13 @@ suite.each(devicesWithLinalg)("device:%s", (device) => {
       const f = (b: np.Array) =>
         np
           .square(
-            lax.linalg.triangularSolve(L.ref, b, {
+            lax.linalg.triangularSolve(L, b, {
               leftSide: true,
               lower: true,
             }),
           )
           .sum();
-      const db = grad(f)(b.ref);
+      const db = grad(f)(b);
 
       // Verify gradient by finite differences
       const eps = 1e-4;

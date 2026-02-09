@@ -11,9 +11,9 @@ function mandelbrotIteration(
   X: np.Array,
   Y: np.Array,
 ) {
-  const Asq = A.ref.mul(A.ref);
-  const Bsq = B.ref.mul(B.ref);
-  V = V.add(Asq.ref.add(Bsq.ref).less(100).astype(np.float32));
+  const Asq = A.mul(A);
+  const Bsq = B.mul(B);
+  V = V.add(Asq.add(Bsq).less(100).astype(np.float32));
   const A2 = np.clip(Asq.sub(Bsq).add(X), -50, 50);
   const B2 = np.clip(A.mul(B).mul(2).add(Y), -50, 50);
   return [A2, B2, V];
@@ -31,7 +31,7 @@ function calculateMandelbrot(iters: number) {
   let B = np.zeros(Y.shape);
   let V = np.zeros(X.shape);
   for (let i = 0; i < iters; i++) {
-    [A, B, V] = f(A, B, V, X.ref, Y.ref);
+    [A, B, V] = f(A, B, V, X, Y);
   }
   X.dispose();
   Y.dispose();

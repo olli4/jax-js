@@ -19,9 +19,9 @@
     X: np.Array,
     Y: np.Array,
   ) {
-    const Asq = A.ref.mul(A.ref);
-    const Bsq = B.ref.mul(B.ref);
-    V = V.add(Asq.ref.add(Bsq.ref).less(100).astype(np.float32));
+    const Asq = A.mul(A);
+    const Bsq = B.mul(B);
+    V = V.add(Asq.add(Bsq).less(100).astype(np.float32));
     const A2 = np.clip(Asq.sub(Bsq).add(X), -50, 50);
     const B2 = np.clip(A.mul(B).mul(2).add(Y), -50, 50);
     return [A2, B2, V];
@@ -30,7 +30,7 @@
   const mandelbrotMultiple = (iters: number) =>
     jit((A: np.Array, B: np.Array, V: np.Array, X: np.Array, Y: np.Array) => {
       for (let i = 0; i < iters; i++) {
-        [A, B, V] = mandelbrotIteration(A, B, V, X.ref, Y.ref);
+        [A, B, V] = mandelbrotIteration(A, B, V, X, Y);
       }
       X.dispose();
       Y.dispose();
@@ -49,7 +49,7 @@
     let B = np.zeros(Y.shape);
     let V = np.zeros(X.shape);
     for (let i = 0; i < iters; i++) {
-      [A, B, V] = f(A, B, V, X.ref, Y.ref);
+      [A, B, V] = f(A, B, V, X, Y);
     }
     X.dispose();
     Y.dispose();
@@ -98,11 +98,11 @@
 
         const step = (carry: Carry, _x: null): [Carry, null] => {
           const { A, B, V } = carry;
-          const Asq = A.ref.mul(A.ref);
-          const Bsq = B.ref.mul(B.ref);
-          const newV = V.add(Asq.ref.add(Bsq.ref).less(100).astype(np.float32));
-          const newA = np.clip(Asq.sub(Bsq).add(X.ref), -50, 50);
-          const newB = np.clip(A.mul(B).mul(2).add(Y.ref), -50, 50);
+          const Asq = A.mul(A);
+          const Bsq = B.mul(B);
+          const newV = V.add(Asq.add(Bsq).less(100).astype(np.float32));
+          const newA = np.clip(Asq.sub(Bsq).add(X), -50, 50);
+          const newB = np.clip(A.mul(B).mul(2).add(Y), -50, 50);
           return [{ A: newA, B: newB, V: newV }, null];
         };
 

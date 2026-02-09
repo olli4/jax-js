@@ -24,7 +24,7 @@ suite("jax.makeJaxpr()", () => {
   });
 
   test("tracks a unary function", () => {
-    const { jaxpr } = makeJaxpr((x: np.Array) => np.multiply(x.ref.add(2), x))(
+    const { jaxpr } = makeJaxpr((x: np.Array) => np.multiply(x.add(2), x))(
       np.array([
         [2, 4, 10],
         [1, 1, 1],
@@ -40,9 +40,9 @@ suite("jax.makeJaxpr()", () => {
   });
 
   test("composes with jvp", () => {
-    const f = (x: np.Array) => np.multiply(x.ref.add(2), x);
+    const f = (x: np.Array) => np.multiply(x.add(2), x);
     const fdot = (x: np.Array) => {
-      const [y, dy] = jvp(f, [x.ref], [1]);
+      const [y, dy] = jvp(f, [x], [1]);
       y.dispose();
       return dy;
     };
@@ -59,8 +59,8 @@ suite("jax.makeJaxpr()", () => {
 
   test("composes with grad", () => {
     const f = (x: np.Array) => {
-      const y = x.ref.add(2);
-      return x.ref.mul(x).add(y);
+      const y = x.add(2);
+      return x.mul(x).add(y);
     };
     const { jaxpr } = makeJaxpr(grad(f))(3);
     expect(jaxpr.consts).toEqual([]);
@@ -74,8 +74,8 @@ suite("jax.makeJaxpr()", () => {
 
   test("can flatten() nested Jaxprs", () => {
     const f = (x: np.Array) => {
-      const y = x.ref.add(2);
-      return x.ref.mul(x).add(y);
+      const y = x.add(2);
+      return x.mul(x).add(y);
     };
     const jf = jit(f);
 
@@ -118,7 +118,7 @@ suite("jax.linearize()", () => {
 
   test("works for simple arrays", () => {
     const [y, lin] = linearize(
-      (x: np.Array) => x.ref.mul(x),
+      (x: np.Array) => x.mul(x),
       [np.array([2, 3])],
     );
     expect(y).toBeAllclose(np.array([4, 9]));
@@ -129,7 +129,7 @@ suite("jax.linearize()", () => {
   test("can take and return jstrees", () => {
     const [y, lin] = linearize(
       (x: { a: np.Array; b: np.Array }) => ({
-        r1: x.a.ref.mul(x.a).add(x.b.ref),
+        r1: x.a.mul(x.a).add(x.b),
         r2: x.b,
       }),
       [{ a: 1, b: 2 }],
@@ -152,7 +152,7 @@ suite("jax.vjp()", () => {
 
   test("hasAux returns aux and computes correct gradients", () => {
     const f = (x: np.Array): [np.Array, np.Array] => {
-      const loss = x.ref.sum();
+      const loss = x.sum();
       const aux = x.mul(2);
       return [loss, aux];
     };
@@ -172,10 +172,10 @@ suite("jax.vjp()", () => {
   test("hasAux handles pytree aux", () => {
     type Aux = { predictions: np.Array; squared: np.Array };
     const f = (x: np.Array): [np.Array, Aux] => {
-      const loss = x.ref.sum();
+      const loss = x.sum();
       const aux = {
-        predictions: x.ref.mul(2),
-        squared: x.ref.mul(x),
+        predictions: x.mul(2),
+        squared: x.mul(x),
       };
       return [loss, aux];
     };
@@ -193,7 +193,7 @@ suite("jax.vjp()", () => {
   test("hasAux handles pytree main output", () => {
     type Main = { a: np.Array; b: np.Array };
     const f = (x: np.Array): [Main, np.Array] => {
-      const main = { a: x.ref.sum(), b: x.ref.prod() };
+      const main = { a: x.sum(), b: x.prod() };
       const aux = x.mul(2);
       return [main, aux];
     };
@@ -218,14 +218,14 @@ suite("jax.vjp()", () => {
 
   test("hasAux gradients match vjp without aux", () => {
     const fWithAux = (x: np.Array): [np.Array, np.Array] => [
-      x.ref.sum(),
+      x.sum(),
       x.mul(2),
     ];
     const fWithoutAux = (x: np.Array): np.Array => x.sum();
 
     const x = np.array([1, 2, 3]);
 
-    const [, vjpFn1] = vjp(fWithAux, [x.ref], { hasAux: true });
+    const [, vjpFn1] = vjp(fWithAux, [x], { hasAux: true });
     const [, vjpFn2] = vjp(fWithoutAux, [x]);
 
     const [grad1] = vjpFn1(np.ones([]));
@@ -238,7 +238,7 @@ suite("jax.vjp()", () => {
 
   test("hasAux works with jit wrapper", () => {
     const f = jit((x: np.Array): [np.Array, np.Array] => [
-      x.ref.sum(),
+      x.sum(),
       x.mul(2),
     ]);
 
@@ -255,7 +255,7 @@ suite("jax.vjp()", () => {
 
   test("hasAux works inside jit", () => {
     const inner = (x: np.Array): [np.Array, np.Array] => [
-      x.ref.sum(),
+      x.sum(),
       x.mul(2),
     ];
 
@@ -277,7 +277,7 @@ suite("jax.vjp()", () => {
 
 suite("jax.grad()", () => {
   test("works for a simple scalar function", () => {
-    const f = (x: np.Array) => x.ref.mul(x.ref).mul(x); // d/dx (x^3) = 3x^2
+    const f = (x: np.Array) => x.mul(x).mul(x); // d/dx (x^3) = 3x^2
     const df = grad(f);
     expect(df(4)).toBeAllclose(48);
     expect(df(5)).toBeAllclose(75);
@@ -301,14 +301,14 @@ suite("jax.grad()", () => {
 
   test("passing const argnums", () => {
     const f = (x: np.Array, y: [np.Array, np.Array]) =>
-      x.ref.mul(y[0]).add(y[1]).sum();
+      x.mul(y[0]).add(y[1]).sum();
     const df_dx = grad(f, { argnums: 0 });
     const df_dy = grad(f, { argnums: 1 });
     const x = np.array([2, 3]);
     const y: [np.Array, np.Array] = [np.array([4, 5]), np.array([10, 20])];
 
-    expect(df_dx(x.ref, tree.ref(y)).js()).toEqual([4, 5]); // dy/dx = y0
-    const w = df_dy(x.ref, tree.ref(y));
+    expect(df_dx(x, y).js()).toEqual([4, 5]); // dy/dx = y0
+    const w = df_dy(x, y);
     expect(w[0].js()).toEqual([2, 3]); // dy/dy0 = x
     expect(w[1].js()).toEqual([1, 1]); // dy/dy1 = 1
 
@@ -371,7 +371,7 @@ suite("jax.grad()", () => {
     ]);
 
     // These numbers are checked for consistency with JAX.
-    expect(loss(tree.ref(params), x.ref)).toBeAllclose(-1.3165712);
+    expect(loss(params, x)).toBeAllclose(-1.3165712);
 
     // console.log(makeJaxpr(grad(loss))(params, x).jaxpr.toString());
     const grads = grad(loss)(params, x);
@@ -386,7 +386,7 @@ suite("jax.grad()", () => {
 
   test("hasAux returns aux and computes correct gradient", () => {
     const f = (x: np.Array): [np.Array, np.Array] => {
-      const loss = x.ref.sum();
+      const loss = x.sum();
       const aux = x.mul(2);
       return [loss, aux];
     };
@@ -401,10 +401,10 @@ suite("jax.grad()", () => {
   test("hasAux handles pytree aux", () => {
     type Aux = { predictions: np.Array; squared: np.Array };
     const f = (x: np.Array): [np.Array, Aux] => {
-      const loss = x.ref.sum();
+      const loss = x.sum();
       const aux = {
-        predictions: x.ref.mul(2),
-        squared: x.ref.mul(x),
+        predictions: x.mul(2),
+        squared: x.mul(x),
       };
       return [loss, aux];
     };
@@ -419,14 +419,14 @@ suite("jax.grad()", () => {
 
   test("hasAux gradients match grad without aux", () => {
     const fWithAux = (x: np.Array): [np.Array, np.Array] => [
-      x.ref.sum(),
+      x.sum(),
       x.mul(2),
     ];
     const fWithoutAux = (x: np.Array) => x.sum();
 
     const x = np.array([1, 2, 3]);
 
-    const [grad1] = grad(fWithAux, { hasAux: true })(x.ref);
+    const [grad1] = grad(fWithAux, { hasAux: true })(x);
     const grad2 = grad(fWithoutAux)(x);
 
     expect(grad1).toBeAllclose(grad2);
@@ -434,7 +434,7 @@ suite("jax.grad()", () => {
 
   test("hasAux works with jit wrapper", () => {
     const f = jit((x: np.Array): [np.Array, np.Array] => [
-      x.ref.sum(),
+      x.sum(),
       x.mul(2),
     ]);
 
@@ -446,13 +446,13 @@ suite("jax.grad()", () => {
   });
 
   test("hasAux throws on non-scalar output", () => {
-    const f = (x: np.Array): [np.Array, np.Array] => [x.ref, x.mul(2)];
+    const f = (x: np.Array): [np.Array, np.Array] => [x, x.mul(2)];
     const x = np.array([1, 2, 3]);
     expect(() => grad(f, { hasAux: true })(x)).toThrow("scalar");
   });
 
   test("hasAux throws on non-float dtype", () => {
-    const f = (x: np.Array): [np.Array, np.Array] => [x.ref.sum(), x.mul(2)];
+    const f = (x: np.Array): [np.Array, np.Array] => [x.sum(), x.mul(2)];
     const x = np.array([1, 2, 3], { dtype: np.int32 });
     expect(() => grad(f, { hasAux: true })(x)).toThrow("floating-point");
   });
@@ -460,7 +460,7 @@ suite("jax.grad()", () => {
   test("grad is not stopped in aux values", () => {
     const f = grad((x: np.Array) => {
       const [one, xsquare] = grad(
-        (y: np.Array): [np.Array, np.Array] => [y.ref, y.ref.mul(y)],
+        (y: np.Array): [np.Array, np.Array] => [y, y.mul(y)],
         { hasAux: true },
       )(x);
       one.dispose();
@@ -472,7 +472,7 @@ suite("jax.grad()", () => {
 
 suite("jax.valueAndGrad()", () => {
   test("returns value and gradient", () => {
-    const f = (x: np.Array) => x.ref.mul(x).sum();
+    const f = (x: np.Array) => x.mul(x).sum();
     const x = np.array([2, 3]);
     const [value, gradient] = valueAndGrad(f)(x);
 
@@ -482,7 +482,7 @@ suite("jax.valueAndGrad()", () => {
 
   test("hasAux returns value, gradient, and aux", () => {
     const f = (x: np.Array): [np.Array, np.Array] => {
-      const loss = x.ref.sum();
+      const loss = x.sum();
       const aux = x.mul(2);
       return [loss, aux];
     };
@@ -497,7 +497,7 @@ suite("jax.valueAndGrad()", () => {
 
   test("hasAux matches valueAndGrad for value and gradient", () => {
     const fWithAux = (x: np.Array): [np.Array, np.Array] => [
-      x.ref.sum(),
+      x.sum(),
       x.mul(2),
     ];
     const fWithoutAux = (x: np.Array) => x.sum();
@@ -505,7 +505,7 @@ suite("jax.valueAndGrad()", () => {
     const x = np.array([1, 2, 3]);
 
     const [[value1, aux1], grad1] = valueAndGrad(fWithAux, { hasAux: true })(
-      x.ref,
+      x,
     );
     const [value2, grad2] = valueAndGrad(fWithoutAux)(x);
     aux1.dispose();
@@ -517,7 +517,7 @@ suite("jax.valueAndGrad()", () => {
 
 suite("jax.jit()", () => {
   test("works for a simple scalar function", () => {
-    const f = (x: np.Array) => x.ref.mul(x.ref).mul(x); // d/dx (x^3) = 3x^2
+    const f = (x: np.Array) => x.mul(x).mul(x); // d/dx (x^3) = 3x^2
     const f2 = jit(f);
     expect(f(np.array(2))).toBeAllclose(8);
     expect(f2(np.array(2))).toBeAllclose(8);
@@ -530,7 +530,7 @@ suite("jax.jit()", () => {
   });
 
   test("works with duplicate output", () => {
-    const f = jit((x: np.Array) => [x.ref, x]);
+    const f = jit((x: np.Array) => [x, x]);
     const [a, b] = f(np.array(3));
     expect(a.js()).toEqual(3);
     expect(b.js()).toEqual(3);
@@ -554,19 +554,19 @@ suite("jax.jit()", () => {
   });
 
   test("jit-of-jit", () => {
-    const f = jit((x: np.Array) => x.ref.mul(x));
+    const f = jit((x: np.Array) => x.mul(x));
     const g = jit((x: np.Array) => f(f(x)));
     expect(g(3)).toBeAllclose(81);
     expect(jit(jit(g))(3)).toBeAllclose(81);
   });
 
   test("jvp-of-jit", () => {
-    const f = jit((x: np.Array) => x.ref.mul(x));
+    const f = jit((x: np.Array) => x.mul(x));
     expect(jvp(f, [3], [1])).toBeAllclose([9, 6]);
   });
 
   test("grad-of-jit", () => {
-    const f = jit((x: np.Array) => x.ref.mul(x));
+    const f = jit((x: np.Array) => x.mul(x));
 
     expect(grad(f)(3)).toBeAllclose(6);
     expect(grad(f)(10)).toBeAllclose(20);
@@ -581,8 +581,8 @@ suite("jax.jit()", () => {
       [1, 2, 3],
       [4, 5, 6],
     ]);
-    expect(s(ar.ref).js()).toEqual(21);
-    expect(vmap(s)(ar.ref).js()).toEqual([6, 15]);
+    expect(s(ar).js()).toEqual(21);
+    expect(vmap(s)(ar).js()).toEqual([6, 15]);
     expect(vmap(s, 1)(ar).js()).toEqual([5, 7, 9]);
   });
 });

@@ -21,7 +21,7 @@ suite.skipIf(!devices.includes("webgpu"))("gpu matmul", async () => {
   });
 
   bench("2048x2048", async () => {
-    const c = np.matmul(a2048.ref, b2048.ref);
+    const c = np.matmul(a2048, b2048);
     await c.blockUntilReady();
     c.dispose();
   });
@@ -35,7 +35,7 @@ suite.skipIf(!devices.includes("webgpu"))("gpu matmul", async () => {
   });
 
   bench("4096x4096", async () => {
-    const c = np.matmul(a4096.ref, b4096.ref);
+    const c = np.matmul(a4096, b4096);
     await c.blockUntilReady();
     c.dispose();
   });

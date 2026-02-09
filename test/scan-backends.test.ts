@@ -70,7 +70,7 @@ describe("lax.scan backend coverage", () => {
       // 3. JIT scan
       {
         const step = (c: np.Array, x: np.Array): [np.Array, np.Array] => {
-          return [np.add(c.ref, x.ref), np.add(c, x)];
+          return [np.add(c, x), np.add(c, x)];
         };
         const run = jit((init, xs) => {
           return lax.scan(step, init, xs);
@@ -88,7 +88,7 @@ describe("lax.scan backend coverage", () => {
       {
         const loss = (xs: np.Array) => {
           const step = (c: np.Array, x: np.Array): [np.Array, np.Array] => {
-            return [np.add(c.ref, x), c];
+            return [np.add(c, x), c];
           };
           const initVal = np.zeros([1]);
           const [final, _] = lax.scan(step, initVal, xs);

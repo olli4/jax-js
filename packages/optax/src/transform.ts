@@ -35,32 +35,30 @@ export function scaleByAdam({
 }: ScaleByAdamOptions = {}): GradientTransformation {
   return {
     init(params) {
-      const mu = treeZerosLike(tree.ref(params)); // first moment
+      const mu = treeZerosLike(params); // first moment
       const nu = treeZerosLike(params); // second moment
       return { count: u32(0), mu, nu };
     },
     update(updates, state, params) {
-      tree.dispose(params);
       let { count, mu, nu } = state as {
         count: np.Array;
         mu: JsTree<np.Array>;
         nu: JsTree<np.Array>;
       };
-      mu = treeUpdateMoment(tree.ref(updates), mu, b1, 1);
-      nu = treeUpdateMoment(tree.ref(updates), nu, b2, 2);
+      mu = treeUpdateMoment(updates, mu, b1, 1);
+      nu = treeUpdateMoment(updates, nu, b2, 2);
       count = count.add(1);
       let muHat: typeof mu;
       if (nesterov) {
         muHat = tree.map(
           (m: np.Array, g: np.Array) => m.mul(b1).add(g.mul(1 - b1)),
-          treeBiasCorrection(tree.ref(mu), b1, count.ref.add(1)),
-          treeBiasCorrection(tree.ref(updates), b1, count.ref),
+          treeBiasCorrection(mu, b1, count.add(1)),
+          treeBiasCorrection(updates, b1, count),
         );
       } else {
-        muHat = treeBiasCorrection(tree.ref(mu), b1, count.ref);
+        muHat = treeBiasCorrection(mu, b1, count);
       }
-      const nuHat = treeBiasCorrection(tree.ref(nu), b2, count.ref);
-      tree.dispose(updates);
+      const nuHat = treeBiasCorrection(nu, b2, count);
       updates = tree.map(
         (m: np.Array, v: np.Array) => m.div(np.sqrt(v.add(epsRoot)).add(eps)),
         muHat,
@@ -76,7 +74,6 @@ export function scale(stepSize: number): GradientTransformation {
   return {
     init: initEmptyState,
     update(updates, state, params) {
-      tree.dispose(params);
       updates = tree.map((g: np.Array) => g.mul(stepSize), updates);
       return [updates, state];
     },
@@ -86,12 +83,10 @@ export function scale(stepSize: number): GradientTransformation {
 /** Scale updates using a custom schedule for the step size. */
 export function scaleBySchedule(stepSizeFn: Schedule): GradientTransformation {
   return {
-    init(params) {
-      tree.dispose(params);
+    init(_params) {
       return { count: u32(0) }; // initial step
     },
-    update(updates, state, params) {
-      tree.dispose(params);
+    update(updates, state, _params) {
       const { count } = state as { count: np.Array };
       const countInt = count.item();
       const stepSize = stepSizeFn(countInt);
@@ -118,15 +113,13 @@ export function scaleByLearningRate(
 export function clipByGlobalNorm(maxNorm: number): GradientTransformation {
   return {
     init: initEmptyState,
-    update(updates, state, params) {
-      tree.dispose(params);
-
-      const gNorm = treeNorm(tree.ref(updates));
-      const trigger = np.less(gNorm.ref, maxNorm);
+    update(updates, state, _params) {
+      const gNorm = treeNorm(updates);
+      const trigger = np.less(gNorm, maxNorm);
 
       const clippedUpdates = tree.map(
         (t: np.Array) =>
-          np.where(trigger.ref, t.ref, t.div(gNorm.ref).mul(maxNorm)),
+          np.where(trigger, t, t.div(gNorm).mul(maxNorm)),
         updates,
       );
 
@@ -153,8 +146,7 @@ export function addDecayedWeights({
   const isSchedule = typeof weightDecay === "function";
 
   return {
-    init(params) {
-      tree.dispose(params);
+    init(_params) {
       if (isSchedule) {
         return { count: u32(0) };
       } else {
@@ -180,28 +172,25 @@ export function addDecayedWeights({
       }
 
       if (currentWeightDecay === 0.0) {
-        tree.dispose(params);
         return [updates, newState];
       }
 
       let decayedParams: JsTree<np.Array>;
       if (mask) {
         const maskTree =
-          typeof mask === "function" ? mask(tree.ref(updates)) : mask;
+          typeof mask === "function" ? mask(updates) : mask;
 
         decayedParams = tree.map(
           (p: np.Array, m: np.Array) => p.mul(m).mul(currentWeightDecay),
-          tree.ref(params),
+          params,
           maskTree,
         );
       } else {
         decayedParams = tree.map(
           (p: np.Array) => p.mul(currentWeightDecay),
-          tree.ref(params),
+          params,
         );
       }
-
-      tree.dispose(params);
 
       updates = tree.map(
         (g: np.Array, d: np.Array) => g.add(d),
@@ -229,14 +218,13 @@ export function trace({
       const trace = treeZerosLike(params);
       return { trace };
     },
-    update(updates, state, params) {
-      tree.dispose(params);
+    update(updates, state, _params) {
       const { trace: prevTrace } = state as { trace: JsTree<np.Array> };
 
       // new_trace = g + decay * t
       const newTrace = tree.map(
         (g: np.Array, t: np.Array) => g.add(t.mul(decay)),
-        tree.ref(updates),
+        updates,
         prevTrace,
       );
 
@@ -246,12 +234,11 @@ export function trace({
         finalUpdates = tree.map(
           (g: np.Array, t: np.Array) => g.add(t.mul(decay)),
           updates,
-          tree.ref(newTrace),
+          newTrace,
         ) as typeof updates;
       } else {
         // Standard momentum: updates = new_trace
-        finalUpdates = tree.ref(newTrace) as typeof updates;
-        tree.dispose(updates);
+        finalUpdates = newTrace as typeof updates;
       }
 
       return [finalUpdates, { trace: newTrace }];

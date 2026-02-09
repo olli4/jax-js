@@ -19,13 +19,13 @@ suite.skipIf(!devices.includes("webgpu"))("gpu argreduce", async () => {
   afterAll(() => arr10k.dispose());
 
   bench("argmax 10k elements", async () => {
-    const result = np.argmax(arr10k.ref);
+    const result = np.argmax(arr10k);
     await result.blockUntilReady();
     result.dispose();
   });
 
   bench("argmin 10k elements", async () => {
-    const result = np.argmin(arr10k.ref);
+    const result = np.argmin(arr10k);
     await result.blockUntilReady();
     result.dispose();
   });
@@ -36,13 +36,13 @@ suite.skipIf(!devices.includes("webgpu"))("gpu argreduce", async () => {
   afterAll(() => arr2d.dispose());
 
   bench("argmax along axis (100x1000)", async () => {
-    const result = np.argmax(arr2d.ref, 1);
+    const result = np.argmax(arr2d, 1);
     await result.blockUntilReady();
     result.dispose();
   });
 
   bench("argmin along axis (100x1000)", async () => {
-    const result = np.argmin(arr2d.ref, 1);
+    const result = np.argmin(arr2d, 1);
     await result.blockUntilReady();
     result.dispose();
   });

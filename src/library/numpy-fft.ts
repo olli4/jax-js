@@ -50,22 +50,22 @@ const fftUpdate = jit(
 
     const k = arange(0, half, 1, { dtype: real.dtype });
     const theta = k.mul(-Math.PI / half);
-    const wr = cos(theta.ref);
+    const wr = cos(theta);
     const wi = sin(theta);
 
-    const ur = real.ref.slice([], [0, half]);
-    const ui = imag.ref.slice([], [0, half]);
+    const ur = real.slice([], [0, half]);
+    const ui = imag.slice([], [0, half]);
     const vr = real.slice([], [half, 2 * half]);
     const vi = imag.slice([], [half, 2 * half]);
 
     // t = w * v
-    const tr = vr.ref.mul(wr.ref).sub(vi.ref.mul(wi.ref));
+    const tr = vr.mul(wr).sub(vi.mul(wi));
     const ti = vr.mul(wi).add(vi.mul(wr));
 
     // store [u + t, u - t]
     return {
-      real: concatenate([ur.ref.add(tr.ref), ur.sub(tr)], -1),
-      imag: concatenate([ui.ref.add(ti.ref), ui.sub(ti)], -1),
+      real: concatenate([ur.add(tr), ur.sub(tr)], -1),
+      imag: concatenate([ui.add(ti), ui.sub(ti)], -1),
     };
   },
   { staticArgnums: [0] },

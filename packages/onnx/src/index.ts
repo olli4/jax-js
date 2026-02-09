@@ -236,10 +236,10 @@ function validateTensorShape(
 function logDebugStats(name: string, arr: np.Array): void {
   arr = arr.astype(np.float32);
 
-  const min = np.min(arr.ref).js() as number;
-  const max = np.max(arr.ref).js() as number;
-  const mean = np.mean(arr.ref).js() as number;
-  const variance = np.var_(arr.ref).js() as number;
+  const min = np.min(arr).js() as number;
+  const max = np.max(arr).js() as number;
+  const mean = np.mean(arr).js() as number;
+  const variance = np.var_(arr).js() as number;
 
   const shortName = name.split("/").pop() || name;
   console.log(`${shortName}

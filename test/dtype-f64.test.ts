@@ -27,18 +27,18 @@ suite.each(devices)("device:%s", (device) => {
     const a = np.array([1.5, 2.5, 3.5], { dtype: np.float64 });
     expect(a.dtype).toBe(np.float64);
     expect(a.shape).toEqual([3]);
-    expect(await a.ref.data()).toEqual(new Float64Array([1.5, 2.5, 3.5]));
-    expect(a.ref.dataSync()).toEqual(new Float64Array([1.5, 2.5, 3.5]));
+    expect(await a.data()).toEqual(new Float64Array([1.5, 2.5, 3.5]));
+    expect(a.dataSync()).toEqual(new Float64Array([1.5, 2.5, 3.5]));
     expect(a.js()).toEqual([1.5, 2.5, 3.5]);
   });
 
   test("jit of f64 calculation", () => {
-    const f = jit((x: np.Array) => np.sum(x.ref.mul(x)));
+    const f = jit((x: np.Array) => np.sum(x.mul(x)));
     expect(f(np.arange(10).astype(np.float64))).toBeAllclose(285);
   });
 
   test("jvp of f64 calculation", () => {
-    const f = (x: np.Array) => x.ref.mul(x);
+    const f = (x: np.Array) => x.mul(x);
     const [y, dy] = jvp(
       f,
       [np.array([1.5, 2.5], { dtype: np.float64 })],
@@ -46,18 +46,18 @@ suite.each(devices)("device:%s", (device) => {
     );
     expect(y.dtype).toBe(np.float64);
     expect(dy.dtype).toBe(np.float64);
-    expect(y.ref.dataSync()).toEqual(new Float64Array([2.25, 6.25]));
-    expect(dy.ref.dataSync()).toEqual(new Float64Array([3.0, 5.0]));
+    expect(y.dataSync()).toEqual(new Float64Array([2.25, 6.25]));
+    expect(dy.dataSync()).toEqual(new Float64Array([3.0, 5.0]));
   });
 
   test("gradient of f64 calculation", () => {
-    const f = (x: np.Array) => np.sum(x.ref.mul(x));
+    const f = (x: np.Array) => np.sum(x.mul(x));
     const g = grad(f);
 
     const x = np.array([1.5, 2.5], { dtype: np.float64 });
     const y = g(x);
     expect(y.dtype).toBe(np.float64);
-    expect(y.ref.dataSync()).toEqual(new Float64Array([3.0, 5.0]));
+    expect(y.dataSync()).toEqual(new Float64Array([3.0, 5.0]));
   });
 
   test("erfc() works for f64", () => {
@@ -71,7 +71,7 @@ suite.each(devices)("device:%s", (device) => {
   test("precision of f64 is high", async () => {
     const a = np.array([1 + 1e-15, 1 + 2e-15], { dtype: np.float64 });
     await a.blockUntilReady();
-    const b: number = await a.ref.slice(1).sub(a.slice(0)).jsAsync();
+    const b: number = await a.slice(1).sub(a.slice(0)).jsAsync();
     expect(b).toBeCloseTo(1e-15, 15);
   });
 });

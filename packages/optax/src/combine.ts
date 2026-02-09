@@ -10,8 +10,7 @@ export function chain(
   const updateFns = transforms.map((t) => t.update);
   return {
     init(params) {
-      const states = initFns.map((fn) => fn(tree.ref(params)));
-      tree.dispose(params);
+      const states = initFns.map((fn) => fn(params));
       return states;
     },
     update(updates, state, params) {
@@ -27,11 +26,10 @@ export function chain(
         [updates, newS] = updateFns[i](
           updates,
           state[i],
-          params ? tree.ref(params) : undefined,
+          params ? params : undefined,
         );
         newState.push(newS);
       }
-      tree.dispose(params);
       return [updates, newState];
     },
   };

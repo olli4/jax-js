@@ -112,7 +112,7 @@ export function runFlowLMStep(
   transformerOut = transformerOut.slice([-1]); // [1, dim]
 
   // Check EOS
-  const eosLogit = runLinear(outEos, transformerOut.ref);
+  const eosLogit = runLinear(outEos, transformerOut);
   const isEos = np.greater(eosLogit, eosThreshold); // [1, 1]
 
   const noiseShape = [1, ldim]; // [T, ldim] with T=1
@@ -125,7 +125,7 @@ export function runFlowLMStep(
 
   // Decode using LSD
   const conditionedFlow = (s: np.Array, t: np.Array, x: np.Array) =>
-    runSimpleMLPAdaLN(tree.ref(flowNet), transformerOut.ref, s, t, x);
+    runSimpleMLPAdaLN(flowNet, transformerOut, s, t, x);
   const latent = lsdDecode(conditionedFlow, noise, lsdDecodeSteps);
   tree.dispose([flowNet, transformerOut]);
 
@@ -164,7 +164,7 @@ export const runSimpleMLPAdaLN = jit(function runSimpleMLPAdaLN(
 
   // Apply residual blocks
   for (const block of resBlocks) {
-    x = runResBlock(block, x, y.ref);
+    x = runResBlock(block, x, y);
   }
 
   // Final layer: LayerNorm (no affine) + AdaLN modulation + Linear
@@ -208,13 +208,13 @@ export function runRope(
   ki = np.squeeze(ki, -1);
 
   const angles = freqs.mul(ts); // [T, 1, D/2] broadcast
-  const rotr = np.cos(angles.ref).astype(qr.dtype);
+  const rotr = np.cos(angles).astype(qr.dtype);
   const roti = np.sin(angles).astype(qr.dtype);
 
   // Apply rotation (complex multiplication)
-  const qor = qr.ref.mul(rotr.ref).sub(qi.ref.mul(roti.ref));
-  const qoi = qr.mul(roti.ref).add(qi.mul(rotr.ref));
-  const kor = kr.ref.mul(rotr.ref).sub(ki.ref.mul(roti.ref));
+  const qor = qr.mul(rotr).sub(qi.mul(roti));
+  const qoi = qr.mul(roti).add(qi.mul(rotr));
+  const kor = kr.mul(rotr).sub(ki.mul(roti));
   const koi = kr.mul(roti).add(ki.mul(rotr));
 
   // Stack and reshape back
@@ -251,7 +251,7 @@ export function runMimiStreamingMultiheadAttention(
   let x: np.Array;
   if (isPrefill) {
     tree.dispose([kvCache, kvCacheLen]);
-    x = nn.dotProductAttention(q, k.ref, v.ref, {
+    x = nn.dotProductAttention(q, k, v, {
       isCausal: true,
       localWindowSize: context ? [context - 1, 0] : undefined,
     });
@@ -263,9 +263,9 @@ export function runMimiStreamingMultiheadAttention(
     const cacheMask = np
       .arange(capacity)
       .reshape([-1, 1, 1])
-      .less(kvCacheLen.ref);
+      .less(kvCacheLen);
     kvCache.key = np.where(
-      cacheMask.ref,
+      cacheMask,
       kvCache.key,
       np.tile(k, [capacity / T, 1, 1]), // Hack: Assume T divides into kv cache length
     );
@@ -280,9 +280,9 @@ export function runMimiStreamingMultiheadAttention(
       .sub(np.arange(T).reshape([T, 1]))
       .sub(kvCacheLen); // [T, capacity]
     const mask = context
-      ? maskDelta.ref.lessEqual(0).mul(maskDelta.greater(-context))
+      ? maskDelta.lessEqual(0).mul(maskDelta.greater(-context))
       : maskDelta.lessEqual(0);
-    x = nn.dotProductAttention(q, kvCache.key.ref, kvCache.value.ref, { mask });
+    x = nn.dotProductAttention(q, kvCache.key, kvCache.value, { mask });
   }
   x = x.reshape([T, embedDim]);
   x = runLinear(outProj, x);
@@ -321,7 +321,7 @@ export const runStreamingTransformerLayer = jit(
     }: { context?: number; numHeads: number; maxPeriod?: number },
   ): [np.Array, KVCache] {
     // Self-attention block with pre-norm
-    const xOrig = x.ref;
+    const xOrig = x;
     x = runLayerNorm(norm1, x);
     let update: np.Array;
     [update, kvCache] = runMimiStreamingMultiheadAttention(
@@ -340,7 +340,7 @@ export const runStreamingTransformerLayer = jit(
     x = xOrig.add(update);
 
     // FFN block with pre-norm
-    const xOrig2 = x.ref;
+    const xOrig2 = x;
     x = runLayerNorm(norm2, x);
     let ffnOut = runLinear(linear1, x);
     ffnOut = nn.gelu(ffnOut, { approximate: false });
@@ -365,7 +365,7 @@ export function runSEANetResnetBlock(
   states: (np.Array | null)[],
   x: np.Array, // [1, C, T]
 ): [np.Array, np.Array[]] {
-  let v = x.ref;
+  let v = x;
   let stateIdx = 0;
   for (const layer of block) {
     if (layer === undefined) {
@@ -584,7 +584,7 @@ export function runMimiEncode(
       layer,
       kvCache,
       x,
-      offset.ref,
+      offset,
       0,
       { context: 250, numHeads: 8 },
     );
@@ -715,7 +715,7 @@ export function lsdDecode(
     const t = (i + 1) / numSteps;
     const sArr = np.full(x0.shape.slice(0, -1).concat([1]), s);
     const tArr = np.full(x0.shape.slice(0, -1).concat([1]), t);
-    const flowDir = flowNet(sArr, tArr, current.ref);
+    const flowDir = flowNet(sArr, tArr, current);
     current = current.add(flowDir.div(numSteps));
   }
   return current;
@@ -735,7 +735,7 @@ export function runTimestepEmbedder(
   // mlp: [Linear, SiLU, Linear, RMSNorm]
   const [linear1, , linear2, rmsNorm] = mlp;
   const args = t.mul(freqs); // [N, 128] or [128]
-  const embedding = np.concatenate([np.cos(args.ref), np.sin(args)], -1); // [N, 256]
+  const embedding = np.concatenate([np.cos(args), np.sin(args)], -1); // [N, 256]
   let x = runLinear(linear1, embedding);
   x = nn.silu(x);
   x = runLinear(linear2, x);
@@ -766,7 +766,7 @@ export function runResBlock(
   const [shiftMlp, scaleMlp, gateMlp] = np.split(modulation, 3, -1);
 
   // Apply AdaLN then MLP
-  let h = runLayerNorm(inLN, x.ref, 1e-6);
+  let h = runLayerNorm(inLN, x, 1e-6);
   h = modulate(h, shiftMlp, scaleMlp);
 
   // MLP: [Linear, SiLU, Linear]
@@ -804,9 +804,9 @@ export const runLayerNorm = jit(
   ) {
     const dtype = x.dtype;
     x = x.astype(np.float32); // LayerNorm in high precision to avoid numerics issues.
-    const mean = x.ref.mean(-1, { keepdims: true });
-    const var_ = np.var_(x.ref, -1, {
-      mean: mean.ref,
+    const mean = x.mean(-1, { keepdims: true });
+    const var_ = np.var_(x, -1, {
+      mean: mean,
       correction: 0,
       keepdims: true,
     });
@@ -831,7 +831,7 @@ export function runRMSNorm(
   // RMSNorm: x * alpha / sqrt(var + eps)
   const dtype = x.dtype;
   x = x.astype(np.float32); // RMSNorm in high precision to avoid numerics issues.
-  const var_ = np.var_(x.ref, -1, { correction: 0, keepdims: true });
+  const var_ = np.var_(x, -1, { correction: 0, keepdims: true });
   x = x.mul(alpha).div(np.sqrt(var_.add(eps)));
   return x.astype(dtype);
 }
@@ -864,7 +864,7 @@ export function runConv1d(
   // x: [1, C_in, T_in]
   state ??= createConv1dState({ weight }, stride);
   x = np.concatenate([state, x], 2); // pad with state
-  state = x.ref.slice([], [], [x.shape[2] - state.shape[2]]);
+  state = x.slice([], [], [x.shape[2] - state.shape[2]]);
   let y = lax.conv(x, weight, [stride], "VALID");
   if (bias) y = y.add(np.expandDims(bias, -1));
   return [y, state];

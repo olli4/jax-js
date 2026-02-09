@@ -11,7 +11,7 @@ expect.extend({
     const actualArray = np.array(actual);
     const expectedArray = np.array(expected);
     return {
-      pass: np.allclose(actualArray.ref, expectedArray.ref, options),
+      pass: np.allclose(actualArray, expectedArray, options),
       message: () => `expected array to be${isNot ? " not" : ""} allclose`,
       actual: actualArray.js(),
       expected: expectedArray.js(),

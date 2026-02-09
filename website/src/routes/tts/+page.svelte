@@ -137,12 +137,12 @@
       .astype(np.float16);
 
     const tokensAr = np.array(tokens, { dtype: np.uint32 });
-    let embeds = model.flowLM.conditionerEmbed.ref.slice(tokensAr); // [seq_len, 1024]
+    let embeds = model.flowLM.conditionerEmbed.slice(tokensAr); // [seq_len, 1024]
     embeds = np.concatenate([voiceEmbed, embeds]);
 
     const player = createStreamingPlayer();
     try {
-      await playTTS(player, tree.ref(model), embeds, {
+      await playTTS(player, model, embeds, {
         framesAfterEos,
         seed,
         temperature,

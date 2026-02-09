@@ -24,7 +24,7 @@ suite("jax.jvp()", () => {
 
   test("can take jvp of pytrees", () => {
     const result = jvp(
-      (x: { a: np.Array; b: np.Array }) => x.a.ref.mul(x.a).add(x.b),
+      (x: { a: np.Array; b: np.Array }) => x.a.mul(x.a).add(x.b),
       [{ a: 1, b: 2 }],
       [{ a: 1, b: 0 }],
     );
@@ -35,7 +35,7 @@ suite("jax.jvp()", () => {
   test("works for vector to scalar functions", () => {
     const f = (x: np.Array) => np.sum(x);
     const x = np.array([1, 2, 3]);
-    expect(f(x.ref)).toBeAllclose(6);
+    expect(f(x)).toBeAllclose(6);
     expect(jvp(f, [x], [np.array([1, 1, 1])])[1]).toBeAllclose(3);
   });
 
@@ -117,8 +117,8 @@ suite("jax.vmap()", () => {
   test("vectorizes a function returning a pytree", () => {
     // f returns an object whose leaves are computed from x.
     const f = (x: np.Array) => ({
-      double: x.ref.mul(2),
-      square: x.ref.mul(x.ref),
+      double: x.mul(2),
+      square: x.mul(x),
       sum: x.sum(),
     });
     const batchedF = vmap(f, [0]);
@@ -167,7 +167,7 @@ suite("jax.vmap()", () => {
       [5, 6],
       [7, 8],
     ]);
-    expect(vmap(np.dot, 0)(a.ref, b.ref).js()).toEqual([17, 53]);
+    expect(vmap(np.dot, 0)(a, b).js()).toEqual([17, 53]);
     expect(vmap(np.dot, 1)(a, b).js()).toEqual([26, 44]);
   });
 
@@ -205,7 +205,7 @@ suite("jax.vmap()", () => {
 
 suite("jax.jacfwd()", () => {
   test("computes jacobian of 3d square", () => {
-    const f = (x: np.Array) => x.ref.mul(x);
+    const f = (x: np.Array) => x.mul(x);
     const x = np.array([1, 2, 3]);
     const j = jacfwd(f)(x);
     expect(j).toBeAllclose(
@@ -218,9 +218,9 @@ suite("jax.jacfwd()", () => {
   });
 
   test("equals jacrev() output", () => {
-    const f = (x: np.Array) => np.sin(x.ref).add(np.cos(x));
+    const f = (x: np.Array) => np.sin(x).add(np.cos(x));
     const x = np.array([1, 2, 3]);
-    const jFwd = jacfwd(f)(x.ref);
+    const jFwd = jacfwd(f)(x);
     const jRev = jacrev(f)(x);
     expect(jFwd).toBeAllclose(jRev);
   });
@@ -229,7 +229,7 @@ suite("jax.jacfwd()", () => {
 suite("jax.hessian()", () => {
   test("computes hessian of sum of squares", () => {
     // f(x) = sum(x^2) => gradient = 2x, hessian = 2*I
-    const f = (x: np.Array) => np.sum(x.ref.mul(x));
+    const f = (x: np.Array) => np.sum(x.mul(x));
     const x = np.array([1, 2, 3]);
     const H = hessian(f)(x);
     expect(H).toBeAllclose(
@@ -247,7 +247,7 @@ suite("jax.hessian()", () => {
     // hessian = diag([2, 4, 6])
     const f = (x: np.Array) => {
       const coeffs = np.array([1, 2, 3]);
-      return np.sum(coeffs.mul(x.ref).mul(x));
+      return np.sum(coeffs.mul(x).mul(x));
     };
     const x = np.array([1, 1, 1]);
     const H = hessian(f)(x);
@@ -266,7 +266,7 @@ suite("jax.hessian()", () => {
     // hessian = [[0, 1, 0], [1, 0, 1], [0, 1, 0]]
     const f = (x: np.Array) => {
       const [x0, x1, x2] = x;
-      return x0.mul(x1.ref).add(x1.mul(x2));
+      return x0.mul(x1).add(x1.mul(x2));
     };
     const x = np.array([1, 2, 3]);
     const H = hessian(f)(x);

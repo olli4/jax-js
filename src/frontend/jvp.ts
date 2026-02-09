@@ -57,6 +57,8 @@ import { ClosedJaxpr, Jaxpr, jaxprAsFun, makeJaxpr } from "./jaxpr";
 import { moveaxis } from "./vmap";
 
 class JVPTracer extends Tracer {
+  #rc = 1;
+
   constructor(
     trace: Trace,
     readonly primal: Tracer,
@@ -74,12 +76,14 @@ class JVPTracer extends Tracer {
   }
 
   get ref() {
-    (this.primal.ref, this.tangent.ref);
+    this.#rc++;
     return this;
   }
   dispose() {
-    this.primal.dispose();
-    this.tangent.dispose();
+    if (--this.#rc === 0) {
+      this.primal.dispose();
+      this.tangent.dispose();
+    }
   }
 }
 
@@ -89,7 +93,7 @@ class JVPTrace extends Trace {
   }
 
   lift(val: Tracer): Tracer {
-    return new JVPTracer(this, val, zerosLike(val.ref));
+    return new JVPTracer(this, val, zerosLike(val));
   }
 
   processPrimitive<P extends Primitive>(
@@ -129,7 +133,7 @@ function linearTangentsJvp<P extends Primitive>(primitive: P): JvpRule<P> {
 /** Rule for product of gradients in bilinear operations. */
 function bilinearTangentsJvp<P extends Primitive>(primitive: P): JvpRule<P> {
   return ([x, y], [dx, dy], params) => {
-    const primal = bind1(primitive, [x.ref, y.ref], params);
+    const primal = bind1(primitive, [x, y], params);
     const tangent = bind1(primitive, [x, dy], params).add(
       bind1(primitive, [dx, y], params),
     ); // (xy)' = xy' + x'y
@@ -140,9 +144,8 @@ function bilinearTangentsJvp<P extends Primitive>(primitive: P): JvpRule<P> {
 /** Rule that zeros out any tangents. */
 function zeroTangentsJvp<P extends Primitive>(primitive: P): JvpRule<P> {
   return (primals, tangents, params) => {
-    for (const t of tangents) t.dispose();
     const ys = bind(primitive, primals, params);
-    return [ys, ys.map((y) => zerosLike(y.ref))];
+    return [ys, ys.map((y) => zerosLike(y))];
   };
 }
 
@@ -176,27 +179,23 @@ const jvpRules: { [P in Primitive]: JvpRule<P> } = {
     // x % y = x - y * trunc(x / y)
     // d(x % y) = dx - dy * trunc(x / y)
     if (!isFloatDtype(x.dtype) && !isFloatDtype(y.dtype)) {
-      dx.dispose();
-      dy.dispose();
-      return [
-        [x.ref, y.ref],
-        [zerosLike(x), zerosLike(y)],
-      ];
+      const result = mod(x, y);
+      return [[result], [zerosLike(result)]];
     }
-    const q = idiv(x.ref, y.ref);
+    const q = idiv(x, y);
     return [[mod(x, y)], [dx.sub(dy.mul(q))]];
   },
   [Primitive.Min]([x, y], [dx, dy]) {
-    return [[min(x.ref, y.ref)], [where(less(y, x), dy, dx)]];
+    return [[min(x, y)], [where(less(y, x), dy, dx)]];
   },
   [Primitive.Max]([x, y], [dx, dy]) {
-    return [[max(x.ref, y.ref)], [where(less(x, y), dy, dx)]];
+    return [[max(x, y)], [where(less(x, y), dy, dx)]];
   },
   [Primitive.Neg]: linearTangentsJvp(Primitive.Neg),
   [Primitive.Reciprocal]([x], [dx]) {
     // d(1/x) = -x^-2 * dx
-    const xRecip = reciprocal(x.ref);
-    return [[xRecip.ref], [neg(xRecip.ref.mul(xRecip)).mul(dx)]];
+    const xRecip = reciprocal(x);
+    return [[xRecip], [neg(xRecip.mul(xRecip)).mul(dx)]];
   },
   [Primitive.Floor]: zeroTangentsJvp(Primitive.Floor),
   [Primitive.Ceil]: zeroTangentsJvp(Primitive.Ceil),
@@ -207,77 +206,75 @@ const jvpRules: { [P in Primitive]: JvpRule<P> } = {
     if (isFloatDtype(dtype) && isFloatDtype(x.dtype)) {
       return [[cast(x, dtype)], [cast(dx, dtype)]];
     } else {
-      dx.dispose();
-      return [[cast(x.ref, dtype)], [zerosLike(x)]];
+      return [[cast(x, dtype)], [zerosLike(x)]];
     }
   },
   [Primitive.Bitcast]([x], [dx], { dtype }) {
     if (x.dtype === dtype) return [[x], [dx]]; // No-op if dtype is the same.
-    dx.dispose(); // Non-differentiable operation.
-    return [[bitcast(x.ref, dtype)], [zerosLike(x)]];
+    return [[bitcast(x, dtype)], [zerosLike(x)]];
   },
   [Primitive.Sin]([x], [dx]) {
-    return [[sin(x.ref)], [cos(x).mul(dx)]];
+    return [[sin(x)], [cos(x).mul(dx)]];
   },
   [Primitive.Cos]([x], [dx]) {
-    return [[cos(x.ref)], [neg(sin(x)).mul(dx)]];
+    return [[cos(x)], [neg(sin(x)).mul(dx)]];
   },
   [Primitive.Asin]([x], [dx]) {
     // d(asin(x)) = 1/sqrt(1 - x^2) * dx
-    const denom = sqrt(reciprocal(cast(1, x.dtype).sub(x.ref.mul(x.ref))));
+    const denom = sqrt(reciprocal(cast(1, x.dtype).sub(x.mul(x))));
     return [[asin(x)], [denom.mul(dx)]];
   },
   [Primitive.Atan]([x], [dx]) {
     // d(atan(x)) = 1/(1 + x^2) * dx
-    const denom = cast(1, x.dtype).add(x.ref.mul(x.ref));
+    const denom = cast(1, x.dtype).add(x.mul(x));
     return [[atan(x)], [dx.div(denom)]];
   },
   [Primitive.Exp]([x], [dx]) {
     // d(exp(x)) = exp(x) * dx
     const z = exp(x);
-    return [[z.ref], [z.mul(dx)]];
+    return [[z], [z.mul(dx)]];
   },
   [Primitive.Log]([x], [dx]) {
     // d(log(x)) = 1/x * dx
-    return [[log(x.ref)], [reciprocal(x).mul(dx)]];
+    return [[log(x)], [reciprocal(x).mul(dx)]];
   },
   [Primitive.Erf]([x], [dx]) {
     // d(erf(x)) = 2/sqrt(pi) * exp(-x^2) * dx
     const coeff = 2 / Math.sqrt(Math.PI);
-    const expTerm = exp(neg(x.ref.mul(x.ref)));
+    const expTerm = exp(neg(x.mul(x)));
     return [[erf(x)], [expTerm.mul(coeff).mul(dx)]];
   },
   [Primitive.Erfc]([x], [dx]) {
     // d(erfc(x)) = -2/sqrt(pi) * exp(-x^2) * dx
     const coeff = -2 / Math.sqrt(Math.PI);
-    const expTerm = exp(neg(x.ref.mul(x.ref)));
+    const expTerm = exp(neg(x.mul(x)));
     return [[erfc(x)], [expTerm.mul(coeff).mul(dx)]];
   },
   [Primitive.Sqrt]([x], [dx]) {
     // d(sqrt(x)) = 1/(2*sqrt(x)) * dx
     const z = sqrt(x);
-    return [[z.ref], [reciprocal(z.mul(2)).mul(dx)]];
+    return [[z], [reciprocal(z.mul(2)).mul(dx)]];
   },
   [Primitive.Reduce]([x], [dx], { op, axis }) {
     if (op === AluOp.Add) {
       return [[reduce(x, op, axis)], [reduce(dx, op, axis)]];
     } else if (op === AluOp.Mul) {
       // Multivariate product rule: (abc)'/abc = a'/a + b'/b + c'/c
-      const primal = reduce(x.ref, op, axis);
-      const tangent = broadcast(primal.ref, x.shape, axis)
+      const primal = reduce(x, op, axis);
+      const tangent = broadcast(primal, x.shape, axis)
         .mul(reciprocal(x))
         .mul(dx)
         .sum(axis);
       return [[primal], [tangent]];
     } else if (op === AluOp.Min || op === AluOp.Max) {
-      const primal = reduce(x.ref, op, axis);
+      const primal = reduce(x, op, axis);
       // (min(x))' = average(where(x != min(x), inf, x'))
       //
       // We take average here to match the behavior of JAX. If there are
       // multiple minima, it's not well-defined which one to take as the tangent
       // vector (sharp discontinuity), so we average over all of them.
-      const notMin = notEqual(x, broadcast(primal.ref, x.shape, axis));
-      const minCount = where(notMin.ref, 0.0, 1.0).sum(axis);
+      const notMin = notEqual(x, broadcast(primal, x.shape, axis));
+      const minCount = where(notMin, 0.0, 1.0).sum(axis);
       const tangent = where(notMin, 0.0, dx).sum(axis).div(minCount);
       return [[primal], [tangent]];
     } else {
@@ -290,8 +287,7 @@ const jvpRules: { [P in Primitive]: JvpRule<P> } = {
   [Primitive.Conv]: bilinearTangentsJvp(Primitive.Conv),
   [Primitive.Compare]: zeroTangentsJvp(Primitive.Compare),
   [Primitive.Where]([cond, x, y], [dcond, dx, dy]) {
-    dcond.dispose();
-    return [[where(cond.ref, x, y)], [where(cond, dx, dy)]];
+    return [[where(cond, x, y)], [where(cond, dx, dy)]];
   },
   [Primitive.Concatenate]: linearTangentsJvp(Primitive.Concatenate),
   [Primitive.Split]: linearTangentsJvp(Primitive.Split),
@@ -299,7 +295,7 @@ const jvpRules: { [P in Primitive]: JvpRule<P> } = {
   [Primitive.Gather]([x, ...indices], [dx, ..._], { axis, outDim }) {
     // d(gather(x, indices)) = gather(dx, indices).
     // Note: We ignore the tangents for indices, since they are not differentiable.
-    const indicesRef = indices.map((t) => t.ref);
+    const indicesRef = indices;
     return [
       [gather(x, indices, axis, outDim)],
       [gather(dx, indicesRef, axis, outDim)],
@@ -320,15 +316,15 @@ const jvpRules: { [P in Primitive]: JvpRule<P> } = {
     const [y, idx] = argsort(x);
     return [
       [y, idx.ref],
-      [gather(dx, [idx.ref], [-1], -1), zerosLike(idx)],
+      [gather(dx, [idx], [-1], -1), zerosLike(idx)],
     ];
   },
   [Primitive.TriangularSolve]([a, b], [da, db], { unitDiagonal }) {
     // A @ X.T = B.T  =>  dA @ X.T + A @ dX.T = dB.T
     // So: A @ dX.T = dB.T - dA @ X.T
     // Therefore: dX.T = A^-1 @ (dB.T - dA @ X.T)
-    const x = triangularSolve(a.ref, b, { unitDiagonal }); // (A^-1 @ B.T).T
-    const dax = batchMatmulT(da, x.ref); // dA @ X.T
+    const x = triangularSolve(a, b, { unitDiagonal }); // (A^-1 @ B.T).T
+    const dax = batchMatmulT(da, x); // dA @ X.T
     const rhsT = db.sub(mT(dax)); // (dB.T - dA @ X.T).T
     const dx = triangularSolve(a, rhsT, { unitDiagonal });
     return [[x], [dx]];
@@ -337,13 +333,13 @@ const jvpRules: { [P in Primitive]: JvpRule<P> } = {
     // If L = cholesky(A), so that A = L @ L^T, then
     // dL = L @ tril(S - 0.5 * diag(S)),
     //   where S = L^{-1} @ dA @ L^{-T}
-    const L = cholesky(a.ref);
-    da = da.ref.add(mT(da)).mul(0.5); // Symmetrize dA for grad
-    const W = triangularSolve(L.ref, da, { lower: true }); // (L^-1 @ dA.T).T = dA @ L^-T
-    const ST = triangularSolve(L.ref, mT(W), { lower: true });
+    const L = cholesky(a);
+    da = da.add(mT(da)).mul(0.5); // Symmetrize dA for grad
+    const W = triangularSolve(L, da, { lower: true }); // (L^-1 @ dA.T).T = dA @ L^-T
+    const ST = triangularSolve(L, mT(W), { lower: true });
     const dL = batchMatmulT(
-      L.ref,
-      triu(ST.ref as any, 1)
+      L,
+      triu(ST as any, 1)
         .add(triu(ST as any))
         .mul(0.5),
     );
@@ -355,47 +351,47 @@ const jvpRules: { [P in Primitive]: JvpRule<P> } = {
     const [m, n] = a.shape.slice(-2);
     const k = Math.min(m, n);
     // Extract full L: lower triangular with unit diagonal, shape [..., m, m]
-    const luSliceL = sliceAxis(luMatrix.ref, -1, [0, k]);
+    const luSliceL = sliceAxis(luMatrix, -1, [0, k]);
     const lLower = tril(luSliceL as any, -1);
     const lPadded = m > k ? padAxis(lLower, -1, [0, m - k]) : lLower;
     const L = lPadded.add(eye(m));
     // Extract full U: upper triangular, shape [..., n, n]
     // U = triu(lu[:k, :]) padded to [..., n, n] + eye for remaining rows
-    const luSliceU = sliceAxis(luMatrix.ref, -2, [0, k]);
+    const luSliceU = sliceAxis(luMatrix, -2, [0, k]);
     const uUpper = triu(luSliceU as any);
     const uPadded = n > k ? padAxis(uUpper, -2, [0, n - k]) : uUpper;
     const uEye =
       n > k
         ? padAxis(padAxis(eye(n - k), -1, [k, 0]), -2, [k, 0])
-        : zerosLike(uPadded.ref);
+        : zerosLike(uPadded);
     const U = uPadded.add(uEye);
     // Apply permutation to da: P @ da (reorder rows)
-    const P = permutation.ref
+    const P = permutation
       .reshape([...permutation.shape, 1])
       .equal(arange(m))
       .astype(da.dtype);
     const pda = batchMatmulT(P, mT(da));
     // Solve L @ la = P @ da for la (la = L^{-1} @ P @ da)
     const la = mT(
-      triangularSolve(L.ref, mT(pda), {
+      triangularSolve(L, mT(pda), {
         lower: true,
         unitDiagonal: true,
       }),
     );
     // Solve lau @ U = la for lau (lau = la @ U^{-1})
-    const lau = triangularSolve(mT(U.ref), la, { lower: true });
-    const lDot = batchMatmulT(L, mT(tril(lau.ref as any, -1))); // L' = L @ tril(lau)
+    const lau = triangularSolve(mT(U), la, { lower: true });
+    const lDot = batchMatmulT(L, mT(tril(lau as any, -1))); // L' = L @ tril(lau)
     const uDot = batchMatmulT(triu(lau as any), mT(U)); // U' = triu(lau) @ U
     return [
       [luMatrix, pivots, permutation],
-      [lDot.add(uDot), zerosLike(pivots.ref), zerosLike(permutation.ref)],
+      [lDot.add(uDot), zerosLike(pivots), zerosLike(permutation)],
     ];
   },
   [Primitive.Jit](primals, tangents, { name, jaxpr }) {
     const newJaxpr = jvpJaxpr(jaxpr);
     const outs = bind(
       Primitive.Jit,
-      [...newJaxpr.consts.map((c) => c.ref), ...primals, ...tangents],
+      [...newJaxpr.consts, ...primals, ...tangents],
       {
         name: `${name}_jvp`,
         jaxpr: newJaxpr.jaxpr,
@@ -501,18 +497,18 @@ const jvpRules: { [P in Primitive]: JvpRule<P> } = {
 
         // Reorder to jvp order: [constsP, carryP, xP, constsT, carryT, xT]
         const jvpOrderArgs = [
-          ...constsP_in.map((x) => x.ref),
-          ...carryP_in.map((x) => x.ref),
-          ...xP_in.map((x) => x.ref),
-          ...constsT_in.map((x) => x.ref),
-          ...carryT_in.map((x) => x.ref),
-          ...xT_in.map((x) => x.ref),
+          ...constsP_in,
+          ...carryP_in,
+          ...xP_in,
+          ...constsT_in,
+          ...carryT_in,
+          ...xT_in,
         ];
 
         // Call the jvpBody jaxpr with jvpConsts (captured) first, then reordered body args
         const jvpOutputs = bind(
           Primitive.Jit,
-          [...jvpBody.consts.map((c) => c.ref), ...jvpOrderArgs],
+          [...jvpBody.consts, ...jvpOrderArgs],
           {
             jaxpr: jvpBody.jaxpr,
             numConsts: numJvpConsts,
@@ -532,7 +528,6 @@ const jvpRules: { [P in Primitive]: JvpRule<P> } = {
 
         return [...carryP_out, ...carryT_out, ...yP_out, ...yT_out];
       },
-      { validateRefs: false },
     )(...wrapperInAvals);
 
     // Original args: consts (numConsts), carry (numCarry), xs (numX)
@@ -547,13 +542,13 @@ const jvpRules: { [P in Primitive]: JvpRule<P> } = {
     // Build scan args in scan order:
     // [wrapperConsts..., constsP, constsT, carryP, carryT, xsP, xsT]
     const scanArgsJvp = [
-      ...wrapperJaxpr.consts.map((c) => c.ref),
-      ...constsP.map((c) => c.ref),
-      ...constsT.map((c) => c.ref),
-      ...carryP.map((c) => c.ref),
-      ...carryT.map((c) => c.ref),
-      ...xsP.map((x) => x.ref),
-      ...xsT.map((x) => x.ref),
+      ...wrapperJaxpr.consts,
+      ...constsP,
+      ...constsT,
+      ...carryP,
+      ...carryT,
+      ...xsP,
+      ...xsT,
     ];
 
     const results = bind(Primitive.Scan, scanArgsJvp, {
@@ -600,7 +595,6 @@ function jvpJaxpr(jaxpr: Jaxpr): ClosedJaxpr {
   const { jaxpr: newJaxpr } = makeJaxpr(
     (primals: Tracer[], tangents: Tracer[]) =>
       jvpFlat(jaxprAsFun(jaxpr), primals, tangents),
-    { validateRefs: false },
   )(inAvals, inAvals);
 
   jvpJaxprCache.set(jaxpr, newJaxpr);
@@ -613,7 +607,6 @@ function jvpFlat(
   tangents: TracerValue[],
 ): [Tracer[], Tracer[]] {
   using main = newMain(JVPTrace);
-  main.isTransform = true;
   const trace = new JVPTrace(main);
   const tracersIn = zip(primals, tangents).map(
     ([x, t]) => new JVPTracer(trace, pureArray(x), pureArray(t)),
@@ -667,7 +660,6 @@ export function lowerAux(aux: any): any {
     if (x instanceof Tracer) {
       while (x._trace.main.level > level) {
         if (x instanceof JVPTracer) {
-          x.tangent.dispose();
           x = x.primal;
         } else {
           const y = x.fullLower();

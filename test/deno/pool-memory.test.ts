@@ -67,7 +67,7 @@ Deno.test({
     const x = np.ones([1024]); // 4096 bytes
 
     // Warm up: first call compiles + runs
-    const warmup = f(x.ref);
+    const warmup = f(x);
     await warmup.data();
 
     // After warmup, record baseline GPU bytes.
@@ -77,7 +77,7 @@ Deno.test({
     // Run many iterations. If pool grows unbounded, bytes will increase.
     const N = 20;
     for (let i = 0; i < N; i++) {
-      const result = f(x.ref);
+      const result = f(x);
       await result.data(); // consumes result
     }
 
@@ -104,19 +104,19 @@ Deno.test({
   ignore: !hasWebGPU,
   fn: withLeakCheck(async () => {
     // Two outputs of the same size → recycling kicks in
-    const f = jit((x: any) => [x.ref.add(1), x.mul(2)]);
+    const f = jit((x: any) => [x.add(1), x.mul(2)]);
 
     const x = np.ones([2048]); // 8192 bytes
 
     // Warmup
-    const [a, b] = f(x.ref) as any[];
+    const [a, b] = f(x) as any[];
     await a.data();
     await b.data();
 
     const baselineBytes = getGpuBytes();
 
     for (let i = 0; i < 15; i++) {
-      const [r1, r2] = f(x.ref) as any[];
+      const [r1, r2] = f(x) as any[];
       await r1.data();
       await r2.data();
     }
@@ -148,16 +148,16 @@ Deno.test({
     const xLarge = np.ones([4096]); // 16384 bytes
 
     // Warmup both
-    (await fSmall(xSmall.ref)).dispose();
-    (await fLarge(xLarge.ref)).dispose();
+    (await fSmall(xSmall)).dispose();
+    (await fLarge(xLarge)).dispose();
 
     // Record baseline after both have run
     const baselineBytes = getGpuBytes();
 
     // Interleave calls: each configurePool evicts the other's stale sizes
     for (let i = 0; i < 10; i++) {
-      (await fSmall(xSmall.ref)).dispose();
-      (await fLarge(xLarge.ref)).dispose();
+      (await fSmall(xSmall)).dispose();
+      (await fLarge(xLarge)).dispose();
     }
 
     const afterBytes = getGpuBytes();
@@ -185,7 +185,7 @@ Deno.test({
       return lax.scan(
         (carry: any, x: any) => {
           const s = carry.add(x);
-          return [s.ref, s];
+          return [s, s];
         },
         init,
         xs.reshape([-1, 64]),
@@ -195,7 +195,7 @@ Deno.test({
     const xs = np.ones([6400]); // 100 rows of 64
 
     // Warmup
-    const [c, ys] = scanF(xs.ref) as any[];
+    const [c, ys] = scanF(xs) as any[];
     await c.data();
     await ys.data();
 
@@ -203,7 +203,7 @@ Deno.test({
 
     // Run again, pool should be stable
     for (let i = 0; i < 5; i++) {
-      const [c2, ys2] = scanF(xs.ref) as any[];
+      const [c2, ys2] = scanF(xs) as any[];
       await c2.data();
       await ys2.data();
     }

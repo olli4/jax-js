@@ -64,7 +64,7 @@ describe("lax.scan", () => {
       const stacked = tree.map(
         (...v: np.Array[]) =>
           np.stack(
-            v.map((a) => a.ref),
+            v.map((a) => a),
             0,
           ),
         ...trees,
@@ -82,7 +82,7 @@ describe("lax.scan", () => {
     it("computes cumulative sum", () => {
       const step = (carry: np.Array, x: np.Array): [np.Array, np.Array] => {
         const newCarry = np.add(carry, x);
-        return [newCarry, newCarry.ref];
+        return [newCarry, newCarry];
       };
 
       const initVal = np.array([0.0]);
@@ -97,7 +97,7 @@ describe("lax.scan", () => {
     it("computes factorial-like recurrence", () => {
       const step = (carry: np.Array, t: np.Array): [np.Array, np.Array] => {
         const newCarry = np.multiply(carry, t);
-        return [newCarry, newCarry.ref];
+        return [newCarry, newCarry];
       };
 
       const initVal = np.array([1.0]);
@@ -112,7 +112,7 @@ describe("lax.scan", () => {
     it("handles length-0 scans with xs array (returns init and empty ys)", () => {
       const step = (carry: np.Array, x: np.Array): [np.Array, np.Array] => {
         const newCarry = np.add(carry, x);
-        return [newCarry, newCarry.ref];
+        return [newCarry, newCarry];
       };
 
       const initVal = np.array([42.0]);
@@ -126,7 +126,7 @@ describe("lax.scan", () => {
 
     it("handles xs=null length-0 scans with explicit length (returns init and empty ys)", () => {
       const step = (carry: np.Array, _x: null): [np.Array, np.Array] => {
-        return [carry, carry.ref];
+        return [carry, carry];
       };
 
       const initVal = np.array([7.0]);
@@ -144,7 +144,7 @@ describe("lax.scan", () => {
         const newCarry = np.add(carry, x);
         return [
           newCarry,
-          { a: newCarry.ref, b: np.multiply(newCarry, np.array([2.0])) },
+          { a: newCarry, b: np.multiply(newCarry, np.array([2.0])) },
         ];
       };
 
@@ -183,7 +183,7 @@ describe("lax.scan", () => {
         const newCount = np.add(carry.count, np.array([1.0]));
         return [
           { sum: newSum, count: newCount },
-          np.divide(newSum.ref, newCount.ref),
+          np.divide(newSum, newCount),
         ];
       };
 
@@ -208,7 +208,7 @@ describe("lax.scan", () => {
       const step = (carry: Carry, x: X): [Carry, Y] => {
         const sum = np.add(x.a, x.b);
         const newCarry = np.add(carry, sum);
-        return [newCarry, newCarry.ref];
+        return [newCarry, newCarry];
       };
 
       const initVal = np.array([0.0]);
@@ -239,7 +239,7 @@ suite.each(devices)("lax.scan device:%s", (device) => {
   test("cumulative sum", () => {
     const step = (carry: np.Array, x: np.Array): [np.Array, np.Array] => {
       const newCarry = np.add(carry, x);
-      return [newCarry, newCarry.ref];
+      return [newCarry, newCarry];
     };
 
     const initCarry = np.array([0.0]);
@@ -254,7 +254,7 @@ suite.each(devices)("lax.scan device:%s", (device) => {
   test("jit + scan", () => {
     const step = jit((carry: np.Array, x: np.Array): [np.Array, np.Array] => {
       const newCarry = np.add(carry, x);
-      return [newCarry, newCarry.ref];
+      return [newCarry, newCarry];
     });
 
     const initCarry = np.array([0.0]);
@@ -270,9 +270,9 @@ suite.each(devices)("lax.scan device:%s", (device) => {
     type Carry = { sum: np.Array; product: np.Array };
 
     const step = (carry: Carry, x: np.Array): [Carry, np.Array] => {
-      const newSum = np.add(carry.sum.ref, x.ref);
+      const newSum = np.add(carry.sum, x);
       const newProduct = np.multiply(carry.product, x);
-      return [{ sum: newSum, product: newProduct }, newSum.ref];
+      return [{ sum: newSum, product: newProduct }, newSum];
     };
 
     const initCarry = { sum: np.array([0.0]), product: np.array([1.0]) };
@@ -288,7 +288,7 @@ suite.each(devices)("lax.scan device:%s", (device) => {
   test("larger iteration count", () => {
     const step = (carry: np.Array, x: np.Array): [np.Array, np.Array] => {
       const newCarry = np.add(carry, x);
-      return [newCarry, newCarry.ref];
+      return [newCarry, newCarry];
     };
 
     const n = 100;
@@ -306,7 +306,7 @@ suite.each(devices)("lax.scan device:%s", (device) => {
       const scaled = np.multiply(x, np.array([0.1]));
       const added = np.add(carry, scaled);
       const newCarry = np.tanh(added);
-      return [newCarry, newCarry.ref];
+      return [newCarry, newCarry];
     };
 
     const initCarry = np.array([0.0]);
@@ -323,7 +323,7 @@ suite.each(devices)("lax.scan device:%s", (device) => {
     test("matmul in body (routine)", async () => {
       const step = (carry: np.Array, x: np.Array): [np.Array, np.Array] => {
         const newCarry = np.matmul(carry, x);
-        return [newCarry.ref, newCarry];
+        return [newCarry, newCarry];
       };
 
       const initCarry = np.eye(2);
@@ -354,7 +354,7 @@ suite.each(devices)("lax.scan device:%s", (device) => {
     test("matmul in body with reverse", async () => {
       const step = (carry: np.Array, x: np.Array): [np.Array, np.Array] => {
         const newCarry = np.matmul(carry, x);
-        return [newCarry.ref, newCarry];
+        return [newCarry, newCarry];
       };
 
       const initCarry = np.eye(2);
@@ -405,21 +405,21 @@ suite.each(devices)("lax.scan device:%s", (device) => {
         const { state, cov } = carry;
         const { obs } = x;
 
-        const statePred = np.matmul(F.ref, state.ref);
-        const FCov = np.matmul(F.ref, cov.ref);
-        const covPred = np.add(np.matmul(FCov, F.ref.transpose()), Q.ref);
+        const statePred = np.matmul(F, state);
+        const FCov = np.matmul(F, cov);
+        const covPred = np.add(np.matmul(FCov, F.transpose()), Q);
         const innovation = np.subtract(
-          obs.ref,
-          np.matmul(H.ref, statePred.ref),
+          obs,
+          np.matmul(H, statePred),
         );
-        const covH = np.matmul(covPred.ref, H.ref.transpose());
+        const covH = np.matmul(covPred, H.transpose());
         const scale = np.array([[0.5]]);
         const K = np.multiply(covH, scale);
         const stateNew = np.add(
-          statePred.ref,
-          np.matmul(K.ref, innovation.ref),
+          statePred,
+          np.matmul(K, innovation),
         );
-        const covNew = np.multiply(covPred.ref, np.array([[0.9]]));
+        const covNew = np.multiply(covPred, np.array([[0.9]]));
 
         return [
           { state: stateNew, cov: covNew },
@@ -445,7 +445,7 @@ suite.each(devices)("lax.scan device:%s", (device) => {
       expect(outputs.pred.shape).toEqual([5, 2, 1]);
       expect(outputs.innovation.shape).toEqual([5, 1, 1]);
 
-      const finalStateData = await finalCarry.state.ref.data();
+      const finalStateData = await finalCarry.state.data();
       expect(Math.abs(finalStateData[0])).toBeGreaterThan(0.1);
 
       F.dispose();
@@ -462,7 +462,7 @@ suite.each(devices)("lax.scan device:%s", (device) => {
       const step = (carry: np.Array, x: np.Array): [np.Array, np.Array] => {
         const sumX = np.sum(x);
         const newCarry = np.add(carry, sumX);
-        return [newCarry, newCarry.ref];
+        return [newCarry, newCarry];
       };
 
       const initCarry = np.array([0.0]);
@@ -483,7 +483,7 @@ suite.each(devices)("lax.scan device:%s", (device) => {
     test("basic", () => {
       const step = (carry: np.Array, x: np.Array): [np.Array, np.Array] => {
         const newCarry = np.add(carry, x);
-        return [newCarry, newCarry.ref];
+        return [newCarry, newCarry];
       };
 
       const initCarry = np.array([0.0]);
@@ -503,7 +503,7 @@ suite.each(devices)("lax.scan device:%s", (device) => {
   describe("scan with xs=null (carry-only)", () => {
     test("generates sequence with no input arrays", () => {
       const step = (carry: np.Array, _x: null): [np.Array, np.Array] => {
-        const newCarry = np.add(carry.ref, np.array([1.0]));
+        const newCarry = np.add(carry, np.array([1.0]));
         return [newCarry, carry];
       };
 
@@ -519,9 +519,9 @@ suite.each(devices)("lax.scan device:%s", (device) => {
 
     test("generates fibonacci sequence", async () => {
       const step = (carry: np.Array, _x: null): [np.Array, np.Array] => {
-        const a = np.take(carry.ref, np.array(0, { dtype: np.int32 }));
+        const a = np.take(carry, np.array(0, { dtype: np.int32 }));
         const b = np.take(carry, np.array(1, { dtype: np.int32 }));
-        const newCarry = np.stack([b.ref, np.add(a.ref, b)]);
+        const newCarry = np.stack([b, np.add(a, b)]);
         return [newCarry, a];
       };
 
@@ -541,7 +541,7 @@ suite.each(devices)("lax.scan device:%s", (device) => {
 
     test("with jit", () => {
       const step = (carry: np.Array, _x: null): [np.Array, np.Array] => {
-        const newCarry = np.add(carry.ref, np.array([1.0]));
+        const newCarry = np.add(carry, np.array([1.0]));
         return [newCarry, carry];
       };
 
@@ -560,7 +560,7 @@ suite.each(devices)("lax.scan device:%s", (device) => {
 
     test("throws when length not provided", () => {
       const step = (carry: np.Array, _x: null): [np.Array, np.Array] => {
-        return [carry.ref, carry.ref];
+        return [carry, carry];
       };
 
       const initCarry = np.array([0.0]);
@@ -570,7 +570,7 @@ suite.each(devices)("lax.scan device:%s", (device) => {
 
     test("with reverse", () => {
       const step = (carry: np.Array, _x: null): [np.Array, np.Array] => {
-        const newCarry = np.add(carry.ref, np.array([1.0]));
+        const newCarry = np.add(carry, np.array([1.0]));
         return [newCarry, carry];
       };
 
@@ -590,7 +590,7 @@ suite.each(devices)("lax.scan device:%s", (device) => {
       type Carry = { a: np.Array; b: np.Array };
 
       const step = (carry: Carry, _x: null): [Carry, np.Array] => {
-        const newA = np.add(carry.a.ref, carry.b.ref);
+        const newA = np.add(carry.a, carry.b);
         const newB = np.add(carry.b, np.array([1.0]));
         return [{ a: newA, b: newB }, carry.a];
       };
@@ -614,7 +614,7 @@ suite.each(devices)("lax.scan device:%s", (device) => {
   describe("scan with Y=null (no output stacking)", () => {
     test("basic carry-only with Y=null", async () => {
       const step = (carry: np.Array, _x: null): [np.Array, null] => {
-        const newCarry = np.add(carry.ref, np.array([1.0]));
+        const newCarry = np.add(carry, np.array([1.0]));
         carry.dispose();
         return [newCarry, null];
       };
@@ -630,7 +630,7 @@ suite.each(devices)("lax.scan device:%s", (device) => {
     test("Y=null with jit", () => {
       const scanFn = (initVal: np.Array) => {
         const step = (carry: np.Array, _x: null): [np.Array, null] => {
-          const newCarry = np.add(carry.ref, np.array([1.0]));
+          const newCarry = np.add(carry, np.array([1.0]));
           carry.dispose();
           return [newCarry, null];
         };
@@ -664,7 +664,7 @@ suite.each(devices)("lax.scan device:%s", (device) => {
       type Carry = { sum: np.Array; count: np.Array };
 
       const step = (carry: Carry, _x: null): [Carry, null] => {
-        const newSum = np.add(carry.sum.ref, np.array([10.0]));
+        const newSum = np.add(carry.sum, np.array([10.0]));
         const newCount = np.add(carry.count, np.array([1.0]));
         carry.sum.dispose();
         return [{ sum: newSum, count: newCount }, null];
@@ -688,7 +688,7 @@ suite.each(devices)("lax.scan device:%s", (device) => {
 
       const step = (carry: np.Array, x: np.Array): [np.Array, np.Array] => {
         const newCarry = np.add(carry, x);
-        return [newCarry, newCarry.ref];
+        return [newCarry, newCarry];
       };
       const initVal = np.array([0.0]);
 
@@ -708,7 +708,7 @@ suite.each(devices)("lax.scan device:%s", (device) => {
 
       const step = (carry: np.Array, x: np.Array): [np.Array, np.Array] => {
         const newCarry = np.add(carry, x);
-        return [newCarry, newCarry.ref];
+        return [newCarry, newCarry];
       };
       const initVal = np.zeros([3]);
 
@@ -723,12 +723,12 @@ suite.each(devices)("lax.scan device:%s", (device) => {
 
     it("jit(scan) over sliced xs", () => {
       const full = np.array([[0.0], [1.0], [2.0], [3.0], [4.0]]);
-      const xs = full.ref.slice([1, 4]); // [1.0], [2.0], [3.0]
+      const xs = full.slice([1, 4]); // [1.0], [2.0], [3.0]
 
       const f = jit(() => {
         const step = (carry: np.Array, x: np.Array): [np.Array, np.Array] => {
           const newCarry = np.add(carry, x);
-          return [newCarry, newCarry.ref];
+          return [newCarry, newCarry];
         };
         const initVal = np.array([0.0]);
         return lax.scan(step, initVal, xs);
@@ -762,7 +762,7 @@ suite.each(devices)("lax.scan device:%s", (device) => {
       const step = (carry: np.Array, x: np.Array): [np.Array, np.Array] => {
         const xSum = np.sum(x);
         const newCarry = np.add(carry, xSum);
-        return [newCarry, newCarry.ref];
+        return [newCarry, newCarry];
       };
       const initVal = np.array([0.0]);
 
@@ -776,9 +776,9 @@ suite.each(devices)("lax.scan device:%s", (device) => {
   describe("scan with routines", () => {
     it("scan with Cholesky in body", async () => {
       const step = (carry: np.Array, x: np.Array): [np.Array, np.Array] => {
-        const scaled = np.multiply(carry.ref, x);
+        const scaled = np.multiply(carry, x);
         const L = lax.linalg.cholesky(scaled);
-        const reconstructed = np.matmul(L.ref, L.transpose());
+        const reconstructed = np.matmul(L, L.transpose());
         return [reconstructed, L];
       };
 
@@ -803,7 +803,7 @@ suite.each(devices)("lax.scan device:%s", (device) => {
       const f = jit(() => {
         const step = (carry: np.Array, _x: np.Array): [np.Array, np.Array] => {
           const L = lax.linalg.cholesky(carry);
-          const reconstructed = np.matmul(L.ref, L.transpose());
+          const reconstructed = np.matmul(L, L.transpose());
           return [reconstructed, L];
         };
 
@@ -833,7 +833,7 @@ suite.each(devices)("lax.scan device:%s", (device) => {
     it("succeeds when acceptPath includes fallback", () => {
       const step = (carry: np.Array, x: np.Array): [np.Array, np.Array] => {
         const newCarry = np.add(carry, x);
-        return [newCarry, newCarry.ref];
+        return [newCarry, newCarry];
       };
 
       const initVal = np.array([0.0]);
@@ -857,7 +857,7 @@ suite.each(devices)("lax.scan device:%s", (device) => {
     it("allows array of paths", () => {
       const step = (carry: np.Array, x: np.Array): [np.Array, np.Array] => {
         const newCarry = np.add(carry, x);
-        return [newCarry, newCarry.ref];
+        return [newCarry, newCarry];
       };
 
       const initVal = np.array([0.0]);
@@ -877,16 +877,16 @@ suite.each(devices)("lax.scan device:%s", (device) => {
   });
 
   describe("ownership edge cases", () => {
-    it("duplicate-slot output: return [x.ref, x]", async () => {
+    it("duplicate-slot output: return [x, x]", async () => {
       const step = (carry: np.Array, x: np.Array): [np.Array, np.Array] => {
         const result = np.add(carry, x);
-        return [result.ref, result];
+        return [result, result];
       };
 
       const initCarry = np.array([0.0]);
       const xs = np.array([[1.0], [2.0], [3.0]]);
 
-      const [finalCarry, ys] = lax.scan(step, initCarry.ref, xs.ref) as [
+      const [finalCarry, ys] = lax.scan(step, initCarry, xs) as [
         np.Array,
         np.Array,
       ];
@@ -897,16 +897,16 @@ suite.each(devices)("lax.scan device:%s", (device) => {
       xs.dispose();
     });
 
-    it("carry passthrough: return [carry.ref, y]", async () => {
+    it("carry passthrough: return [carry, y]", async () => {
       const step = (carry: np.Array, x: np.Array): [np.Array, np.Array] => {
-        const y = np.add(carry.ref, x);
+        const y = np.add(carry, x);
         return [carry, y];
       };
 
       const initCarry = np.array([10.0]);
       const xs = np.array([[1.0], [2.0], [3.0]]);
 
-      const [finalCarry, ys] = lax.scan(step, initCarry.ref, xs.ref) as [
+      const [finalCarry, ys] = lax.scan(step, initCarry, xs) as [
         np.Array,
         np.Array,
       ];
@@ -919,14 +919,14 @@ suite.each(devices)("lax.scan device:%s", (device) => {
 
     it("xs passthrough: return [newCarry, x]", async () => {
       const step = (carry: np.Array, x: np.Array): [np.Array, np.Array] => {
-        const newCarry = np.add(carry, x.ref);
+        const newCarry = np.add(carry, x);
         return [newCarry, x];
       };
 
       const initCarry = np.array([0.0]);
       const xs = np.array([[1.0], [2.0], [3.0]]);
 
-      const [finalCarry, ys] = lax.scan(step, initCarry.ref, xs.ref) as [
+      const [finalCarry, ys] = lax.scan(step, initCarry, xs) as [
         np.Array,
         np.Array,
       ];
@@ -940,7 +940,7 @@ suite.each(devices)("lax.scan device:%s", (device) => {
     it("jit(scan) with duplicate-slot output", async () => {
       const step = (carry: np.Array, x: np.Array): [np.Array, np.Array] => {
         const result = np.add(carry, x);
-        return [result.ref, result];
+        return [result, result];
       };
 
       const initCarry = np.array([0.0]);
@@ -956,7 +956,7 @@ suite.each(devices)("lax.scan device:%s", (device) => {
 
     it("jit(scan) with xs passthrough, reverse=true", async () => {
       const step = (carry: np.Array, x: np.Array): [np.Array, np.Array] => {
-        const newCarry = np.add(carry, x.ref);
+        const newCarry = np.add(carry, x);
         return [newCarry, x];
       };
 
@@ -974,7 +974,7 @@ suite.each(devices)("lax.scan device:%s", (device) => {
 
     it("jit(scan) with carry passthrough and multiple iterations", async () => {
       const step = (carry: np.Array, x: np.Array): [np.Array, np.Array] => {
-        const y = np.multiply(carry.ref, x);
+        const y = np.multiply(carry, x);
         return [carry, y];
       };
 
@@ -1001,7 +1001,7 @@ describe("scan preallocate", () => {
   test("basic stacked outputs", async () => {
     const step = (carry: np.Array, x: np.Array): [np.Array, np.Array] => {
       const newCarry = np.add(carry, x);
-      return [newCarry, newCarry.ref];
+      return [newCarry, newCarry];
     };
 
     const initCarry = np.array([0.0]);
@@ -1017,7 +1017,7 @@ describe("scan preallocate", () => {
   test("duplicate-slot ys: carry and y are same slot", async () => {
     const step = (carry: np.Array, x: np.Array): [np.Array, np.Array] => {
       const result = np.add(carry, x);
-      return [result.ref, result]; // carry = y (same underlying slot)
+      return [result, result]; // carry = y (same underlying slot)
     };
 
     const initCarry = np.array([0.0]);
@@ -1032,7 +1032,7 @@ describe("scan preallocate", () => {
 
   test("passthrough ys: y is the carry value (no new computation for y)", async () => {
     const step = (carry: np.Array, x: np.Array): [np.Array, np.Array] => {
-      const newCarry = np.add(carry.ref, x);
+      const newCarry = np.add(carry, x);
       return [newCarry, carry]; // y = old carry (passthrough)
     };
 
@@ -1050,7 +1050,7 @@ describe("scan preallocate", () => {
   test("reverse scan preallocate", async () => {
     const step = (carry: np.Array, x: np.Array): [np.Array, np.Array] => {
       const newCarry = np.add(carry, x);
-      return [newCarry, newCarry.ref];
+      return [newCarry, newCarry];
     };
 
     const initCarry = np.array([0.0]);
@@ -1068,7 +1068,7 @@ describe("scan preallocate", () => {
   test("length-0 scan preallocate", async () => {
     const step = (carry: np.Array, x: np.Array): [np.Array, np.Array] => {
       const newCarry = np.add(carry, x);
-      return [newCarry, newCarry.ref];
+      return [newCarry, newCarry];
     };
 
     const initCarry = np.array([42.0]);
@@ -1092,7 +1092,7 @@ describe("jit(scan) DLM patterns", () => {
 
     const step = (carry: Carry, x: np.Array): [Carry, np.Array] => {
       const { state, P } = carry;
-      const newState = np.add(state.ref, np.multiply(P.ref, x));
+      const newState = np.add(state, np.multiply(P, x));
       const newP = np.multiply(P, np.array([0.9]));
       return [{ state: newState, P: newP }, state]; // y = old state (passthrough)
     };
@@ -1126,7 +1126,7 @@ describe("jit(scan) DLM patterns", () => {
 
     const step = (carry: Carry, x: np.Array): [Carry, np.Array] => {
       const { state, P } = carry;
-      const newState = np.add(state.ref, np.multiply(P.ref, x));
+      const newState = np.add(state, np.multiply(P, x));
       const newP = np.multiply(P, np.array([0.9]));
       return [{ state: newState, P: newP }, state];
     };
@@ -1151,7 +1151,7 @@ describe("jit(scan) DLM patterns", () => {
       x: np.Array,
     ): [np.Array, np.Array] => {
       const newCarry = np.add(carry, x);
-      return [newCarry, newCarry.ref];
+      return [newCarry, newCarry];
     };
 
     const xs = np.array([[1.0], [2.0], [3.0], [4.0], [5.0]]);
@@ -1163,7 +1163,7 @@ describe("jit(scan) DLM patterns", () => {
       x: np.Array,
     ): [np.Array, np.Array] => {
       const newCarry = np.add(carry, x);
-      return [newCarry, newCarry.ref];
+      return [newCarry, newCarry];
     };
 
     const [revFinal, _revOutputs] = lax.scan(
@@ -1185,7 +1185,7 @@ describe("jit(scan) DLM patterns", () => {
     const step = (carry: Carry, x: np.Array): [Carry, Y] => {
       const newSum = np.add(carry.sum, x);
       const newCount = np.add(carry.count, np.array([1.0]));
-      const mean = np.divide(newSum.ref, newCount.ref);
+      const mean = np.divide(newSum, newCount);
       return [{ sum: newSum, count: newCount }, { running_mean: mean }];
     };
 
@@ -1221,8 +1221,8 @@ describe("scan autodiff", () => {
     it("computes jvp of cumulative sum", async () => {
       const cumsumScan = (xs: np.Array) => {
         const step = (carry: np.Array, x: np.Array): [np.Array, np.Array] => {
-          const newCarry = np.add(carry.ref, x);
-          return [newCarry, newCarry.ref];
+          const newCarry = np.add(carry, x);
+          return [newCarry, newCarry];
         };
         const initVal = np.zeros([1]);
         const [finalCarry, _outputs] = lax.scan(step, initVal, xs);
@@ -1241,8 +1241,8 @@ describe("scan autodiff", () => {
     it("computes jvp of cumulative product", async () => {
       const cumprodScan = (xs: np.Array) => {
         const step = (carry: np.Array, x: np.Array): [np.Array, np.Array] => {
-          const newCarry = np.multiply(carry.ref, x);
-          return [newCarry, newCarry.ref];
+          const newCarry = np.multiply(carry, x);
+          return [newCarry, newCarry];
         };
         const initVal = np.ones([1]);
         const [finalCarry, _outputs] = lax.scan(step, initVal, xs);
@@ -1261,8 +1261,8 @@ describe("scan autodiff", () => {
     it("jvp works with reverse scan", async () => {
       const revCumsumScan = (xs: np.Array) => {
         const step = (carry: np.Array, x: np.Array): [np.Array, np.Array] => {
-          const newCarry = np.add(carry.ref, x);
-          return [newCarry, newCarry.ref];
+          const newCarry = np.add(carry, x);
+          return [newCarry, newCarry];
         };
         const initVal = np.zeros([1]);
         const [finalCarry, _] = lax.scan(step, initVal, xs, { reverse: true });
@@ -1283,8 +1283,8 @@ describe("scan autodiff", () => {
     it("computes gradient through scan (sum of final carry)", async () => {
       const cumsumScan = (xs: np.Array) => {
         const step = (carry: np.Array, x: np.Array): [np.Array, np.Array] => {
-          const newCarry = np.add(carry.ref, x);
-          return [newCarry, newCarry.ref];
+          const newCarry = np.add(carry, x);
+          return [newCarry, newCarry];
         };
         const initVal = np.zeros([1]);
         const [finalCarry, _] = lax.scan(step, initVal, xs);
@@ -1300,8 +1300,8 @@ describe("scan autodiff", () => {
     it("computes gradient through scan (sum of all cumsum values)", async () => {
       const sumOfCumsum = (xs: np.Array) => {
         const step = (carry: np.Array, x: np.Array): [np.Array, np.Array] => {
-          const newCarry = np.add(carry.ref, x);
-          return [newCarry, newCarry.ref];
+          const newCarry = np.add(carry, x);
+          return [newCarry, newCarry];
         };
         const initVal = np.zeros([1]);
         const [_, ys] = lax.scan(step, initVal, xs);
@@ -1317,8 +1317,8 @@ describe("scan autodiff", () => {
     it("computes gradient through reverse scan", async () => {
       const reverseCumsumScan = (xs: np.Array) => {
         const step = (carry: np.Array, x: np.Array): [np.Array, np.Array] => {
-          const newCarry = np.add(carry.ref, x);
-          return [newCarry, newCarry.ref];
+          const newCarry = np.add(carry, x);
+          return [newCarry, newCarry];
         };
         const initVal = np.zeros([1]);
         const [finalCarry, _] = lax.scan(step, initVal, xs, { reverse: true });
@@ -1335,8 +1335,8 @@ describe("scan autodiff", () => {
   describe("gradient checkpointing", () => {
     it("default (sqrt-N) produces same gradient as checkpoint: false", async () => {
       const step = (carry: np.Array, x: np.Array): [np.Array, np.Array] => {
-        const newCarry = np.add(carry.ref, x);
-        return [newCarry, newCarry.ref];
+        const newCarry = np.add(carry, x);
+        return [newCarry, newCarry];
       };
 
       const cumsumScanNoCheckpoint = (xs: np.Array) => {
@@ -1354,7 +1354,7 @@ describe("scan autodiff", () => {
       };
 
       const xs = np.array([[1.0], [2.0], [3.0], [4.0], [5.0]]);
-      const dxsRef = grad(cumsumScanNoCheckpoint)(xs.ref);
+      const dxsRef = grad(cumsumScanNoCheckpoint)(xs);
       const dxsDefault = grad(cumsumScanDefault)(xs);
 
       expect(await dxsDefault.data()).toEqual(await dxsRef.data());
@@ -1362,8 +1362,8 @@ describe("scan autodiff", () => {
 
     it("default checkpointing produces correct gradient (sum of all outputs)", async () => {
       const step = (carry: np.Array, x: np.Array): [np.Array, np.Array] => {
-        const newCarry = np.add(carry.ref, x);
-        return [newCarry, newCarry.ref];
+        const newCarry = np.add(carry, x);
+        return [newCarry, newCarry];
       };
 
       const sumOfCumsum = (xs: np.Array) => {
@@ -1380,8 +1380,8 @@ describe("scan autodiff", () => {
 
     it("checkpoint: number uses custom segment size", async () => {
       const step = (carry: np.Array, x: np.Array): [np.Array, np.Array] => {
-        const newCarry = np.add(carry.ref, x);
-        return [newCarry, newCarry.ref];
+        const newCarry = np.add(carry, x);
+        return [newCarry, newCarry];
       };
 
       const cumsumScan = (xs: np.Array) => {
@@ -1398,8 +1398,8 @@ describe("scan autodiff", () => {
 
     it("checkpoint works with reverse scan", async () => {
       const step = (carry: np.Array, x: np.Array): [np.Array, np.Array] => {
-        const newCarry = np.add(carry.ref, x);
-        return [newCarry, newCarry.ref];
+        const newCarry = np.add(carry, x);
+        return [newCarry, newCarry];
       };
 
       const reverseScan = (xs: np.Array) => {
@@ -1416,8 +1416,8 @@ describe("scan autodiff", () => {
 
     it("checkpoint works with larger iteration count", async () => {
       const step = (carry: np.Array, x: np.Array): [np.Array, np.Array] => {
-        const newCarry = np.add(carry.ref, x);
-        return [newCarry, newCarry.ref];
+        const newCarry = np.add(carry, x);
+        return [newCarry, newCarry];
       };
 
       const cumsumScan = (xs: np.Array) => {
@@ -1441,7 +1441,7 @@ describe("scan autodiff", () => {
     it("checkpoint works with nonlinear body (multiplicative)", async () => {
       const mulScan = (xs: np.Array) => {
         const step = (carry: np.Array, x: np.Array): [np.Array, np.Array] => {
-          const newCarry = np.multiply(carry.ref, x);
+          const newCarry = np.multiply(carry, x);
           return [newCarry, carry];
         };
         const initVal = np.array([1.0]);
@@ -1452,7 +1452,7 @@ describe("scan autodiff", () => {
       const xs = np.array([[2.0], [3.0], [4.0]]);
       const dxsRef = grad((xs: np.Array) => {
         const step = (carry: np.Array, x: np.Array): [np.Array, np.Array] => {
-          const newCarry = np.multiply(carry.ref, x);
+          const newCarry = np.multiply(carry, x);
           return [newCarry, carry];
         };
         const initVal = np.array([1.0]);
@@ -1460,7 +1460,7 @@ describe("scan autodiff", () => {
           checkpoint: false,
         });
         return finalCarry.sum();
-      })(xs.ref);
+      })(xs);
       const dxsDefault = grad(mulScan)(xs);
 
       expect(await dxsDefault.data()).toEqual(await dxsRef.data());
@@ -1468,8 +1468,8 @@ describe("scan autodiff", () => {
 
     it("jit(grad(scan)) works with default checkpointing", async () => {
       const step = (carry: np.Array, x: np.Array): [np.Array, np.Array] => {
-        const newCarry = np.add(carry.ref, x);
-        return [newCarry, newCarry.ref];
+        const newCarry = np.add(carry, x);
+        return [newCarry, newCarry];
       };
 
       const cumsumScan = (xs: np.Array) => {
@@ -1490,8 +1490,8 @@ describe("scan autodiff", () => {
     it("vmaps cumulative sum over batch dimension", async () => {
       const cumsumScan = (xs: np.Array) => {
         const step = (carry: np.Array, x: np.Array): [np.Array, np.Array] => {
-          const newCarry = np.add(carry.ref, x);
-          return [newCarry, newCarry.ref];
+          const newCarry = np.add(carry, x);
+          return [newCarry, newCarry];
         };
         const initVal = np.zeros([1]);
         const [finalCarry, outputs] = lax.scan(step, initVal, xs);
@@ -1518,8 +1518,8 @@ describe("scan autodiff", () => {
     it("jit(vmap(scan)) works correctly", async () => {
       const cumsumScan = (xs: np.Array) => {
         const step = (carry: np.Array, x: np.Array): [np.Array, np.Array] => {
-          const newCarry = np.add(carry.ref, x);
-          return [newCarry, newCarry.ref];
+          const newCarry = np.add(carry, x);
+          return [newCarry, newCarry];
         };
         const initVal = np.zeros([1]);
         const [finalCarry, _] = lax.scan(step, initVal, xs);
@@ -1549,8 +1549,8 @@ describe("scan autodiff", () => {
     it("jit(grad(scan)) computes gradient through JIT-compiled grad", async () => {
       const cumsumScan = (xs: np.Array) => {
         const step = (carry: np.Array, x: np.Array): [np.Array, np.Array] => {
-          const newCarry = np.add(carry.ref, x);
-          return [newCarry, newCarry.ref];
+          const newCarry = np.add(carry, x);
+          return [newCarry, newCarry];
         };
         const initVal = np.zeros([1]);
         const [finalCarry, _] = lax.scan(step, initVal, xs);
@@ -1560,7 +1560,7 @@ describe("scan autodiff", () => {
       const jitGrad = jit(grad(cumsumScan));
 
       const xs = np.array([[1.0], [2.0], [3.0]]);
-      const dxs1 = jitGrad(xs.ref);
+      const dxs1 = jitGrad(xs);
       expect(dxs1.shape).toEqual([3, 1]);
       expect(await dxs1.data()).toEqual(new Float32Array([1, 1, 1]));
 
@@ -1586,7 +1586,7 @@ describe("native scan paths (P2+)", () => {
   test("small array with acceptPath: compiled-loop", () => {
     const step = (carry: np.Array, x: np.Array): [np.Array, np.Array] => {
       const newCarry = np.add(carry, x);
-      return [newCarry, newCarry.ref];
+      return [newCarry, newCarry];
     };
 
     const size = 64;
@@ -1605,10 +1605,10 @@ describe("native scan paths (P2+)", () => {
     const offset = np.array([1.0]);
 
     const step = (carry: np.Array, x: np.Array): [np.Array, np.Array] => {
-      const scaled = np.multiply(x, scale.ref);
-      const shifted = np.add(scaled, offset.ref);
+      const scaled = np.multiply(x, scale);
+      const shifted = np.add(scaled, offset);
       const newCarry = np.add(carry, shifted);
-      return [newCarry, newCarry.ref];
+      return [newCarry, newCarry];
     };
 
     const initCarry = np.array([0.0]);
@@ -1629,7 +1629,7 @@ describe("native scan paths (P2+)", () => {
     const step = (carry: np.Array, x: np.Array): [np.Array, np.Array] => {
       const sumX = np.sum(x);
       const newCarry = np.add(carry, sumX);
-      return [newCarry, newCarry.ref];
+      return [newCarry, newCarry];
     };
 
     const initCarry = np.array([0.0]);
@@ -1650,7 +1650,7 @@ describe("native scan paths (P2+)", () => {
   test("large native scan (many iterations)", () => {
     const step = (carry: np.Array, x: np.Array): [np.Array, np.Array] => {
       const newCarry = np.add(carry, x);
-      return [newCarry, newCarry.ref];
+      return [newCarry, newCarry];
     };
 
     const n = 500;
@@ -1667,7 +1667,7 @@ describe("native scan paths (P2+)", () => {
   test("routine body: matmul in native scan", () => {
     const step = (carry: np.Array, x: np.Array): [np.Array, np.Array] => {
       const newCarry = np.matmul(carry, x);
-      return [newCarry.ref, newCarry];
+      return [newCarry, newCarry];
     };
 
     const initCarry = np.eye(4);

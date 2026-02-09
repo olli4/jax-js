@@ -1,7 +1,7 @@
 import { jvp, makeJaxpr, numpy as np } from "@jax-js/jax";
 
 // f(x) = (x + 2) * x
-const f = (x: np.Array) => x.ref.add(2).mul(x);
+const f = (x: np.Array) => x.add(2).mul(x);
 
 // fdot(x) = 2 * x + 2
 const fdot = (x: np.Array) => jvp(f, [x], [np.array(1)])[1];

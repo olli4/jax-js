@@ -35,7 +35,7 @@ suite.each(devices)("device:%s", (device) => {
 
     test("is identity on empty axes", () => {
       const x = np.arange(24).reshape([2, 3, 4]);
-      const y = x.ref.sum([]);
+      const y = x.sum([]);
       expect(x.js()).toEqual(y.js());
     });
   });
@@ -46,7 +46,7 @@ suite.each(devices)("device:%s", (device) => {
         [1, 2, 3],
         [4, 5, 6],
       ]);
-      const y = np.cumsum(x.ref, 0);
+      const y = np.cumsum(x, 0);
       expect(y.js()).toEqual([
         [1, 2, 3],
         [5, 7, 9],
@@ -79,7 +79,7 @@ suite.each(devices)("device:%s", (device) => {
 
     test("can be multiplied", () => {
       const x = np.eye(3, 5).mul(-42);
-      expect(x.ref.sum()).toBeAllclose(-126);
+      expect(x.sum()).toBeAllclose(-126);
       expect(x).toBeAllclose([
         [-42, 0, 0, 0, 0],
         [0, -42, 0, 0, 0],
@@ -105,7 +105,7 @@ suite.each(devices)("device:%s", (device) => {
         [4, 5, 6],
         [7, 8, 9],
       ]);
-      const y = np.diag(x.ref);
+      const y = np.diag(x);
       expect(y.js()).toEqual([1, 5, 9]);
       const z = np.diag(x, 1);
       expect(z.js()).toEqual([2, 6]);
@@ -129,8 +129,8 @@ suite.each(devices)("device:%s", (device) => {
   suite("jax.numpy.diagonal()", () => {
     test("diagonal defaults to first two axes", () => {
       const a = np.arange(4).reshape([2, 2]);
-      expect(a.ref.diagonal().js()).toEqual([0, 3]);
-      expect(a.ref.diagonal(1).js()).toEqual([1]);
+      expect(a.diagonal().js()).toEqual([0, 3]);
+      expect(a.diagonal(1).js()).toEqual([1]);
       expect(a.diagonal(-1).js()).toEqual([2]);
 
       const b = np.arange(8).reshape([2, 2, 2]);
@@ -142,18 +142,18 @@ suite.each(devices)("device:%s", (device) => {
 
     test("can take diagonal over other axes", () => {
       const a = np.arange(12).reshape([3, 2, 2]);
-      expect(a.ref.diagonal(0, 1, 2).js()).toEqual([
+      expect(a.diagonal(0, 1, 2).js()).toEqual([
         [0, 3],
         [4, 7],
         [8, 11],
       ]);
 
       // a[:, :, 0] = [[0, 2], [4, 6], [8, 10]]
-      expect(np.diagonal(a.ref, 0, 0, 1).js()).toEqual([
+      expect(np.diagonal(a, 0, 0, 1).js()).toEqual([
         [0, 6],
         [1, 7],
       ]);
-      expect(np.diagonal(a.ref, 1, 0, 1).js()).toEqual([[2], [3]]);
+      expect(np.diagonal(a, 1, 0, 1).js()).toEqual([[2], [3]]);
       expect(np.diagonal(a, 1, 1, 0).js()).toEqual([
         [4, 10],
         [5, 11],
@@ -162,7 +162,7 @@ suite.each(devices)("device:%s", (device) => {
 
     test("gradient over diagonal sum-of-squares", () => {
       const a = np.arange(6).astype(np.float32).reshape([2, 3]);
-      const f = (a: np.Array) => a.ref.mul(a).diagonal(1).sum();
+      const f = (a: np.Array) => a.mul(a).diagonal(1).sum();
       expect(grad(f)(a).js()).toEqual([
         [0, 2, 0],
         [0, 0, 10],
@@ -171,7 +171,7 @@ suite.each(devices)("device:%s", (device) => {
 
     test("computes trace", () => {
       const x = np.arange(9).reshape([3, 3]);
-      expect(np.trace(x.ref).js()).toEqual(12);
+      expect(np.trace(x).js()).toEqual(12);
       expect(np.trace(x, 1).js()).toEqual(6);
     });
   });
@@ -357,7 +357,7 @@ suite.each(devices)("device:%s", (device) => {
       const y = np.array([4, 5, 6]);
       const z = np.array([true, false, true]);
       const f = ({ x, y }: { x: np.Array; y: np.Array }) =>
-        np.where(z.ref, x, y).sum();
+        np.where(z, x, y).sum();
       const grads = grad(f)({ x, y });
       expect(grads.x.js()).toEqual([1, 0, 1]);
       expect(grads.y.js()).toEqual([0, 1, 0]);
@@ -377,7 +377,7 @@ suite.each(devices)("device:%s", (device) => {
     test("computes equal", () => {
       const x = np.array([1, 2, 3, 4]);
       const y = np.array([4, 5, 3, 4]);
-      expect(np.equal(x.ref, y.ref).js()).toEqual([false, false, true, true]);
+      expect(np.equal(x, y).js()).toEqual([false, false, true, true]);
       expect(np.notEqual(x, y).js()).toEqual([true, true, false, false]);
     });
 
@@ -418,17 +418,17 @@ suite.each(devices)("device:%s", (device) => {
         [4, 5, 6],
       ]);
       const [y, dy] = jvp(
-        (x: np.Array) => x.ref.transpose().mul(x.transpose()),
-        [x.ref],
+        (x: np.Array) => x.transpose().mul(x.transpose()),
+        [x],
         [np.ones([2, 3])],
       );
-      expect(y).toBeAllclose(x.ref.mul(x.ref).transpose());
+      expect(y).toBeAllclose(x.mul(x).transpose());
       expect(dy).toBeAllclose(x.mul(2).transpose());
     });
 
     test("composes with grad", () => {
       const x = np.ones([3, 4]);
-      const dx = grad((x: np.Array) => x.transpose().sum())(x.ref);
+      const dx = grad((x: np.Array) => x.transpose().sum())(x);
       expect(dx).toBeAllclose(x);
     });
   });
@@ -493,11 +493,11 @@ suite.each(devices)("device:%s", (device) => {
         [1, 2, 3],
         [4, 5, 6],
       ]);
-      expect(np.flip(x.ref).js()).toEqual([
+      expect(np.flip(x).js()).toEqual([
         [6, 5, 4],
         [3, 2, 1],
       ]);
-      expect(np.flip(x.ref, 0).js()).toEqual([
+      expect(np.flip(x, 0).js()).toEqual([
         [4, 5, 6],
         [1, 2, 3],
       ]);
@@ -653,7 +653,7 @@ suite.each(devices)("device:%s", (device) => {
           .reshape([200, 1])
           .mul(np.ones([200, 256]));
         const y = np.ones([256, 200]);
-        await Promise.all([x.ref.data(), y.ref.data()]);
+        await Promise.all([x.data(), y.data()]);
         const buf = await np.dot(x, y).data();
         expect(buf.length).toEqual(200 * 200);
         expect(buf[0]).toEqual(0);
@@ -667,7 +667,7 @@ suite.each(devices)("device:%s", (device) => {
     test("1-784-10 matrix product", async () => {
       const x = np.arange(784).astype(np.float32).reshape([1, 784]);
       const y = np.ones([784, 10]);
-      await Promise.all([x.ref.data(), y.ref.data()]);
+      await Promise.all([x.data(), y.data()]);
       const buf = await np.dot(x, y).data();
       expect(buf.length).toEqual(10);
       expect(buf).toEqual(
@@ -680,7 +680,7 @@ suite.each(devices)("device:%s", (device) => {
     test("2-3-4 with 3-4-5", async () => {
       const x1 = np.arange(24).reshape([2, 3, 4]);
       const x2 = np.ones([3, 4, 5]);
-      let z = np.tensordot(x1.ref, x2.ref);
+      let z = np.tensordot(x1, x2);
       expect(await z.jsAsync()).toEqual([
         [66, 66, 66, 66, 66],
         [210, 210, 210, 210, 210],
@@ -710,19 +710,19 @@ suite.each(devices)("device:%s", (device) => {
 
     test("einsum one-array sums", () => {
       const a = np.arange(6).reshape([2, 3]);
-      let c = np.einsum("ij->", a.ref);
+      let c = np.einsum("ij->", a);
       expect(c.js()).toEqual(15);
 
-      c = np.einsum(a.ref, [0, 1], []);
+      c = np.einsum(a, [0, 1], []);
       expect(c.js()).toEqual(15);
 
-      c = np.einsum(a.ref, [0, 1], []);
+      c = np.einsum(a, [0, 1], []);
       expect(c.js()).toEqual(15);
 
-      c = np.einsum("ij->j", a.ref);
+      c = np.einsum("ij->j", a);
       expect(c.js()).toEqual([3, 5, 7]);
 
-      c = np.einsum("ji->j", a.ref);
+      c = np.einsum("ji->j", a);
       expect(c.js()).toEqual([3, 12]);
 
       c = np.einsum("ii->", a.slice([0, 2], [1, 3]));
@@ -751,18 +751,18 @@ suite.each(devices)("device:%s", (device) => {
       });
 
       // Vector product
-      expect(np.einsum("i,i", x.ref, y.ref).js()).toEqual(16);
-      expect(np.einsum("i,i->", x.ref, y.ref).js()).toEqual(16);
-      expect(np.einsum(x.ref, [0], y.ref, [0]).js()).toEqual(16);
-      expect(np.einsum(x.ref, [0], y.ref, [0], []).js()).toEqual(16);
+      expect(np.einsum("i,i", x, y).js()).toEqual(16);
+      expect(np.einsum("i,i->", x, y).js()).toEqual(16);
+      expect(np.einsum(x, [0], y, [0]).js()).toEqual(16);
+      expect(np.einsum(x, [0], y, [0], []).js()).toEqual(16);
 
       // Matrix product
-      expect(np.einsum("ij,j->i", M.ref, x.ref).js()).toEqual([14, 38, 62, 86]);
-      expect(np.einsum("ij,j", M.ref, x.ref).js()).toEqual([14, 38, 62, 86]);
-      expect(np.einsum(M.ref, [0, 1], x.ref, [1], [0]).js()).toEqual([
+      expect(np.einsum("ij,j->i", M, x).js()).toEqual([14, 38, 62, 86]);
+      expect(np.einsum("ij,j", M, x).js()).toEqual([14, 38, 62, 86]);
+      expect(np.einsum(M, [0, 1], x, [1], [0]).js()).toEqual([
         14, 38, 62, 86,
       ]);
-      expect(np.einsum(M.ref, [0, 1], x.ref, [1]).js()).toEqual([
+      expect(np.einsum(M, [0, 1], x, [1]).js()).toEqual([
         14, 38, 62, 86,
       ]);
 
@@ -773,19 +773,19 @@ suite.each(devices)("device:%s", (device) => {
         [10, 8, 6, 4],
         [15, 12, 9, 6],
       ];
-      expect(np.einsum("i,j->ij", x.ref, y.ref).js()).toEqual(outerExpected);
-      expect(np.einsum("i,j", x.ref, y.ref).js()).toEqual(outerExpected);
-      expect(np.einsum(x.ref, [0], y.ref, [1], [0, 1]).js()).toEqual(
+      expect(np.einsum("i,j->ij", x, y).js()).toEqual(outerExpected);
+      expect(np.einsum("i,j", x, y).js()).toEqual(outerExpected);
+      expect(np.einsum(x, [0], y, [1], [0, 1]).js()).toEqual(
         outerExpected,
       );
-      expect(np.einsum(x.ref, [0], y.ref, [1]).js()).toEqual(outerExpected);
+      expect(np.einsum(x, [0], y, [1]).js()).toEqual(outerExpected);
 
       // 1D array sum
-      expect(np.einsum("i->", x.ref).js()).toEqual(6);
-      expect(np.einsum(x.ref, [0], []).js()).toEqual(6);
+      expect(np.einsum("i->", x).js()).toEqual(6);
+      expect(np.einsum(x, [0], []).js()).toEqual(6);
 
       // Sum along an axis
-      expect(np.einsum("...j->...", M.ref).js()).toEqual([6, 22, 38, 54]);
+      expect(np.einsum("...j->...", M).js()).toEqual([6, 22, 38, 54]);
 
       // Matrix transpose
       const y2 = np.array([
@@ -798,16 +798,16 @@ suite.each(devices)("device:%s", (device) => {
         [2, 5],
         [3, 6],
       ];
-      expect(np.einsum("ij->ji", y2.ref).js()).toEqual(transposeExpected);
-      expect(np.einsum("ji", y2.ref).js()).toEqual(transposeExpected);
-      expect(np.einsum(y2.ref, [1, 0]).js()).toEqual(transposeExpected);
-      expect(np.einsum(y2.ref, [0, 1], [1, 0]).js()).toEqual(transposeExpected);
+      expect(np.einsum("ij->ji", y2).js()).toEqual(transposeExpected);
+      expect(np.einsum("ji", y2).js()).toEqual(transposeExpected);
+      expect(np.einsum(y2, [1, 0]).js()).toEqual(transposeExpected);
+      expect(np.einsum(y2, [0, 1], [1, 0]).js()).toEqual(transposeExpected);
 
       // Matrix diagonal
-      expect(np.einsum("ii->i", M.ref).js()).toEqual([0, 5, 10, 15]);
+      expect(np.einsum("ii->i", M).js()).toEqual([0, 5, 10, 15]);
 
       // Matrix trace
-      expect(np.einsum("ii", M.ref).js()).toEqual(30);
+      expect(np.einsum("ii", M).js()).toEqual(30);
 
       // Tensor products
       const tx = np.arange(30).reshape([2, 3, 5]);
@@ -820,14 +820,14 @@ suite.each(devices)("device:%s", (device) => {
         [3340, 3865, 4390, 4915],
         [8290, 9940, 11590, 13240],
       ];
-      expect(np.einsum("ijk,jlk->il", tx.ref, ty.ref).js()).toEqual(
+      expect(np.einsum("ijk,jlk->il", tx, ty).js()).toEqual(
         tensorExpected,
       );
-      expect(np.einsum("ijk,jlk", tx.ref, ty.ref).js()).toEqual(tensorExpected);
+      expect(np.einsum("ijk,jlk", tx, ty).js()).toEqual(tensorExpected);
       expect(
-        np.einsum(tx.ref, [0, 1, 2], ty.ref, [1, 3, 2], [0, 3]).js(),
+        np.einsum(tx, [0, 1, 2], ty, [1, 3, 2], [0, 3]).js(),
       ).toEqual(tensorExpected);
-      expect(np.einsum(tx.ref, [0, 1, 2], ty.ref, [1, 3, 2]).js()).toEqual(
+      expect(np.einsum(tx, [0, 1, 2], ty, [1, 3, 2]).js()).toEqual(
         tensorExpected,
       );
 
@@ -850,11 +850,11 @@ suite.each(devices)("device:%s", (device) => {
         [651, 1125, 1599],
       ];
       expect(
-        np.einsum("ij,jk,kl,lm->im", w.ref, cx.ref, cy.ref, z.ref).js(),
+        np.einsum("ij,jk,kl,lm->im", w, cx, cy, z).js(),
       ).toEqual(chainedExpected);
       expect(
         np
-          .einsum(w.ref, [0, 1], cx.ref, [1, 2], cy.ref, [2, 3], z.ref, [3, 4])
+          .einsum(w, [0, 1], cx, [1, 2], cy, [2, 3], z, [3, 4])
           .js(),
       ).toEqual(chainedExpected);
     });
@@ -1027,7 +1027,7 @@ suite.each(devices)("device:%s", (device) => {
   suite("jax.numpy.absolute()", () => {
     test("computes absolute value", () => {
       const x = np.array([-1, 2, -3]);
-      const y = np.absolute(x.ref);
+      const y = np.absolute(x);
       expect(y.js()).toEqual([1, 2, 3]);
 
       const z = np.abs(x); // Alias for absolute
@@ -1075,7 +1075,7 @@ suite.each(devices)("device:%s", (device) => {
     test("called via Array.div() and jax.numpy.divide()", () => {
       const x = np.array([1, 2, 3]);
       const y = np.array([4, 5, 6]);
-      const z = x.ref.div(y.ref);
+      const z = x.div(y);
       expect(z).toBeAllclose([0.25, 0.4, 0.5]);
 
       const w = np.divide(x, y);
@@ -1187,7 +1187,7 @@ suite.each(devices)("device:%s", (device) => {
     test("satisfies invariant x == q*y + r", () => {
       const x = np.array([5, -5, 10, -10]);
       const y = np.array([3, 3, 4, 4]);
-      const [q, r] = np.divmod(x, y.ref);
+      const [q, r] = np.divmod(x, y);
       // Verify: x == q * y + r
       const reconstructed = np.add(np.multiply(q, y), r);
       expect(reconstructed.js()).toEqual([5, -5, 10, -10]);
@@ -1289,7 +1289,7 @@ suite.each(devices)("device:%s", (device) => {
 
     test("log2 and log10", () => {
       const x = np.array([1, 2, 4, 8]);
-      const y2 = np.log2(x.ref);
+      const y2 = np.log2(x);
       const y10 = np.log10(x);
       expect(y2.js()).toBeAllclose([0, 1, 2, 3]);
       expect(y10.js()).toBeAllclose([
@@ -1787,7 +1787,7 @@ suite.each(devices)("device:%s", (device) => {
         [1, 2],
         [3, 4],
       ]);
-      const y = np.repeat(x.ref, 2, 0);
+      const y = np.repeat(x, 2, 0);
       expect(y.js()).toEqual([
         [1, 2],
         [1, 2],
@@ -1824,7 +1824,7 @@ suite.each(devices)("device:%s", (device) => {
         [1, 2],
         [3, 4],
       ]);
-      const y = np.tile(x.ref, [2, 1]);
+      const y = np.tile(x, [2, 1]);
       expect(y.js()).toEqual([
         [1, 2],
         [3, 4],
@@ -1903,11 +1903,11 @@ suite.each(devices)("device:%s", (device) => {
     test("identify special values", () => {
       // Test isnan and related functions (isinf, isfinite, etc.)
       const x = np.array([NaN, Infinity, -Infinity, 1]);
-      expect(np.isnan(x.ref).js()).toEqual([true, false, false, false]);
-      expect(np.isinf(x.ref).js()).toEqual([false, true, true, false]);
-      expect(np.isfinite(x.ref).js()).toEqual([false, false, false, true]);
-      expect(np.isneginf(x.ref).js()).toEqual([false, false, true, false]);
-      expect(np.isposinf(x.ref).js()).toEqual([false, true, false, false]);
+      expect(np.isnan(x).js()).toEqual([true, false, false, false]);
+      expect(np.isinf(x).js()).toEqual([false, true, true, false]);
+      expect(np.isfinite(x).js()).toEqual([false, false, false, true]);
+      expect(np.isneginf(x).js()).toEqual([false, false, true, false]);
+      expect(np.isposinf(x).js()).toEqual([false, true, false, false]);
       x.dispose();
     });
   });
@@ -1955,10 +1955,10 @@ suite.each(devices)("device:%s", (device) => {
       const x = np.array([1, 2, 3, 2, 1]);
       const y = np.array([4, 1, 2]);
 
-      const full = np.convolve(x.ref, y.ref);
+      const full = np.convolve(x, y);
       expect(full.js()).toEqual([4, 9, 16, 15, 12, 5, 2]);
 
-      const same = np.convolve(x.ref, y.ref, "same");
+      const same = np.convolve(x, y, "same");
       expect(same.js()).toEqual([9, 16, 15, 12, 5]);
 
       const valid = np.convolve(x, y, "valid");
@@ -1969,10 +1969,10 @@ suite.each(devices)("device:%s", (device) => {
       const x = np.array([1, 2, 3, 2, 1]);
       const y = np.array([4, 5, 6]);
 
-      const valid = np.correlate(x.ref, y.ref);
+      const valid = np.correlate(x, y);
       expect(valid.js()).toEqual([32, 35, 28]);
 
-      const full = np.correlate(x.ref, y.ref, "full");
+      const full = np.correlate(x, y, "full");
       expect(full.js()).toEqual([6, 17, 32, 35, 28, 13, 4]);
 
       const same = np.correlate(x, y, "same");
@@ -1980,7 +1980,7 @@ suite.each(devices)("device:%s", (device) => {
 
       const x1 = np.array([1, 2, 3, 2, 1]);
       const y1 = np.array([4, 5, 4]);
-      const corr = np.correlate(x1.ref, y1.ref, "full");
+      const corr = np.correlate(x1, y1, "full");
       const conv = np.convolve(x1, y1, "full");
       expect(corr.js()).toEqual([4, 13, 26, 31, 26, 13, 4]);
       expect(conv.js()).toEqual([4, 13, 26, 31, 26, 13, 4]);
@@ -2003,7 +2003,7 @@ suite.each(devices)("device:%s", (device) => {
         [true, false],
         [true, true],
       ]);
-      expect(np.all(x.ref, 0).js()).toEqual([true, false]);
+      expect(np.all(x, 0).js()).toEqual([true, false]);
       expect(np.all(x, 1).js()).toEqual([false, true]);
     });
 
@@ -2042,7 +2042,7 @@ suite.each(devices)("device:%s", (device) => {
         [false, false],
         [true, false],
       ]);
-      expect(np.any(x.ref, 0).js()).toEqual([true, false]);
+      expect(np.any(x, 0).js()).toEqual([true, false]);
       expect(np.any(x, 1).js()).toEqual([false, true]);
     });
 
@@ -2099,7 +2099,7 @@ suite.each(devices)("device:%s", (device) => {
         [1, 2, 3],
         [4, 5, 6],
       ]);
-      const y = np.expandDims(x.ref, 0);
+      const y = np.expandDims(x, 0);
       expect(y.shape).toEqual([1, 2, 3]);
 
       const z = np.expandDims(x, 2);
@@ -2148,7 +2148,7 @@ suite.each(devices)("device:%s", (device) => {
           [3, 1, 2],
           [6, 4, 5],
         ]);
-        const y0 = np.sort(x.ref, 0);
+        const y0 = np.sort(x, 0);
         expect(y0.js()).toEqual([
           [3, 1, 2],
           [6, 4, 5],
@@ -2213,7 +2213,7 @@ suite.each(devices)("device:%s", (device) => {
         // into a single-workgroup sort. This test exercises multi-pass sorting in
         // global memory for GPUs.
         const x = np.linspace(0, 1, 8192);
-        const y = np.sort(np.flip(x.ref));
+        const y = np.sort(np.flip(x));
         expect(y).toBeAllclose(x);
       });
     });
@@ -2288,7 +2288,7 @@ suite.each(devices)("device:%s", (device) => {
         [70, 80, 90],
       ]);
       const indices = np.array([2, 0]);
-      const y0 = np.take(x.ref, indices.ref, 0);
+      const y0 = np.take(x, indices, 0);
       expect(y0.js()).toEqual([
         [70, 80, 90],
         [10, 20, 30],

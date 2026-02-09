@@ -124,37 +124,22 @@ export interface ScanOptions {
  * - Supports autodiff: `grad(f)` works through scan
  * - The carry shape/dtype must be fixed across all iterations
  *
- * ## Reference Counting Contract
+ * ## Ownership
  *
- * **Inputs (consumed):**
- * - `init` and `xs` are consumed by scan (refcount decremented)
- * - Use `.ref` if you need to keep inputs alive: `scan(f, init.ref, xs.ref)`
+ * **Inputs:** `init` and `xs` are NOT consumed. Use `using` or `.dispose()` to
+ * manage their lifetime if needed.
  *
  * **Body function:**
  * - `carry` and `x` are **managed** by scan — do NOT manually dispose them
- * - Standard consumption rules apply inside the body (same as regular functions):
- *   - **Single use:** `np.add(carry, x)` — no `.ref` needed
- *   - **Multiple uses:** Use `.ref` to keep alive for additional uses
- * - Return **new** arrays for `newCarry` and `y`
- * - For passthrough (same array in both), use `.ref`: `[result.ref, result]`
+ * - Operations do NOT consume inputs, so no `.ref` is needed inside the body
  *
- * **Example — multiple uses of carry:**
+ * **Example — simple body:**
  * ```ts
- * // ✓ Works: .ref keeps carry alive, then bare carry consumed in return
  * const step = (carry, x) => {
- *   const newCarry = np.add(carry.ref, x);  // .ref: we'll use carry again
- *   return [newCarry, carry];               // carry consumed here
- * };
- *
- * // ✗ Fails: can't use carry in TWO separate operations after .ref
- * const step = (carry, x) => {
- *   const a = np.add(carry.ref, x);  // first operation
- *   const b = np.add(a, carry);      // ERROR: second operation on carry
- *   return [b, a.ref];
+ *   const newCarry = np.add(carry, x);
+ *   return [newCarry, carry];  // carry used freely in multiple places
  * };
  * ```
- *
- * **Workaround:** Use pytree carries so each field can be `.ref`'d independently.
  *
  * **Outputs (caller owns):**
  * - `finalCarry` and `ys` are owned by caller — dispose when done
@@ -181,7 +166,7 @@ export interface ScanOptions {
  *
  * const step = (carry, x) => {
  *   const sum = np.add(carry, x);
- *   return [sum, sum.ref];  // .ref: sum used in both outputs
+ *   return [sum, sum];  // same array can be used in both outputs
  * };
  *
  * const init = np.array([0.0]);
@@ -200,7 +185,7 @@ export interface ScanOptions {
  * // Compute n! for n = 1..5
  * const step = (carry, x) => {
  *   const next = np.multiply(carry, x);
- *   return [next, next.ref];
+ *   return [next, next];
  * };
  *
  * const init = np.array([1]);
@@ -216,7 +201,7 @@ export interface ScanOptions {
  *   const newSum = np.add(carry.sum, x);
  *   const newCount = np.add(carry.count, np.array([1]));
  *   return [
- *     { sum: newSum.ref, count: newCount.ref },
+ *     { sum: newSum, count: newCount },
  *     { sum: newSum, count: newCount }
  *   ];
  * };
@@ -253,7 +238,7 @@ export interface ScanOptions {
  * ```ts
  * // Generate a sequence without allocating input arrays
  * const step = (carry, _x) => {
- *   const next = np.add(carry.ref, np.array([1.0]));
+ *   const next = np.add(carry, np.array([1.0]));
  *   return [next, carry];  // output is old carry value
  * };
  *
@@ -266,7 +251,7 @@ export interface ScanOptions {
  * ```ts
  * // Only need final carry, not intermediate outputs (saves memory)
  * const step = (carry, x) => {
- *   const Asq = carry.A.ref.mul(carry.A);
+ *   const Asq = carry.A.mul(carry.A);
  *   const newA = Asq.add(x);
  *   const newCount = carry.count.add(Asq.less(100).astype(np.int32));
  *   return [{ A: newA, count: newCount }, null];  // null skips Y stacking
@@ -285,7 +270,7 @@ export interface ScanOptions {
  * // This is the most common and efficient pattern for production use.
  * const step = (carry, x) => {
  *   const newCarry = np.add(carry, x);
- *   return [newCarry, newCarry.ref];
+ *   return [newCarry, newCarry];
  * };
  *
  * const scanFn = jit((init, xs) => lax.scan(step, init, xs));
@@ -307,7 +292,7 @@ export interface ScanOptions {
  * // but you want to inspect intermediate values or the scan body is dynamic.
  * const step = jit((carry, x) => {
  *   const newCarry = np.add(carry, x);
- *   return [newCarry, newCarry.ref];
+ *   return [newCarry, newCarry];
  * });
  *
  * const init = np.array([0.0]);
@@ -400,9 +385,9 @@ export function scan<
   const traceAvals = [...carryAvals, ...xSliceAvals];
 
   // Trace to get jaxpr
-  const { jaxpr: closedJaxpr, treedef: _outTreedef } = makeJaxpr(traceFn, {
-    validateRefs: false,
-  })(...traceAvals);
+  const { jaxpr: closedJaxpr, treedef: _outTreedef } = makeJaxpr(traceFn)(
+    ...traceAvals,
+  );
   const jaxpr = closedJaxpr.jaxpr;
   const consts = closedJaxpr.consts;
 
@@ -412,8 +397,11 @@ export function scan<
       throw new Error("scan: length option is required when xs is null");
     }
 
-    // Final carry is the initial carry (transfer ownership).
-    const finalCarryFlat = initFlat.map((arr) => arr.ref);
+    // Dispose captured consts (nothing was consumed on this path)
+    closedJaxpr.dispose();
+
+    // Final carry is the initial carry.
+    const finalCarryFlat = initFlat;
 
     // Build empty Y leaves based on jaxpr outputs.
     const numCarry = initFlat.length;
@@ -431,21 +419,12 @@ export function scan<
         ? (null as Y)
         : (tree.unflatten(yTreedef_!, yFlatEmpty) as Y);
 
-    // Dispose inputs and tracing artifacts
-    initFlat.forEach((arr) => arr.dispose());
-    xsFlat.forEach((arr) => arr.dispose());
-    closedJaxpr.dispose();
-
     return [finalCarry, ys];
   }
 
   // Call the Scan primitive
   // Args: [...consts, ...initCarry, ...xs]
-  const scanArgs = [
-    ...consts.map((c) => c.ref),
-    ...initFlat.map((arr) => arr.ref),
-    ...xsFlat.map((arr) => arr.ref),
-  ];
+  const scanArgs = [...consts, ...initFlat, ...xsFlat];
 
   const numCarry = initFlat.length;
   const numConsts = consts.length;
@@ -460,14 +439,15 @@ export function scan<
     checkpoint,
   });
 
-  // Dispose original inputs
-  initFlat.forEach((arr) => arr.dispose());
-  xsFlat.forEach((arr) => arr.dispose());
-  closedJaxpr.dispose();
-
   // Split results into carry and ys
   const carryOut = results.slice(0, numCarry) as Array[];
   const ysFlat = results.slice(numCarry) as Array[];
+
+  // Dispose the captured constants from tracing.  getOrMakeConstTracer ref'd
+  // each const, so ClosedJaxpr.dispose() decrements that ref.  User-held consts
+  // survive (they still have the user's own ref).  Anonymous consts created
+  // inside the body (e.g. np.array([2,3])) get freed.
+  closedJaxpr.dispose();
 
   // Reconstruct pytrees
   const finalCarry = tree.unflatten(initTreedef, carryOut) as Carry;

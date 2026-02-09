@@ -32,7 +32,7 @@ suite.each(devices)("device:%s", (device) => {
     test("FFT followed by IFFT returns original input", async () => {
       const real = np.array([1, 2, 3, 4, 5, 6, 7, 8]);
       const imag = np.array([-5, 9, 0, 3, -1, 4, 2, 8]);
-      const fftResult = np.fft.fft({ real: real.ref, imag: imag.ref });
+      const fftResult = np.fft.fft({ real: real, imag: imag });
       const ifftResult = np.fft.ifft(fftResult);
       expect(await ifftResult.real.jsAsync()).toBeAllclose(real, {
         atol: 1e-5,

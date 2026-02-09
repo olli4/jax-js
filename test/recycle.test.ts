@@ -44,13 +44,15 @@ describe("buffer recycling", () => {
     const x = np.array([10, 20, 30, 40]);
     const result = f(x);
     await result.data();
+    result.dispose();
+    x.dispose();
     f.dispose();
     expect(slotCount() - before).toBe(0);
   });
 
   it("works with grad through chained ops", () => {
     // f(x) = x^2, f'(x) = 2x
-    const f = (x: np.Array) => np.multiply(x.ref, x).sum();
+    const f = (x: np.Array) => np.multiply(x, x).sum();
     const df = grad(f);
     const x = np.array([1, 2, 3]);
     expect(df(x).js()).toEqual([2, 4, 6]);
@@ -59,7 +61,7 @@ describe("buffer recycling", () => {
   it("works correctly with scan", async () => {
     const step = (carry: np.Array, x: np.Array): [np.Array, np.Array] => {
       const newCarry = np.add(carry, x);
-      return [newCarry.ref, newCarry];
+      return [newCarry, newCarry];
     };
     const xs = np.array([
       [1, 2],
@@ -111,6 +113,8 @@ describe("buffer recycling (WASM)", () => {
     const x = np.array([10, 20, 30, 40]);
     const result = f(x);
     await result.data();
+    result.dispose();
+    x.dispose();
     f.dispose();
     expect(slotCount() - before).toBe(0);
   });

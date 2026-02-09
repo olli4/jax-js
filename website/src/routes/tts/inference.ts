@@ -29,7 +29,7 @@ export async function playTTS(
     noiseClamp = null,
   }: Partial<PlayTTSOptions> = {},
 ): Promise<void> {
-  let sequence = model.flowLM.bosEmb.ref.reshape([1, -1]); // [1, 32]
+  let sequence = model.flowLM.bosEmb.reshape([1, -1]); // [1, 32]
   let audioPromise: Promise<void> = Promise.resolve();
 
   if (seed === null) seed = Math.floor(Math.random() * 2 ** 32);
@@ -51,11 +51,11 @@ export async function playTTS(
         isEos,
         state: newFlowLMState,
       } = runFlowLMStep(
-        tree.ref(model.flowLM),
+        model.flowLM,
         flowLMState,
         stepKey,
-        step === 0 ? sequence.ref : sequence.ref.slice([-1]),
-        step === 0 ? embeds.ref : null,
+        step === 0 ? sequence : sequence.slice([-1]),
+        step === 0 ? embeds : null,
         flowLMState.kvCacheLen, // same as offset
         lsdDecodeSteps,
         temperature,
@@ -84,13 +84,13 @@ export async function playTTS(
       );
       lastTimestamp = timestamp;
 
-      let mimiInput = sequence.ref.slice([-1]);
+      let mimiInput = sequence.slice([-1]);
       mimiInput = mimiInput
-        .mul(model.flowLM.embStd.ref)
-        .add(model.flowLM.embMean.ref);
+        .mul(model.flowLM.embStd)
+        .add(model.flowLM.embMean);
 
       const [audio, newMimiState] = runMimiDecode(
-        tree.ref(model.mimi),
+        model.mimi,
         mimiState,
         mimiInput,
         step,

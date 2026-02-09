@@ -583,8 +583,7 @@ type MainTrace = {
   level: number;
   traceType: new (main: MainTrace) => Trace; // Concrete Trace subclass.
   globalData: any | null;
-  /** True for transform traces (JVP, vmap) that alter .ref usage patterns. */
-  isTransform?: boolean;
+  isTransform?: boolean; // True for JVP/vmap/PartialEval traces (ref validation)
 };
 
 const traceStack: MainTrace[] = []; // Global trace stack, mutable
@@ -625,18 +624,6 @@ export function newDynamic(main: MainTrace): Disposable {
 
 export function currentTraceLevel(): number {
   return traceStack[traceStack.length - 1].level;
-}
-
-/**
- * Check if any transform trace (JVP, vmap) is active above the given level.
- * Used by JaxprTracer to distinguish user .ref calls from system .ref calls
- * made by transform machinery.
- */
-export function isUnderTransform(level: number): boolean {
-  for (let i = level + 1; i < traceStack.length; i++) {
-    if (traceStack[i].isTransform) return true;
-  }
-  return false;
 }
 
 export type TracerValue = Tracer | number | boolean;
@@ -722,46 +709,31 @@ export abstract class Tracer {
    * Access an array by reference, incrementing the reference count.
    *
    * jax-js handles freeing arrays by using "move" semantics, like in Rust/C++.
-   * Whenever you pass an array into a function, that function should consume
-   * the array, and it will no longer be usable. For example, if you had:
+   * Increment the reference count of this array.
+   *
+   * In most code, you don't need `.ref` because operations do NOT consume
+   * their inputs. The main use case is when you need an array to survive
+   * an explicit `.dispose()` call or `using` block.
    *
    * ```
    * const x = np.array([1, 2, 3]);
-   * const y = np.add(x, x);
+   * const y = np.add(x, x); // works — x is not consumed
    * ```
-   *
-   * The second line does not work because the first parameter consumes `x`, and
-   * then the second parameter will already have been freed / disposed.
-   *
-   * To fix this, you can write:
-   *
-   * ```
-   * const y = np.add(x.ref, x);
-   * ```
-   *
-   * Under the hood, every access to `.ref` increments the internal reference
-   * count of the array. The reference count starts at 1. When it hits 0, the
-   * memory behind the array is freed.
    */
   abstract get ref(): this;
 
   /**
    * Manually decrement the reference count of the array.
    *
-   * Arrays are created with reference count 1. Whenever it is used as argument
-   * to a function or other operation, it is disposed (i.e., reference count
-   * decreases by 1) automatically. Whenever a `.ref` is created, the reference
-   * count increases.
+   * Arrays are created with reference count 1. When the reference count
+   * reaches 0, the underlying memory is freed.
    *
-   * You generally don't need to call this function directly since arrays are
-   * automatically disposed after being passed into an operation. One common
-   * exception is when writing a function and ignoring one of its arguments. In
-   * that case, by convention you should dispose of that argument manually.
+   * You can use the `using` keyword for automatic disposal:
    *
    * ```
-   * function myCustomOperation(a: np.Array, b: np.Array) {
-   *   b.dispose(); // Needed to satisfy "move" rules.
-   *   return a.add(1);
+   * {
+   *   using x = np.array([1, 2, 3]);
+   *   // x is automatically disposed at the end of this block
    * }
    * ```
    */
@@ -1358,7 +1330,7 @@ export function flattenFunWithAux(
 export class UseAfterFreeError extends ReferenceError {
   constructor(tracer: Tracer) {
     super(
-      `Referenced tracer ${tracer.toString()} freed, please use .ref move semantics`,
+      `Referenced tracer ${tracer.toString()} has been disposed`,
     );
   }
 }

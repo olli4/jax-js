@@ -22,15 +22,15 @@ suite.skipIf(!devices.includes("wasm"))("wasm scan", async () => {
     const cumsumJit = jit((xs: any) => {
       return lax.scan(
         (carry: any, x: any) => {
-          const c = carry.ref.add(x);
-          return [c.ref, c];
+          const c = carry.add(x);
+          return [c, c];
         },
         np.zeros([64]),
         xs,
       );
     });
     // Warmup to trigger compilation
-    const [wc, wy] = cumsumJit(xs.ref);
+    const [wc, wy] = cumsumJit(xs);
     wc.dispose();
     wy.dispose();
 
@@ -40,7 +40,7 @@ suite.skipIf(!devices.includes("wasm"))("wasm scan", async () => {
     });
 
     bench("cumsum N=100 size=64", () => {
-      const [c, y] = cumsumJit(xs.ref) as [any, any];
+      const [c, y] = cumsumJit(xs) as [any, any];
       c.dispose();
       y.dispose();
     });
@@ -54,14 +54,14 @@ suite.skipIf(!devices.includes("wasm"))("wasm scan", async () => {
     const cumsumJit = jit((xs: any) => {
       return lax.scan(
         (carry: any, x: any) => {
-          const c = carry.ref.add(x);
-          return [c.ref, c];
+          const c = carry.add(x);
+          return [c, c];
         },
         np.zeros([256]),
         xs,
       );
     });
-    const [wc, wy] = cumsumJit(xs.ref);
+    const [wc, wy] = cumsumJit(xs);
     wc.dispose();
     wy.dispose();
 
@@ -71,7 +71,7 @@ suite.skipIf(!devices.includes("wasm"))("wasm scan", async () => {
     });
 
     bench("cumsum N=500 size=256", () => {
-      const [c, y] = cumsumJit(xs.ref) as [any, any];
+      const [c, y] = cumsumJit(xs) as [any, any];
       c.dispose();
       y.dispose();
     });
@@ -111,14 +111,14 @@ suite.skipIf(!devices.includes("wasm"))("wasm scan", async () => {
     const reductionJit = jit((xs: any) => {
       return lax.scan(
         (carry: any, x: any) => {
-          const s = carry.ref.add(np.sum(x));
-          return [s.ref, s];
+          const s = carry.add(np.sum(x));
+          return [s, s];
         },
         np.zeros([]),
         xs,
       );
     });
-    const [wc, wy] = reductionJit(xs.ref);
+    const [wc, wy] = reductionJit(xs);
     wc.dispose();
     wy.dispose();
 
@@ -128,7 +128,7 @@ suite.skipIf(!devices.includes("wasm"))("wasm scan", async () => {
     });
 
     bench("reduction N=100 size=64", () => {
-      const [c, y] = reductionJit(xs.ref) as [any, any];
+      const [c, y] = reductionJit(xs) as [any, any];
       c.dispose();
       y.dispose();
     });
@@ -142,15 +142,15 @@ suite.skipIf(!devices.includes("wasm"))("wasm scan", async () => {
     const reverseJit = jit((xs: any) => {
       return lax.scan(
         (carry: any, x: any) => {
-          const c = carry.ref.add(x);
-          return [c.ref, c];
+          const c = carry.add(x);
+          return [c, c];
         },
         np.zeros([64]),
         xs,
         { reverse: true },
       );
     });
-    const [wc, wy] = reverseJit(xs.ref);
+    const [wc, wy] = reverseJit(xs);
     wc.dispose();
     wy.dispose();
 
@@ -160,7 +160,7 @@ suite.skipIf(!devices.includes("wasm"))("wasm scan", async () => {
     });
 
     bench("reverse N=200 size=64", () => {
-      const [c, y] = reverseJit(xs.ref) as [any, any];
+      const [c, y] = reverseJit(xs) as [any, any];
       c.dispose();
       y.dispose();
     });
@@ -179,14 +179,14 @@ suite.skipIf(!devices.includes("wasm"))("wasm scan", async () => {
       const step = (carry: Carry, x: np.Array): [Carry, np.Array] => {
         const { state, covDiag } = carry;
         // Predict: state propagates, cov grows
-        const predState = state.ref;
-        const predCov = covDiag.ref.add(processNoise.ref);
+        const predState = state;
+        const predCov = covDiag.add(processNoise);
         // Update: scalar innovation, diagonal Kalman gain
-        const innovation = x.sub(np.sum(predState.ref.mul(H.ref)));
-        const S = np.sum(predCov.ref.mul(H.ref).mul(H.ref)).add(measNoise.ref);
-        const K = predCov.ref.mul(H.ref).div(S);
-        const newState = predState.ref.add(K.ref.mul(innovation));
-        const newCov = predCov.mul(np.ones([4]).sub(K.mul(H.ref)));
+        const innovation = x.sub(np.sum(predState.mul(H)));
+        const S = np.sum(predCov.mul(H).mul(H)).add(measNoise);
+        const K = predCov.mul(H).div(S);
+        const newState = predState.add(K.mul(innovation));
+        const newCov = predCov.mul(np.ones([4]).sub(K.mul(H)));
         return [{ state: newState, covDiag: newCov }, predState];
       };
 
@@ -226,14 +226,14 @@ suite.skipIf(!hasWebGPU)("webgpu scan", async () => {
     const cumsumJit = jit((xs: any) => {
       return lax.scan(
         (carry: any, x: any) => {
-          const c = carry.ref.add(x);
-          return [c.ref, c];
+          const c = carry.add(x);
+          return [c, c];
         },
         np.zeros([64]),
         xs,
       );
     });
-    const [wc, wy] = cumsumJit(xs.ref);
+    const [wc, wy] = cumsumJit(xs);
     wc.dispose();
     wy.dispose();
 
@@ -243,7 +243,7 @@ suite.skipIf(!hasWebGPU)("webgpu scan", async () => {
     });
 
     bench("cumsum N=100 size=64", () => {
-      const [c, y] = cumsumJit(xs.ref) as [any, any];
+      const [c, y] = cumsumJit(xs) as [any, any];
       c.dispose();
       y.dispose();
     });
@@ -257,14 +257,14 @@ suite.skipIf(!hasWebGPU)("webgpu scan", async () => {
     const cumsumJit = jit((xs: any) => {
       return lax.scan(
         (carry: any, x: any) => {
-          const c = carry.ref.add(x);
-          return [c.ref, c];
+          const c = carry.add(x);
+          return [c, c];
         },
         np.zeros([256]),
         xs,
       );
     });
-    const [wc, wy] = cumsumJit(xs.ref);
+    const [wc, wy] = cumsumJit(xs);
     wc.dispose();
     wy.dispose();
 
@@ -274,7 +274,7 @@ suite.skipIf(!hasWebGPU)("webgpu scan", async () => {
     });
 
     bench("cumsum N=500 size=256", () => {
-      const [c, y] = cumsumJit(xs.ref) as [any, any];
+      const [c, y] = cumsumJit(xs) as [any, any];
       c.dispose();
       y.dispose();
     });
@@ -288,15 +288,15 @@ suite.skipIf(!hasWebGPU)("webgpu scan", async () => {
     const reverseJit = jit((xs: any) => {
       return lax.scan(
         (carry: any, x: any) => {
-          const c = carry.ref.add(x);
-          return [c.ref, c];
+          const c = carry.add(x);
+          return [c, c];
         },
         np.zeros([64]),
         xs,
         { reverse: true },
       );
     });
-    const [wc, wy] = reverseJit(xs.ref);
+    const [wc, wy] = reverseJit(xs);
     wc.dispose();
     wy.dispose();
 
@@ -306,7 +306,7 @@ suite.skipIf(!hasWebGPU)("webgpu scan", async () => {
     });
 
     bench("reverse N=200 size=64", () => {
-      const [c, y] = reverseJit(xs.ref) as [any, any];
+      const [c, y] = reverseJit(xs) as [any, any];
       c.dispose();
       y.dispose();
     });
@@ -323,13 +323,13 @@ suite.skipIf(!hasWebGPU)("webgpu scan", async () => {
 
       const step = (carry: Carry, x: np.Array): [Carry, np.Array] => {
         const { state, covDiag } = carry;
-        const predState = state.ref;
-        const predCov = covDiag.ref.add(processNoise.ref);
-        const innovation = x.sub(np.sum(predState.ref.mul(H.ref)));
-        const S = np.sum(predCov.ref.mul(H.ref).mul(H.ref)).add(measNoise.ref);
-        const K = predCov.ref.mul(H.ref).div(S);
-        const newState = predState.ref.add(K.ref.mul(innovation));
-        const newCov = predCov.mul(np.ones([4]).sub(K.mul(H.ref)));
+        const predState = state;
+        const predCov = covDiag.add(processNoise);
+        const innovation = x.sub(np.sum(predState.mul(H)));
+        const S = np.sum(predCov.mul(H).mul(H)).add(measNoise);
+        const K = predCov.mul(H).div(S);
+        const newState = predState.add(K.mul(innovation));
+        const newCov = predCov.mul(np.ones([4]).sub(K.mul(H)));
         return [{ state: newState, covDiag: newCov }, predState];
       };
 

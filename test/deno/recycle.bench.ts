@@ -41,10 +41,10 @@ const chainX4k = np.ones([4096]);
 await blockUntilReady(chainX4k);
 
 const chainJit4k = jit((x: any) => x.add(1).mul(2).sub(3).add(4).mul(0.5));
-chainJit4k(chainX4k.ref).dispose(); // warmup/compile
+chainJit4k(chainX4k).dispose(); // warmup/compile
 
 Deno.bench("jit chain x5 fused 4096 [baseline]", { group: "jit" }, () => {
-  chainJit4k(chainX4k.ref).dispose();
+  chainJit4k(chainX4k).dispose();
 });
 
 // --- Fused chain 65536 ---
@@ -53,10 +53,10 @@ const chainX64k = np.ones([65536]);
 await blockUntilReady(chainX64k);
 
 const chainJit64k = jit((x: any) => x.add(1).mul(2).sub(3).add(4).mul(0.5));
-chainJit64k(chainX64k.ref).dispose();
+chainJit64k(chainX64k).dispose();
 
 Deno.bench("jit chain x5 fused 65536 [baseline]", { group: "jit" }, () => {
-  chainJit64k(chainX64k.ref).dispose();
+  chainJit64k(chainX64k).dispose();
 });
 
 // --- 2 outputs same size (recycling fires: free input → malloc output) ---
@@ -65,18 +65,18 @@ const twoOutX = np.ones([4096]);
 await blockUntilReady(twoOutX);
 
 const twoOutJit = jit((x: any) => {
-  const a = x.ref.add(1);
+  const a = x.add(1);
   const b = x.mul(2);
   return [a, b];
 });
 {
-  const [a, b] = twoOutJit(twoOutX.ref) as [any, any];
+  const [a, b] = twoOutJit(twoOutX) as [any, any];
   a.dispose();
   b.dispose();
 }
 
 Deno.bench("jit 2-output same-size 4096 [recycle]", { group: "jit" }, () => {
-  const [a, b] = twoOutJit(twoOutX.ref) as [any, any];
+  const [a, b] = twoOutJit(twoOutX) as [any, any];
   a.dispose();
   b.dispose();
 });
@@ -87,20 +87,20 @@ const threeOutX = np.ones([4096]);
 await blockUntilReady(threeOutX);
 
 const threeOutJit = jit((x: any) => {
-  const a = x.ref.add(1);
-  const b = x.ref.mul(2);
+  const a = x.add(1);
+  const b = x.mul(2);
   const c = x.sub(3);
   return [a, b, c];
 });
 {
-  const [a, b, c] = threeOutJit(threeOutX.ref) as [any, any, any];
+  const [a, b, c] = threeOutJit(threeOutX) as [any, any, any];
   a.dispose();
   b.dispose();
   c.dispose();
 }
 
 Deno.bench("jit 3-output same-size 4096 [recycle]", { group: "jit" }, () => {
-  const [a, b, c] = threeOutJit(threeOutX.ref) as [any, any, any];
+  const [a, b, c] = threeOutJit(threeOutX) as [any, any, any];
   a.dispose();
   b.dispose();
   c.dispose();
@@ -112,10 +112,10 @@ const reduceX = np.ones([4096]);
 await blockUntilReady(reduceX);
 
 const reduceJit = jit((x: any) => x.add(1).sum().add(1));
-reduceJit(reduceX.ref).dispose();
+reduceJit(reduceX).dispose();
 
 Deno.bench("jit chain+reduce 4096", { group: "jit" }, () => {
-  reduceJit(reduceX.ref).dispose();
+  reduceJit(reduceX).dispose();
 });
 
 // --- 2x matmul 32x32 (unfused: two routines, free→malloc between them) ---
@@ -126,18 +126,18 @@ await blockUntilReady(matA32);
 await blockUntilReady(matB32);
 
 const matmul2Jit = jit((a: any, b: any) => {
-  const c = np.matmul(a.ref, b.ref);
+  const c = np.matmul(a, b);
   const d = np.matmul(b, a);
   return [c, d];
 });
 {
-  const [c, d] = matmul2Jit(matA32.ref, matB32.ref) as [any, any];
+  const [c, d] = matmul2Jit(matA32, matB32) as [any, any];
   c.dispose();
   d.dispose();
 }
 
 Deno.bench("jit 2x matmul 32x32 [recycle]", { group: "jit" }, () => {
-  const [c, d] = matmul2Jit(matA32.ref, matB32.ref) as [any, any];
+  const [c, d] = matmul2Jit(matA32, matB32) as [any, any];
   c.dispose();
   d.dispose();
 });
@@ -150,10 +150,10 @@ await blockUntilReady(matA64);
 await blockUntilReady(matB64);
 
 const matmulJit = jit((a: any, b: any) => np.matmul(a, b));
-matmulJit(matA64.ref, matB64.ref).dispose();
+matmulJit(matA64, matB64).dispose();
 
 Deno.bench("jit matmul 64x64", { group: "jit" }, () => {
-  matmulJit(matA64.ref, matB64.ref).dispose();
+  matmulJit(matA64, matB64).dispose();
 });
 
 // ============================================================================
@@ -168,8 +168,8 @@ await blockUntilReady(cumsumXs100);
 const cumsumJit100 = jit((xs: any) => {
   return lax.scan(
     (carry: any, x: any) => {
-      const c = carry.ref.add(x);
-      return [c.ref, c];
+      const c = carry.add(x);
+      return [c, c];
     },
     np.zeros([64]),
     xs,
@@ -177,13 +177,13 @@ const cumsumJit100 = jit((xs: any) => {
   );
 });
 {
-  const [c, y] = cumsumJit100(cumsumXs100.ref) as [any, any];
+  const [c, y] = cumsumJit100(cumsumXs100) as [any, any];
   c.dispose();
   y.dispose();
 }
 
 Deno.bench("scan cumsum N=100 size=64", { group: "scan" }, () => {
-  const [c, y] = cumsumJit100(cumsumXs100.ref) as [any, any];
+  const [c, y] = cumsumJit100(cumsumXs100) as [any, any];
   c.dispose();
   y.dispose();
 });
@@ -196,8 +196,8 @@ await blockUntilReady(cumsumXs500);
 const cumsumJit500 = jit((xs: any) => {
   return lax.scan(
     (carry: any, x: any) => {
-      const c = carry.ref.add(x);
-      return [c.ref, c];
+      const c = carry.add(x);
+      return [c, c];
     },
     np.zeros([256]),
     xs,
@@ -205,13 +205,13 @@ const cumsumJit500 = jit((xs: any) => {
   );
 });
 {
-  const [c, y] = cumsumJit500(cumsumXs500.ref) as [any, any];
+  const [c, y] = cumsumJit500(cumsumXs500) as [any, any];
   c.dispose();
   y.dispose();
 }
 
 Deno.bench("scan cumsum N=500 size=256", { group: "scan" }, () => {
-  const [c, y] = cumsumJit500(cumsumXs500.ref) as [any, any];
+  const [c, y] = cumsumJit500(cumsumXs500) as [any, any];
   c.dispose();
   y.dispose();
 });
@@ -226,7 +226,7 @@ const eagerX4k = np.ones([4096]);
 await blockUntilReady(eagerX4k);
 
 Deno.bench("eager chain x5 4096 [pool]", { group: "eager" }, () => {
-  eagerX4k.ref.add(1).mul(2).sub(3).add(4).mul(0.5).dispose();
+  eagerX4k.add(1).mul(2).sub(3).add(4).mul(0.5).dispose();
 });
 
 // --- Eager chain 65536 ---
@@ -235,7 +235,7 @@ const eagerX64k = np.ones([65536]);
 await blockUntilReady(eagerX64k);
 
 Deno.bench("eager chain x5 65536 [pool]", { group: "eager" }, () => {
-  eagerX64k.ref.add(1).mul(2).sub(3).add(4).mul(0.5).dispose();
+  eagerX64k.add(1).mul(2).sub(3).add(4).mul(0.5).dispose();
 });
 
 // --- Alloc/free cycle (pure pool benchmark) ---

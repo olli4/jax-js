@@ -257,6 +257,10 @@ export class Array extends Tracer {
     }
   }
 
+  [Symbol.dispose]() {
+    this.dispose();
+  }
+
   /** Get the pending executes as a list, trimming if already submitted. */
   get #pending(): PendingExecute[] {
     if (!this.#pendingSet) return [];
@@ -295,9 +299,7 @@ export class Array extends Tracer {
     const pending = this.#pending;
     for (const exe of pending) exe.updateRc(+1);
     if (typeof this.#source === "number") this.#backend.incRef(this.#source);
-    const ar = this.#newArrayFrom({ st, pending });
-    this.dispose(); // After constructing Array, so we don't free this.#source early.
-    return ar;
+    return this.#newArrayFrom({ st, pending });
   }
 
   /**
@@ -375,10 +377,6 @@ export class Array extends Tracer {
     for (const exe of pending) exe.updateRc(+1);
     pending.push(new PendingExecute(this.#backend, kernel, inputs, [output]));
 
-    // Dispose of inputs after creating PendingExecute.
-    this.dispose();
-    for (const ar of indices) ar.dispose();
-
     return this.#newArrayFrom({
       source: output,
       st: ShapeTracker.fromShape(finalShape),
@@ -420,7 +418,6 @@ export class Array extends Tracer {
     // Short circuit if the array is already AluExp.
     if (this.#source instanceof AluExp) {
       const exp = new AluExp(op, dtypeOutput, [this.#source]);
-      this.dispose();
       return this.#newArrayFrom({
         source: exp.simplify(),
         dtype: dtypeOutput,
@@ -440,7 +437,6 @@ export class Array extends Tracer {
       new PendingExecute(this.#backend, kernel, [this.#source], [output]),
     );
 
-    this.dispose(); // Dispose of inputs after creating PendingExecute.
     return this.#newArrayFrom({
       source: output,
       st: ShapeTracker.fromShape(this.shape),
@@ -515,7 +511,6 @@ export class Array extends Tracer {
       if (arrays.every((ar) => deepEqual(ar.#st, arrays[0].#st))) {
         // All are AluExp and have the same shape tracker.
         const exp = custom(sources);
-        arrays.forEach((ar) => ar.dispose());
         return new Array({
           source: exp.simplify(),
           st: arrays[0].#st,
@@ -534,7 +529,6 @@ export class Array extends Tracer {
         }),
       );
       const st = ShapeTracker.fromShape(newShape);
-      arrays.forEach((ar) => ar.dispose());
       return new Array({
         source: exp.simplify(),
         st,
@@ -583,7 +577,6 @@ export class Array extends Tracer {
     for (const exe of pending) exe.updateRc(+1);
     pending.add(new PendingExecute(backend, kernel, inputs, [output]));
 
-    arrays.forEach((ar) => ar.dispose()); // Dispose of inputs after creating PendingExecute.
     return new Array({
       source: output,
       st: ShapeTracker.fromShape(newShape),
@@ -619,7 +612,6 @@ export class Array extends Tracer {
     for (const exe of pending) exe.updateRc(+1);
     pending.push(new PendingExecute(this.#backend, kernel, inputs, [output]));
 
-    this.dispose(); // Dispose of inputs after creating PendingExecute.
     return this.#newArrayFrom({
       source: output,
       st: ShapeTracker.fromShape(newShape),
@@ -655,7 +647,6 @@ export class Array extends Tracer {
       pending.push(new PendingExecute(backend, routine, inputs, outputs));
       pending[pending.length - 1].updateRc(+outputs.length - 1);
 
-      arrays.forEach((ar) => ar.dispose()); // Dispose of inputs after creating PendingExecute.
       return outputs.map(
         (output, i) =>
           new Array({
@@ -720,7 +711,6 @@ export class Array extends Tracer {
     if (!(this.#source instanceof AluExp))
       throw new Error("internal: #dataInline called on non-AluExp source");
     const ar = this.#newArrayFrom({ backend: getBackend("cpu") });
-    this.dispose();
     return ar.dataSync();
   }
 
@@ -785,7 +775,6 @@ export class Array extends Tracer {
     // While the array is contiguous, it might not be the whole buffer.
     const byteCount = byteWidth(this.#dtype) * this.size;
     const buf = await this.#backend.read(this.#source as Slot, 0, byteCount);
-    this.dispose();
     return dtypedArray(this.dtype, buf);
   }
 
@@ -835,7 +824,6 @@ export class Array extends Tracer {
     // While the array is contiguous, it might not be the whole buffer.
     const byteCount = byteWidth(this.#dtype) * this.size;
     const buf = this.#backend.readSync(this.#source as Slot, 0, byteCount);
-    this.dispose();
     return dtypedArray(this.dtype, buf);
   }
 
@@ -896,7 +884,7 @@ export class Array extends Tracer {
         return [x.#binary(AluOp.Max, y)];
       },
       [Primitive.Neg]([x]) {
-        return [zerosLike(x.ref).#binary(AluOp.Sub, x)];
+        return [zerosLike(x).#binary(AluOp.Sub, x)];
       },
       [Primitive.Reciprocal]([x]) {
         return [x.#unary(AluOp.Reciprocal)];
@@ -930,9 +918,7 @@ export class Array extends Tracer {
           x.#backend.incRef(x.#source);
           const pending = x.#pending;
           for (const exe of pending) exe.updateRc(+1);
-          const y = x.#newArrayFrom({ dtype, weakType: false, pending });
-          x.dispose();
-          return [y];
+          return [x.#newArrayFrom({ dtype, weakType: false, pending })];
         }
       },
       [Primitive.Sin]([x]) {
@@ -1037,10 +1023,9 @@ export class Array extends Tracer {
           const slice = range(x.ndim).map<Pair>((d) =>
             d === axis ? [start, start + sizes[i]] : [0, x.shape[d]],
           );
-          outputs.push(x.ref.#reshape(x.#st.shrink(slice)));
+          outputs.push(x.#reshape(x.#st.shrink(slice)));
           start += sizes[i];
         }
-        x.dispose();
         return outputs;
       },
       [Primitive.RandomBits]([k0, k1], { shape, mode }) {
@@ -1117,8 +1102,6 @@ export class Array extends Tracer {
         const jp = jitCompile(backend, jaxpr);
         const { outputs, pending } = jp.execute(slots);
         for (const exe of pending) exe.updateRc(+outputs.length - 1);
-
-        args.forEach((x) => x.dispose()); // Dispose of args after dispatch.
 
         return outputs.map((source, i) => {
           return new Array({
@@ -1382,7 +1365,6 @@ export class Array extends Tracer {
         // Dispose original args (consts, xs refs consumed above)
         for (const s of constSlots) backend.decRef(s);
         for (const s of xsSlots) backend.decRef(s);
-        allArgs.forEach((a) => a.dispose());
 
         // Wrap output slots as Arrays
         const outputs: Array[] = [];
@@ -1435,12 +1417,12 @@ export class Array extends Tracer {
     if (this.#backend === backend) return this;
     if (this.#source instanceof AluExp) {
       // Not realized yet, just dump the AluExp on the target backend.
-      const ar = this.#newArrayFrom({ backend, committed: true });
-      this.dispose();
-      return ar;
+      return this.#newArrayFrom({ backend, committed: true });
     } else {
       // Realize the array and copy data to the new backend.
-      const data = await this.data();
+      const byteCount = byteWidth(this.#dtype) * this.size;
+      const buf = await this.#backend.read(this.#source as Slot, 0, byteCount);
+      const data = dtypedArray(this.dtype, buf);
       return arrayFromData(
         data,
         this.shape,
@@ -1455,12 +1437,12 @@ export class Array extends Tracer {
     if (this.#backend === backend) return this;
     if (this.#source instanceof AluExp) {
       // Not realized yet, just dump the AluExp on the target backend.
-      const ar = this.#newArrayFrom({ backend, committed: true });
-      this.dispose();
-      return ar;
+      return this.#newArrayFrom({ backend, committed: true });
     } else {
       // Realize the array and copy data to the new backend.
-      const data = this.dataSync();
+      const byteCount = byteWidth(this.#dtype) * this.size;
+      const buf = this.#backend.readSync(this.#source as Slot, 0, byteCount);
+      const data = dtypedArray(this.dtype, buf);
       return arrayFromData(
         data,
         this.shape,
@@ -1661,7 +1643,6 @@ export function fullLike(
   { dtype, shape, device }: DTypeShapeAndDevice = {},
 ): Array {
   const aval = getAval(val);
-  if (val instanceof Tracer) val.dispose();
   if (fillValue instanceof Tracer) {
     // TODO: Full can also take an array as a fill value. This is equivalent to
     // expanding the array.
@@ -1847,7 +1828,7 @@ export function tril(a: ArrayLike, k: number = 0): Array {
   const [n, m] = a.shape.slice(-2);
   return where(
     tri(n, m, k, { dtype: DType.Bool }),
-    a.ref,
+    a,
     zerosLike(a),
   ) as Array;
 }
@@ -1861,7 +1842,7 @@ export function triu(a: ArrayLike, k: number = 0): Array {
   const [n, m] = a.shape.slice(-2);
   return where(
     tri(n, m, k - 1, { dtype: DType.Bool }),
-    zerosLike(a.ref),
+    zerosLike(a),
     a,
   ) as Array;
 }

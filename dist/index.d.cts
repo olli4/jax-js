@@ -661,8 +661,6 @@ declare class JaxprEqn {
   readonly inputs: Atom[];
   readonly params: Record<string, any>;
   readonly outBinders: Var[];
-  /** Source location of user code that triggered this equation (V8 only). */
-  _userLoc?: string;
   constructor(primitive: Primitive, inputs: Atom[], params: Record<string, any>, outBinders: Var[]);
   pprint(usedVars?: Set<Var>, vp?: VarPrinter): PPrint;
   toString(): string;
@@ -710,12 +708,6 @@ declare class ClosedJaxpr {
 /** @inline */
 type JitOpts = {
   staticArgnums?: number[];
-  /**
-   * When true, validate that the function body uses `.ref` correctly for
-   * eager-mode compatibility.  Tracing always succeeds; validation runs
-   * afterwards and reports every missing / extra `.ref` with an actionable
-   * error message.  Default: true when called via `jit()`.
-   */
   validateRefs?: boolean;
 };
 //#endregion
@@ -893,7 +885,6 @@ type MainTrace = {
   level: number;
   traceType: new (main: MainTrace) => Trace;
   globalData: any | null;
-  /** True for transform traces (JVP, vmap) that alter .ref usage patterns. */
   isTransform?: boolean;
 };
 /**
@@ -953,45 +944,30 @@ declare abstract class Tracer {
    * Access an array by reference, incrementing the reference count.
    *
    * jax-js handles freeing arrays by using "move" semantics, like in Rust/C++.
-   * Whenever you pass an array into a function, that function should consume
-   * the array, and it will no longer be usable. For example, if you had:
+   * Increment the reference count of this array.
+   *
+   * In most code, you don't need `.ref` because operations do NOT consume
+   * their inputs. The main use case is when you need an array to survive
+   * an explicit `.dispose()` call or `using` block.
    *
    * ```
    * const x = np.array([1, 2, 3]);
-   * const y = np.add(x, x);
+   * const y = np.add(x, x); // works — x is not consumed
    * ```
-   *
-   * The second line does not work because the first parameter consumes `x`, and
-   * then the second parameter will already have been freed / disposed.
-   *
-   * To fix this, you can write:
-   *
-   * ```
-   * const y = np.add(x.ref, x);
-   * ```
-   *
-   * Under the hood, every access to `.ref` increments the internal reference
-   * count of the array. The reference count starts at 1. When it hits 0, the
-   * memory behind the array is freed.
    */
   abstract get ref(): this;
   /**
    * Manually decrement the reference count of the array.
    *
-   * Arrays are created with reference count 1. Whenever it is used as argument
-   * to a function or other operation, it is disposed (i.e., reference count
-   * decreases by 1) automatically. Whenever a `.ref` is created, the reference
-   * count increases.
+   * Arrays are created with reference count 1. When the reference count
+   * reaches 0, the underlying memory is freed.
    *
-   * You generally don't need to call this function directly since arrays are
-   * automatically disposed after being passed into an operation. One common
-   * exception is when writing a function and ignoring one of its arguments. In
-   * that case, by convention you should dispose of that argument manually.
+   * You can use the `using` keyword for automatic disposal:
    *
    * ```
-   * function myCustomOperation(a: np.Array, b: np.Array) {
-   *   b.dispose(); // Needed to satisfy "move" rules.
-   *   return a.add(1);
+   * {
+   *   using x = np.array([1, 2, 3]);
+   *   // x is automatically disposed at the end of this block
    * }
    * ```
    */
@@ -1198,6 +1174,7 @@ declare class Array extends Tracer {
   /** Get the current reference count (for debugging memory management). */
   get refCount(): number;
   dispose(): void;
+  [Symbol.dispose](): void;
   /**
    * Convert this array into a primitive value.
    *
@@ -1578,37 +1555,22 @@ interface ScanOptions {
  * - Supports autodiff: `grad(f)` works through scan
  * - The carry shape/dtype must be fixed across all iterations
  *
- * ## Reference Counting Contract
+ * ## Ownership
  *
- * **Inputs (consumed):**
- * - `init` and `xs` are consumed by scan (refcount decremented)
- * - Use `.ref` if you need to keep inputs alive: `scan(f, init.ref, xs.ref)`
+ * **Inputs:** `init` and `xs` are NOT consumed. Use `using` or `.dispose()` to
+ * manage their lifetime if needed.
  *
  * **Body function:**
  * - `carry` and `x` are **managed** by scan — do NOT manually dispose them
- * - Standard consumption rules apply inside the body (same as regular functions):
- *   - **Single use:** `np.add(carry, x)` — no `.ref` needed
- *   - **Multiple uses:** Use `.ref` to keep alive for additional uses
- * - Return **new** arrays for `newCarry` and `y`
- * - For passthrough (same array in both), use `.ref`: `[result.ref, result]`
+ * - Operations do NOT consume inputs, so no `.ref` is needed inside the body
  *
- * **Example — multiple uses of carry:**
+ * **Example — simple body:**
  * ```ts
- * // ✓ Works: .ref keeps carry alive, then bare carry consumed in return
  * const step = (carry, x) => {
- *   const newCarry = np.add(carry.ref, x);  // .ref: we'll use carry again
- *   return [newCarry, carry];               // carry consumed here
- * };
- *
- * // ✗ Fails: can't use carry in TWO separate operations after .ref
- * const step = (carry, x) => {
- *   const a = np.add(carry.ref, x);  // first operation
- *   const b = np.add(a, carry);      // ERROR: second operation on carry
- *   return [b, a.ref];
+ *   const newCarry = np.add(carry, x);
+ *   return [newCarry, carry];  // carry used freely in multiple places
  * };
  * ```
- *
- * **Workaround:** Use pytree carries so each field can be `.ref`'d independently.
  *
  * **Outputs (caller owns):**
  * - `finalCarry` and `ys` are owned by caller — dispose when done
@@ -1635,7 +1597,7 @@ interface ScanOptions {
  *
  * const step = (carry, x) => {
  *   const sum = np.add(carry, x);
- *   return [sum, sum.ref];  // .ref: sum used in both outputs
+ *   return [sum, sum];  // same array can be used in both outputs
  * };
  *
  * const init = np.array([0.0]);
@@ -1654,7 +1616,7 @@ interface ScanOptions {
  * // Compute n! for n = 1..5
  * const step = (carry, x) => {
  *   const next = np.multiply(carry, x);
- *   return [next, next.ref];
+ *   return [next, next];
  * };
  *
  * const init = np.array([1]);
@@ -1670,7 +1632,7 @@ interface ScanOptions {
  *   const newSum = np.add(carry.sum, x);
  *   const newCount = np.add(carry.count, np.array([1]));
  *   return [
- *     { sum: newSum.ref, count: newCount.ref },
+ *     { sum: newSum, count: newCount },
  *     { sum: newSum, count: newCount }
  *   ];
  * };
@@ -1707,7 +1669,7 @@ interface ScanOptions {
  * ```ts
  * // Generate a sequence without allocating input arrays
  * const step = (carry, _x) => {
- *   const next = np.add(carry.ref, np.array([1.0]));
+ *   const next = np.add(carry, np.array([1.0]));
  *   return [next, carry];  // output is old carry value
  * };
  *
@@ -1720,7 +1682,7 @@ interface ScanOptions {
  * ```ts
  * // Only need final carry, not intermediate outputs (saves memory)
  * const step = (carry, x) => {
- *   const Asq = carry.A.ref.mul(carry.A);
+ *   const Asq = carry.A.mul(carry.A);
  *   const newA = Asq.add(x);
  *   const newCount = carry.count.add(Asq.less(100).astype(np.int32));
  *   return [{ A: newA, count: newCount }, null];  // null skips Y stacking
@@ -1739,7 +1701,7 @@ interface ScanOptions {
  * // This is the most common and efficient pattern for production use.
  * const step = (carry, x) => {
  *   const newCarry = np.add(carry, x);
- *   return [newCarry, newCarry.ref];
+ *   return [newCarry, newCarry];
  * };
  *
  * const scanFn = jit((init, xs) => lax.scan(step, init, xs));
@@ -1761,7 +1723,7 @@ interface ScanOptions {
  * // but you want to inspect intermediate values or the scan body is dynamic.
  * const step = jit((carry, x) => {
  *   const newCarry = np.add(carry, x);
- *   return [newCarry, newCarry.ref];
+ *   return [newCarry, newCarry];
  * });
  *
  * const init = np.array([0.0]);
@@ -3084,10 +3046,6 @@ declare const makeJaxpr: <F extends (...args: any[]) => JsTree<Array>>(f: F) => 
  * - `staticArgnums`: An array of argument indices to treat as static
  *   (compile-time constant). These arguments must be hashable, won't be traced,
  *   and different values will trigger recompilation.
- * - `validateRefs`: When `true` (default), validates that the function body
- *   uses `.ref` correctly for eager-mode compatibility.  Tracing always
- *   succeeds; validation runs afterwards and reports every missing or extra
- *   `.ref` with an actionable error message.  Set to `false` to skip.
  * - `device`: The device to place the computation on. If not specified, the
  *   computation will be placed on the default device.
  */
@@ -3185,7 +3143,7 @@ declare const jacrev: typeof jacfwd;
  *
  * @example
  * ```ts
- * const f = (x: np.Array) => np.sum(x.ref.mul(x.ref).mul(x)); // x^3
+ * const f = (x: np.Array) => np.sum(x.mul(x).mul(x)); // x^3
  * const H = hessian(f)(np.array([1, 2, 3]));
  * // H[i,j] = d^2f / dx_i dx_j
  * ```

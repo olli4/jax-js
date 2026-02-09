@@ -51,8 +51,9 @@ describe("scan fallback leak detection (CPU)", () => {
     };
 
     const before = slotCount();
-    const [carry] = lax.scan(step, initC.ref, xs.ref);
+    const [carry] = lax.scan(step, initC, xs);
     await carry.data();
+    carry.dispose();
     expect(slotCount() - before).toBe(0);
 
     xs.dispose();
@@ -69,12 +70,13 @@ describe("scan fallback leak detection (CPU)", () => {
     const initC = np.array([10, 20]);
 
     const step = (carry: any, x: any): [any, null] => {
-      return [np.add(np.add(carry, x), bias.ref), null];
+      return [np.add(np.add(carry, x), bias), null];
     };
 
     const before = slotCount();
-    const [carry] = lax.scan(step, initC.ref, xs.ref);
+    const [carry] = lax.scan(step, initC, xs);
     await carry.data();
+    carry.dispose();
     expect(slotCount() - before).toBe(0);
 
     xs.dispose();
@@ -94,13 +96,15 @@ describe("scan fallback leak detection (CPU)", () => {
 
     const step = (carry: any, x: any): [any, any] => {
       const newC = np.add(carry, x);
-      return [newC.ref, newC];
+      return [newC, newC];
     };
 
     const before = slotCount();
-    const [carry, ys] = lax.scan(step, initC.ref, xs.ref);
+    const [carry, ys] = lax.scan(step, initC, xs);
     await carry.data();
     await ys.data();
+    carry.dispose();
+    ys.dispose();
     expect(slotCount() - before).toBe(0);
 
     xs.dispose();
@@ -114,39 +118,44 @@ describe("scan fallback leak detection (CPU)", () => {
       [5, 6],
     ]);
     const initC = np.array([10, 20]);
+    const factor = np.array([2, 3]);
 
     const step = (carry: any, x: any): [any, any] => {
-      const newC = np.add(carry, x.ref);
-      return [newC, np.multiply(x, np.array([2, 3]))];
+      const newC = np.add(carry, x);
+      return [newC, np.multiply(x, factor)];
     };
 
     const before = slotCount();
-    const [carry, ys] = lax.scan(step, initC.ref, xs.ref);
+    const [carry, ys] = lax.scan(step, initC, xs);
     await carry.data();
     await ys.data();
+    carry.dispose();
+    ys.dispose();
     expect(slotCount() - before).toBe(0);
 
     xs.dispose();
     initC.dispose();
+    factor.dispose();
   });
 
   it("xs=null carry-only scan does not leak", async () => {
     const initC = np.array([10, 20]);
+    const increment = np.array([1, 2]);
 
     const step = (carry: any, _x: any): [any, null] => {
-      // np.array([1, 2]) is a lazy constant (same elements = no malloc)
-      // but np.add will inline it during tracing
-      const newC = np.add(carry, np.array([1, 2]));
+      const newC = np.add(carry, increment);
       return [newC, null];
     };
 
     const before = slotCount();
-    const [carry, ys] = lax.scan(step, initC.ref, null, { length: 5 });
+    const [carry, ys] = lax.scan(step, initC, null, { length: 5 });
     expect(ys).toBeNull();
     await carry.data();
+    carry.dispose();
     expect(slotCount() - before).toBe(0);
 
     initC.dispose();
+    increment.dispose();
   });
 
   it("pytree carry does not leak", async () => {
@@ -157,23 +166,30 @@ describe("scan fallback leak detection (CPU)", () => {
     ]);
     const initA = np.array([10, 20]);
     const initB = np.array([30, 40]);
+    const bIncrement = np.array([1, 2]);
+    const yFactor = np.array([2, 3]);
 
     const step = (carry: { a: any; b: any }, x: any): [any, any] => {
-      const newA = np.add(carry.a, x.ref);
-      const newB = np.add(carry.b, np.array([1, 2]));
-      return [{ a: newA, b: newB }, np.multiply(x, np.array([2, 3]))];
+      const newA = np.add(carry.a, x);
+      const newB = np.add(carry.b, bIncrement);
+      return [{ a: newA, b: newB }, np.multiply(x, yFactor)];
     };
 
     const before = slotCount();
-    const [carry, ys] = lax.scan(step, { a: initA.ref, b: initB.ref }, xs.ref);
+    const [carry, ys] = lax.scan(step, { a: initA, b: initB }, xs);
     await (carry as any).a.data();
     await (carry as any).b.data();
     await ys.data();
+    (carry as any).a.dispose();
+    (carry as any).b.dispose();
+    ys.dispose();
     expect(slotCount() - before).toBe(0);
 
     xs.dispose();
     initA.dispose();
     initB.dispose();
+    bIncrement.dispose();
+    yFactor.dispose();
   });
 
   it("reverse scan does not leak", async () => {
@@ -184,21 +200,25 @@ describe("scan fallback leak detection (CPU)", () => {
       [7, 8],
     ]);
     const initC = np.array([10, 20]);
+    const yFactor = np.array([3, 4]);
 
     const step = (carry: any, x: any): [any, any] => {
-      return [np.add(carry, x.ref), np.multiply(x, np.array([3, 4]))];
+      return [np.add(carry, x), np.multiply(x, yFactor)];
     };
 
     const before = slotCount();
-    const [carry, ys] = lax.scan(step, initC.ref, xs.ref, {
+    const [carry, ys] = lax.scan(step, initC, xs, {
       reverse: true,
     });
     await carry.data();
     await ys.data();
+    carry.dispose();
+    ys.dispose();
     expect(slotCount() - before).toBe(0);
 
     xs.dispose();
     initC.dispose();
+    yFactor.dispose();
   });
 
   it("longer scan (L=50) does not leak", async () => {
@@ -211,8 +231,9 @@ describe("scan fallback leak detection (CPU)", () => {
     };
 
     const before = slotCount();
-    const [carry] = lax.scan(step, initC.ref, xs.ref);
+    const [carry] = lax.scan(step, initC, xs);
     await carry.data();
+    carry.dispose();
     expect(slotCount() - before).toBe(0);
 
     xs.dispose();
@@ -232,7 +253,7 @@ describe("scan fallback leak detection (CPU)", () => {
 
     // CPU only supports fallback — requesting compiled-loop should throw
     expect(() =>
-      lax.scan(step, initC.ref, xs.ref, { acceptPath: "compiled-loop" }),
+      lax.scan(step, initC, xs, { acceptPath: "compiled-loop" }),
     ).toThrow();
 
     xs.dispose();

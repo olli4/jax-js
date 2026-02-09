@@ -26,9 +26,9 @@ suite.each(devicesWithLinalg)("device:%s", (device) => {
         [4.0, 2.01],
         [1.99, 5.0],
       ]);
-      const L = np.linalg.cholesky(x.ref);
-      const reconstructed = np.matmul(L.ref, L.transpose());
-      const symmetrized = x.ref.add(x.transpose()).mul(0.5);
+      const L = np.linalg.cholesky(x);
+      const reconstructed = np.matmul(L, L.transpose());
+      const symmetrized = x.add(x.transpose()).mul(0.5);
       expect(reconstructed).toBeAllclose(symmetrized);
     });
   });
@@ -39,14 +39,14 @@ suite.each(devicesWithLinalg)("device:%s", (device) => {
         [4.0, 7.0],
         [2.0, 6.0],
       ]);
-      const detA = np.linalg.det(a.ref);
+      const detA = np.linalg.det(a);
       expect(detA).toBeAllclose(10.0);
     });
 
     test("gradient of det is adjugate.mT", () => {
       const a = random.uniform(random.key(0), [15, 15]);
       const g = valueAndGrad(np.linalg.det);
-      const [detA, da] = g(a.ref);
+      const [detA, da] = g(a);
       const adjA = np.linalg.inv(a).mul(detA);
       expect(da).toBeAllclose(np.matrixTranspose(adjA), { rtol: 1e-3 });
     });
@@ -58,14 +58,14 @@ suite.each(devicesWithLinalg)("device:%s", (device) => {
         [4.0, 7.0],
         [2.0, 6.0],
       ]);
-      const aInv = np.linalg.inv(a.ref);
+      const aInv = np.linalg.inv(a);
       const identity = np.matmul(a, aInv);
       expect(identity).toBeAllclose(np.eye(2));
     });
 
     test("computes inverse of batched matrices", () => {
       const a = random.uniform(random.key(0), [2, 3, 4, 4]);
-      const aInv = np.linalg.inv(a.ref);
+      const aInv = np.linalg.inv(a);
       const identity = np.matmul(a, aInv);
       expect(identity).toBeAllclose(np.broadcastTo(np.eye(4), [2, 3, 4, 4]), {
         atol: 1e-4,
@@ -82,13 +82,13 @@ suite.each(devicesWithLinalg)("device:%s", (device) => {
         [5.0, 6.0],
       ]);
       const b = np.array([[1.0], [2.0], [3.0]]);
-      const x = np.linalg.lstsq(a.ref, b.ref);
+      const x = np.linalg.lstsq(a, b);
 
       // Verify solution minimizes ||Ax - b||
       // The normal equations: A^T A x = A^T b
-      const atA = np.matmul(a.ref.transpose(), a.ref);
-      const atb = np.matmul(a.ref.transpose(), b.ref);
-      const lhs = np.matmul(atA.ref, x.ref);
+      const atA = np.matmul(a.transpose(), a);
+      const atb = np.matmul(a.transpose(), b);
+      const lhs = np.matmul(atA, x);
       expect(lhs).toBeAllclose(atb, { rtol: 1e-4, atol: 1e-4 });
     });
 
@@ -99,10 +99,10 @@ suite.each(devicesWithLinalg)("device:%s", (device) => {
         [4.0, 5.0, 6.0],
       ]);
       const b = np.array([[1.0], [2.0]]);
-      const x = np.linalg.lstsq(a.ref, b.ref);
+      const x = np.linalg.lstsq(a, b);
 
       // Verify Ax = b (should be exact for underdetermined systems)
-      const ax = np.matmul(a.ref, x.ref);
+      const ax = np.matmul(a, x);
       expect(ax).toBeAllclose(b, { rtol: 1e-4, atol: 1e-4 });
     });
 
@@ -112,10 +112,10 @@ suite.each(devicesWithLinalg)("device:%s", (device) => {
         [1.0, 3.0],
       ]);
       const b = np.array([[5.0], [7.0]]);
-      const x = np.linalg.lstsq(a.ref, b.ref);
+      const x = np.linalg.lstsq(a, b);
 
       // Verify Ax = b
-      const ax = np.matmul(a.ref, x.ref);
+      const ax = np.matmul(a, x);
       expect(ax).toBeAllclose(b, { rtol: 1e-4, atol: 1e-4 });
     });
 
@@ -130,15 +130,15 @@ suite.each(devicesWithLinalg)("device:%s", (device) => {
         [3.0, 4.0],
         [5.0, 6.0],
       ]);
-      const x = np.linalg.lstsq(a.ref, b.ref);
+      const x = np.linalg.lstsq(a, b);
 
       // x should have shape (2, 2)
       expect(x.shape).toEqual([2, 2]);
 
       // Verify normal equations for each column
-      const atA = np.matmul(a.ref.transpose(), a.ref);
-      const atb = np.matmul(a.ref.transpose(), b.ref);
-      const lhs = np.matmul(atA.ref, x.ref);
+      const atA = np.matmul(a.transpose(), a);
+      const atb = np.matmul(a.transpose(), b);
+      const lhs = np.matmul(atA, x);
       expect(lhs).toBeAllclose(atb, { rtol: 1e-4, atol: 1e-4 });
     });
 
@@ -151,13 +151,13 @@ suite.each(devicesWithLinalg)("device:%s", (device) => {
         [1.0, 2.0],
         [3.0, 4.0],
       ]);
-      const x = np.linalg.lstsq(a.ref, b.ref);
+      const x = np.linalg.lstsq(a, b);
 
       // x should have shape (3, 2)
       expect(x.shape).toEqual([3, 2]);
 
       // Verify Ax = b
-      const ax = np.matmul(a.ref, x.ref);
+      const ax = np.matmul(a, x);
       expect(ax).toBeAllclose(b, { rtol: 1e-4, atol: 1e-4 });
     });
 
@@ -184,8 +184,8 @@ suite.each(devicesWithLinalg)("device:%s", (device) => {
       const b = np.array([[1.0], [2.0]]);
       const db = np.array([[0.1], [0.1]]);
 
-      const solve = (b: np.Array) => np.linalg.lstsq(a.ref, b);
-      const [x, dx] = jvp(solve, [b.ref], [db.ref]);
+      const solve = (b: np.Array) => np.linalg.lstsq(a, b);
+      const [x, dx] = jvp(solve, [b], [db]);
 
       // Verify dx by finite differences
       const eps = 1e-4;
@@ -201,8 +201,8 @@ suite.each(devicesWithLinalg)("device:%s", (device) => {
       ]);
       const b = np.array([[1.0], [2.0]]);
 
-      const f = (b: np.Array) => np.square(np.linalg.lstsq(a.ref, b)).sum();
-      const db = grad(f)(b.ref);
+      const f = (b: np.Array) => np.square(np.linalg.lstsq(a, b)).sum();
+      const db = grad(f)(b);
 
       // Verify gradient by finite differences
       const eps = 1e-4;
@@ -227,7 +227,7 @@ suite.each(devicesWithLinalg)("device:%s", (device) => {
         [4.0, 7.0],
         [2.0, 6.0],
       ]);
-      const [sign, logdet] = np.linalg.slogdet(a.ref);
+      const [sign, logdet] = np.linalg.slogdet(a);
       expect(sign).toBeAllclose(1);
       expect(logdet).toBeAllclose(Math.log(10));
     });
@@ -248,7 +248,7 @@ suite.each(devicesWithLinalg)("device:%s", (device) => {
       const [k1, k2] = random.split(random.key(0), 2);
       const a = random.uniform(k1, [10, 15, 15]);
       const xTrue = random.uniform(k2, [10, 15, 5]);
-      const b = np.matmul(a.ref, xTrue.ref); // B = A @ X_true
+      const b = np.matmul(a, xTrue); // B = A @ X_true
       expect(b.shape).toEqual(xTrue.shape);
 
       const xPred = np.linalg.solve(a, b);

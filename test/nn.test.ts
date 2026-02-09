@@ -157,7 +157,7 @@ suite.each(devices)("device:%s", (device) => {
 
     test("is consistent with logSoftmax", () => {
       const x = np.array([-10, -1, 1, 2]);
-      const softmax = nn.softmax(x.ref);
+      const softmax = nn.softmax(x);
       const logSoftmax = nn.logSoftmax(x);
       expect(np.log(softmax)).toBeAllclose(logSoftmax);
     });
@@ -328,7 +328,7 @@ suite.each(devices)("device:%s", (device) => {
       const out = nn.dotProductAttention(query, key, value, { mask });
       expect(out.shape).toEqual([1, 2, 1, 2]);
       // First query attends only to first key (value [1, 0])
-      expect(out.ref.slice(0, 0, 0)).toBeAllclose([1, 0]);
+      expect(out.slice(0, 0, 0)).toBeAllclose([1, 0]);
       // Second query attends only to second key (value [0, 1])
       expect(out.slice(0, 1, 0)).toBeAllclose([0, 1]);
     });
@@ -344,9 +344,9 @@ suite.each(devices)("device:%s", (device) => {
       expect(out.shape).toEqual([1, 3, 1, 2]);
 
       // Position 0 can only attend to position 0 -> outputs value[0] = [1, 0]
-      expect(out.ref.slice(0, 0, 0)).toBeAllclose([1, 0]);
+      expect(out.slice(0, 0, 0)).toBeAllclose([1, 0]);
       // Position 1 can attend to positions 0 and 1
-      expect(out.ref.slice(0, 1, 0)).toBeAllclose([0.5, 0.5]);
+      expect(out.slice(0, 1, 0)).toBeAllclose([0.5, 0.5]);
       // Position 2 can attend to positions 0, 1, and 2
       expect(out.slice(0, 2, 0)).toBeAllclose([
         1 / (2 + Math.exp(Math.SQRT1_2)),

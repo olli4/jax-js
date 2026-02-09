@@ -404,7 +404,7 @@ const vmapRules: Partial<{ [P in Primitive]: VmapRule<P> }> = {
     const newJaxpr = vmapJaxpr(jaxpr, axisSize, dims);
     const outs = bind(
       Primitive.Jit,
-      [...newJaxpr.consts.map((c) => c.ref), ...args],
+      [...newJaxpr.consts, ...args],
       {
         name: `${name}_vmap`,
         jaxpr: newJaxpr.jaxpr,
@@ -479,7 +479,7 @@ const vmapRules: Partial<{ [P in Primitive]: VmapRule<P> }> = {
 
     // Build scan args with moved arrays
     const scanArgs = [
-      ...vmappedBody.consts.map((c) => c.ref),
+      ...vmappedBody.consts,
       ...movedConsts,
       ...movedCarry,
       ...movedXs,
@@ -530,7 +530,6 @@ function vmapJaxpr(
   });
   const { jaxpr: newJaxpr } = makeJaxpr(
     (args: Tracer[]) => vmapFlat(jaxprAsFun(jaxpr), dims, args),
-    { validateRefs: false },
   )(inAvals);
 
   if (!vmapJaxprCache.has(jaxpr)) vmapJaxprCache.set(jaxpr, new Map());
@@ -567,7 +566,6 @@ function vmapFlat(
   let valsOut: Tracer[], bdimsOut: (number | null)[];
   {
     using main = newMain(BatchTrace, axisSize);
-    main.isTransform = true;
     const trace = new BatchTrace(main);
     const tracersIn = args.map((x, i) =>
       inAxes[i] === null

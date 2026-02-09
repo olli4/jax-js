@@ -162,11 +162,11 @@
       );
 
       for (let i = 0; i < ar.shape[0]; i += 16) {
-        const batch = ar.ref.slice([i, Math.min(i + 16, ar.shape[0])]);
+        const batch = ar.slice([i, Math.min(i + 16, ar.shape[0])]);
         const batchSize = batch.shape[0];
         performance.mark("clip-start");
         const t0 = performance.now();
-        const result = runEncoder(tree.ref(model.text), batch);
+        const result = runEncoder(model.text, batch);
         await result.blockUntilReady();
         const t1 = performance.now();
         performance.mark("clip-end");
@@ -222,13 +222,13 @@
       const queryArray = np.array([queryTokens], { dtype: np.uint32 });
 
       // Run the encoder to get embeddings (~100 ms?)
-      const queryEmbed = runEncoder(tree.ref(model.text), queryArray).slice(0);
+      const queryEmbed = runEncoder(model.text, queryArray).slice(0);
 
       // Compute cosine similarity scores: query @ embeddings.T
       // queryEmbed is [D_EMBED], embeddingArray is [N, D_EMBED]
       const scores: number[] = await np
         .dot(
-          embeddingArray.ref.astype(np.float32),
+          embeddingArray.astype(np.float32),
           queryEmbed.astype(np.float32),
         )
         .jsAsync();

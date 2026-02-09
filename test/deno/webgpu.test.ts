@@ -12,7 +12,7 @@
  * jax-js Reference Counting:
  * - Arrays passed to functions are CONSUMED (refcount -1, internal dispose)
  * - .data() CONSUMES the array (reads data then disposes)
- * - Use .ref to KEEP an array alive for reuse
+ * - Use  to KEEP an array alive for reuse
  * - Don't manually .dispose() arrays that are consumed
  *
  * Memory Leak Detection:
@@ -140,10 +140,10 @@ Deno.test({
 
     defaultDevice("webgpu");
 
-    // x.ref keeps x alive for second use, x.ref keeps for third use
+    // x keeps x alive for second use, x keeps for third use
     const f = (x: np.Array) => {
       const two = np.array([2]);
-      const x2 = np.multiply(x.ref, x.ref); // need .ref on both since we use x again
+      const x2 = np.multiply(x, x); // need  on both since we use x again
       return np.add(x2, np.multiply(x, two)); // x consumed here
     };
     const jitF = jit(f);
@@ -173,7 +173,7 @@ Deno.test({
     defaultDevice("webgpu");
 
     // f(x) = sum(x^2), so grad(f)(x) = 2x
-    const f = (x: np.Array) => np.sum(np.multiply(x.ref, x));
+    const f = (x: np.Array) => np.sum(np.multiply(x, x));
     const gradF = grad(f);
 
     const x = np.array([1, 2, 3]);
@@ -202,10 +202,10 @@ Deno.test({
       [4, 5, 6],
     ]);
 
-    // Use .ref to keep x alive for multiple operations
-    const sumAll = np.sum(x.ref);
-    const sumAxis0 = np.sum(x.ref, 0);
-    const sumAxis1 = np.sum(x, 1); // last use, no .ref needed
+    // Use  to keep x alive for multiple operations
+    const sumAll = np.sum(x);
+    const sumAxis0 = np.sum(x, 0);
+    const sumAxis1 = np.sum(x, 1); // last use, no  needed
 
     // Each .data() consumes its array
     assertEquals(Array.from(await sumAll.data()), [21]);
@@ -230,8 +230,8 @@ Deno.test({
     const f = jit((xs: np.Array) =>
       lax.scan(
         (carry: np.Array, x: np.Array) => {
-          const out = np.add(carry.ref, x);
-          return [out.ref, out];
+          const out = np.add(carry, x);
+          return [out, out];
         },
         np.array([0]),
         xs,
@@ -259,8 +259,8 @@ Deno.test({
     const f = jit((xs: np.Array) => {
       const [carry, ys] = lax.scan(
         (c: np.Array, x: np.Array) => {
-          const out = np.add(c.ref, x);
-          return [out.ref, out];
+          const out = np.add(c, x);
+          return [out, out];
         },
         np.array([0]),
         xs,
@@ -298,8 +298,8 @@ Deno.test({
     const f = jit((initC: np.Array, xsIn: np.Array) =>
       lax.scan(
         (carry: np.Array, x: np.Array) => {
-          const result = np.matmul(carry.ref, x);
-          return [result.ref, result];
+          const result = np.matmul(carry, x);
+          return [result, result];
         },
         initC,
         xsIn,
@@ -370,8 +370,8 @@ Deno.test({
     const f = jit((initC: np.Array, xsIn: np.Array) =>
       lax.scan(
         (carry: np.Array, x: np.Array) => {
-          const out = np.matmul(carry.ref, x);
-          return [out.ref, out];
+          const out = np.matmul(carry, x);
+          return [out, out];
         },
         initC,
         xsIn,

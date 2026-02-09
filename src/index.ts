@@ -105,10 +105,6 @@ export const makeJaxpr = jaxprModule.makeJaxpr as unknown as <
  * - `staticArgnums`: An array of argument indices to treat as static
  *   (compile-time constant). These arguments must be hashable, won't be traced,
  *   and different values will trigger recompilation.
- * - `validateRefs`: When `true` (default), validates that the function body
- *   uses `.ref` correctly for eager-mode compatibility.  Tracing always
- *   succeeds; validation runs afterwards and reports every missing or extra
- *   `.ref` with an actionable error message.  Set to `false` to skip.
  * - `device`: The device to place the computation on. If not specified, the
  *   computation will be placed on the default device.
  */
@@ -300,7 +296,7 @@ export { jacrev as jacobian };
  *
  * @example
  * ```ts
- * const f = (x: np.Array) => np.sum(x.ref.mul(x.ref).mul(x)); // x^3
+ * const f = (x: np.Array) => np.sum(x.mul(x).mul(x)); // x^3
  * const H = hessian(f)(np.array([1, 2, 3]));
  * // H[i,j] = d^2f / dx_i dx_j
  * ```

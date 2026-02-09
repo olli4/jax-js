@@ -21,13 +21,13 @@ suite.skipIf(!devices.includes("webgpu"))("gpu sort/argsort", async () => {
   });
 
   bench("sort", async () => {
-    const c = np.sort(a.ref);
+    const c = np.sort(a);
     await c.blockUntilReady();
     c.dispose();
   });
 
   bench("argsort", async () => {
-    const c = np.argsort(a.ref);
+    const c = np.argsort(a);
     await c.blockUntilReady();
     c.dispose();
   });
@@ -45,13 +45,13 @@ suite.skipIf(!devices.includes("wasm"))("cpu sort/argsort", async () => {
   });
 
   bench("sort", async () => {
-    const c = np.sort(a.ref);
+    const c = np.sort(a);
     await c.blockUntilReady();
     c.dispose();
   });
 
   bench("argsort", async () => {
-    const c = np.argsort(a.ref);
+    const c = np.argsort(a);
     await c.blockUntilReady();
     c.dispose();
   });

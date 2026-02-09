@@ -45,7 +45,7 @@ suite.each(devices)("device:%s", (device) => {
 
     test("erf derivative", () => {
       const x = np.linspace(-3, 3, 10);
-      const dy = vmap(grad(special.erf))(x.ref);
+      const dy = vmap(grad(special.erf))(x);
       const expected = np.multiply(
         2 / Math.sqrt(Math.PI),
         np.exp(np.negative(np.square(x))),
@@ -55,7 +55,7 @@ suite.each(devices)("device:%s", (device) => {
 
     test("erfc derivative", () => {
       const x = np.linspace(-3, 3, 10);
-      const dy = vmap(grad(special.erfc))(x.ref);
+      const dy = vmap(grad(special.erfc))(x);
       const expected = np.multiply(
         -2 / Math.sqrt(Math.PI),
         np.exp(np.negative(np.square(x))),

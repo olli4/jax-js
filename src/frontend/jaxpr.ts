@@ -24,7 +24,6 @@ import {
   flattenFun,
   fullRaise,
   getAval,
-  isUnderTransform,
   ndim,
   newDynamic,
   newMain,
@@ -129,43 +128,8 @@ class VarPrinter {
   }
 }
 
-// Match paths inside jax-js internals (source tree or installed package).
-const INTERNAL_FRAME_RE =
-  /[\\/]src[\\/](frontend|library|backend)[\\/]|[\\/]src[\\/](alu|routine|shape|tree|utils|index|polyfills|tuner|pprint|backend)\.|[\\/](dist|node_modules)[\\/]/;
-
-/**
- * When true, `captureStackTrace` is called in `.ref` and `processPrimitive`
- * to record source locations for ref-validation error messages.  Off by
- * default — turned on only when a ref-count mismatch is detected and the
- * function is re-traced to produce an actionable error.
- */
-let _captureLocations = false;
-
-const _hasCaptureStackTrace = typeof Error.captureStackTrace === "function";
-
-/**
- * Parse a V8 stack trace to find the first user-level frame
- * (i.e. not inside jax-js internals). Returns "file:line:col" or undefined.
- */
-function parseUserFrame(stack: string | undefined): string | undefined {
-  if (!stack) return undefined;
-  for (const line of stack.split("\n")) {
-    if (!line.includes(" at ")) continue;
-    if (INTERNAL_FRAME_RE.test(line)) continue;
-    const m =
-      line.match(/\((.+):(\d+):(\d+)\)/) ?? line.match(/at (.+):(\d+):(\d+)/);
-    if (m) {
-      const file = m[1].replace(/^.*[\\/]/, ""); // last path component
-      return `${file}:${m[2]}:${m[3]}`;
-    }
-  }
-  return undefined;
-}
-
 /** A single statement / binding in a Jaxpr, in ANF form. */
 export class JaxprEqn {
-  /** Source location of user code that triggered this equation (V8 only). */
-  _userLoc?: string;
   constructor(
     readonly primitive: Primitive,
     readonly inputs: Atom[],
@@ -519,17 +483,21 @@ export function evalJaxpr(jaxpr: Jaxpr, args: Tracer[]): Tracer[] {
   const env = new Map<Var, Tracer>();
 
   // Number of usages of each variable, in an eqn or the output.
-  // Needed for reference tracking / move semantics.
   const usageCount = new Map<Var, number>();
   for (const x of jaxpr.eqns.flatMap((eqn) => eqn.inputs).concat(jaxpr.outs)) {
     if (x instanceof Var) usageCount.set(x, (usageCount.get(x) ?? 0) + 1);
+  }
+
+  // Variables that appear in the outputs — don't dispose these early.
+  const outputVars = new Set<Var>();
+  for (const x of jaxpr.outs) {
+    if (x instanceof Var) outputVars.add(x);
   }
 
   const remainingRefs = new Map<Var, number>();
 
   const read = (x: Atom) => {
     if (x instanceof Var) {
-      remainingRefs.set(x, (remainingRefs.get(x) ?? 0) - 1);
       return env.get(x)!;
     } else {
       return array(x.value, { dtype: x.dtype });
@@ -542,9 +510,20 @@ export function evalJaxpr(jaxpr: Jaxpr, args: Tracer[]): Tracer[] {
     if (refCount) {
       env.set(v, val);
       remainingRefs.set(v, refCount);
-      while (refCount-- > 1) val.ref;
     } else {
       val.dispose(); // If variable not used, dispose immediately.
+    }
+  };
+
+  // Decrement remaining count for a variable; dispose if last use and not output.
+  const consumeRead = (x: Atom) => {
+    if (x instanceof Var) {
+      const left = remainingRefs.get(x)!;
+      remainingRefs.set(x, left - 1);
+      if (left === 1 && !outputVars.has(x)) {
+        env.get(x)?.dispose();
+        env.delete(x);
+      }
     }
   };
 
@@ -554,15 +533,14 @@ export function evalJaxpr(jaxpr: Jaxpr, args: Tracer[]): Tracer[] {
       const inVals = eqn.inputs.map(read);
       const outVals = bind(eqn.primitive, inVals, eqn.params);
       for (const [v, val] of zip(eqn.outBinders, outVals)) write(v, val);
+      // Dispose variables after their last use in equations.
+      for (const x of eqn.inputs) consumeRead(x);
     }
     return jaxpr.outs.map(read);
   } catch (error) {
     // Clean up any remaining references on error, to avoid leaking memory.
-    for (let [v, refCount] of remainingRefs.entries()) {
-      if (refCount > 0) {
-        const tracer = env.get(v)!;
-        while (refCount--) tracer.dispose();
-      }
+    for (const val of env.values()) {
+      val.dispose();
     }
     throw error;
   }
@@ -598,18 +576,7 @@ export class ClosedJaxpr {
 
 /** Tracer that records its operations to dynamically construct a Jaxpr. */
 class JaxprTracer extends Tracer {
-  // Reference count for this JaxprTracer. Although the tracer doesn't hold
-  // resources, we wouldn't want a function that double-frees a variable to work
-  // after being wrapped in `jit()` if it wouldn't otherwise be correct.
   #rc: number;
-  /**
-   * Number of `.ref` calls attributable to user code. System-internal refs
-   * (e.g. const-lifting in inner makeJaxpr traces) are excluded so that
-   * validation only checks the user's ref discipline.
-   */
-  _userRefCalls: number = 0;
-  /** Source locations of user .ref calls (for "remove .ref" diagnostics). */
-  _userRefLocs: string[] = [];
 
   constructor(
     trace: Trace,
@@ -624,35 +591,14 @@ class JaxprTracer extends Tracer {
   }
 
   get ref() {
-    if (this.#rc <= 0) throw new UseAfterFreeError(this);
     this.#rc++;
-    // Only count as user .ref when no transform trace (JVP, vmap) is above
-    // this JaxprTrace. When transforms are active, they call .ref on inner
-    // tracers as part of their derivative/batching algebra — those are system
-    // refs that shouldn't be validated.
-    if (isUnderTransform(this._trace.main.level)) {
-      (this._trace as JaxprTrace).builder._hadTransform = true;
-    } else {
-      this._userRefCalls++;
-      if (_captureLocations && _hasCaptureStackTrace) {
-        const holder: { stack?: string } = {};
-        Error.captureStackTrace(holder);
-        const loc = parseUserFrame(holder.stack);
-        if (loc) this._userRefLocs.push(loc);
-      }
-    }
     return this;
   }
   dispose() {
-    if (this.#rc <= 0) throw new UseAfterFreeError(this);
     this.#rc--;
-    // Mirror .ref tracking: .dispose() cancels a preceding .ref call.
-    // This makes library-internal .ref/.dispose pairs (e.g. scan's ownership
-    // transfer) invisible to validation — only net user refs are counted.
-    // Only decrement when no transform trace is active (matching .ref logic).
-    if (this._userRefCalls > 0 && !isUnderTransform(this._trace.main.level)) {
-      this._userRefCalls--;
-    }
+  }
+  [Symbol.dispose]() {
+    this.dispose();
   }
   /** Number of live references the user holds (1 + .ref count − .dispose count). */
   get refCount(): number {
@@ -685,15 +631,9 @@ class JaxprTrace extends Trace {
     let tracer = this.builder.constTracers.get(val);
     if (tracer === undefined) {
       tracer = this.builder.newTracer(this, ShapedArray.fromAval(getAval(val)));
-      // For JaxprTracers from an outer trace: take a ref to keep them alive
-      // while this ClosedJaxpr exists. This is a system ref — don't count it
-      // as a user .ref for validation purposes.
-      // For regular Arrays: ClosedJaxpr adopts ownership (no extra ref).
-      if (val instanceof JaxprTracer) {
-        val.ref;
-        // Undo user-ref attribution if .ref incremented it (not under transform).
-        if (val._userRefCalls > 0) val._userRefCalls--;
-      }
+      // Take a ref so ClosedJaxpr owns the const independently of the caller.
+      // This protects the const from PETracer cascade in linearize transforms.
+      val.ref;
       this.builder.addConst(tracer, val);
     } else {
       tracer.trackLiftedConstant();
@@ -719,12 +659,6 @@ class JaxprTrace extends Trace {
       params,
       outTracers.map((t) => this.builder.addVar(t)),
     );
-    // Capture source location for ref validation diagnostics (V8 only).
-    if (_captureLocations && _hasCaptureStackTrace) {
-      const holder: { stack?: string } = {};
-      Error.captureStackTrace(holder);
-      eqn._userLoc = parseUserFrame(holder.stack);
-    }
     this.builder.addEqn(eqn);
     return outTracers;
   }
@@ -741,12 +675,6 @@ class JaxprBuilder {
   constTracers: Map<Tracer, JaxprTracer> = new Map(); // already-seen value -> tracer
   constVals: Map<Var, Tracer> = new Map(); // var -> const value
   tracers: JaxprTracer[] = [];
-  /**
-   * Set to true when a transform trace (JVP, vmap, etc.) was active above
-   * this JaxprTrace during tracing. When true, .ref validation is skipped
-   * because transforms alter usage patterns internally.
-   */
-  _hadTransform: boolean = false;
 
   newTracer(trace: JaxprTrace, aval: ShapedArray): JaxprTracer {
     const tracer = new JaxprTracer(trace, aval);
@@ -1172,168 +1100,8 @@ function joinIdx(n: number, a: any[], b: any[], argnums: Set<number>): any[] {
 /** @inline */
 export type JitOpts = {
   staticArgnums?: number[];
-  /**
-   * When true, validate that the function body uses `.ref` correctly for
-   * eager-mode compatibility.  Tracing always succeeds; validation runs
-   * afterwards and reports every missing / extra `.ref` with an actionable
-   * error message.  Default: true when called via `jit()`.
-   */
   validateRefs?: boolean;
 };
-
-/**
- * Validate that the user's .ref usage matches the actual usage count in the
- * traced Jaxpr.  Since tracing never consumes tracers (always-autoRef), we
- * track user .ref calls via `_userRefCalls` on each JaxprTracer.  The effective
- * user refcount is `1 + _userRefCalls`.  The usage count is how many times
- * the corresponding Var appears as an equation input or output.  For correct
- * eager execution these must be equal.
- *
- * Tracers with effective rc === 1 and usageCount === 0 are "discarded
- * intermediates" (e.g. one branch of `random.split`) and are silently skipped.
- *
- * Returns `true` when all ref counts are correct (or validation was skipped
- * because transforms were active).  Returns `false` when mismatches exist.
- * When `throwOnError` is true (default), a `false` result throws an error
- * instead of returning — use `throwOnError: false` for the fast first-pass
- * check that determines whether a re-trace with source locations is needed.
- */
-function validateRefCounts(
-  builder: JaxprBuilder,
-  tracersIn: JaxprTracer[],
-  tracersOut: JaxprTracer[],
-  throwOnError = true,
-): boolean {
-  // When transforms (JVP, vmap, etc.) were active during tracing, they alter
-  // both usage counts (adding derivative equations) and .ref calls (JVP rules
-  // call .ref on primals). These effects don't balance, making validation
-  // unreliable. Skip in this case.
-  if (builder._hadTransform) return true;
-
-  // Build usage count: how many times each Var appears as an eqn input or output.
-  const usageCount = new Map<Var, number>();
-  for (const eqn of builder.eqns) {
-    for (const v of eqn.inputs) {
-      if (v instanceof Var) usageCount.set(v, (usageCount.get(v) ?? 0) + 1);
-    }
-  }
-  const outVars = tracersOut.map((t) => builder.getVar(t));
-  for (const v of outVars) {
-    usageCount.set(v, (usageCount.get(v) ?? 0) + 1);
-  }
-
-  // Collect the set of constant tracers (skip validation for these).
-  const constTracerSet = new Set(builder.constTracers.values());
-
-  // VarPrinter for nice variable names.
-  const vp = new VarPrinter();
-
-  // Describe where a Var is produced.
-  const describeSource = (v: Var, argIdx: number | null): string => {
-    const dtype = v.aval.dtype;
-    const shape = `[${v.aval.shape.join(",")}]`;
-    if (argIdx !== null) return `argument ${argIdx} (${dtype}${shape})`;
-    // Find which equation produces this var.
-    for (const eqn of builder.eqns) {
-      for (const outV of eqn.outBinders) {
-        if (outV === v) {
-          const inputs = eqn.inputs
-            .map((x) => (x instanceof Var ? vp.name(x) : String(x.value)))
-            .join(", ");
-          const loc = eqn._userLoc ? ` at ${eqn._userLoc}` : "";
-          return `result of ${eqn.primitive}(${inputs}) → ${vp.name(v)} (${dtype}${shape})${loc}`;
-        }
-      }
-    }
-    return `${vp.name(v)} (${dtype}${shape})`;
-  };
-
-  // Describe all use-sites for a Var.
-  const describeUses = (v: Var): string[] => {
-    const uses: string[] = [];
-    for (const eqn of builder.eqns) {
-      for (const inp of eqn.inputs) {
-        if (inp === v) {
-          const inputs = eqn.inputs
-            .map((x) => (x instanceof Var ? vp.name(x) : String(x.value)))
-            .join(", ");
-          const loc = eqn._userLoc ? `  ← ${eqn._userLoc}` : "";
-          uses.push(`${eqn.primitive}(${inputs})${loc}`);
-        }
-      }
-    }
-    for (let i = 0; i < outVars.length; i++) {
-      if (outVars[i] === v) uses.push(`output[${i}]`);
-    }
-    return uses;
-  };
-
-  const errors: string[] = [];
-
-  // Check each non-constant tracer.
-  for (const [tracer, v] of builder.tracerToVar) {
-    if (constTracerSet.has(tracer)) continue;
-
-    // Effective user rc: 1 (initial) + user .ref calls (excludes system refs).
-    const rc = 1 + tracer._userRefCalls;
-    const used = usageCount.get(v) ?? 0;
-
-    if (rc === used) continue; // Correct!
-
-    // Skip discarded intermediates: rc=1 (no user .ref) and unused (0 uses).
-    // These are multi-output results where only some outputs are consumed
-    // (e.g. discarded branch of random.split). Not a ref-counting bug.
-    if (rc === 1 && used === 0) continue;
-
-    const argIdx = tracersIn.indexOf(tracer);
-    const source = describeSource(v, argIdx >= 0 ? argIdx : null);
-    const userRefs = rc - 1;
-    const needed = Math.max(0, used - 1);
-
-    if (rc < used) {
-      const missing = used - rc;
-      const uses = describeUses(v);
-      // Annotate: every use except the last needs .ref.
-      const annotated = uses.map((u, i) =>
-        i < uses.length - 1
-          ? `${u}  ← use .ref here`
-          : `${u}  ← last use (consumed)`,
-      );
-      errors.push(
-        `${source}: used ${used} time${used > 1 ? "s" : ""} but has ` +
-          `${userRefs} .ref call${userRefs !== 1 ? "s" : ""} (need ${needed}).\n` +
-          `  Add ${missing}x .ref — every use except the last needs .ref:\n` +
-          annotated.map((u, i) => `    ${i + 1}. ${u}`).join("\n"),
-      );
-    } else {
-      const extra = userRefs - needed;
-      const usedStr =
-        used === 0
-          ? "never used"
-          : `only used ${used} time${used > 1 ? "s" : ""}`;
-      // Show where .ref was called so the user knows which to remove.
-      const refLocs = tracer._userRefLocs;
-      const refLocStr =
-        refLocs.length > 0
-          ? "\n" + refLocs.map((l) => `    - .ref at ${l}`).join("\n")
-          : "";
-      errors.push(
-        `${source}: has ${userRefs} .ref call${userRefs !== 1 ? "s" : ""} ` +
-          `but is ${usedStr} ` +
-          `(need ${needed}). Remove ${extra}x .ref (would leak memory).${refLocStr}`,
-      );
-    }
-  }
-
-  if (errors.length > 0) {
-    if (!throwOnError) return false;
-    throw new Error(
-      `jit: ref validation failed — the function body has incorrect .ref usage:\n\n` +
-        errors.join("\n\n"),
-    );
-  }
-  return true;
-}
 
 export function makeJaxpr(
   f: (...args: any[]) => any,
@@ -1362,31 +1130,6 @@ export function makeJaxpr(
     const tracersOut = outs.map(
       (out: Tracer) => fullRaise(trace, out) as JaxprTracer,
     );
-
-    if (opts?.validateRefs !== false) {
-      if (_captureLocations) {
-        // Re-trace pass: source locations have been captured — throw with
-        // full diagnostics.
-        validateRefCounts(builder, tracersIn, tracersOut, true);
-      } else {
-        // Fast first pass: check ref counts without source locations.
-        const ok = validateRefCounts(builder, tracersIn, tracersOut, false);
-        if (!ok) {
-          // Re-trace with source-location capture enabled so the error
-          // message includes file:line:col for every use and .ref call.
-          _captureLocations = true;
-          try {
-            makeJaxpr(f, opts)(...argsIn);
-          } finally {
-            _captureLocations = false;
-          }
-          // If re-trace didn't throw (shouldn't happen), throw generic.
-          throw new Error(
-            "jit: ref validation failed (re-trace did not reproduce)",
-          );
-        }
-      }
-    }
 
     const jaxpr = builder.build(tracersIn, tracersOut);
 
@@ -1418,22 +1161,12 @@ export function jit<F extends (...args: any[]) => any>(
 
     const jaxprArgs = joinIdx(args.length, staticArgs, avalsIn, staticArgnums);
     const { jaxpr, treedef: outTree } = runWithCache(cache, jaxprArgs, () => {
-      // When called under transforms (inputs are non-concrete tracers from
-      // outer trace), skip ref validation — transforms alter .ref usage patterns.
-      // Note: Array extends Tracer, so check specifically for non-Array tracers.
-      const underTransform = argsFlat.some(
-        (x) => x instanceof Tracer && !(x instanceof Array),
-      );
-      const traceOpts =
-        underTransform && opts?.validateRefs !== false
-          ? { ...opts, validateRefs: false as const }
-          : opts;
-      return makeJaxpr(f, traceOpts)(...jaxprArgs);
+      return makeJaxpr(f, opts)(...jaxprArgs);
     });
 
     const outs = bind(
       Primitive.Jit,
-      [...jaxpr.consts.map((c) => c.ref), ...argsFlat],
+      [...jaxpr.consts, ...argsFlat],
       {
         name: f.name || "closure",
         jaxpr: jaxpr.jaxpr,
@@ -1451,3 +1184,4 @@ export function jit<F extends (...args: any[]) => any>(
 
   return result;
 }
+

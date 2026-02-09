@@ -72,7 +72,7 @@ suite.each(devices)("device:%s", (device) => {
 
     test("vmap random is consistent", () => {
       const keys = random.split(random.key(1234), 5);
-      const samples = vmap((k: np.Array) => random.uniform(k, [100]))(keys.ref);
+      const samples = vmap((k: np.Array) => random.uniform(k, [100]))(keys);
       expect(samples.shape).toEqual([5, 100]);
 
       // Also generate samples with looped calls
@@ -334,18 +334,18 @@ suite.each(devices)("device:%s", (device) => {
         const logits = np.ones([2, 5, 3]); // 5 categories at axis=1
 
         // Default shape removes axis
-        const s1 = random.categorical(random.key(100), logits.ref, { axis: 1 });
+        const s1 = random.categorical(random.key(100), logits, { axis: 1 });
         expect(s1.shape).toEqual([2, 3]);
 
         // With shape prefix
-        const s2 = random.categorical(random.key(101), logits.ref, {
+        const s2 = random.categorical(random.key(101), logits, {
           axis: 1,
           shape: [10, 2, 3],
         });
         expect(s2.shape).toEqual([10, 2, 3]);
 
         // Negative axis (-2 means axis=1)
-        const s3 = random.categorical(random.key(102), logits.ref, {
+        const s3 = random.categorical(random.key(102), logits, {
           axis: -2,
           shape: [4, 2, 3],
         });
@@ -411,10 +411,10 @@ suite.each(devices)("device:%s", (device) => {
           [1.0, 0.5],
           [0.5, 2.0],
         ]);
-        const y = random.multivariateNormal(key, mean.ref, cov.ref, [count]);
+        const y = random.multivariateNormal(key, mean, cov, [count]);
         expect(y.shape).toEqual([count, 2]);
 
-        expect(np.mean(y.ref, 0)).toBeAllclose(mean, { atol: 3e-2 });
+        expect(np.mean(y, 0)).toBeAllclose(mean, { atol: 3e-2 });
         expect(np.cov(y, null, { rowvar: false })).toBeAllclose(cov, {
           atol: 3e-2,
         });

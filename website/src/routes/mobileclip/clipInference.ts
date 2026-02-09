@@ -69,19 +69,19 @@ export function runMobileCLIPTextEncoder(
   textTokens: np.Array,
 ): np.Array {
   // Embed tokens and add positional embeddings
-  let x = tokenEmbedding.slice(textTokens.ref); // [L, D]
+  let x = tokenEmbedding.slice(textTokens); // [L, D]
   x = x.add(positionalEmbedding);
 
   for (const block of transformer) {
     x = runMobileCLIPTextBlock(block, x);
   }
-  x = runLayerNorm(lnFinal, x.ref);
+  x = runLayerNorm(lnFinal, x);
 
   const finalFeatures = x.slice(np.argmax(textTokens, -1));
   const output = np.dot(textProjection.transpose(), finalFeatures); // [D_out]
 
   // Normalize output to be a unit vector
-  return output.ref.div(np.sqrt(np.sum(np.square(output))).add(1e-3));
+  return output.div(np.sqrt(np.sum(np.square(output))).add(1e-3));
 }
 
 export type MobileCLIPTextBlock = {
@@ -97,12 +97,12 @@ export function runMobileCLIPTextBlock(
   x: np.Array,
 ): np.Array {
   // Pre-norm attention block
-  const normed1 = runLayerNorm(ln1, x.ref);
+  const normed1 = runLayerNorm(ln1, x);
   const attnOut = runMultiHeadAttention(attn, normed1);
   x = x.add(attnOut); // Residual connection
 
   // Pre-norm MLP block
-  const normed2 = runLayerNorm(ln2, x.ref);
+  const normed2 = runLayerNorm(ln2, x);
   let mlpOut = runLinear(mlpUp, normed2);
   mlpOut = nn.gelu(mlpOut, { approximate: false });
   mlpOut = runLinear(mlpDown, mlpOut);
@@ -160,12 +160,12 @@ export function runLayerNorm(
 ): np.Array {
   // Normalize with respect to the last dimension of x.
   const dimSize = x.shape[x.ndim - 1];
-  const avg = x.ref.mean(-1, { keepdims: true });
+  const avg = x.mean(-1, { keepdims: true });
   x = x.sub(avg);
   const denom = np
     .sqrt(
       np
-        .square(x.ref)
+        .square(x)
         .mul(1 / dimSize)
         .sum(-1, { keepdims: true }),
     )

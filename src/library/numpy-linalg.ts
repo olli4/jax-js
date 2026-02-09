@@ -32,7 +32,7 @@ export function cholesky(
   a = fudgeArray(a);
   checkSquare("cholesky", a);
   if (symmetrizeInput) {
-    a = a.ref.add(np.matrixTranspose(a)).mul(0.5);
+    a = a.add(np.matrixTranspose(a)).mul(0.5);
   }
   return lax.linalg.cholesky(a, { upper });
 }
@@ -42,7 +42,6 @@ export function det(a: ArrayLike): Array {
   a = fudgeArray(a);
   const n = checkSquare("det", a);
   const [lu, pivots, permutation] = lax.linalg.lu(a);
-  permutation.dispose();
 
   const parity = pivots.notEqual(np.arange(n)).astype(np.int32).sum(-1).mod(2);
   const sign = parity.mul(-2).add(1); // (-1)^parity
@@ -82,12 +81,12 @@ export function lstsq(a: ArrayLike, b: ArrayLike): Array {
     throw new Error(
       `lstsq: leading dimension of 'b' must match number of rows of 'a', got ${b.aval}`,
     );
-  const at = np.matrixTranspose(a.ref);
+  const at = np.matrixTranspose(a);
   if (m <= n) {
     // Underdetermined or square system: A.T @ (A @ A.T)^-1 @ B
-    const aat = np.matmul(a, at.ref); // A @ A.T, shape (M, M)
+    const aat = np.matmul(a, at); // A @ A.T, shape (M, M)
     const l = cholesky(aat, { symmetrizeInput: false }); // L @ L.T = A @ A.T
-    const lb = triangularSolve(l.ref, b, { leftSide: true, lower: true }); // L^-1 @ B
+    const lb = triangularSolve(l, b, { leftSide: true, lower: true }); // L^-1 @ B
     const llb = triangularSolve(l, lb, {
       leftSide: true,
       lower: true,
@@ -96,10 +95,10 @@ export function lstsq(a: ArrayLike, b: ArrayLike): Array {
     return np.matmul(at, llb); // A.T @ (A @ A.T)^-1 @ B
   } else {
     // Overdetermined system: (A.T @ A)^-1 @ A.T @ B
-    const ata = np.matmul(at.ref, a); // A.T @ A, shape (N, N)
+    const ata = np.matmul(at, a); // A.T @ A, shape (N, N)
     const l = cholesky(ata, { symmetrizeInput: false }); // L @ L.T = A.T @ A
     const atb = np.matmul(at, b); // A.T @ B
-    const lb = triangularSolve(l.ref, atb, { leftSide: true, lower: true }); // L^-1 @ A.T @ B
+    const lb = triangularSolve(l, atb, { leftSide: true, lower: true }); // L^-1 @ A.T @ B
     const llb = triangularSolve(l, lb, {
       leftSide: true,
       lower: true,
@@ -118,7 +117,6 @@ export function matrixPower(a: ArrayLike, n: number): Array {
   a = fudgeArray(a);
   const m = checkSquare("matrixPower", a);
   if (n === 0) {
-    a.dispose();
     return np.broadcastTo(np.eye(m), a.shape);
   }
   if (n < 0) {
@@ -128,12 +126,11 @@ export function matrixPower(a: ArrayLike, n: number): Array {
   let result: Array | null = null;
   let a2k = a; // a^(2^k)
   for (let k = 0; n; k++) {
-    if (k > 0) a2k = np.matmul(a2k.ref, a2k);
+    if (k > 0) a2k = np.matmul(a2k, a2k);
     if (n % 2 === 1)
-      result = result === null ? a2k.ref : np.matmul(result, a2k.ref);
+      result = result === null ? a2k : np.matmul(result, a2k);
     n = Math.floor(n / 2);
   }
-  a2k.dispose();
   return result!;
 }
 
@@ -145,11 +142,10 @@ export function slogdet(a: ArrayLike): [Array, Array] {
   a = fudgeArray(a);
   const n = checkSquare("slogdet", a);
   const [lu, pivots, permutation] = lax.linalg.lu(a);
-  permutation.dispose();
 
   let parity = pivots.notEqual(np.arange(n)).astype(np.int32).sum(-1);
   const diag = lu.diagonal(0, -1, -2);
-  parity = parity.add(diag.ref.less(0).astype(np.int32).sum(-1)).mod(2);
+  parity = parity.add(diag.less(0).astype(np.int32).sum(-1)).mod(2);
   const logabsdet = np.log(np.abs(diag)).sum(-1);
   const sign = parity.mul(-2).add(1); // (-1)^parity
   return [sign, logabsdet];
@@ -189,14 +185,13 @@ export function solve(a: ArrayLike, b: ArrayLike): Array {
 
   // Compute the LU decomposition with partial pivoting.
   const [lu, pivots, permutation] = lax.linalg.lu(a);
-  pivots.dispose();
 
   // L @ U @ x = P @ b
   const P = np
     .arange(n)
     .equal(permutation.reshape([...permutation.shape, 1]))
     .astype(b.dtype);
-  const LPb = triangularSolve(lu.ref, np.matmul(P, b), {
+  const LPb = triangularSolve(lu, np.matmul(P, b), {
     leftSide: true,
     lower: true,
     unitDiagonal: true,

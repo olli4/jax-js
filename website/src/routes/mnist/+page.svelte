@@ -229,7 +229,7 @@
     const loss = lossFn(Model.predict);
 
     tree.dispose(latestParams);
-    latestParams = tree.ref(params);
+    latestParams = params;
 
     log(`=> Loading MNIST database from CDN or cache...`);
     const startTime = performance.now();
@@ -238,7 +238,7 @@
     log(`=> Data loaded in ${duration.toFixed(1)} ms`);
 
     const solver = adam(learningRate);
-    let optState = solver.init(tree.ref(params));
+    let optState = solver.init(params);
     let updates: Params;
 
     try {
@@ -255,10 +255,10 @@
           );
 
           const startTime = performance.now();
-          const X = X_train.ref.slice(indices.ref);
-          const y = y_train.ref.slice(indices);
+          const X = X_train.slice(indices);
+          const y = y_train.slice(indices);
           const [lossVal, lossGrad] = valueAndGrad(loss)(
-            tree.ref(params),
+            params,
             X,
             y,
           );
@@ -278,7 +278,7 @@
         }
 
         tree.dispose(latestParams);
-        latestParams = tree.ref(params);
+        latestParams = params;
 
         // Retrigger the inference demo if the user has drawn something.
         if (hasDrawn) inferenceDemo();
@@ -291,12 +291,12 @@
         const testLoss: number[] = [];
         const testAcc: number[] = [];
         for (let i = 0; i + batchSize <= testSize; i += batchSize) {
-          const X = X_test.ref.slice([i, i + batchSize]).reshape([-1, 784]);
-          const y = y_test.ref.slice([i, i + batchSize]);
-          testLoss.push(await loss(tree.ref(params), X.ref, y.ref).jsAsync());
+          const X = X_test.slice([i, i + batchSize]).reshape([-1, 784]);
+          const y = y_test.slice([i, i + batchSize]);
+          testLoss.push(await loss(params, X, y).jsAsync());
           testAcc.push(
             await np
-              .argmax(Model.predict(tree.ref(params), X), 1)
+              .argmax(Model.predict(params, X), 1)
               .equal(y)
               .astype(np.uint32)
               .sum()
@@ -344,8 +344,8 @@
       [np.arange(28).astype(np.float32), np.arange(28).astype(np.float32)],
       { indexing: "ij" },
     );
-    const dx = Math.round(13.5 - X.ref.mul(xgrid).sum().div(X.ref.sum()).js());
-    const dy = Math.round(13.5 - X.ref.mul(ygrid).sum().div(X.ref.sum()).js());
+    const dx = Math.round(13.5 - X.mul(xgrid).sum().div(X.sum()).js());
+    const dy = Math.round(13.5 - X.mul(ygrid).sum().div(X.sum()).js());
     if (dx > 0) X = np.pad(X, { 0: [dx, 0] }).slice([0, 28], []);
     if (dx < 0) X = np.pad(X, { 0: [0, -dx] }).slice([-dx], []);
     if (dy > 0) X = np.pad(X, { 1: [dy, 0] }).slice([], [0, 28]);
@@ -376,7 +376,7 @@
       log("No model available for inference. Train the model first.");
       return;
     }
-    const params = tree.ref(latestParams);
+    const params = latestParams;
     let image = np.array(ar).reshape([28, 28]);
     image = normalizeImage(image); // Mimic the MNIST train set preprocessing.
     const logits = Model.predict(params, image.reshape([1, 28, 28]));

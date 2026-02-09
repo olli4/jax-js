@@ -37,8 +37,8 @@ suite.each(devices)("device:%s", (device) => {
         [7, 8, 9],
       ]);
 
-      expect(np.argmax(x.ref).js()).toEqual(8); // Global argmax
-      expect(np.argmax(x.ref, 0).js()).toEqual([2, 2, 2]); // Column-wise
+      expect(np.argmax(x).js()).toEqual(8); // Global argmax
+      expect(np.argmax(x, 0).js()).toEqual([2, 2, 2]); // Column-wise
       expect(np.argmax(x, 1).js()).toEqual([2, 0, 2]); // Row-wise
     });
   });
@@ -63,8 +63,8 @@ suite.each(devices)("device:%s", (device) => {
         [3, 2, 1],
       ]);
 
-      expect(np.argmin(x.ref).js()).toEqual(8); // Global argmin
-      expect(np.argmin(x.ref, 0).js()).toEqual([2, 2, 2]); // Column-wise
+      expect(np.argmin(x).js()).toEqual(8); // Global argmin
+      expect(np.argmin(x, 0).js()).toEqual([2, 2, 2]); // Column-wise
       expect(np.argmin(x, 1).js()).toEqual([2, 0, 2]); // Row-wise
     });
   });

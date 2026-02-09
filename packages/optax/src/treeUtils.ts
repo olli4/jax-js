@@ -18,11 +18,11 @@ function ipow(a: np.Array, order: number) {
   if (!Number.isInteger(order) || order <= 0) {
     throw new Error("Order must be a positive integer");
   }
-  let result = a.ref;
+  if (order === 1) return a;
+  let result = a;
   for (let i = 1; i < order; i++) {
-    result = result.mul(a.ref);
+    result = result.mul(a);
   }
-  a.dispose();
   return result;
 }
 
@@ -88,7 +88,6 @@ export function treeNorm(
     const result = treeMax(absTree);
     return squared ? np.square(result) : result;
   } else {
-    tree.dispose(tr);
     throw new Error(`Unsupported ord: ${ord}`);
   }
 }

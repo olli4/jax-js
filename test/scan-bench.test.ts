@@ -29,8 +29,8 @@ describe("scan performance benchmarks", () => {
     const scanAuto = jit((xs: any) => {
       return lax.scan(
         (carry: any, x: any) => {
-          const newCarry = carry.ref.add(x);
-          return [newCarry.ref, newCarry];
+          const newCarry = carry.add(x);
+          return [newCarry, newCarry];
         },
         np.zeros([SIZE]),
         xs,
@@ -38,13 +38,13 @@ describe("scan performance benchmarks", () => {
     });
 
     // Verify correctness
-    const [c, _y] = scanAuto(xs.ref);
+    const [c, _y] = scanAuto(xs);
     const data = await c.data();
     expect(data[0]).toBeCloseTo(N, 1);
     _y.dispose();
 
     const autoMs = await timeMs(() => {
-      const [c, y] = scanAuto(xs.ref) as [any, any];
+      const [c, y] = scanAuto(xs) as [any, any];
       c.dispose();
       y.dispose();
     });
@@ -66,8 +66,8 @@ describe("scan performance benchmarks", () => {
     const scanAuto = jit((xs: any) => {
       return lax.scan(
         (carry: any, x: any) => {
-          const newCarry = carry.ref.add(x);
-          return [newCarry.ref, newCarry];
+          const newCarry = carry.add(x);
+          return [newCarry, newCarry];
         },
         np.zeros([SIZE]),
         xs,
@@ -75,7 +75,7 @@ describe("scan performance benchmarks", () => {
     });
 
     const autoMs = await timeMs(() => {
-      const [c, y] = scanAuto(xs.ref) as [any, any];
+      const [c, y] = scanAuto(xs) as [any, any];
       c.dispose();
       y.dispose();
     });
@@ -127,10 +127,10 @@ describe("scan performance benchmarks", () => {
       return lax.scan(
         (carry: any, x: any) => {
           const [a, b] = carry;
-          const newA = a.ref.add(x.ref);
-          const newB = b.ref.mul(np.array([0.99])).add(x.mul(np.array([0.01])));
+          const newA = a.add(x);
+          const newB = b.mul(np.array([0.99])).add(x.mul(np.array([0.01])));
           return [
-            [newA.ref, newB.ref],
+            [newA, newB],
             [newA, newB],
           ] as any;
         },
@@ -140,7 +140,7 @@ describe("scan performance benchmarks", () => {
     });
 
     const autoMs = await timeMs(() => {
-      const [c, y] = scanAuto(xs.ref) as [any, any];
+      const [c, y] = scanAuto(xs) as [any, any];
       (c as any)[0].dispose();
       (c as any)[1].dispose();
       (y as any)[0].dispose();
@@ -164,8 +164,8 @@ describe("scan performance benchmarks", () => {
     const scanAuto = jit((xs: any) => {
       return lax.scan(
         (carry: any, x: any) => {
-          const s = carry.ref.add(np.sum(x));
-          return [s.ref, s];
+          const s = carry.add(np.sum(x));
+          return [s, s];
         },
         np.zeros([]),
         xs,
@@ -173,7 +173,7 @@ describe("scan performance benchmarks", () => {
     });
 
     const autoMs = await timeMs(() => {
-      const [c, y] = scanAuto(xs.ref) as [any, any];
+      const [c, y] = scanAuto(xs) as [any, any];
       c.dispose();
       y.dispose();
     });
@@ -195,8 +195,8 @@ describe("scan performance benchmarks", () => {
     const scanAuto = jit((xs: any) => {
       return lax.scan(
         (carry: any, x: any) => {
-          const newCarry = carry.ref.add(x);
-          return [newCarry.ref, newCarry];
+          const newCarry = carry.add(x);
+          return [newCarry, newCarry];
         },
         np.zeros([SIZE]),
         xs,
@@ -205,7 +205,7 @@ describe("scan performance benchmarks", () => {
     });
 
     const autoMs = await timeMs(() => {
-      const [c, y] = scanAuto(xs.ref) as [any, any];
+      const [c, y] = scanAuto(xs) as [any, any];
       c.dispose();
       y.dispose();
     });

@@ -313,7 +313,7 @@ export function ptp(
   opts?: core.ReduceOpts,
 ): Array {
   a = fudgeArray(a);
-  return max(a.ref, axis, opts).sub(min(a, axis, opts));
+  return max(a, axis, opts).sub(min(a, axis, opts));
 }
 
 /** Compute the average of the array elements along the specified axis. */
@@ -344,7 +344,7 @@ export function argmin(
     axis = checkAxis(axis, a.ndim);
   }
   const shape = a.shape;
-  const isMax = equal(a, min(a.ref, axis, { keepdims: true }));
+  const isMax = equal(a, min(a, axis, { keepdims: true }));
   const length = array(shape[axis], { dtype: int32, device: a.device });
   const idx = isMax.astype(DType.Int32).mul(
     // Index by length-i instead of i, so we can take the max and get the first i.
@@ -375,7 +375,7 @@ export function argmax(
     axis = checkAxis(axis, a.ndim);
   }
   const shape = a.shape;
-  const isMax = equal(a, max(a.ref, axis, { keepdims: true }));
+  const isMax = equal(a, max(a, axis, { keepdims: true }));
   const length = array(shape[axis], { dtype: int32, device: a.device });
   const idx = isMax.astype(DType.Int32).mul(
     // Index by length-i instead of i, so we can take the max and get the first i.
@@ -827,7 +827,7 @@ export function diag(v: ArrayLike, k = 0): Array {
   if (!Number.isInteger(k)) throw new Error(`k must be an integer, got ${k}`);
   if (a.ndim === 1) {
     const n = a.shape[0];
-    const ret = where(eye(n).equal(1), a.ref, zerosLike(a));
+    const ret = where(eye(n).equal(1), a, zerosLike(a));
     if (k > 0) {
       return pad(ret, [
         [0, k],
@@ -1327,7 +1327,7 @@ export function clip(a: ArrayLike, min?: ArrayLike, max?: ArrayLike): Array {
  */
 export function absolute(x: ArrayLike): Array {
   x = fudgeArray(x);
-  return where(less(x.ref, 0), x.ref.mul(-1), x);
+  return where(less(x, 0), x.mul(-1), x);
 }
 
 export { absolute as abs };
@@ -1335,7 +1335,7 @@ export { absolute as abs };
 /** Return an element-wise indication of sign of the input. */
 export function sign(x: ArrayLike): Array {
   x = fudgeArray(x);
-  return where(notEqual(x.ref, 0), where(less(x, 0), -1, 1), 0);
+  return where(notEqual(x, 0), where(less(x, 0), -1, 1), 0);
 }
 
 /** @function Return element-wise positive values of the input (no-op). */
@@ -1371,19 +1371,19 @@ export function hann(M: number): Array {
  * - `heaviside(x1, x2) = 1` for `x1 > 0`.
  */
 export const heaviside = jit(function heaviside(x1: Array, x2: Array) {
-  return where(less(x1.ref, 0), 0, where(equal(x1, 0), x2, 1));
+  return where(less(x1, 0), 0, where(equal(x1, 0), x2, 1));
 });
 
 /** Calculate element-wise square of the input array. */
 export function square(x: ArrayLike): Array {
   x = fudgeArray(x);
-  return x.ref.mul(x);
+  return x.mul(x);
 }
 
 /** Element-wise tangent function (takes radians). */
 export function tan(x: ArrayLike): Array {
   x = fudgeArray(x);
-  return sin(x.ref).div(cos(x));
+  return sin(x).div(cos(x));
 }
 
 /**
@@ -1397,9 +1397,9 @@ export function tan(x: ArrayLike): Array {
  * requires a custom JVP rule to handle properly (see JAX implementation).
  */
 export const sinc = jit(function sinc(x: Array): Array {
-  const pix = x.ref.mul(Math.PI);
+  const pix = x.mul(Math.PI);
   // sinc(0) = 1, otherwise sin(πx) / (πx)
-  return where(equal(x, 0), 1, sin(pix.ref).div(pix));
+  return where(equal(x, 0), 1, sin(pix).div(pix));
 });
 
 /** Element-wise inverse cosine function (inverse of cos). */
@@ -1433,13 +1433,13 @@ export const hypot = jit(function hypot(x1: Array, x2: Array) {
  * The output is ill-defined when both x and y are zero.
  */
 export const atan2 = jit(function atan2(y: Array, x: Array) {
-  const r = sqrt(square(x.ref).add(square(y.ref)));
-  const xNeg = less(x.ref, 0);
+  const r = sqrt(square(x).add(square(y)));
+  const xNeg = less(x, 0);
 
   // Select numerator and denominator based on sign of x
   // When x >= 0: numer = y,     denom = r + x
   // When x < 0:  numer = r - x, denom = y
-  const numer = where(xNeg.ref, r.ref.sub(x.ref), y.ref);
+  const numer = where(xNeg, r.sub(x), y);
   const denom = where(xNeg, y, r.add(x));
 
   return atan(numer.div(denom)).mul(2);
@@ -1489,7 +1489,7 @@ export function floorDivide(x: ArrayLike, y: ArrayLike): Array {
   }
   // For integers, use (x - remainder(x, y)) / y to round toward -infinity
   // This avoids the truncation behavior of idiv which rounds toward zero
-  return subtract(x, remainder(x.ref, y.ref)).div(y) as Array;
+  return subtract(x, remainder(x, y)).div(y) as Array;
 }
 
 /**
@@ -1497,7 +1497,7 @@ export function floorDivide(x: ArrayLike, y: ArrayLike): Array {
  * Calculate element-wise floating-point modulo operation.
  */
 export const fmod = jit(function fmod(x: Array, y: Array): Array {
-  return x.ref.sub(y.ref.mul(core.idiv(x, y) as Array));
+  return x.sub(y.mul(core.idiv(x, y) as Array));
 });
 
 /**
@@ -1507,7 +1507,7 @@ export const fmod = jit(function fmod(x: Array, y: Array): Array {
 export const remainder = jit(function remainder(x: Array, y: Array): Array {
   // The `Mod` primitive matches the sign of x, following JS rounding rules.
   // This function must match the sign of y instead.
-  return core.mod(core.mod(x, y.ref).add(y.ref), y) as Array;
+  return core.mod(core.mod(x, y).add(y), y) as Array;
 });
 
 /**
@@ -1522,8 +1522,8 @@ export const remainder = jit(function remainder(x: Array, y: Array): Array {
 export function divmod(x: ArrayLike, y: ArrayLike): [Array, Array] {
   const xArr = fudgeArray(x);
   const yArr = fudgeArray(y);
-  // floorDivide and remainder both consume their inputs, so use .ref for the first call
-  return [floorDivide(xArr.ref, yArr.ref), remainder(xArr, yArr)];
+  // floorDivide and remainder both use their inputs non-destructively
+  return [floorDivide(xArr, yArr), remainder(xArr, yArr)];
 }
 
 /** Round input to the nearest integer towards zero. */
@@ -1549,13 +1549,13 @@ export function ldexp(x1: ArrayLike, x2: ArrayLike): Array {
  */
 export function frexp(x: ArrayLike): [Array, Array] {
   x = fudgeArray(x);
-  const absx = absolute(x.ref);
+  const absx = absolute(x);
   const exponent = where(
-    equal(x.ref, 0),
+    equal(x, 0),
     0,
     floor(log2(absx)).add(1).astype(DType.Int32),
   );
-  const mantissa = x.div(exp2(exponent.ref.astype(x.dtype)));
+  const mantissa = x.div(exp2(exponent.astype(x.dtype)));
   return [mantissa, exponent];
 }
 
@@ -1609,13 +1609,13 @@ export const degrees = rad2deg;
 export const power = jit(function power(x1: Array, x2: Array) {
   // TODO: This is a little bit inefficient since we need to handle negative
   // numbers to integer exponents, should eventually move it into the backend.
-  const x2i = trunc(x2.ref);
+  const x2i = trunc(x2);
   // Should be NaN if x1 < 0 and x2 is non-integer.
-  const shouldBeNaN = multiply(x2.ref.notEqual(x2i.ref), x1.ref.less(0));
+  const shouldBeNaN = multiply(x2.notEqual(x2i), x1.less(0));
   // If x2 is odd integer, result sign matches x1, else it's positive.
   const resultSign = where(
     core.mod(x2i, 2).notEqual(0) as Array,
-    where(x1.ref.less(0), -1, 1),
+    where(x1.less(0), -1, 1),
     1,
   );
   return where(
@@ -1630,8 +1630,8 @@ export { power as pow };
 /** @function Calculate the element-wise cube root of the input array. */
 export const cbrt = jit(function cbrt(x: Array) {
   // This isn't just power(x, 1/3) since we need to handle negative numbers.
-  const sgn = where(less(x.ref, 0), -1, 1);
-  return sgn.ref.mul(exp(log(x.mul(sgn)).mul(1 / 3)));
+  const sgn = where(less(x, 0), -1, 1);
+  return sgn.mul(exp(log(x.mul(sgn)).mul(1 / 3)));
 });
 
 /**
@@ -1642,7 +1642,7 @@ export const cbrt = jit(function cbrt(x: Array) {
  */
 export const sinh = jit(function sinh(x: Array) {
   const ex = exp(x);
-  const emx = reciprocal(ex.ref);
+  const emx = reciprocal(ex);
   return ex.sub(emx).mul(0.5);
 });
 
@@ -1654,7 +1654,7 @@ export const sinh = jit(function sinh(x: Array) {
  */
 export const cosh = jit(function cosh(x: Array) {
   const ex = exp(x);
-  const emx = reciprocal(ex.ref);
+  const emx = reciprocal(ex);
   return ex.add(emx).mul(0.5);
 });
 
@@ -1667,9 +1667,9 @@ export const cosh = jit(function cosh(x: Array) {
 export const tanh = jit(function tanh(x: Array) {
   // Avoid overflow for large x by taking advantage of alternate representations:
   // tanh(x) = -tanh(-x) = (1 - e^{-2x}) / (1 + e^{-2x})
-  const negsgn = where(less(x.ref, 0), 1, -1);
-  const en2x = exp(x.mul(negsgn.ref).mul(2));
-  return en2x.ref.sub(1).div(en2x.add(1)).mul(negsgn);
+  const negsgn = where(less(x, 0), 1, -1);
+  const en2x = exp(x.mul(negsgn).mul(2));
+  return en2x.sub(1).div(en2x.add(1)).mul(negsgn);
 });
 
 /**
@@ -1679,7 +1679,7 @@ export const tanh = jit(function tanh(x: Array) {
  * `arcsinh(x) = ln(x + sqrt(x^2 + 1))`
  */
 export const arcsinh = jit(function arcsinh(x: Array) {
-  return log(x.ref.add(sqrt(square(x).add(1))));
+  return log(x.add(sqrt(square(x).add(1))));
 });
 
 /**
@@ -1689,7 +1689,7 @@ export const arcsinh = jit(function arcsinh(x: Array) {
  * `arccosh(x) = ln(x + sqrt(x^2 - 1))`
  */
 export const arccosh = jit(function arccosh(x: Array) {
-  return log(x.ref.add(sqrt(square(x).sub(1))));
+  return log(x.add(sqrt(square(x).sub(1))));
 });
 
 /**
@@ -1699,7 +1699,7 @@ export const arccosh = jit(function arccosh(x: Array) {
  * `arctanh(x) = 0.5 * ln((1 + x) / (1 - x))`
  */
 export const arctanh = jit(function arctanh(x: Array) {
-  return log(add(1, x.ref).div(subtract(1, x))).mul(0.5);
+  return log(add(1, x).div(subtract(1, x))).mul(0.5);
 });
 
 export { arcsinh as asinh, arccosh as acosh, arctanh as atanh };
@@ -1727,7 +1727,7 @@ export function var_(
   const mu =
     opts?.mean !== undefined
       ? opts.mean
-      : mean(x.ref, axis, { keepdims: true });
+      : mean(x, axis, { keepdims: true });
   return square(x.sub(mu))
     .sum(axis, { keepdims: opts?.keepdims })
     .mul(1 / (n - (opts?.correction ?? 0)));
@@ -1767,15 +1767,15 @@ export function cov(
   }
   if (!rowvar) x = x.transpose();
   const [_M, N] = x.shape;
-  x = x.ref.sub(x.mean(1, { keepdims: true })); // Center variables
-  return dot(x.ref, x.transpose()).div(N - 1); // [M, M]
+  x = x.sub(x.mean(1, { keepdims: true })); // Center variables
+  return dot(x, x.transpose()).div(N - 1); // [M, M]
 }
 
 /** Compute the Pearson correlation coefficients (in range `[-1, 1]`). */
 export function corrcoef(x: ArrayLike, y?: ArrayLike): Array {
   const c = cov(x, y);
-  const variances = diag(c.ref);
-  const norm = sqrt(outer(variances.ref, variances));
+  const variances = diag(c);
+  const norm = sqrt(outer(variances, variances));
   return c.div(norm);
 }
 
@@ -1783,14 +1783,14 @@ export function corrcoef(x: ArrayLike, y?: ArrayLike): Array {
 export function isinf(x: ArrayLike): Array {
   x = fudgeArray(x);
   return isFloatDtype(x.dtype)
-    ? x.ref.equal(Infinity).add(x.equal(-Infinity))
+    ? x.equal(Infinity).add(x.equal(-Infinity))
     : fullLike(x, false);
 }
 
 /** Test element-wise for NaN (Not a Number). */
 export function isnan(x: ArrayLike): Array {
   x = fudgeArray(x);
-  return isFloatDtype(x.dtype) ? x.ref.notEqual(x) : fullLike(x, false);
+  return isFloatDtype(x.dtype) ? x.notEqual(x) : fullLike(x, false);
 }
 
 /** Test element-wise for negative infinity, return bool array. */
@@ -1824,11 +1824,11 @@ export function nanToNum(
   } = {},
 ): Array {
   x = fudgeArray(x);
-  x = where(isnan(x.ref), nan, x);
+  x = where(isnan(x), nan, x);
   posinf ??= isFloatDtype(x.dtype) ? finfo(x.dtype).max : iinfo(x.dtype).max;
   neginf ??= isFloatDtype(x.dtype) ? finfo(x.dtype).min : iinfo(x.dtype).min;
-  x = where(isposinf(x.ref), posinf, x);
-  x = where(isneginf(x.ref), neginf, x);
+  x = where(isposinf(x), posinf, x);
+  x = where(isneginf(x), neginf, x);
   return x;
 }
 
@@ -1838,5 +1838,5 @@ export function nanToNum(
  */
 export const isfinite = jit(function isfinite(x: Array): Array {
   if (!isFloatDtype(x.dtype)) return fullLike(x, true);
-  return isnan(x.ref).add(isinf(x)).notEqual(true);
+  return isnan(x).add(isinf(x)).notEqual(true);
 });

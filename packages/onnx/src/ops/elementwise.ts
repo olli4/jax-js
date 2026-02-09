@@ -121,7 +121,7 @@ export function Swish(
   if (alpha === 1.0) {
     return [nn.silu(x)];
   }
-  return [x.ref.mul(nn.sigmoid(x.mul(alpha)))];
+  return [x.mul(nn.sigmoid(x.mul(alpha)))];
 }
 
 export function LeakyRelu(

@@ -85,9 +85,9 @@ export function softplus(x: ArrayLike): Array {
  */
 export const sparsePlus = jit((x: Array): Array => {
   return where(
-    x.ref.lessEqual(-1),
+    x.lessEqual(-1),
     0,
-    where(x.ref.less(1), square(x.ref.add(1)).mul(0.25), x),
+    where(x.less(1), square(x.add(1)).mul(0.25), x),
   );
 });
 
@@ -109,7 +109,7 @@ export const sparseSigmoid = jit((x: Array): Array => {
  */
 export function softSign(x: ArrayLike): Array {
   x = fudgeArray(x);
-  return x.ref.div(absolute(x).add(1));
+  return x.div(absolute(x).add(1));
 }
 
 /**
@@ -123,7 +123,7 @@ export function softSign(x: ArrayLike): Array {
  * Reference: https://en.wikipedia.org/wiki/Swish_function
  */
 export const silu = jit(function silu(x: Array) {
-  return x.ref.mul(sigmoid(x));
+  return x.mul(sigmoid(x));
 });
 
 export { silu as swish };
@@ -148,7 +148,7 @@ export function leakyRelu(
   negativeSlope: ArrayLike = 0.01,
 ): Array {
   x = fudgeArray(x);
-  return where(less(x.ref, 0), x.ref.mul(negativeSlope), x);
+  return where(less(x, 0), x.mul(negativeSlope), x);
 }
 
 /** Hard sigmoid activation function: `relu6(x+3)/6`. */
@@ -159,7 +159,7 @@ export function hardSigmoid(x: ArrayLike): Array {
 /** Hard SiLU (swish) activation function: `x * hardSigmoid(x)`. */
 export function hardSilu(x: ArrayLike): Array {
   x = fudgeArray(x);
-  return x.ref.mul(hardSigmoid(x));
+  return x.mul(hardSigmoid(x));
 }
 
 export { hardSilu as hardSwish };
@@ -177,7 +177,7 @@ export function hardTanh(x: ArrayLike): Array {
  */
 export function elu(x: ArrayLike, alpha: ArrayLike = 1.0): Array {
   x = fudgeArray(x);
-  return where(less(x.ref, 0), exp(x.ref).sub(1).mul(alpha), x);
+  return where(less(x, 0), exp(x).sub(1).mul(alpha), x);
 }
 
 /**
@@ -188,7 +188,7 @@ export function elu(x: ArrayLike, alpha: ArrayLike = 1.0): Array {
  */
 export function celu(x: ArrayLike, alpha: ArrayLike = 1.0): Array {
   x = fudgeArray(x);
-  return where(less(x.ref, 0), exp(x.ref.div(alpha)).sub(1).mul(alpha), x);
+  return where(less(x, 0), exp(x.div(alpha)).sub(1).mul(alpha), x);
 }
 
 /**
@@ -203,7 +203,7 @@ export function celu(x: ArrayLike, alpha: ArrayLike = 1.0): Array {
 export const selu = jit(function selu(x: Array) {
   const alpha = 1.6732632423543772;
   const lambda = 1.0507009873554805;
-  return where(x.ref.less(0), expm1(x.ref).mul(alpha), x).mul(lambda);
+  return where(x.less(0), expm1(x).mul(alpha), x).mul(lambda);
 });
 
 /**
@@ -222,15 +222,15 @@ export const gelu = jit(
   function gelu(x: Array, opts?: { approximate?: boolean }): Array {
     if (opts?.approximate ?? true) {
       const SQRT_2_OVER_PI = Math.sqrt(2 / Math.PI);
-      return x.ref
+      return x
         .mul(0.5)
         .mul(
           tanh(
-            x.ref.mul(x.ref.mul(x).mul(0.044715).add(1)).mul(SQRT_2_OVER_PI),
+            x.mul(x.mul(x).mul(0.044715).add(1)).mul(SQRT_2_OVER_PI),
           ).add(1),
         );
     } else {
-      return x.ref.mul(0.5).mul(erfc(negative(x.mul(Math.SQRT1_2))));
+      return x.mul(0.5).mul(erfc(negative(x.mul(Math.SQRT1_2))));
     }
   },
   { staticArgnums: [1] },
@@ -252,7 +252,7 @@ export function glu(x: ArrayLike, axis: number = -1): Array {
     );
   }
   const slice = x.shape.map<Pair>((a) => [0, a]);
-  const a = shrink(x.ref, slice.toSpliced(axis, 1, [0, size / 2])) as Array;
+  const a = shrink(x, slice.toSpliced(axis, 1, [0, size / 2])) as Array;
   const b = shrink(x, slice.toSpliced(axis, 1, [size / 2, size])) as Array;
   return a.mul(sigmoid(b));
 }
@@ -265,7 +265,7 @@ export function glu(x: ArrayLike, axis: number = -1): Array {
  */
 export function squareplus(x: ArrayLike, b: ArrayLike = 4.0): Array {
   x = fudgeArray(x);
-  return x.ref.add(sqrt(square(x).add(b))).mul(0.5);
+  return x.add(sqrt(square(x).add(b))).mul(0.5);
 }
 
 /**
@@ -276,7 +276,7 @@ export function squareplus(x: ArrayLike, b: ArrayLike = 4.0): Array {
  */
 export function mish(x: ArrayLike): Array {
   x = fudgeArray(x);
-  return x.ref.mul(tanh(softplus(x)));
+  return x.mul(tanh(softplus(x)));
 }
 
 /**
@@ -294,9 +294,9 @@ export function softmax(x: ArrayLike, axis: Axis = -1): Array {
     return onesLike(x); // scalar case, return ones
   }
 
-  const xMax = max(x.ref, axis, { keepdims: true });
+  const xMax = max(x, axis, { keepdims: true });
   const unnormalized = exp(x.sub(stopGradient(xMax)));
-  return unnormalized.ref.div(unnormalized.sum(axis, { keepdims: true }));
+  return unnormalized.div(unnormalized.sum(axis, { keepdims: true }));
 }
 
 /**
@@ -314,9 +314,9 @@ export function logSoftmax(x: ArrayLike, axis: Axis = -1): Array {
     return zerosLike(x); // scalar case, return log(1)
   }
 
-  const xMax = max(x.ref, axis, { keepdims: true }); // keep dims
+  const xMax = max(x, axis, { keepdims: true }); // keep dims
   const shifted = x.sub(stopGradient(xMax));
-  const shiftedLogsumexp = log(exp(shifted.ref).sum(axis, { keepdims: true }));
+  const shiftedLogsumexp = log(exp(shifted).sum(axis, { keepdims: true }));
   return shifted.sub(shiftedLogsumexp);
 }
 
@@ -337,8 +337,8 @@ export function logsumexp(
   axis = normalizeAxis(axis, x.ndim);
   if (axis.length === 0) return x;
 
-  const xMax = stopGradient(max(x.ref, axis, { keepdims: true })) as Array;
-  const shifted = x.sub(xMax.ref);
+  const xMax = stopGradient(max(x, axis, { keepdims: true })) as Array;
+  const shifted = x.sub(xMax);
   const result = xMax.add(log(exp(shifted).sum(axis, { keepdims: true })));
   return opts?.keepdims ? result : squeeze(result, axis);
 }
@@ -380,14 +380,14 @@ export function standardize(
   const mu =
     opts.mean !== undefined
       ? fudgeArray(opts.mean)
-      : x.ref.mean(axis, { keepdims: true });
+      : x.mean(axis, { keepdims: true });
 
   // Like JAX, we'll use the Var[X] = E[X^2] - (E[X])^2 formula for this one.
   // It's supposed to be better in the case of neural network activations.
   const sigma2 =
     opts.variance !== undefined
       ? fudgeArray(opts.variance)
-      : square(x.ref).mean(axis, { keepdims: true }).sub(square(mu.ref));
+      : square(x).mean(axis, { keepdims: true }).sub(square(mu));
 
   return x.sub(mu).div(sqrt(sigma2.add(opts.epsilon ?? 1e-5)));
 }

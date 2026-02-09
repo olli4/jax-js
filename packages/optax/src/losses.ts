@@ -23,9 +23,9 @@ export function squaredError(
   if (targets) {
     checkSameShape(predictions, targets);
     const delta = predictions.sub(targets);
-    return delta.ref.mul(delta);
+    return delta.mul(delta);
   } else {
-    return predictions.ref.mul(predictions);
+    return predictions.mul(predictions);
   }
 }
 

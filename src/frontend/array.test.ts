@@ -18,10 +18,10 @@ suite.each(devices)("device:%s", (device) => {
     const ar = zeros([3, 3]);
     expect(ar.shape).toEqual([3, 3]);
     expect(ar.dtype).toEqual("float32");
-    expect(await ar.ref.data()).toEqual(
+    expect(await ar.data()).toEqual(
       new Float32Array([0, 0, 0, 0, 0, 0, 0, 0, 0]),
     );
-    expect(await ar.ref.transpose().data()).toEqual(
+    expect(await ar.transpose().data()).toEqual(
       new Float32Array([0, 0, 0, 0, 0, 0, 0, 0, 0]),
     );
     expect(ar.transpose().dataSync()).toEqual(
@@ -51,7 +51,7 @@ suite.each(devices)("device:%s", (device) => {
     const c = a.mul(b);
     expect(c.shape).toEqual([4]);
     expect(c.dtype).toEqual("float32");
-    expect(c.ref.dataSync()).toEqual(new Float32Array([10, 10, 6, -34]));
+    expect(c.dataSync()).toEqual(new Float32Array([10, 10, 6, -34]));
     expect(c.reshape([2, 2]).transpose().dataSync()).toEqual(
       new Float32Array([10, 6, 10, -34]),
     );
@@ -72,7 +72,7 @@ suite.each(devices)("device:%s", (device) => {
     // Multiply them together -- outer products of a[i] and b[i].
     const c = a.mul(b);
     expect(c.shape).toEqual([2, 3, 2]);
-    expect(c.ref.js()).toEqual([
+    expect(c.js()).toEqual([
       [
         [10, 220],
         [5, 110],
@@ -94,7 +94,7 @@ suite.each(devices)("device:%s", (device) => {
       ],
     ]); // 3D
     expect(a.shape).toEqual([1, 2, 2]);
-    expect(a.ref.flatten().js()).toEqual([1, 2, 3, 4]);
+    expect(a.flatten().js()).toEqual([1, 2, 3, 4]);
     expect(a.ravel().js()).toEqual([1, 2, 3, 4]);
     expect(array(3).flatten().js()).toEqual([3]);
   });
@@ -102,17 +102,17 @@ suite.each(devices)("device:%s", (device) => {
   test("can add array to itself", () => {
     const a = array([1, 2, 3]);
     // Make sure duplicate references don't trip up the backend.
-    const b = a.ref.add(a.ref).add(a);
+    const b = a.add(a).add(a);
     expect(b.dataSync()).toEqual(new Float32Array([3, 6, 9]));
   });
 
   test("can coerce array to primitive", () => {
     const a = array(42);
-    expect(a.ref).toBeCloseTo(42);
+    expect(a).toBeCloseTo(42);
 
     // https://github.com/microsoft/TypeScript/issues/42218
-    expect(+(a.ref as any)).toEqual(42);
-    expect((a.ref as any) + 1).toEqual(43);
+    expect(+(a as any)).toEqual(42);
+    expect((a as any) + 1).toEqual(43);
     expect((a as any) ** 2).toEqual(42 ** 2);
   });
 
@@ -121,29 +121,29 @@ suite.each(devices)("device:%s", (device) => {
     expect(a.shape).toEqual([3]);
     expect(a.dtype).toEqual("bool");
 
-    expect(a.ref.dataSync()).toEqual(new Int32Array([1, 0, 1]));
-    expect(a.ref.js()).toEqual([true, false, true]);
+    expect(a.dataSync()).toEqual(new Int32Array([1, 0, 1]));
+    expect(a.js()).toEqual([true, false, true]);
 
     const b = array([1, 3, 4]);
-    expect(b.ref.greater(2).js()).toEqual([false, true, true]);
-    expect(b.ref.greater(2).dataSync()).toEqual(new Int32Array([0, 1, 1]));
+    expect(b.greater(2).js()).toEqual([false, true, true]);
+    expect(b.greater(2).dataSync()).toEqual(new Int32Array([0, 1, 1]));
 
-    expect(b.ref.equal(3).js()).toEqual([false, true, false]);
+    expect(b.equal(3).js()).toEqual([false, true, false]);
     expect(b.notEqual(array([2, 3, 4])).js()).toEqual([true, false, false]);
   });
 
   test("comparison operators async", async () => {
     const x = array([1, 2, 3]);
-    expect(await x.ref.greater(2).jsAsync()).toEqual([false, false, true]);
-    expect(await x.ref.greaterEqual(2).jsAsync()).toEqual([false, true, true]);
-    expect(await x.ref.less(2).jsAsync()).toEqual([true, false, false]);
-    expect(await x.ref.lessEqual(2).jsAsync()).toEqual([true, true, false]);
-    expect(await x.ref.equal(2).jsAsync()).toEqual([false, true, false]);
-    expect(await x.ref.notEqual(2).jsAsync()).toEqual([true, false, true]);
+    expect(await x.greater(2).jsAsync()).toEqual([false, false, true]);
+    expect(await x.greaterEqual(2).jsAsync()).toEqual([false, true, true]);
+    expect(await x.less(2).jsAsync()).toEqual([true, false, false]);
+    expect(await x.lessEqual(2).jsAsync()).toEqual([true, true, false]);
+    expect(await x.equal(2).jsAsync()).toEqual([false, true, false]);
+    expect(await x.notEqual(2).jsAsync()).toEqual([true, false, true]);
     x.dispose();
 
     let ar = arange(0, 5000, 1, { dtype: DType.Float32 });
-    await ar.ref.data(); // Ensure data is loaded
+    await ar.data(); // Ensure data is loaded
     ar = ar.add(1);
     const vals = (await ar.less(2500).data()) as Int32Array;
     for (let i = 0; i < vals.length; i++) {
@@ -153,12 +153,12 @@ suite.each(devices)("device:%s", (device) => {
 
   test("comparison ops handle nan", async () => {
     const x = array([NaN, 0]);
-    expect(await x.ref.greater(NaN).jsAsync()).toEqual([false, false]);
-    expect(await x.ref.less(NaN).jsAsync()).toEqual([false, false]);
-    expect(await x.ref.equal(NaN).jsAsync()).toEqual([false, false]);
-    expect(await x.ref.notEqual(NaN).jsAsync()).toEqual([true, true]);
-    expect(await x.ref.greaterEqual(NaN).jsAsync()).toEqual([false, false]);
-    expect(await x.ref.lessEqual(NaN).jsAsync()).toEqual([false, false]);
+    expect(await x.greater(NaN).jsAsync()).toEqual([false, false]);
+    expect(await x.less(NaN).jsAsync()).toEqual([false, false]);
+    expect(await x.equal(NaN).jsAsync()).toEqual([false, false]);
+    expect(await x.notEqual(NaN).jsAsync()).toEqual([true, true]);
+    expect(await x.greaterEqual(NaN).jsAsync()).toEqual([false, false]);
+    expect(await x.lessEqual(NaN).jsAsync()).toEqual([false, false]);
     x.dispose();
   });
 
@@ -169,24 +169,24 @@ suite.each(devices)("device:%s", (device) => {
     ]);
 
     // Basic slicing and element access.
-    expect(x.ref.slice(0, 0).js()).toEqual(1);
-    expect(x.ref.slice(0, 2).js()).toEqual(3);
-    expect(x.ref.slice(1, 2).js()).toEqual(6);
-    expect(x.ref.slice(1).js()).toEqual([4, 5, 6]);
-    expect(x.ref.slice().js()).toEqual([
+    expect(x.slice(0, 0).js()).toEqual(1);
+    expect(x.slice(0, 2).js()).toEqual(3);
+    expect(x.slice(1, 2).js()).toEqual(6);
+    expect(x.slice(1).js()).toEqual([4, 5, 6]);
+    expect(x.slice().js()).toEqual([
       [1, 2, 3],
       [4, 5, 6],
     ]);
 
     // Try slicing with negative indices.
-    expect(x.ref.slice(-1, -1).js()).toEqual(6);
-    expect(x.ref.slice(-2, -1).js()).toEqual(3);
-    expect(x.ref.slice(-1, -3).js()).toEqual(4);
+    expect(x.slice(-1, -1).js()).toEqual(6);
+    expect(x.slice(-2, -1).js()).toEqual(3);
+    expect(x.slice(-1, -3).js()).toEqual(4);
 
     // Try adding new axes.
-    expect(x.ref.slice(0, 0, null).js()).toEqual([1]);
-    expect(x.ref.slice(0, null, 0).js()).toEqual([1]);
-    expect(x.ref.slice(null).js()).toEqual([x.ref.js()]);
+    expect(x.slice(0, 0, null).js()).toEqual([1]);
+    expect(x.slice(0, null, 0).js()).toEqual([1]);
+    expect(x.slice(null).js()).toEqual([x.js()]);
 
     x.dispose();
   });
@@ -196,7 +196,7 @@ suite.each(devices)("device:%s", (device) => {
       [1, 2, 3],
       [4, 5, 6],
     ]);
-    expect(x.ref.sum(-1).js()).toEqual([6, 15]);
+    expect(x.sum(-1).js()).toEqual([6, 15]);
     expect(x.sum(-2).js()).toEqual([5, 7, 9]);
   });
 
@@ -205,23 +205,23 @@ suite.each(devices)("device:%s", (device) => {
       [1, 2, 3],
       [4, 5, 6],
     ]);
-    expect(x.ref.mean().js()).toEqual(3.5);
-    expect(x.ref.mean([0, 1]).js()).toEqual(3.5);
-    expect(x.ref.mean(0).js()).toEqual([2.5, 3.5, 4.5]);
-    expect(x.ref.mean(1).js()).toEqual([2, 5]);
+    expect(x.mean().js()).toEqual(3.5);
+    expect(x.mean([0, 1]).js()).toEqual(3.5);
+    expect(x.mean(0).js()).toEqual([2.5, 3.5, 4.5]);
+    expect(x.mean(1).js()).toEqual([2, 5]);
     x.dispose();
   });
 
   test("advanced indexing with gather", () => {
     const x = array([1, 3, 2], { dtype: DType.Int32 });
     // np.eye(5)[[1, 3, 2]]
-    expect(eye(5).slice(x.ref).js()).toEqual([
+    expect(eye(5).slice(x).js()).toEqual([
       [0, 1, 0, 0, 0],
       [0, 0, 0, 1, 0],
       [0, 0, 1, 0, 0],
     ]);
     // np.eye(5)[[1, 3, 2], np.newaxis]
-    expect(eye(5).slice(x.ref, null).js()).toEqual([
+    expect(eye(5).slice(x, null).js()).toEqual([
       [[0, 1, 0, 0, 0]],
       [[0, 0, 0, 1, 0]],
       [[0, 0, 1, 0, 0]],
@@ -261,24 +261,24 @@ suite.each(devices)("device:%s", (device) => {
   test("u32 data type", () => {
     const a = array([1, 2, 3], { dtype: DType.Uint32 });
     expect(a.dtype).toBe(DType.Uint32);
-    expect(a.ref.dataSync()).toEqual(new Uint32Array([1, 2, 3]));
-    expect(a.ref.js()).toEqual([1, 2, 3]);
+    expect(a.dataSync()).toEqual(new Uint32Array([1, 2, 3]));
+    expect(a.js()).toEqual([1, 2, 3]);
 
     const b = a.sub(array(2, { dtype: DType.Uint32 }));
     expect(b.dtype).toBe(DType.Uint32);
-    expect(b.ref.dataSync()).toEqual(new Uint32Array([4294967295, 0, 1]));
+    expect(b.dataSync()).toEqual(new Uint32Array([4294967295, 0, 1]));
     expect(b.js()).toEqual([4294967295, 0, 1]);
   });
 
   test("casting arrays", () => {
     const a = array([1, 2, 3], { dtype: DType.Int32 });
     expect(a.dtype).toBe(DType.Int32);
-    expect(a.ref.dataSync()).toEqual(new Int32Array([1, 2, 3]));
-    expect(a.ref.js()).toEqual([1, 2, 3]);
+    expect(a.dataSync()).toEqual(new Int32Array([1, 2, 3]));
+    expect(a.js()).toEqual([1, 2, 3]);
 
     const b = a.astype(DType.Float32);
     expect(b.dtype).toBe(DType.Float32);
-    expect(b.ref.dataSync()).toEqual(new Float32Array([1, 2, 3]));
+    expect(b.dataSync()).toEqual(new Float32Array([1, 2, 3]));
     expect(b.js()).toEqual([1, 2, 3]);
   });
 

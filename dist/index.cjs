@@ -709,15 +709,6 @@ function newDynamic(main) {
 function currentTraceLevel() {
 	return traceStack[traceStack.length - 1].level;
 }
-/**
-* Check if any transform trace (JVP, vmap) is active above the given level.
-* Used by JaxprTracer to distinguish user .ref calls from system .ref calls
-* made by transform machinery.
-*/
-function isUnderTransform(level) {
-	for (let i = level + 1; i < traceStack.length; i++) if (traceStack[i].isTransform) return true;
-	return false;
-}
 var Trace = class {
 	constructor(main) {
 		this.main = main;
@@ -1145,7 +1136,7 @@ function flattenFunWithAux(f, inTree) {
 }
 var UseAfterFreeError = class extends ReferenceError {
 	constructor(tracer) {
-		super(`Referenced tracer ${tracer.toString()} freed, please use .ref move semantics`);
+		super(`Referenced tracer ${tracer.toString()} has been disposed`);
 	}
 };
 
@@ -1267,36 +1258,8 @@ var VarPrinter = class {
 		return `${this.name(v)}:${v.aval.toString()}`;
 	}
 };
-const INTERNAL_FRAME_RE = /[\\/]src[\\/](frontend|library|backend)[\\/]|[\\/]src[\\/](alu|routine|shape|tree|utils|index|polyfills|tuner|pprint|backend)\.|[\\/](dist|node_modules)[\\/]/;
-/**
-* When true, `captureStackTrace` is called in `.ref` and `processPrimitive`
-* to record source locations for ref-validation error messages.  Off by
-* default — turned on only when a ref-count mismatch is detected and the
-* function is re-traced to produce an actionable error.
-*/
-let _captureLocations = false;
-const _hasCaptureStackTrace = typeof Error.captureStackTrace === "function";
-/**
-* Parse a V8 stack trace to find the first user-level frame
-* (i.e. not inside jax-js internals). Returns "file:line:col" or undefined.
-*/
-function parseUserFrame(stack$1) {
-	if (!stack$1) return void 0;
-	for (const line of stack$1.split("\n")) {
-		if (!line.includes(" at ")) continue;
-		if (INTERNAL_FRAME_RE.test(line)) continue;
-		const m = line.match(/\((.+):(\d+):(\d+)\)/) ?? line.match(/at (.+):(\d+):(\d+)/);
-		if (m) {
-			const file = m[1].replace(/^.*[\\/]/, "");
-			return `${file}:${m[2]}:${m[3]}`;
-		}
-	}
-	return void 0;
-}
 /** A single statement / binding in a Jaxpr, in ANF form. */
 var JaxprEqn = class {
-	/** Source location of user code that triggered this equation (V8 only). */
-	_userLoc;
 	constructor(primitive, inputs, params, outBinders) {
 		this.primitive = primitive;
 		this.inputs = inputs;
@@ -1492,12 +1455,12 @@ function evalJaxpr(jaxpr, args) {
 	const env = /* @__PURE__ */ new Map();
 	const usageCount = /* @__PURE__ */ new Map();
 	for (const x of jaxpr.eqns.flatMap((eqn) => eqn.inputs).concat(jaxpr.outs)) if (x instanceof Var) usageCount.set(x, (usageCount.get(x) ?? 0) + 1);
+	const outputVars = /* @__PURE__ */ new Set();
+	for (const x of jaxpr.outs) if (x instanceof Var) outputVars.add(x);
 	const remainingRefs = /* @__PURE__ */ new Map();
 	const read = (x) => {
-		if (x instanceof Var) {
-			remainingRefs.set(x, (remainingRefs.get(x) ?? 0) - 1);
-			return env.get(x);
-		} else return array(x.value, { dtype: x.dtype });
+		if (x instanceof Var) return env.get(x);
+		else return array(x.value, { dtype: x.dtype });
 	};
 	const write = (v, val) => {
 		if (env.has(v)) throw new Error(`Variable already bound: ${v}`);
@@ -1505,8 +1468,17 @@ function evalJaxpr(jaxpr, args) {
 		if (refCount) {
 			env.set(v, val);
 			remainingRefs.set(v, refCount);
-			while (refCount-- > 1) val.ref;
 		} else val.dispose();
+	};
+	const consumeRead = (x) => {
+		if (x instanceof Var) {
+			const left = remainingRefs.get(x);
+			remainingRefs.set(x, left - 1);
+			if (left === 1 && !outputVars.has(x)) {
+				env.get(x)?.dispose();
+				env.delete(x);
+			}
+		}
 	};
 	try {
 		for (const [v, arg] of require_backend.zip(jaxpr.inBinders, args)) write(v, arg);
@@ -1514,13 +1486,11 @@ function evalJaxpr(jaxpr, args) {
 			const inVals = eqn.inputs.map(read);
 			const outVals = bind(eqn.primitive, inVals, eqn.params);
 			for (const [v, val] of require_backend.zip(eqn.outBinders, outVals)) write(v, val);
+			for (const x of eqn.inputs) consumeRead(x);
 		}
 		return jaxpr.outs.map(read);
 	} catch (error) {
-		for (let [v, refCount] of remainingRefs.entries()) if (refCount > 0) {
-			const tracer = env.get(v);
-			while (refCount--) tracer.dispose();
-		}
+		for (const val of env.values()) val.dispose();
 		throw error;
 	}
 }
@@ -1550,14 +1520,6 @@ var ClosedJaxpr = class ClosedJaxpr {
 /** Tracer that records its operations to dynamically construct a Jaxpr. */
 var JaxprTracer = class extends Tracer {
 	#rc;
-	/**
-	* Number of `.ref` calls attributable to user code. System-internal refs
-	* (e.g. const-lifting in inner makeJaxpr traces) are excluded so that
-	* validation only checks the user's ref discipline.
-	*/
-	_userRefCalls = 0;
-	/** Source locations of user .ref calls (for "remove .ref" diagnostics). */
-	_userRefLocs = [];
 	constructor(trace$1, aval) {
 		super(trace$1);
 		this.aval = aval;
@@ -1567,24 +1529,14 @@ var JaxprTracer = class extends Tracer {
 		return `JaxprTracer(${this.aval.toString()})`;
 	}
 	get ref() {
-		if (this.#rc <= 0) throw new UseAfterFreeError(this);
 		this.#rc++;
-		if (isUnderTransform(this._trace.main.level)) this._trace.builder._hadTransform = true;
-		else {
-			this._userRefCalls++;
-			if (_captureLocations && _hasCaptureStackTrace) {
-				const holder = {};
-				Error.captureStackTrace(holder);
-				const loc = parseUserFrame(holder.stack);
-				if (loc) this._userRefLocs.push(loc);
-			}
-		}
 		return this;
 	}
 	dispose() {
-		if (this.#rc <= 0) throw new UseAfterFreeError(this);
 		this.#rc--;
-		if (this._userRefCalls > 0 && !isUnderTransform(this._trace.main.level)) this._userRefCalls--;
+	}
+	[Symbol.dispose]() {
+		this.dispose();
 	}
 	/** Number of live references the user holds (1 + .ref count − .dispose count). */
 	get refCount() {
@@ -1609,10 +1561,7 @@ var JaxprTrace = class extends Trace {
 		let tracer = this.builder.constTracers.get(val);
 		if (tracer === void 0) {
 			tracer = this.builder.newTracer(this, ShapedArray.fromAval(getAval(val)));
-			if (val instanceof JaxprTracer) {
-				val.ref;
-				if (val._userRefCalls > 0) val._userRefCalls--;
-			}
+			val.ref;
 			this.builder.addConst(tracer, val);
 		} else tracer.trackLiftedConstant();
 		return tracer;
@@ -1624,11 +1573,6 @@ var JaxprTrace = class extends Trace {
 		const avalsOut = abstractEvalRules[primitive](avalsIn, params);
 		const outTracers = avalsOut.map((aval) => this.builder.newTracer(this, aval));
 		const eqn = new JaxprEqn(primitive, tracers.map((t) => this.builder.getVar(t)), params, outTracers.map((t) => this.builder.addVar(t)));
-		if (_captureLocations && _hasCaptureStackTrace) {
-			const holder = {};
-			Error.captureStackTrace(holder);
-			eqn._userLoc = parseUserFrame(holder.stack);
-		}
 		this.builder.addEqn(eqn);
 		return outTracers;
 	}
@@ -1643,12 +1587,6 @@ var JaxprBuilder = class {
 	constTracers = /* @__PURE__ */ new Map();
 	constVals = /* @__PURE__ */ new Map();
 	tracers = [];
-	/**
-	* Set to true when a transform trace (JVP, vmap, etc.) was active above
-	* this JaxprTrace during tracing. When true, .ref validation is skipped
-	* because transforms alter usage patterns internally.
-	*/
-	_hadTransform = false;
 	newTracer(trace$1, aval) {
 		const tracer = new JaxprTracer(trace$1, aval);
 		this.tracers.push(tracer);
@@ -1909,82 +1847,6 @@ function joinIdx(n, a, b, argnums) {
 	else result.push(b[bi++]);
 	return result;
 }
-/**
-* Validate that the user's .ref usage matches the actual usage count in the
-* traced Jaxpr.  Since tracing never consumes tracers (always-autoRef), we
-* track user .ref calls via `_userRefCalls` on each JaxprTracer.  The effective
-* user refcount is `1 + _userRefCalls`.  The usage count is how many times
-* the corresponding Var appears as an equation input or output.  For correct
-* eager execution these must be equal.
-*
-* Tracers with effective rc === 1 and usageCount === 0 are "discarded
-* intermediates" (e.g. one branch of `random.split`) and are silently skipped.
-*
-* Returns `true` when all ref counts are correct (or validation was skipped
-* because transforms were active).  Returns `false` when mismatches exist.
-* When `throwOnError` is true (default), a `false` result throws an error
-* instead of returning — use `throwOnError: false` for the fast first-pass
-* check that determines whether a re-trace with source locations is needed.
-*/
-function validateRefCounts(builder, tracersIn, tracersOut, throwOnError = true) {
-	if (builder._hadTransform) return true;
-	const usageCount = /* @__PURE__ */ new Map();
-	for (const eqn of builder.eqns) for (const v of eqn.inputs) if (v instanceof Var) usageCount.set(v, (usageCount.get(v) ?? 0) + 1);
-	const outVars = tracersOut.map((t) => builder.getVar(t));
-	for (const v of outVars) usageCount.set(v, (usageCount.get(v) ?? 0) + 1);
-	const constTracerSet = new Set(builder.constTracers.values());
-	const vp = new VarPrinter();
-	const describeSource = (v, argIdx) => {
-		const dtype = v.aval.dtype;
-		const shape$1 = `[${v.aval.shape.join(",")}]`;
-		if (argIdx !== null) return `argument ${argIdx} (${dtype}${shape$1})`;
-		for (const eqn of builder.eqns) for (const outV of eqn.outBinders) if (outV === v) {
-			const inputs = eqn.inputs.map((x) => x instanceof Var ? vp.name(x) : String(x.value)).join(", ");
-			const loc = eqn._userLoc ? ` at ${eqn._userLoc}` : "";
-			return `result of ${eqn.primitive}(${inputs}) → ${vp.name(v)} (${dtype}${shape$1})${loc}`;
-		}
-		return `${vp.name(v)} (${dtype}${shape$1})`;
-	};
-	const describeUses = (v) => {
-		const uses = [];
-		for (const eqn of builder.eqns) for (const inp of eqn.inputs) if (inp === v) {
-			const inputs = eqn.inputs.map((x) => x instanceof Var ? vp.name(x) : String(x.value)).join(", ");
-			const loc = eqn._userLoc ? `  ← ${eqn._userLoc}` : "";
-			uses.push(`${eqn.primitive}(${inputs})${loc}`);
-		}
-		for (let i = 0; i < outVars.length; i++) if (outVars[i] === v) uses.push(`output[${i}]`);
-		return uses;
-	};
-	const errors = [];
-	for (const [tracer, v] of builder.tracerToVar) {
-		if (constTracerSet.has(tracer)) continue;
-		const rc = 1 + tracer._userRefCalls;
-		const used = usageCount.get(v) ?? 0;
-		if (rc === used) continue;
-		if (rc === 1 && used === 0) continue;
-		const argIdx = tracersIn.indexOf(tracer);
-		const source = describeSource(v, argIdx >= 0 ? argIdx : null);
-		const userRefs = rc - 1;
-		const needed = Math.max(0, used - 1);
-		if (rc < used) {
-			const missing = used - rc;
-			const uses = describeUses(v);
-			const annotated = uses.map((u, i) => i < uses.length - 1 ? `${u}  ← use .ref here` : `${u}  ← last use (consumed)`);
-			errors.push(`${source}: used ${used} time${used > 1 ? "s" : ""} but has ${userRefs} .ref call${userRefs !== 1 ? "s" : ""} (need ${needed}).\n  Add ${missing}x .ref — every use except the last needs .ref:\n` + annotated.map((u, i) => `    ${i + 1}. ${u}`).join("\n"));
-		} else {
-			const extra = userRefs - needed;
-			const usedStr = used === 0 ? "never used" : `only used ${used} time${used > 1 ? "s" : ""}`;
-			const refLocs = tracer._userRefLocs;
-			const refLocStr = refLocs.length > 0 ? "\n" + refLocs.map((l) => `    - .ref at ${l}`).join("\n") : "";
-			errors.push(`${source}: has ${userRefs} .ref call${userRefs !== 1 ? "s" : ""} but is ${usedStr} (need ${needed}). Remove ${extra}x .ref (would leak memory).${refLocStr}`);
-		}
-	}
-	if (errors.length > 0) {
-		if (!throwOnError) return false;
-		throw new Error(`jit: ref validation failed — the function body has incorrect .ref usage:\n\n` + errors.join("\n\n"));
-	}
-	return true;
-}
 function makeJaxpr$1(f, opts) {
 	return (...argsIn) => {
 		try {
@@ -2002,19 +1864,6 @@ function makeJaxpr$1(f, opts) {
 			const tracersIn = avalsIn.map((aval) => trace$1.newArg(typeof aval === "object" ? aval : pureArray(aval)));
 			const outs = fFlat(...tracersIn);
 			const tracersOut = outs.map((out) => fullRaise(trace$1, out));
-			if (opts?.validateRefs !== false) if (_captureLocations) validateRefCounts(builder, tracersIn, tracersOut, true);
-			else {
-				const ok = validateRefCounts(builder, tracersIn, tracersOut, false);
-				if (!ok) {
-					_captureLocations = true;
-					try {
-						makeJaxpr$1(f, opts)(...argsIn);
-					} finally {
-						_captureLocations = false;
-					}
-					throw new Error("jit: ref validation failed (re-trace did not reproduce)");
-				}
-			}
 			const jaxpr = builder.build(tracersIn, tracersOut);
 			if (outTree.value === void 0) throw new Error("outTree was not set in makeJaxpr");
 			return {
@@ -2038,14 +1887,9 @@ function jit$1(f, opts) {
 		const avalsIn = unflatten(inTree, avalsInFlat);
 		const jaxprArgs = joinIdx(args.length, staticArgs, avalsIn, staticArgnums);
 		const { jaxpr, treedef: outTree } = require_backend.runWithCache(cache, jaxprArgs, () => {
-			const underTransform = argsFlat.some((x) => x instanceof Tracer && !(x instanceof Array$1));
-			const traceOpts = underTransform && opts?.validateRefs !== false ? {
-				...opts,
-				validateRefs: false
-			} : opts;
-			return makeJaxpr$1(f, traceOpts)(...jaxprArgs);
+			return makeJaxpr$1(f, opts)(...jaxprArgs);
 		});
-		const outs = bind(Primitive.Jit, [...jaxpr.consts.map((c) => c.ref), ...argsFlat], {
+		const outs = bind(Primitive.Jit, [...jaxpr.consts, ...argsFlat], {
 			name: f.name || "closure",
 			jaxpr: jaxpr.jaxpr,
 			numConsts: jaxpr.consts.length
@@ -3590,6 +3434,9 @@ var Array$1 = class Array$1 extends Tracer {
 			if (typeof this.#source === "number") this.#backend.decRef(this.#source);
 		}
 	}
+	[Symbol.dispose]() {
+		this.dispose();
+	}
 	/** Get the pending executes as a list, trimming if already submitted. */
 	get #pending() {
 		if (!this.#pendingSet) return [];
@@ -3617,12 +3464,10 @@ var Array$1 = class Array$1 extends Tracer {
 		const pending = this.#pending;
 		for (const exe of pending) exe.updateRc(1);
 		if (typeof this.#source === "number") this.#backend.incRef(this.#source);
-		const ar = this.#newArrayFrom({
+		return this.#newArrayFrom({
 			st,
 			pending
 		});
-		this.dispose();
-		return ar;
 	}
 	/**
 	* Underlying implementation of the Gather primitive. This indexes an array
@@ -3668,8 +3513,6 @@ var Array$1 = class Array$1 extends Tracer {
 		const pending = [...this.#pending, ...indices.flatMap((ar) => ar.#pending)];
 		for (const exe of pending) exe.updateRc(1);
 		pending.push(new PendingExecute(this.#backend, kernel, inputs, [output]));
-		this.dispose();
-		for (const ar of indices) ar.dispose();
 		return this.#newArrayFrom({
 			source: output,
 			st: require_backend.ShapeTracker.fromShape(finalShape),
@@ -3702,7 +3545,6 @@ var Array$1 = class Array$1 extends Tracer {
 		this.#check();
 		if (this.#source instanceof require_backend.AluExp) {
 			const exp$3 = new require_backend.AluExp(op, dtypeOutput, [this.#source]);
-			this.dispose();
 			return this.#newArrayFrom({
 				source: exp$3.simplify(),
 				dtype: dtypeOutput,
@@ -3716,7 +3558,6 @@ var Array$1 = class Array$1 extends Tracer {
 		const pending = [...this.#pending];
 		for (const exe of pending) exe.updateRc(1);
 		pending.push(new PendingExecute(this.#backend, kernel, [this.#source], [output]));
-		this.dispose();
 		return this.#newArrayFrom({
 			source: output,
 			st: require_backend.ShapeTracker.fromShape(this.shape),
@@ -3753,7 +3594,6 @@ var Array$1 = class Array$1 extends Tracer {
 			});
 			if (arrays.every((ar) => require_backend.deepEqual(ar.#st, arrays[0].#st))) {
 				const exp$4 = custom(sources);
-				arrays.forEach((ar) => ar.dispose());
 				return new Array$1({
 					source: exp$4.simplify(),
 					st: arrays[0].#st,
@@ -3769,7 +3609,6 @@ var Array$1 = class Array$1 extends Tracer {
 				return require_backend.accessorAluExp(src$1, ar.#st, require_backend.unravelAlu(newShape, require_backend.AluVar.idx));
 			}));
 			const st = require_backend.ShapeTracker.fromShape(newShape);
-			arrays.forEach((ar) => ar.dispose());
 			return new Array$1({
 				source: exp$3.simplify(),
 				st,
@@ -3812,7 +3651,6 @@ var Array$1 = class Array$1 extends Tracer {
 		const pending = new Set([...arrays.flatMap((ar) => ar.#pending)]);
 		for (const exe of pending) exe.updateRc(1);
 		pending.add(new PendingExecute(backend, kernel, inputs, [output]));
-		arrays.forEach((ar) => ar.dispose());
 		return new Array$1({
 			source: output,
 			st: require_backend.ShapeTracker.fromShape(newShape),
@@ -3842,7 +3680,6 @@ var Array$1 = class Array$1 extends Tracer {
 		const pending = [...this.#pending];
 		for (const exe of pending) exe.updateRc(1);
 		pending.push(new PendingExecute(this.#backend, kernel, inputs, [output]));
-		this.dispose();
 		return this.#newArrayFrom({
 			source: output,
 			st: require_backend.ShapeTracker.fromShape(newShape),
@@ -3868,7 +3705,6 @@ var Array$1 = class Array$1 extends Tracer {
 			for (const exe of pending) exe.updateRc(+outputs.length);
 			pending.push(new PendingExecute(backend, routine, inputs, outputs));
 			pending[pending.length - 1].updateRc(+outputs.length - 1);
-			arrays.forEach((ar) => ar.dispose());
 			return outputs.map((output, i) => new Array$1({
 				source: output,
 				st: require_backend.ShapeTracker.fromShape(avalsOut[i].shape),
@@ -3916,7 +3752,6 @@ var Array$1 = class Array$1 extends Tracer {
 		this.#check();
 		if (!(this.#source instanceof require_backend.AluExp)) throw new Error("internal: #dataInline called on non-AluExp source");
 		const ar = this.#newArrayFrom({ backend: require_backend.getBackend("cpu") });
-		this.dispose();
 		return ar.dataSync();
 	}
 	static #broadcastArrays(arrays) {
@@ -3956,7 +3791,6 @@ var Array$1 = class Array$1 extends Tracer {
 		}
 		const byteCount = require_backend.byteWidth(this.#dtype) * this.size;
 		const buf = await this.#backend.read(this.#source, 0, byteCount);
-		this.dispose();
 		return require_backend.dtypedArray(this.dtype, buf);
 	}
 	/**
@@ -3996,7 +3830,6 @@ var Array$1 = class Array$1 extends Tracer {
 		}
 		const byteCount = require_backend.byteWidth(this.#dtype) * this.size;
 		const buf = this.#backend.readSync(this.#source, 0, byteCount);
-		this.dispose();
 		return require_backend.dtypedArray(this.dtype, buf);
 	}
 	/**
@@ -4047,7 +3880,7 @@ var Array$1 = class Array$1 extends Tracer {
 				return [x.#binary(require_backend.AluOp.Max, y)];
 			},
 			[Primitive.Neg]([x]) {
-				return [zerosLike$1(x.ref).#binary(require_backend.AluOp.Sub, x)];
+				return [zerosLike$1(x).#binary(require_backend.AluOp.Sub, x)];
 			},
 			[Primitive.Reciprocal]([x]) {
 				return [x.#unary(require_backend.AluOp.Reciprocal)];
@@ -4073,13 +3906,11 @@ var Array$1 = class Array$1 extends Tracer {
 					x.#backend.incRef(x.#source);
 					const pending = x.#pending;
 					for (const exe of pending) exe.updateRc(1);
-					const y = x.#newArrayFrom({
+					return [x.#newArrayFrom({
 						dtype,
 						weakType: false,
 						pending
-					});
-					x.dispose();
-					return [y];
+					})];
 				}
 			},
 			[Primitive.Sin]([x]) {
@@ -4162,10 +3993,9 @@ var Array$1 = class Array$1 extends Tracer {
 				const outputs = [];
 				for (let i = 0, start = 0; i < sizes.length; i++) {
 					const slice = require_backend.range(x.ndim).map((d) => d === axis ? [start, start + sizes[i]] : [0, x.shape[d]]);
-					outputs.push(x.ref.#reshape(x.#st.shrink(slice)));
+					outputs.push(x.#reshape(x.#st.shrink(slice)));
 					start += sizes[i];
 				}
-				x.dispose();
 				return outputs;
 			},
 			[Primitive.RandomBits]([k0, k1], { shape: shape$1, mode }) {
@@ -4229,7 +4059,6 @@ var Array$1 = class Array$1 extends Tracer {
 				const jp = jitCompile(backend, jaxpr);
 				const { outputs, pending } = jp.execute(slots);
 				for (const exe of pending) exe.updateRc(+outputs.length - 1);
-				args.forEach((x) => x.dispose());
 				return outputs.map((source, i) => {
 					return new Array$1({
 						source,
@@ -4387,7 +4216,6 @@ var Array$1 = class Array$1 extends Tracer {
 				}
 				for (const s of constSlots) backend.decRef(s);
 				for (const s of xsSlots) backend.decRef(s);
-				allArgs.forEach((a) => a.dispose());
 				const outputs = [];
 				for (let ci = 0; ci < numCarry; ci++) {
 					const aval = bodyOutAvals[ci];
@@ -4425,15 +4253,14 @@ var Array$1 = class Array$1 extends Tracer {
 	/** @private Put this array on a new backend, asynchronously. */
 	async _put(backend) {
 		if (this.#backend === backend) return this;
-		if (this.#source instanceof require_backend.AluExp) {
-			const ar = this.#newArrayFrom({
-				backend,
-				committed: true
-			});
-			this.dispose();
-			return ar;
-		} else {
-			const data = await this.data();
+		if (this.#source instanceof require_backend.AluExp) return this.#newArrayFrom({
+			backend,
+			committed: true
+		});
+		else {
+			const byteCount = require_backend.byteWidth(this.#dtype) * this.size;
+			const buf = await this.#backend.read(this.#source, 0, byteCount);
+			const data = require_backend.dtypedArray(this.dtype, buf);
 			return arrayFromData(data, this.shape, {
 				dtype: this.#dtype,
 				device: backend.type
@@ -4443,15 +4270,14 @@ var Array$1 = class Array$1 extends Tracer {
 	/** @private Put this array on a new backend, synchronously. */
 	_putSync(backend) {
 		if (this.#backend === backend) return this;
-		if (this.#source instanceof require_backend.AluExp) {
-			const ar = this.#newArrayFrom({
-				backend,
-				committed: true
-			});
-			this.dispose();
-			return ar;
-		} else {
-			const data = this.dataSync();
+		if (this.#source instanceof require_backend.AluExp) return this.#newArrayFrom({
+			backend,
+			committed: true
+		});
+		else {
+			const byteCount = require_backend.byteWidth(this.#dtype) * this.size;
+			const buf = this.#backend.readSync(this.#source, 0, byteCount);
+			const data = require_backend.dtypedArray(this.dtype, buf);
 			return arrayFromData(data, this.shape, {
 				dtype: this.#dtype,
 				device: backend.type
@@ -4590,7 +4416,6 @@ function onesLike$1(val, dtype) {
 }
 function fullLike(val, fillValue, dtype) {
 	const aval = getAval(val);
-	if (val instanceof Tracer) val.dispose();
 	if (fillValue instanceof Tracer) throw new Error("numpy.fullLike() with array argument not implemented yet");
 	const sa = new ShapedArray(aval.shape, dtype ?? aval.dtype, aval.weakType);
 	return fullInternal(sa, fillValue);
@@ -4723,14 +4548,14 @@ function tril(a, k = 0) {
 	if (ndim$1(a) < 2) throw new Error(`tril: input array must be at least 2D, got ${ndim$1(a)}D`);
 	a = fudgeArray(a);
 	const [n, m] = a.shape.slice(-2);
-	return where$1(tri(n, m, k, { dtype: require_backend.DType.Bool }), a.ref, zerosLike$1(a));
+	return where$1(tri(n, m, k, { dtype: require_backend.DType.Bool }), a, zerosLike$1(a));
 }
 /** Return the upper triangle of an array. Must be of dimension >= 2. */
 function triu(a, k = 0) {
 	if (ndim$1(a) < 2) throw new Error(`tril: input array must be at least 2D, got ${ndim$1(a)}D`);
 	a = fudgeArray(a);
 	const [n, m] = a.shape.slice(-2);
-	return where$1(tri(n, m, k - 1, { dtype: require_backend.DType.Bool }), zerosLike$1(a.ref), a);
+	return where$1(tri(n, m, k - 1, { dtype: require_backend.DType.Bool }), zerosLike$1(a), a);
 }
 /**
 * Return evenly spaced numbers over a specified interval.
@@ -5065,7 +4890,7 @@ const vmapRules = {
 	[Primitive.LU]: lastDimsBatcher(Primitive.LU, 2, 3),
 	[Primitive.Jit](axisSize, args, dims, { name, jaxpr }) {
 		const newJaxpr = vmapJaxpr(jaxpr, axisSize, dims);
-		const outs = bind(Primitive.Jit, [...newJaxpr.consts.map((c) => c.ref), ...args], {
+		const outs = bind(Primitive.Jit, [...newJaxpr.consts, ...args], {
 			name: `${name}_vmap`,
 			jaxpr: newJaxpr.jaxpr,
 			numConsts: newJaxpr.consts.length
@@ -5104,7 +4929,7 @@ const vmapRules = {
 		];
 		const vmappedBody = vmapJaxpr(jaxpr, axisSize, bodyDims);
 		const scanArgs = [
-			...vmappedBody.consts.map((c) => c.ref),
+			...vmappedBody.consts,
 			...movedConsts,
 			...movedCarry,
 			...movedXs
@@ -5133,7 +4958,7 @@ function vmapJaxpr(jaxpr, axisSize, dims) {
 		shape$1.splice(dims[i], 0, axisSize);
 		return new ShapedArray(shape$1, v.aval.dtype, v.aval.weakType);
 	});
-	const { jaxpr: newJaxpr } = makeJaxpr$1((args) => vmapFlat(jaxprAsFun(jaxpr), dims, args), { validateRefs: false })(inAvals);
+	const { jaxpr: newJaxpr } = makeJaxpr$1((args) => vmapFlat(jaxprAsFun(jaxpr), dims, args))(inAvals);
 	if (!vmapJaxprCache.has(jaxpr)) vmapJaxprCache.set(jaxpr, /* @__PURE__ */ new Map());
 	vmapJaxprCache.get(jaxpr).set(cacheKey, newJaxpr);
 	return newJaxpr;
@@ -5152,7 +4977,6 @@ function vmapFlat(f, inAxes, args) {
 	try {
 		var _usingCtx$1 = (0, import_usingCtx$1.default)();
 		const main = _usingCtx$1.u(newMain(BatchTrace, axisSize));
-		main.isTransform = true;
 		const trace$1 = new BatchTrace(main);
 		const tracersIn = args.map((x, i) => inAxes[i] === null ? pureArray(x) : new BatchTracer(trace$1, pureArray(x), inAxes[i]));
 		const outs = f(...tracersIn);
@@ -5196,6 +5020,7 @@ function jacfwd$1(f) {
 //#region src/frontend/jvp.ts
 var import_usingCtx = /* @__PURE__ */ __toESM(require_usingCtx(), 1);
 var JVPTracer = class extends Tracer {
+	#rc = 1;
 	constructor(trace$1, primal, tangent) {
 		super(trace$1);
 		this.primal = primal;
@@ -5208,12 +5033,14 @@ var JVPTracer = class extends Tracer {
 		return `JVPTracer(${this.primal.toString()}, ${this.tangent.toString()})`;
 	}
 	get ref() {
-		this.primal.ref, this.tangent.ref;
+		this.#rc++;
 		return this;
 	}
 	dispose() {
-		this.primal.dispose();
-		this.tangent.dispose();
+		if (--this.#rc === 0) {
+			this.primal.dispose();
+			this.tangent.dispose();
+		}
 	}
 };
 var JVPTrace = class extends Trace {
@@ -5221,7 +5048,7 @@ var JVPTrace = class extends Trace {
 		return this.lift(pureArray(val));
 	}
 	lift(val) {
-		return new JVPTracer(this, val, zerosLike$1(val.ref));
+		return new JVPTracer(this, val, zerosLike$1(val));
 	}
 	processPrimitive(primitive, tracers, params) {
 		const [primalsIn, tangentsIn] = require_backend.unzip2(tracers.map((x) => [x.primal, x.tangent]));
@@ -5242,7 +5069,7 @@ function linearTangentsJvp(primitive) {
 /** Rule for product of gradients in bilinear operations. */
 function bilinearTangentsJvp(primitive) {
 	return ([x, y], [dx, dy], params) => {
-		const primal = bind1(primitive, [x.ref, y.ref], params);
+		const primal = bind1(primitive, [x, y], params);
 		const tangent = bind1(primitive, [x, dy], params).add(bind1(primitive, [dx, y], params));
 		return [[primal], [tangent]];
 	};
@@ -5250,9 +5077,8 @@ function bilinearTangentsJvp(primitive) {
 /** Rule that zeros out any tangents. */
 function zeroTangentsJvp(primitive) {
 	return (primals, tangents, params) => {
-		for (const t of tangents) t.dispose();
 		const ys = bind(primitive, primals, params);
-		return [ys, ys.map((y) => zerosLike$1(y.ref))];
+		return [ys, ys.map((y) => zerosLike$1(y))];
 	};
 }
 /** Compute `a @ b.T`, batched to last two axes. */
@@ -5279,23 +5105,22 @@ const jvpRules = {
 	[Primitive.Idiv]: zeroTangentsJvp(Primitive.Idiv),
 	[Primitive.Mod]([x, y], [dx, dy]) {
 		if (!require_backend.isFloatDtype(x.dtype) && !require_backend.isFloatDtype(y.dtype)) {
-			dx.dispose();
-			dy.dispose();
-			return [[x.ref, y.ref], [zerosLike$1(x), zerosLike$1(y)]];
+			const result = mod(x, y);
+			return [[result], [zerosLike$1(result)]];
 		}
-		const q = idiv(x.ref, y.ref);
+		const q = idiv(x, y);
 		return [[mod(x, y)], [dx.sub(dy.mul(q))]];
 	},
 	[Primitive.Min]([x, y], [dx, dy]) {
-		return [[min$1(x.ref, y.ref)], [where$1(less$1(y, x), dy, dx)]];
+		return [[min$1(x, y)], [where$1(less$1(y, x), dy, dx)]];
 	},
 	[Primitive.Max]([x, y], [dx, dy]) {
-		return [[max$1(x.ref, y.ref)], [where$1(less$1(x, y), dy, dx)]];
+		return [[max$1(x, y)], [where$1(less$1(x, y), dy, dx)]];
 	},
 	[Primitive.Neg]: linearTangentsJvp(Primitive.Neg),
 	[Primitive.Reciprocal]([x], [dx]) {
-		const xRecip = reciprocal$1(x.ref);
-		return [[xRecip.ref], [neg(xRecip.ref.mul(xRecip)).mul(dx)]];
+		const xRecip = reciprocal$1(x);
+		return [[xRecip], [neg(xRecip.mul(xRecip)).mul(dx)]];
 	},
 	[Primitive.Floor]: zeroTangentsJvp(Primitive.Floor),
 	[Primitive.Ceil]: zeroTangentsJvp(Primitive.Ceil),
@@ -5303,61 +5128,57 @@ const jvpRules = {
 	[Primitive.Cast]([x], [dx], { dtype }) {
 		if (x.dtype === dtype) return [[x], [dx]];
 		if (require_backend.isFloatDtype(dtype) && require_backend.isFloatDtype(x.dtype)) return [[cast(x, dtype)], [cast(dx, dtype)]];
-		else {
-			dx.dispose();
-			return [[cast(x.ref, dtype)], [zerosLike$1(x)]];
-		}
+		else return [[cast(x, dtype)], [zerosLike$1(x)]];
 	},
 	[Primitive.Bitcast]([x], [dx], { dtype }) {
 		if (x.dtype === dtype) return [[x], [dx]];
-		dx.dispose();
-		return [[bitcast(x.ref, dtype)], [zerosLike$1(x)]];
+		return [[bitcast(x, dtype)], [zerosLike$1(x)]];
 	},
 	[Primitive.Sin]([x], [dx]) {
-		return [[sin$1(x.ref)], [cos$1(x).mul(dx)]];
+		return [[sin$1(x)], [cos$1(x).mul(dx)]];
 	},
 	[Primitive.Cos]([x], [dx]) {
-		return [[cos$1(x.ref)], [neg(sin$1(x)).mul(dx)]];
+		return [[cos$1(x)], [neg(sin$1(x)).mul(dx)]];
 	},
 	[Primitive.Asin]([x], [dx]) {
-		const denom = sqrt$1(reciprocal$1(cast(1, x.dtype).sub(x.ref.mul(x.ref))));
+		const denom = sqrt$1(reciprocal$1(cast(1, x.dtype).sub(x.mul(x))));
 		return [[asin$1(x)], [denom.mul(dx)]];
 	},
 	[Primitive.Atan]([x], [dx]) {
-		const denom = cast(1, x.dtype).add(x.ref.mul(x.ref));
+		const denom = cast(1, x.dtype).add(x.mul(x));
 		return [[atan$1(x)], [dx.div(denom)]];
 	},
 	[Primitive.Exp]([x], [dx]) {
 		const z = exp$1(x);
-		return [[z.ref], [z.mul(dx)]];
+		return [[z], [z.mul(dx)]];
 	},
 	[Primitive.Log]([x], [dx]) {
-		return [[log$1(x.ref)], [reciprocal$1(x).mul(dx)]];
+		return [[log$1(x)], [reciprocal$1(x).mul(dx)]];
 	},
 	[Primitive.Erf]([x], [dx]) {
 		const coeff = 2 / Math.sqrt(Math.PI);
-		const expTerm = exp$1(neg(x.ref.mul(x.ref)));
+		const expTerm = exp$1(neg(x.mul(x)));
 		return [[erf$1(x)], [expTerm.mul(coeff).mul(dx)]];
 	},
 	[Primitive.Erfc]([x], [dx]) {
 		const coeff = -2 / Math.sqrt(Math.PI);
-		const expTerm = exp$1(neg(x.ref.mul(x.ref)));
+		const expTerm = exp$1(neg(x.mul(x)));
 		return [[erfc$1(x)], [expTerm.mul(coeff).mul(dx)]];
 	},
 	[Primitive.Sqrt]([x], [dx]) {
 		const z = sqrt$1(x);
-		return [[z.ref], [reciprocal$1(z.mul(2)).mul(dx)]];
+		return [[z], [reciprocal$1(z.mul(2)).mul(dx)]];
 	},
 	[Primitive.Reduce]([x], [dx], { op, axis }) {
 		if (op === require_backend.AluOp.Add) return [[reduce(x, op, axis)], [reduce(dx, op, axis)]];
 		else if (op === require_backend.AluOp.Mul) {
-			const primal = reduce(x.ref, op, axis);
-			const tangent = broadcast(primal.ref, x.shape, axis).mul(reciprocal$1(x)).mul(dx).sum(axis);
+			const primal = reduce(x, op, axis);
+			const tangent = broadcast(primal, x.shape, axis).mul(reciprocal$1(x)).mul(dx).sum(axis);
 			return [[primal], [tangent]];
 		} else if (op === require_backend.AluOp.Min || op === require_backend.AluOp.Max) {
-			const primal = reduce(x.ref, op, axis);
-			const notMin = notEqual$1(x, broadcast(primal.ref, x.shape, axis));
-			const minCount = where$1(notMin.ref, 0, 1).sum(axis);
+			const primal = reduce(x, op, axis);
+			const notMin = notEqual$1(x, broadcast(primal, x.shape, axis));
+			const minCount = where$1(notMin, 0, 1).sum(axis);
 			const tangent = where$1(notMin, 0, dx).sum(axis).div(minCount);
 			return [[primal], [tangent]];
 		} else throw new Error(`JVP rule not implemented for reduce op: ${op}`);
@@ -5368,14 +5189,13 @@ const jvpRules = {
 	[Primitive.Conv]: bilinearTangentsJvp(Primitive.Conv),
 	[Primitive.Compare]: zeroTangentsJvp(Primitive.Compare),
 	[Primitive.Where]([cond, x, y], [dcond, dx, dy]) {
-		dcond.dispose();
-		return [[where$1(cond.ref, x, y)], [where$1(cond, dx, dy)]];
+		return [[where$1(cond, x, y)], [where$1(cond, dx, dy)]];
 	},
 	[Primitive.Concatenate]: linearTangentsJvp(Primitive.Concatenate),
 	[Primitive.Split]: linearTangentsJvp(Primitive.Split),
 	[Primitive.RandomBits]: zeroTangentsJvp(Primitive.RandomBits),
 	[Primitive.Gather]([x, ...indices], [dx, ..._], { axis, outDim }) {
-		const indicesRef = indices.map((t) => t.ref);
+		const indicesRef = indices;
 		return [[gather(x, indices, axis, outDim)], [gather(dx, indicesRef, axis, outDim)]];
 	},
 	[Primitive.Transpose]: linearTangentsJvp(Primitive.Transpose),
@@ -5390,44 +5210,44 @@ const jvpRules = {
 	},
 	[Primitive.Argsort]([x], [dx]) {
 		const [y, idx] = argsort$1(x);
-		return [[y, idx.ref], [gather(dx, [idx.ref], [-1], -1), zerosLike$1(idx)]];
+		return [[y, idx.ref], [gather(dx, [idx], [-1], -1), zerosLike$1(idx)]];
 	},
 	[Primitive.TriangularSolve]([a, b], [da, db], { unitDiagonal }) {
-		const x = triangularSolve$1(a.ref, b, { unitDiagonal });
-		const dax = batchMatmulT(da, x.ref);
+		const x = triangularSolve$1(a, b, { unitDiagonal });
+		const dax = batchMatmulT(da, x);
 		const rhsT = db.sub(mT(dax));
 		const dx = triangularSolve$1(a, rhsT, { unitDiagonal });
 		return [[x], [dx]];
 	},
 	[Primitive.Cholesky]([a], [da]) {
-		const L = cholesky$2(a.ref);
-		da = da.ref.add(mT(da)).mul(.5);
-		const W = triangularSolve$1(L.ref, da, { lower: true });
-		const ST = triangularSolve$1(L.ref, mT(W), { lower: true });
-		const dL = batchMatmulT(L.ref, triu(ST.ref, 1).add(triu(ST)).mul(.5));
+		const L = cholesky$2(a);
+		da = da.add(mT(da)).mul(.5);
+		const W = triangularSolve$1(L, da, { lower: true });
+		const ST = triangularSolve$1(L, mT(W), { lower: true });
+		const dL = batchMatmulT(L, triu(ST, 1).add(triu(ST)).mul(.5));
 		return [[L], [dL]];
 	},
 	[Primitive.LU]([a], [da]) {
 		const [luMatrix, pivots, permutation] = lu$1(a);
 		const [m, n] = a.shape.slice(-2);
 		const k = Math.min(m, n);
-		const luSliceL = sliceAxis(luMatrix.ref, -1, [0, k]);
+		const luSliceL = sliceAxis(luMatrix, -1, [0, k]);
 		const lLower = tril(luSliceL, -1);
 		const lPadded = m > k ? padAxis(lLower, -1, [0, m - k]) : lLower;
 		const L = lPadded.add(eye(m));
-		const luSliceU = sliceAxis(luMatrix.ref, -2, [0, k]);
+		const luSliceU = sliceAxis(luMatrix, -2, [0, k]);
 		const uUpper = triu(luSliceU);
 		const uPadded = n > k ? padAxis(uUpper, -2, [0, n - k]) : uUpper;
-		const uEye = n > k ? padAxis(padAxis(eye(n - k), -1, [k, 0]), -2, [k, 0]) : zerosLike$1(uPadded.ref);
+		const uEye = n > k ? padAxis(padAxis(eye(n - k), -1, [k, 0]), -2, [k, 0]) : zerosLike$1(uPadded);
 		const U = uPadded.add(uEye);
-		const P = permutation.ref.reshape([...permutation.shape, 1]).equal(arange(m)).astype(da.dtype);
+		const P = permutation.reshape([...permutation.shape, 1]).equal(arange(m)).astype(da.dtype);
 		const pda = batchMatmulT(P, mT(da));
-		const la = mT(triangularSolve$1(L.ref, mT(pda), {
+		const la = mT(triangularSolve$1(L, mT(pda), {
 			lower: true,
 			unitDiagonal: true
 		}));
-		const lau = triangularSolve$1(mT(U.ref), la, { lower: true });
-		const lDot = batchMatmulT(L, mT(tril(lau.ref, -1)));
+		const lau = triangularSolve$1(mT(U), la, { lower: true });
+		const lDot = batchMatmulT(L, mT(tril(lau, -1)));
 		const uDot = batchMatmulT(triu(lau), mT(U));
 		return [[
 			luMatrix,
@@ -5435,14 +5255,14 @@ const jvpRules = {
 			permutation
 		], [
 			lDot.add(uDot),
-			zerosLike$1(pivots.ref),
-			zerosLike$1(permutation.ref)
+			zerosLike$1(pivots),
+			zerosLike$1(permutation)
 		]];
 	},
 	[Primitive.Jit](primals, tangents, { name, jaxpr }) {
 		const newJaxpr = jvpJaxpr(jaxpr);
 		const outs = bind(Primitive.Jit, [
-			...newJaxpr.consts.map((c) => c.ref),
+			...newJaxpr.consts,
 			...primals,
 			...tangents
 		], {
@@ -5487,14 +5307,14 @@ const jvpRules = {
 			const xP_in = scanOrderArgs.slice(numConsts * 2 + numCarry * 2, numConsts * 2 + numCarry * 2 + numX);
 			const xT_in = scanOrderArgs.slice(numConsts * 2 + numCarry * 2 + numX);
 			const jvpOrderArgs = [
-				...constsP_in.map((x) => x.ref),
-				...carryP_in.map((x) => x.ref),
-				...xP_in.map((x) => x.ref),
-				...constsT_in.map((x) => x.ref),
-				...carryT_in.map((x) => x.ref),
-				...xT_in.map((x) => x.ref)
+				...constsP_in,
+				...carryP_in,
+				...xP_in,
+				...constsT_in,
+				...carryT_in,
+				...xT_in
 			];
-			const jvpOutputs = bind(Primitive.Jit, [...jvpBody.consts.map((c) => c.ref), ...jvpOrderArgs], {
+			const jvpOutputs = bind(Primitive.Jit, [...jvpBody.consts, ...jvpOrderArgs], {
 				jaxpr: jvpBody.jaxpr,
 				numConsts: numJvpConsts,
 				name: "jvp_body"
@@ -5509,7 +5329,7 @@ const jvpRules = {
 				...yP_out,
 				...yT_out
 			];
-		}, { validateRefs: false })(...wrapperInAvals);
+		})(...wrapperInAvals);
 		const constsP = primals.slice(0, numConsts);
 		const carryP = primals.slice(numConsts, numConsts + numCarry);
 		const xsP = primals.slice(numConsts + numCarry);
@@ -5517,13 +5337,13 @@ const jvpRules = {
 		const carryT = tangents.slice(numConsts, numConsts + numCarry);
 		const xsT = tangents.slice(numConsts + numCarry);
 		const scanArgsJvp = [
-			...wrapperJaxpr.consts.map((c) => c.ref),
-			...constsP.map((c) => c.ref),
-			...constsT.map((c) => c.ref),
-			...carryP.map((c) => c.ref),
-			...carryT.map((c) => c.ref),
-			...xsP.map((x) => x.ref),
-			...xsT.map((x) => x.ref)
+			...wrapperJaxpr.consts,
+			...constsP,
+			...constsT,
+			...carryP,
+			...carryT,
+			...xsP,
+			...xsT
 		];
 		const results = bind(Primitive.Scan, scanArgsJvp, {
 			jaxpr: wrapperJaxpr.jaxpr,
@@ -5547,7 +5367,7 @@ const jvpJaxprCache = /* @__PURE__ */ new Map();
 function jvpJaxpr(jaxpr) {
 	if (jvpJaxprCache.has(jaxpr)) return jvpJaxprCache.get(jaxpr);
 	const inAvals = jaxpr.inBinders.map((v) => v.aval);
-	const { jaxpr: newJaxpr } = makeJaxpr$1((primals, tangents) => jvpFlat(jaxprAsFun(jaxpr), primals, tangents), { validateRefs: false })(inAvals, inAvals);
+	const { jaxpr: newJaxpr } = makeJaxpr$1((primals, tangents) => jvpFlat(jaxprAsFun(jaxpr), primals, tangents))(inAvals, inAvals);
 	jvpJaxprCache.set(jaxpr, newJaxpr);
 	return newJaxpr;
 }
@@ -5555,7 +5375,6 @@ function jvpFlat(f, primals, tangents) {
 	try {
 		var _usingCtx$1 = (0, import_usingCtx.default)();
 		const main = _usingCtx$1.u(newMain(JVPTrace));
-		main.isTransform = true;
 		const trace$1 = new JVPTrace(main);
 		const tracersIn = require_backend.zip(primals, tangents).map(([x, t]) => new JVPTracer(trace$1, pureArray(x), pureArray(t)));
 		const outs = f(...tracersIn);
@@ -5589,10 +5408,8 @@ function jvp$1(f, primals, tangents, { hasAux = false } = {}) {
 function lowerAux(aux) {
 	const level = currentTraceLevel();
 	return map((x) => {
-		if (x instanceof Tracer) while (x._trace.main.level > level) if (x instanceof JVPTracer) {
-			x.tangent.dispose();
-			x = x.primal;
-		} else {
+		if (x instanceof Tracer) while (x._trace.main.level > level) if (x instanceof JVPTracer) x = x.primal;
+		else {
 			const y = x.fullLower();
 			if (y._trace.main.level >= x._trace.main.level) throw new Error("internal: lowerAux did not reduce trace level");
 			x = y;
@@ -5717,18 +5534,11 @@ var PartialEvalTracer = class extends Tracer {
 		if (this.#rc <= 0) throw new UseAfterFreeError(this);
 		if (--this.#rc === 0) {
 			if (this.pval.isKnown) this.pval.val.dispose();
-			else if (this.recipe) {
-				if (this.recipe.type === "Const") this.recipe.val.dispose();
-				else if (this.recipe.type === "JaxprEqn") this.recipe.tracersIn.forEach((t) => t.dispose());
-			}
+			else if (this.recipe?.type === "Const") this.recipe.val.dispose();
 		}
 	}
 	fullLower() {
-		if (this.pval.isKnown) {
-			const val = this.pval.val.ref;
-			this.dispose();
-			return val;
-		}
+		if (this.pval.isKnown) return this.pval.val;
 		return this;
 	}
 };
@@ -5746,7 +5556,6 @@ var PartialEvalTrace = class extends Trace {
 		else {
 			const pval = PartialVal.unknown(ShapedArray.fromAval(tracer.aval));
 			const val = tracer.pval.val.ref;
-			tracer.dispose();
 			return new PartialEvalTracer(this, pval, {
 				type: "Const",
 				val
@@ -6015,7 +5824,11 @@ function evalJaxprTransposed(jaxpr, args, cotangents) {
 		if (allInputsKnown) for (const outVar of eqn.outBinders) knownVars.add(outVar);
 	}
 	const knownPrimals = /* @__PURE__ */ new Map();
-	for (let i = 0; i < jaxpr.inBinders.length; i++) if (!(args[i] instanceof UndefPrimal)) knownPrimals.set(jaxpr.inBinders[i], args[i]);
+	const argPrimals = /* @__PURE__ */ new Set();
+	for (let i = 0; i < jaxpr.inBinders.length; i++) if (!(args[i] instanceof UndefPrimal)) {
+		knownPrimals.set(jaxpr.inBinders[i], args[i]);
+		argPrimals.add(jaxpr.inBinders[i]);
+	}
 	const ctStore = /* @__PURE__ */ new Map();
 	const readCotangent = (v) => {
 		const ct = ctStore.get(v);
@@ -6050,7 +5863,7 @@ function evalJaxprTransposed(jaxpr, args, cotangents) {
 			else if (cotangentsIn[j] !== null) throw new Error("internal: cotangent should be null");
 		}
 	}
-	for (const t of knownPrimals.values()) t.dispose();
+	for (const [v, t] of knownPrimals.entries()) if (!argPrimals.has(v)) t.dispose();
 	const results = [];
 	for (let i = 0; i < jaxpr.inBinders.length; i++) if (args[i] instanceof UndefPrimal) results.push(readCotangent(jaxpr.inBinders[i]));
 	return results;
@@ -6795,17 +6608,17 @@ const fftUpdate = jit$1(function fftUpdate$1(i, { real, imag }) {
 	imag = imag.reshape([-1, 2 * half]);
 	const k = arange(0, half, 1, { dtype: real.dtype });
 	const theta = k.mul(-Math.PI / half);
-	const wr = cos(theta.ref);
+	const wr = cos(theta);
 	const wi = sin(theta);
-	const ur = real.ref.slice([], [0, half]);
-	const ui = imag.ref.slice([], [0, half]);
+	const ur = real.slice([], [0, half]);
+	const ui = imag.slice([], [0, half]);
 	const vr = real.slice([], [half, 2 * half]);
 	const vi = imag.slice([], [half, 2 * half]);
-	const tr = vr.ref.mul(wr.ref).sub(vi.ref.mul(wi.ref));
+	const tr = vr.mul(wr).sub(vi.mul(wi));
 	const ti = vr.mul(wi).add(vi.mul(wr));
 	return {
-		real: concatenate([ur.ref.add(tr.ref), ur.sub(tr)], -1),
-		imag: concatenate([ui.ref.add(ti.ref), ui.sub(ti)], -1)
+		real: concatenate([ur.add(tr), ur.sub(tr)], -1),
+		imag: concatenate([ui.add(ti), ui.sub(ti)], -1)
 	};
 }, { staticArgnums: [0] });
 /**
@@ -6900,7 +6713,7 @@ function checkSquare(name, a) {
 function cholesky(a, { upper = false, symmetrizeInput = true } = {}) {
 	a = fudgeArray(a);
 	checkSquare("cholesky", a);
-	if (symmetrizeInput) a = a.ref.add(matrixTranspose(a)).mul(.5);
+	if (symmetrizeInput) a = a.add(matrixTranspose(a)).mul(.5);
 	return cholesky$1(a, { upper });
 }
 /** Compute the determinant of a square matrix (batched). */
@@ -6908,7 +6721,6 @@ function det(a) {
 	a = fudgeArray(a);
 	const n = checkSquare("det", a);
 	const [lu$2, pivots, permutation] = lu(a);
-	permutation.dispose();
 	const parity = pivots.notEqual(arange(n)).astype(int32).sum(-1).mod(2);
 	const sign$1 = parity.mul(-2).add(1);
 	const diag$1 = lu$2.diagonal(0, -1, -2);
@@ -6939,11 +6751,11 @@ function lstsq(a, b) {
 	if (a.ndim !== 2) throw new Error(`lstsq: 'a' must be a 2D array, got ${a.aval}`);
 	const [m, n] = a.shape;
 	if (b.shape[0] !== m) throw new Error(`lstsq: leading dimension of 'b' must match number of rows of 'a', got ${b.aval}`);
-	const at = matrixTranspose(a.ref);
+	const at = matrixTranspose(a);
 	if (m <= n) {
-		const aat = matmul(a, at.ref);
+		const aat = matmul(a, at);
 		const l = cholesky(aat, { symmetrizeInput: false });
-		const lb = triangularSolve(l.ref, b, {
+		const lb = triangularSolve(l, b, {
 			leftSide: true,
 			lower: true
 		});
@@ -6954,10 +6766,10 @@ function lstsq(a, b) {
 		});
 		return matmul(at, llb);
 	} else {
-		const ata = matmul(at.ref, a);
+		const ata = matmul(at, a);
 		const l = cholesky(ata, { symmetrizeInput: false });
 		const atb = matmul(at, b);
-		const lb = triangularSolve(l.ref, atb, {
+		const lb = triangularSolve(l, atb, {
 			leftSide: true,
 			lower: true
 		});
@@ -6974,10 +6786,7 @@ function matrixPower(a, n) {
 	if (!Number.isInteger(n)) throw new Error(`matrixPower: exponent must be an integer, got ${n}`);
 	a = fudgeArray(a);
 	const m = checkSquare("matrixPower", a);
-	if (n === 0) {
-		a.dispose();
-		return broadcastTo(eye(m), a.shape);
-	}
+	if (n === 0) return broadcastTo(eye(m), a.shape);
 	if (n < 0) {
 		a = inv(a);
 		n = -n;
@@ -6985,11 +6794,10 @@ function matrixPower(a, n) {
 	let result = null;
 	let a2k = a;
 	for (let k = 0; n; k++) {
-		if (k > 0) a2k = matmul(a2k.ref, a2k);
-		if (n % 2 === 1) result = result === null ? a2k.ref : matmul(result, a2k.ref);
+		if (k > 0) a2k = matmul(a2k, a2k);
+		if (n % 2 === 1) result = result === null ? a2k : matmul(result, a2k);
 		n = Math.floor(n / 2);
 	}
-	a2k.dispose();
 	return result;
 }
 /** Return sign and natural logarithm of the determinant of `a`. */
@@ -6997,10 +6805,9 @@ function slogdet(a) {
 	a = fudgeArray(a);
 	const n = checkSquare("slogdet", a);
 	const [lu$2, pivots, permutation] = lu(a);
-	permutation.dispose();
 	let parity = pivots.notEqual(arange(n)).astype(int32).sum(-1);
 	const diag$1 = lu$2.diagonal(0, -1, -2);
-	parity = parity.add(diag$1.ref.less(0).astype(int32).sum(-1)).mod(2);
+	parity = parity.add(diag$1.less(0).astype(int32).sum(-1)).mod(2);
 	const logabsdet = log(absolute(diag$1)).sum(-1);
 	const sign$1 = parity.mul(-2).add(1);
 	return [sign$1, logabsdet];
@@ -7036,9 +6843,8 @@ function solve(a, b) {
 		m
 	]);
 	const [lu$2, pivots, permutation] = lu(a);
-	pivots.dispose();
 	const P = arange(n).equal(permutation.reshape([...permutation.shape, 1])).astype(b.dtype);
-	const LPb = triangularSolve(lu$2.ref, matmul(P, b), {
+	const LPb = triangularSolve(lu$2, matmul(P, b), {
 		leftSide: true,
 		lower: true,
 		unitDiagonal: true
@@ -7469,7 +7275,7 @@ function all(a, axis = null, opts) {
 /** Return the peak-to-peak range along a given axis (`max - min`). */
 function ptp(a, axis = null, opts) {
 	a = fudgeArray(a);
-	return max(a.ref, axis, opts).sub(min(a, axis, opts));
+	return max(a, axis, opts).sub(min(a, axis, opts));
 }
 /** Compute the average of the array elements along the specified axis. */
 function mean(a, axis = null, opts) {
@@ -7488,7 +7294,7 @@ function argmin(a, axis, opts) {
 		axis = 0;
 	} else axis = require_backend.checkAxis(axis, a.ndim);
 	const shape$1 = a.shape;
-	const isMax = equal(a, min(a.ref, axis, { keepdims: true }));
+	const isMax = equal(a, min(a, axis, { keepdims: true }));
 	const length = array(shape$1[axis], {
 		dtype: int32,
 		device: a.device
@@ -7512,7 +7318,7 @@ function argmax(a, axis, opts) {
 		axis = 0;
 	} else axis = require_backend.checkAxis(axis, a.ndim);
 	const shape$1 = a.shape;
-	const isMax = equal(a, max(a.ref, axis, { keepdims: true }));
+	const isMax = equal(a, max(a, axis, { keepdims: true }));
 	const length = array(shape$1[axis], {
 		dtype: int32,
 		device: a.device
@@ -7833,7 +7639,7 @@ function diag(v, k = 0) {
 	if (!Number.isInteger(k)) throw new Error(`k must be an integer, got ${k}`);
 	if (a.ndim === 1) {
 		const n = a.shape[0];
-		const ret = where(eye(n).equal(1), a.ref, zerosLike(a));
+		const ret = where(eye(n).equal(1), a, zerosLike(a));
 		if (k > 0) return pad(ret, [[0, k], [k, 0]]);
 		else if (k < 0) return pad(ret, [[-k, 0], [0, -k]]);
 		else return ret;
@@ -8152,12 +7958,12 @@ function clip(a, min$2, max$2) {
 */
 function absolute(x) {
 	x = fudgeArray(x);
-	return where(less(x.ref, 0), x.ref.mul(-1), x);
+	return where(less(x, 0), x.mul(-1), x);
 }
 /** Return an element-wise indication of sign of the input. */
 function sign(x) {
 	x = fudgeArray(x);
-	return where(notEqual(x.ref, 0), where(less(x, 0), -1, 1), 0);
+	return where(notEqual(x, 0), where(less(x, 0), -1, 1), 0);
 }
 /** @function Return element-wise positive values of the input (no-op). */
 const positive = fudgeArray;
@@ -8185,17 +7991,17 @@ function hann(M) {
 * - `heaviside(x1, x2) = 1` for `x1 > 0`.
 */
 const heaviside = jit$1(function heaviside$1(x1, x2) {
-	return where(less(x1.ref, 0), 0, where(equal(x1, 0), x2, 1));
+	return where(less(x1, 0), 0, where(equal(x1, 0), x2, 1));
 });
 /** Calculate element-wise square of the input array. */
 function square(x) {
 	x = fudgeArray(x);
-	return x.ref.mul(x);
+	return x.mul(x);
 }
 /** Element-wise tangent function (takes radians). */
 function tan(x) {
 	x = fudgeArray(x);
-	return sin(x.ref).div(cos(x));
+	return sin(x).div(cos(x));
 }
 /**
 * @function
@@ -8208,8 +8014,8 @@ function tan(x) {
 * requires a custom JVP rule to handle properly (see JAX implementation).
 */
 const sinc = jit$1(function sinc$1(x) {
-	const pix = x.ref.mul(Math.PI);
-	return where(equal(x, 0), 1, sin(pix.ref).div(pix));
+	const pix = x.mul(Math.PI);
+	return where(equal(x, 0), 1, sin(pix).div(pix));
 });
 /** Element-wise inverse cosine function (inverse of cos). */
 function acos(x) {
@@ -8240,9 +8046,9 @@ const hypot = jit$1(function hypot$1(x1, x2) {
 * The output is ill-defined when both x and y are zero.
 */
 const atan2 = jit$1(function atan2$1(y, x) {
-	const r = sqrt(square(x.ref).add(square(y.ref)));
-	const xNeg = less(x.ref, 0);
-	const numer = where(xNeg.ref, r.ref.sub(x.ref), y.ref);
+	const r = sqrt(square(x).add(square(y)));
+	const xNeg = less(x, 0);
+	const numer = where(xNeg, r.sub(x), y);
 	const denom = where(xNeg, y, r.add(x));
 	return atan(numer.div(denom)).mul(2);
 });
@@ -8279,21 +8085,21 @@ function floorDivide(x, y) {
 	x = fudgeArray(x);
 	y = fudgeArray(y);
 	if (require_backend.isFloatDtype(x.dtype) || require_backend.isFloatDtype(y.dtype)) return floor(trueDivide(x, y));
-	return subtract(x, remainder(x.ref, y.ref)).div(y);
+	return subtract(x, remainder(x, y)).div(y);
 }
 /**
 * @function
 * Calculate element-wise floating-point modulo operation.
 */
 const fmod = jit$1(function fmod$1(x, y) {
-	return x.ref.sub(y.ref.mul(idiv(x, y)));
+	return x.sub(y.mul(idiv(x, y)));
 });
 /**
 * @function
 * Calculate element-wise remainder of the division (matches sign of y).
 */
 const remainder = jit$1(function remainder$1(x, y) {
-	return mod(mod(x, y.ref).add(y.ref), y);
+	return mod(mod(x, y).add(y), y);
 });
 /**
 * Return element-wise quotient and remainder simultaneously.
@@ -8307,7 +8113,7 @@ const remainder = jit$1(function remainder$1(x, y) {
 function divmod(x, y) {
 	const xArr = fudgeArray(x);
 	const yArr = fudgeArray(y);
-	return [floorDivide(xArr.ref, yArr.ref), remainder(xArr, yArr)];
+	return [floorDivide(xArr, yArr), remainder(xArr, yArr)];
 }
 /** Round input to the nearest integer towards zero. */
 function trunc(x) {
@@ -8330,9 +8136,9 @@ function ldexp(x1, x2) {
 */
 function frexp(x) {
 	x = fudgeArray(x);
-	const absx = absolute(x.ref);
-	const exponent = where(equal(x.ref, 0), 0, floor(log2(absx)).add(1).astype(require_backend.DType.Int32));
-	const mantissa = x.div(exp2(exponent.ref.astype(x.dtype)));
+	const absx = absolute(x);
+	const exponent = where(equal(x, 0), 0, floor(log2(absx)).add(1).astype(require_backend.DType.Int32));
+	const mantissa = x.div(exp2(exponent.astype(x.dtype)));
 	return [mantissa, exponent];
 }
 /** Calculate `2**p` for all p in the input array. */
@@ -8372,15 +8178,15 @@ const degrees = rad2deg;
 * Computes first array raised to power of second array, element-wise.
 */
 const power = jit$1(function power$1(x1, x2) {
-	const x2i = trunc(x2.ref);
-	const shouldBeNaN = multiply(x2.ref.notEqual(x2i.ref), x1.ref.less(0));
-	const resultSign = where(mod(x2i, 2).notEqual(0), where(x1.ref.less(0), -1, 1), 1);
+	const x2i = trunc(x2);
+	const shouldBeNaN = multiply(x2.notEqual(x2i), x1.less(0));
+	const resultSign = where(mod(x2i, 2).notEqual(0), where(x1.less(0), -1, 1), 1);
 	return where(shouldBeNaN, nan, exp(log(absolute(x1)).mul(x2)).mul(resultSign));
 });
 /** @function Calculate the element-wise cube root of the input array. */
 const cbrt = jit$1(function cbrt$1(x) {
-	const sgn = where(less(x.ref, 0), -1, 1);
-	return sgn.ref.mul(exp(log(x.mul(sgn)).mul(1 / 3)));
+	const sgn = where(less(x, 0), -1, 1);
+	return sgn.mul(exp(log(x.mul(sgn)).mul(1 / 3)));
 });
 /**
 * @function
@@ -8390,7 +8196,7 @@ const cbrt = jit$1(function cbrt$1(x) {
 */
 const sinh = jit$1(function sinh$1(x) {
 	const ex = exp(x);
-	const emx = reciprocal(ex.ref);
+	const emx = reciprocal(ex);
 	return ex.sub(emx).mul(.5);
 });
 /**
@@ -8401,7 +8207,7 @@ const sinh = jit$1(function sinh$1(x) {
 */
 const cosh = jit$1(function cosh$1(x) {
 	const ex = exp(x);
-	const emx = reciprocal(ex.ref);
+	const emx = reciprocal(ex);
 	return ex.add(emx).mul(.5);
 });
 /**
@@ -8411,9 +8217,9 @@ const cosh = jit$1(function cosh$1(x) {
 * `tanh(x) = sinh(x)/cosh(x) = (exp(x) - exp(-x)) / (exp(x) + exp(-x))`
 */
 const tanh = jit$1(function tanh$1(x) {
-	const negsgn = where(less(x.ref, 0), 1, -1);
-	const en2x = exp(x.mul(negsgn.ref).mul(2));
-	return en2x.ref.sub(1).div(en2x.add(1)).mul(negsgn);
+	const negsgn = where(less(x, 0), 1, -1);
+	const en2x = exp(x.mul(negsgn).mul(2));
+	return en2x.sub(1).div(en2x.add(1)).mul(negsgn);
 });
 /**
 * @function
@@ -8422,7 +8228,7 @@ const tanh = jit$1(function tanh$1(x) {
 * `arcsinh(x) = ln(x + sqrt(x^2 + 1))`
 */
 const arcsinh = jit$1(function arcsinh$1(x) {
-	return log(x.ref.add(sqrt(square(x).add(1))));
+	return log(x.add(sqrt(square(x).add(1))));
 });
 /**
 * @function
@@ -8431,7 +8237,7 @@ const arcsinh = jit$1(function arcsinh$1(x) {
 * `arccosh(x) = ln(x + sqrt(x^2 - 1))`
 */
 const arccosh = jit$1(function arccosh$1(x) {
-	return log(x.ref.add(sqrt(square(x).sub(1))));
+	return log(x.add(sqrt(square(x).sub(1))));
 });
 /**
 * @function
@@ -8440,7 +8246,7 @@ const arccosh = jit$1(function arccosh$1(x) {
 * `arctanh(x) = 0.5 * ln((1 + x) / (1 - x))`
 */
 const arctanh = jit$1(function arctanh$1(x) {
-	return log(add(1, x.ref).div(subtract(1, x))).mul(.5);
+	return log(add(1, x).div(subtract(1, x))).mul(.5);
 });
 /**
 * Compute the variance of an array.
@@ -8456,7 +8262,7 @@ function var_(x, axis = null, opts) {
 	axis = require_backend.normalizeAxis(axis, x.ndim);
 	const n = axis.reduce((acc, a) => acc * x.shape[a], 1);
 	if (n === 0) throw new Error("var: cannot compute variance over zero-length axis");
-	const mu = opts?.mean !== void 0 ? opts.mean : mean(x.ref, axis, { keepdims: true });
+	const mu = opts?.mean !== void 0 ? opts.mean : mean(x, axis, { keepdims: true });
 	return square(x.sub(mu)).sum(axis, { keepdims: opts?.keepdims }).mul(1 / (n - (opts?.correction ?? 0)));
 }
 /**
@@ -8482,25 +8288,25 @@ function cov(x, y = null, { rowvar = true } = {}) {
 	}
 	if (!rowvar) x = x.transpose();
 	const [_M, N] = x.shape;
-	x = x.ref.sub(x.mean(1, { keepdims: true }));
-	return dot$1(x.ref, x.transpose()).div(N - 1);
+	x = x.sub(x.mean(1, { keepdims: true }));
+	return dot$1(x, x.transpose()).div(N - 1);
 }
 /** Compute the Pearson correlation coefficients (in range `[-1, 1]`). */
 function corrcoef(x, y) {
 	const c = cov(x, y);
-	const variances = diag(c.ref);
-	const norm = sqrt(outer(variances.ref, variances));
+	const variances = diag(c);
+	const norm = sqrt(outer(variances, variances));
 	return c.div(norm);
 }
 /** Test element-wise for positive or negative infinity, return bool array. */
 function isinf(x) {
 	x = fudgeArray(x);
-	return require_backend.isFloatDtype(x.dtype) ? x.ref.equal(Infinity).add(x.equal(-Infinity)) : fullLike$1(x, false);
+	return require_backend.isFloatDtype(x.dtype) ? x.equal(Infinity).add(x.equal(-Infinity)) : fullLike$1(x, false);
 }
 /** Test element-wise for NaN (Not a Number). */
 function isnan(x) {
 	x = fudgeArray(x);
-	return require_backend.isFloatDtype(x.dtype) ? x.ref.notEqual(x) : fullLike$1(x, false);
+	return require_backend.isFloatDtype(x.dtype) ? x.notEqual(x) : fullLike$1(x, false);
 }
 /** Test element-wise for negative infinity, return bool array. */
 function isneginf(x) {
@@ -8520,11 +8326,11 @@ function isposinf(x) {
 */
 function nanToNum(x, { nan: nan$1 = 0, posinf = null, neginf = null } = {}) {
 	x = fudgeArray(x);
-	x = where(isnan(x.ref), nan$1, x);
+	x = where(isnan(x), nan$1, x);
 	posinf ??= require_backend.isFloatDtype(x.dtype) ? finfo(x.dtype).max : iinfo(x.dtype).max;
 	neginf ??= require_backend.isFloatDtype(x.dtype) ? finfo(x.dtype).min : iinfo(x.dtype).min;
-	x = where(isposinf(x.ref), posinf, x);
-	x = where(isneginf(x.ref), neginf, x);
+	x = where(isposinf(x), posinf, x);
+	x = where(isneginf(x), neginf, x);
 	return x;
 }
 /**
@@ -8533,7 +8339,7 @@ function nanToNum(x, { nan: nan$1 = 0, posinf = null, neginf = null } = {}) {
 */
 const isfinite = jit$1(function isfinite$1(x) {
 	if (!require_backend.isFloatDtype(x.dtype)) return fullLike$1(x, true);
-	return isnan(x.ref).add(isinf(x)).notEqual(true);
+	return isnan(x).add(isinf(x)).notEqual(true);
 });
 
 //#endregion
@@ -8682,37 +8488,22 @@ function triangularSolve(a, b, { leftSide = false, lower = false, transposeA = f
 * - Supports autodiff: `grad(f)` works through scan
 * - The carry shape/dtype must be fixed across all iterations
 *
-* ## Reference Counting Contract
+* ## Ownership
 *
-* **Inputs (consumed):**
-* - `init` and `xs` are consumed by scan (refcount decremented)
-* - Use `.ref` if you need to keep inputs alive: `scan(f, init.ref, xs.ref)`
+* **Inputs:** `init` and `xs` are NOT consumed. Use `using` or `.dispose()` to
+* manage their lifetime if needed.
 *
 * **Body function:**
 * - `carry` and `x` are **managed** by scan — do NOT manually dispose them
-* - Standard consumption rules apply inside the body (same as regular functions):
-*   - **Single use:** `np.add(carry, x)` — no `.ref` needed
-*   - **Multiple uses:** Use `.ref` to keep alive for additional uses
-* - Return **new** arrays for `newCarry` and `y`
-* - For passthrough (same array in both), use `.ref`: `[result.ref, result]`
+* - Operations do NOT consume inputs, so no `.ref` is needed inside the body
 *
-* **Example — multiple uses of carry:**
+* **Example — simple body:**
 * ```ts
-* // ✓ Works: .ref keeps carry alive, then bare carry consumed in return
 * const step = (carry, x) => {
-*   const newCarry = np.add(carry.ref, x);  // .ref: we'll use carry again
-*   return [newCarry, carry];               // carry consumed here
-* };
-*
-* // ✗ Fails: can't use carry in TWO separate operations after .ref
-* const step = (carry, x) => {
-*   const a = np.add(carry.ref, x);  // first operation
-*   const b = np.add(a, carry);      // ERROR: second operation on carry
-*   return [b, a.ref];
+*   const newCarry = np.add(carry, x);
+*   return [newCarry, carry];  // carry used freely in multiple places
 * };
 * ```
-*
-* **Workaround:** Use pytree carries so each field can be `.ref`'d independently.
 *
 * **Outputs (caller owns):**
 * - `finalCarry` and `ys` are owned by caller — dispose when done
@@ -8739,7 +8530,7 @@ function triangularSolve(a, b, { leftSide = false, lower = false, transposeA = f
 *
 * const step = (carry, x) => {
 *   const sum = np.add(carry, x);
-*   return [sum, sum.ref];  // .ref: sum used in both outputs
+*   return [sum, sum];  // same array can be used in both outputs
 * };
 *
 * const init = np.array([0.0]);
@@ -8758,7 +8549,7 @@ function triangularSolve(a, b, { leftSide = false, lower = false, transposeA = f
 * // Compute n! for n = 1..5
 * const step = (carry, x) => {
 *   const next = np.multiply(carry, x);
-*   return [next, next.ref];
+*   return [next, next];
 * };
 *
 * const init = np.array([1]);
@@ -8774,7 +8565,7 @@ function triangularSolve(a, b, { leftSide = false, lower = false, transposeA = f
 *   const newSum = np.add(carry.sum, x);
 *   const newCount = np.add(carry.count, np.array([1]));
 *   return [
-*     { sum: newSum.ref, count: newCount.ref },
+*     { sum: newSum, count: newCount },
 *     { sum: newSum, count: newCount }
 *   ];
 * };
@@ -8811,7 +8602,7 @@ function triangularSolve(a, b, { leftSide = false, lower = false, transposeA = f
 * ```ts
 * // Generate a sequence without allocating input arrays
 * const step = (carry, _x) => {
-*   const next = np.add(carry.ref, np.array([1.0]));
+*   const next = np.add(carry, np.array([1.0]));
 *   return [next, carry];  // output is old carry value
 * };
 *
@@ -8824,7 +8615,7 @@ function triangularSolve(a, b, { leftSide = false, lower = false, transposeA = f
 * ```ts
 * // Only need final carry, not intermediate outputs (saves memory)
 * const step = (carry, x) => {
-*   const Asq = carry.A.ref.mul(carry.A);
+*   const Asq = carry.A.mul(carry.A);
 *   const newA = Asq.add(x);
 *   const newCount = carry.count.add(Asq.less(100).astype(np.int32));
 *   return [{ A: newA, count: newCount }, null];  // null skips Y stacking
@@ -8843,7 +8634,7 @@ function triangularSolve(a, b, { leftSide = false, lower = false, transposeA = f
 * // This is the most common and efficient pattern for production use.
 * const step = (carry, x) => {
 *   const newCarry = np.add(carry, x);
-*   return [newCarry, newCarry.ref];
+*   return [newCarry, newCarry];
 * };
 *
 * const scanFn = jit((init, xs) => lax.scan(step, init, xs));
@@ -8865,7 +8656,7 @@ function triangularSolve(a, b, { leftSide = false, lower = false, transposeA = f
 * // but you want to inspect intermediate values or the scan body is dynamic.
 * const step = jit((carry, x) => {
 *   const newCarry = np.add(carry, x);
-*   return [newCarry, newCarry.ref];
+*   return [newCarry, newCarry];
 * });
 *
 * const init = np.array([0.0]);
@@ -8922,12 +8713,13 @@ function scan(f, init$1, xs, options) {
 		return [...newCarryFlat, ...yFlat];
 	};
 	const traceAvals = [...carryAvals, ...xSliceAvals];
-	const { jaxpr: closedJaxpr, treedef: _outTreedef } = makeJaxpr$1(traceFn, { validateRefs: false })(...traceAvals);
+	const { jaxpr: closedJaxpr, treedef: _outTreedef } = makeJaxpr$1(traceFn)(...traceAvals);
 	const jaxpr = closedJaxpr.jaxpr;
 	const consts = closedJaxpr.consts;
 	if (n === 0) {
 		if (xsIsNull && lengthOpt === void 0) throw new Error("scan: length option is required when xs is null");
-		const finalCarryFlat = initFlat.map((arr) => arr.ref);
+		closedJaxpr.dispose();
+		const finalCarryFlat = initFlat;
 		const numCarry$1 = initFlat.length;
 		const yOutAtoms = jaxpr.outs.slice(numCarry$1);
 		const yFlatEmpty = yOutAtoms.map((atom) => {
@@ -8936,15 +8728,12 @@ function scan(f, init$1, xs, options) {
 		});
 		const finalCarry$1 = unflatten(initTreedef, finalCarryFlat);
 		const ys$1 = yTreedef_ === JsTreeDef.none ? null : unflatten(yTreedef_, yFlatEmpty);
-		initFlat.forEach((arr) => arr.dispose());
-		xsFlat.forEach((arr) => arr.dispose());
-		closedJaxpr.dispose();
 		return [finalCarry$1, ys$1];
 	}
 	const scanArgs = [
-		...consts.map((c) => c.ref),
-		...initFlat.map((arr) => arr.ref),
-		...xsFlat.map((arr) => arr.ref)
+		...consts,
+		...initFlat,
+		...xsFlat
 	];
 	const numCarry = initFlat.length;
 	const numConsts = consts.length;
@@ -8957,11 +8746,9 @@ function scan(f, init$1, xs, options) {
 		acceptPath,
 		checkpoint
 	});
-	initFlat.forEach((arr) => arr.dispose());
-	xsFlat.forEach((arr) => arr.dispose());
-	closedJaxpr.dispose();
 	const carryOut = results.slice(0, numCarry);
 	const ysFlat = results.slice(numCarry);
+	closedJaxpr.dispose();
 	const finalCarry = unflatten(initTreedef, carryOut);
 	const ys = unflatten(yTreedef_, ysFlat);
 	return [finalCarry, ys];
@@ -9282,7 +9069,7 @@ function softplus(x) {
 * - When `x >= 1`: `x`
 */
 const sparsePlus = jit$1((x) => {
-	return where(x.ref.lessEqual(-1), 0, where(x.ref.less(1), square(x.ref.add(1)).mul(.25), x));
+	return where(x.lessEqual(-1), 0, where(x.less(1), square(x.add(1)).mul(.25), x));
 });
 /**
 * @function
@@ -9301,7 +9088,7 @@ const sparseSigmoid = jit$1((x) => {
 */
 function softSign(x) {
 	x = fudgeArray(x);
-	return x.ref.div(absolute(x).add(1));
+	return x.div(absolute(x).add(1));
 }
 /**
 * @function
@@ -9314,7 +9101,7 @@ function softSign(x) {
 * Reference: https://en.wikipedia.org/wiki/Swish_function
 */
 const silu = jit$1(function silu$1(x) {
-	return x.ref.mul(sigmoid(x));
+	return x.mul(sigmoid(x));
 });
 /**
 * Log-sigmoid activation function, computed element-wise:
@@ -9331,7 +9118,7 @@ const identity = fudgeArray;
 /** Leaky rectified linear (ReLU) activation function */
 function leakyRelu(x, negativeSlope = .01) {
 	x = fudgeArray(x);
-	return where(less(x.ref, 0), x.ref.mul(negativeSlope), x);
+	return where(less(x, 0), x.mul(negativeSlope), x);
 }
 /** Hard sigmoid activation function: `relu6(x+3)/6`. */
 function hardSigmoid(x) {
@@ -9340,7 +9127,7 @@ function hardSigmoid(x) {
 /** Hard SiLU (swish) activation function: `x * hardSigmoid(x)`. */
 function hardSilu(x) {
 	x = fudgeArray(x);
-	return x.ref.mul(hardSigmoid(x));
+	return x.mul(hardSigmoid(x));
 }
 /** Hard tanh activation function: `clip(x, -1, 1)`. */
 function hardTanh(x) {
@@ -9354,7 +9141,7 @@ function hardTanh(x) {
 */
 function elu(x, alpha = 1) {
 	x = fudgeArray(x);
-	return where(less(x.ref, 0), exp(x.ref).sub(1).mul(alpha), x);
+	return where(less(x, 0), exp(x).sub(1).mul(alpha), x);
 }
 /**
 * Continuously-differentiable exponential linear unit activation function.
@@ -9364,7 +9151,7 @@ function elu(x, alpha = 1) {
 */
 function celu(x, alpha = 1) {
 	x = fudgeArray(x);
-	return where(less(x.ref, 0), exp(x.ref.div(alpha)).sub(1).mul(alpha), x);
+	return where(less(x, 0), exp(x.div(alpha)).sub(1).mul(alpha), x);
 }
 /**
 * @function
@@ -9378,7 +9165,7 @@ function celu(x, alpha = 1) {
 const selu = jit$1(function selu$1(x) {
 	const alpha = 1.6732632423543772;
 	const lambda = 1.0507009873554805;
-	return where(x.ref.less(0), expm1(x.ref).mul(alpha), x).mul(lambda);
+	return where(x.less(0), expm1(x).mul(alpha), x).mul(lambda);
 });
 /**
 * @function
@@ -9395,8 +9182,8 @@ const selu = jit$1(function selu$1(x) {
 const gelu = jit$1(function gelu$1(x, opts) {
 	if (opts?.approximate ?? true) {
 		const SQRT_2_OVER_PI = Math.sqrt(2 / Math.PI);
-		return x.ref.mul(.5).mul(tanh(x.ref.mul(x.ref.mul(x).mul(.044715).add(1)).mul(SQRT_2_OVER_PI)).add(1));
-	} else return x.ref.mul(.5).mul(erfc$1(negative(x.mul(Math.SQRT1_2))));
+		return x.mul(.5).mul(tanh(x.mul(x.mul(x).mul(.044715).add(1)).mul(SQRT_2_OVER_PI)).add(1));
+	} else return x.mul(.5).mul(erfc$1(negative(x.mul(Math.SQRT1_2))));
 }, { staticArgnums: [1] });
 /**
 * Gated linear unit (GLU) activation function.
@@ -9410,7 +9197,7 @@ function glu(x, axis = -1) {
 	const size$1 = x.shape[axis];
 	if (size$1 % 2 !== 0) throw new Error(`glu: axis ${axis} of shape (${x.shape}) does not have even length`);
 	const slice = x.shape.map((a$1) => [0, a$1]);
-	const a = shrink(x.ref, slice.toSpliced(axis, 1, [0, size$1 / 2]));
+	const a = shrink(x, slice.toSpliced(axis, 1, [0, size$1 / 2]));
 	const b = shrink(x, slice.toSpliced(axis, 1, [size$1 / 2, size$1]));
 	return a.mul(sigmoid(b));
 }
@@ -9422,7 +9209,7 @@ function glu(x, axis = -1) {
 */
 function squareplus(x, b = 4) {
 	x = fudgeArray(x);
-	return x.ref.add(sqrt(square(x).add(b))).mul(.5);
+	return x.add(sqrt(square(x).add(b))).mul(.5);
 }
 /**
 * Mish activation function.
@@ -9432,7 +9219,7 @@ function squareplus(x, b = 4) {
 */
 function mish(x) {
 	x = fudgeArray(x);
-	return x.ref.mul(tanh(softplus(x)));
+	return x.mul(tanh(softplus(x)));
 }
 /**
 * Softmax function. Computes the function which rescales elements to the range
@@ -9446,9 +9233,9 @@ function softmax(x, axis = -1) {
 	x = fudgeArray(x);
 	axis = require_backend.normalizeAxis(axis, x.ndim);
 	if (axis.length === 0) return onesLike(x);
-	const xMax = max(x.ref, axis, { keepdims: true });
+	const xMax = max(x, axis, { keepdims: true });
 	const unnormalized = exp(x.sub(stopGradient(xMax)));
-	return unnormalized.ref.div(unnormalized.sum(axis, { keepdims: true }));
+	return unnormalized.div(unnormalized.sum(axis, { keepdims: true }));
 }
 /**
 * Log-Softmax function.
@@ -9462,9 +9249,9 @@ function logSoftmax(x, axis = -1) {
 	x = fudgeArray(x);
 	axis = require_backend.normalizeAxis(axis, x.ndim);
 	if (axis.length === 0) return zerosLike(x);
-	const xMax = max(x.ref, axis, { keepdims: true });
+	const xMax = max(x, axis, { keepdims: true });
 	const shifted = x.sub(stopGradient(xMax));
-	const shiftedLogsumexp = log(exp(shifted.ref).sum(axis, { keepdims: true }));
+	const shiftedLogsumexp = log(exp(shifted).sum(axis, { keepdims: true }));
 	return shifted.sub(shiftedLogsumexp);
 }
 /**
@@ -9479,8 +9266,8 @@ function logsumexp(x, axis = null, opts) {
 	x = fudgeArray(x);
 	axis = require_backend.normalizeAxis(axis, x.ndim);
 	if (axis.length === 0) return x;
-	const xMax = stopGradient(max(x.ref, axis, { keepdims: true }));
-	const shifted = x.sub(xMax.ref);
+	const xMax = stopGradient(max(x, axis, { keepdims: true }));
+	const shifted = x.sub(xMax);
 	const result = xMax.add(log(exp(shifted).sum(axis, { keepdims: true })));
 	return opts?.keepdims ? result : squeeze(result, axis);
 }
@@ -9504,8 +9291,8 @@ function standardize(x, axis = -1, opts = {}) {
 	x = fudgeArray(x);
 	axis = require_backend.normalizeAxis(axis, x.ndim);
 	if (axis.length === 0) return x;
-	const mu = opts.mean !== void 0 ? fudgeArray(opts.mean) : x.ref.mean(axis, { keepdims: true });
-	const sigma2 = opts.variance !== void 0 ? fudgeArray(opts.variance) : square(x.ref).mean(axis, { keepdims: true }).sub(square(mu.ref));
+	const mu = opts.mean !== void 0 ? fudgeArray(opts.mean) : x.mean(axis, { keepdims: true });
+	const sigma2 = opts.variance !== void 0 ? fudgeArray(opts.variance) : square(x).mean(axis, { keepdims: true }).sub(square(mu));
 	return x.sub(mu).div(sqrt(sigma2.add(opts.epsilon ?? 1e-5)));
 }
 /**
@@ -9689,7 +9476,7 @@ function split(key$1, num = 2) {
 	const shape$1 = typeof num === "number" ? [num] : num;
 	for (const len of shape$1) if (len <= 0 || !Number.isInteger(len)) throw new Error(`Invalid split length: ${len}. Must be a positive integer.`);
 	const [k0, k1] = getK01(key$1);
-	return stack([randomBits(k0.ref, k1.ref, shape$1, 0), randomBits(k0, k1, shape$1, 1)], -1);
+	return stack([randomBits(k0, k1, shape$1, 0), randomBits(k0, k1, shape$1, 1)], -1);
 }
 /** Sample uniform bits in the form of unsigned integers. */
 function bits(key$1, shape$1 = []) {
@@ -9802,7 +9589,7 @@ const gumbel = jit$1(function gumbel$1(key$1, shape$1 = []) {
 const laplace = jit$1(function laplace$1(key$1, shape$1 = []) {
 	const u = uniform(key$1, shape$1);
 	const centered = u.sub(.5);
-	const s = sign(centered.ref);
+	const s = sign(centered);
 	const absVal = absolute(centered);
 	return s.mul(log1p(absVal.mul(-2)).mul(-1));
 }, { staticArgnums: [1] });
@@ -9865,7 +9652,7 @@ __export(scipy_special_exports, {
 * The logit function, `logit(p) = log(p / (1-p))`.
 */
 const logit = jit$1(function logit$1(x) {
-	return log(x.ref.div(subtract(1, x)));
+	return log(x.div(subtract(1, x)));
 });
 
 //#endregion
@@ -9910,10 +9697,6 @@ const makeJaxpr = makeJaxpr$1;
 * - `staticArgnums`: An array of argument indices to treat as static
 *   (compile-time constant). These arguments must be hashable, won't be traced,
 *   and different values will trigger recompilation.
-* - `validateRefs`: When `true` (default), validates that the function body
-*   uses `.ref` correctly for eager-mode compatibility.  Tracing always
-*   succeeds; validation runs afterwards and reports every missing or extra
-*   `.ref` with an actionable error message.  Set to `false` to skip.
 * - `device`: The device to place the computation on. If not specified, the
 *   computation will be placed on the default device.
 */
@@ -9999,7 +9782,7 @@ const jacrev = jacrev$1;
 *
 * @example
 * ```ts
-* const f = (x: np.Array) => np.sum(x.ref.mul(x.ref).mul(x)); // x^3
+* const f = (x: np.Array) => np.sum(x.mul(x).mul(x)); // x^3
 * const H = hessian(f)(np.array([1, 2, 3]));
 * // H[i,j] = d^2f / dx_i dx_j
 * ```

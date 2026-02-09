@@ -8,7 +8,7 @@ test("chain function combines transformations", () => {
 
   // Chain two simple transformations
   const combined = chain(scale(2.0), scale(0.5));
-  const state = combined.init(params.ref);
+  const state = combined.init(params);
 
   const [newUpdates, _newState] = combined.update(updates, state, params);
 

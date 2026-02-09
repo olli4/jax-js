@@ -248,25 +248,21 @@ class PartialEvalTracer extends Tracer {
       throw new UseAfterFreeError(this);
     }
     if (--this.#rc === 0) {
-      // Clear reference to the recipe and pval, if needed.
+      // Cascade dispose to owned values. Known pval values and Const recipe
+      // values are ref'd by partialEvalGraphToJaxpr before cleanup, so the
+      // cascade here just releases the PETracer's share of ownership.
+      // JaxprEqn tracersIn are NOT cascaded — they are handled by the
+      // graph-wide toposort cleanup in partialEvalGraphToJaxpr.
       if (this.pval.isKnown) {
         this.pval.val!.dispose();
-      } else if (this.recipe) {
-        if (this.recipe.type === "Const") {
-          this.recipe.val.dispose();
-        } else if (this.recipe.type === "JaxprEqn") {
-          this.recipe.tracersIn.forEach((t) => t.dispose());
-        }
+      } else if (this.recipe?.type === "Const") {
+        this.recipe.val.dispose();
       }
     }
   }
 
   fullLower(): Tracer {
-    if (this.pval.isKnown) {
-      const val = this.pval.val!.ref;
-      this.dispose();
-      return val;
-    }
+    if (this.pval.isKnown) return this.pval.val!;
     return this;
   }
 }
@@ -287,9 +283,9 @@ class PartialEvalTrace extends Trace {
       return tracer;
     } else {
       // Translate known value into unknown "Const" recipe for abstract eval.
+      // Ref the value for the new Const tracer's ownership.
       const pval = PartialVal.unknown(ShapedArray.fromAval(tracer.aval));
       const val = tracer.pval.val!.ref;
-      tracer.dispose();
       return new PartialEvalTracer(this, pval, { type: "Const", val });
     }
   }
@@ -663,8 +659,10 @@ function partialEvalGraphToJaxpr(
   let jaxpr = new Jaxpr(inBinders, eqns, outVars);
   typecheckJaxpr(jaxpr); // sanity check
 
-  // Fix up reference counts.
+  // Ref consts so PETracer cascade doesn't free them prematurely.
+  // Consts are owned by the returned ClosedJaxpr.
   for (const t of consts) t.ref;
+  // Cleanup PETracer wrappers.
   for (const t of tracersIn) t.dispose();
   for (const t of tracersOut) t.dispose();
 
@@ -770,9 +768,11 @@ function evalJaxprTransposed(
 
   // Now collect actual Tracer values for known input variables
   const knownPrimals = new Map<Var, Tracer>();
+  const argPrimals = new Set<Var>(); // Track which primals are from args (owned by caller)
   for (let i = 0; i < jaxpr.inBinders.length; i++) {
     if (!(args[i] instanceof UndefPrimal)) {
       knownPrimals.set(jaxpr.inBinders[i], args[i] as Tracer);
+      argPrimals.add(jaxpr.inBinders[i]);
     }
   }
 
@@ -845,7 +845,11 @@ function evalJaxprTransposed(
       }
     }
   }
-  for (const t of knownPrimals.values()) t.dispose();
+  // Only dispose computed primals (from getOrComputePrimal), not arg primals
+  // which are owned by the caller (e.g., jaxpr consts owned by ClosedJaxpr).
+  for (const [v, t] of knownPrimals.entries()) {
+    if (!argPrimals.has(v)) t.dispose();
+  }
 
   const results: Tracer[] = [];
   for (let i = 0; i < jaxpr.inBinders.length; i++) {

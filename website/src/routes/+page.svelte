@@ -190,11 +190,11 @@
     <EmbeddedRepl
       initialText={String.raw`import { grad, numpy as np, vmap } from "@jax-js/jax";
 
-const f = (x: np.Array) => np.sqrt(x.ref.mul(x).sum());
+const f = (x: np.Array) => np.sqrt(x.mul(x).sum());
 const x = np.array([1, 2, 3, 4]);
 
-console.log(f(x.ref));
-console.log(grad(f)(x.ref));
+console.log(f(x));
+console.log(grad(f)(x));
 console.log(vmap(grad(np.square))(x));
 `}
     />
