@@ -27,7 +27,7 @@ import {
  * evaluates it.
  *
  * The returned function takes input tensors and returns output tensors.
- * Input tensors are consumed (their reference count decremented).
+ * Input tensors are NOT consumed — dispose them yourself when done.
  * Initializers (model weights, data) are cached and reused across calls.
  *
  * @example

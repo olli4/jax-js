@@ -73,8 +73,8 @@ naturally.
 - **Lightweight over exhaustive** — prefer a small, composable set of primitives over a large
   surface area of specialized ops. If something can be expressed via existing primitives and `jit`,
   that's preferred over adding a new backend kernel.
-- **Move semantics over GC** — JavaScript has no reliable destructor, so jax-js uses explicit
-  ownership (`.ref` / `.dispose()`). This is a deliberate choice, not a workaround. It enables
+- **Explicit disposal over GC** — JavaScript has no reliable destructor, so jax-js uses explicit
+  `.dispose()` for memory management. This is a deliberate choice, not a workaround. It enables
   predictable memory management on GPU, which is essential for real applications.
 - **Compounding returns** — every improvement to the compiler makes _all_ operations faster, every
   new primitive gets autodiff for free, every `jit`-wrapped function gets kernel fusion
@@ -211,25 +211,25 @@ pnpm run test:deno
 sudo usermod -a -G render,video $USER  # then log out/in
 ```
 
-## Reference-counting & ownership (critical)
+## Memory management & ownership
 
-Function arguments are **consumed by default** (refcount −1). Reuse an array by accessing `.ref`
-(refcount +1). The `.data()` method also **consumes the array** after reading.
+Operations **do not consume** their inputs. Arrays stay alive until explicitly `.dispose()`'d.
+`.data()` and `.dataSync()` read the buffer without consuming.
 
 ```ts
-// BAD: consumes x twice
-function foo(x) {
-  return x.add(x.mul(y));
+// Arrays can be reused freely — no .ref needed
+function foo(x, y) {
+  return x.add(x.mul(y)); // x used twice, no problem
 }
 
-// GOOD: .ref keeps x alive for the second use
-function foo(x) {
-  return x.ref.add(x.mul(y));
-}
-
-// .data() consumes - don't dispose after!
-const result = await arr.data(); // arr is now consumed
+// .data() reads without consuming
+const result = await arr.data(); // arr is still alive
+arr.dispose(); // explicit disposal when done
 ```
+
+Inside `jit()` bodies, the compiler manages intermediate lifetimes automatically (freeing at exact
+last-use). In eager mode, intermediates live until collected by GC or explicit `.dispose()`. **Wrap
+compute-heavy code in `jit()`** for both performance (kernel fusion) and automatic memory management.
 
 Canonical examples: `test/refcount.test.ts`, `test/conv.test.ts`, `test/deno/webgpu.test.ts`.
 
@@ -239,10 +239,11 @@ A **Slot** is jax-js's internal handle to a backend memory allocation (WASM poin
 
 1. **Array creation** — `np.array(...)` allocates a backend `Slot` with refcount = 1.
 2. **`.ref` accessor** — increments the Array object's `#rc`; same underlying Slot.
-3. **Function call** — passing an Array decrements `#rc` by 1 (ownership transfer).
-4. **`.data()` / `.dataSync()`** — reads buffer, then calls `dispose()` internally.
+3. **Operations** — do NOT consume inputs; inputs remain alive.
+4. **`.data()` / `.dataSync()`** — reads buffer; array stays alive.
 5. **`.dispose()`** — decrements `#rc`; when 0, calls `backend.decRef(slot)`.
-6. **Pending ops** — `PendingExecute` (batched GPU commands awaiting submission) holds refs on Slots
+6. **`evalJaxpr` / JIT** — automatically manage intermediate lifetimes from the Jaxpr graph.
+7. **Pending ops** — `PendingExecute` (batched GPU commands awaiting submission) holds refs on Slots
    until `submit()`.
 
 ### Backend memory comparison
@@ -555,11 +556,11 @@ The JVP rule defines the derivative **in terms of other primitives**:
 
 ```typescript
 [Primitive.Cholesky]([a], [da]) {
-  const L = cholesky(a.ref);
-  da = da.ref.add(mT(da)).mul(0.5);  // Symmetrize
-  const W = triangularSolve(L.ref, da, { lower: true });
-  const ST = triangularSolve(L.ref, mT(W), { lower: true });
-  const dL = batchMatmulT(L.ref, triu(ST, 1).add(triu(ST)).mul(0.5));
+  const L = cholesky(a);
+  da = da.add(mT(da)).mul(0.5);  // Symmetrize
+  const W = triangularSolve(L, da, { lower: true });
+  const ST = triangularSolve(L, mT(W), { lower: true });
+  const dL = batchMatmulT(L, triu(ST, 1).add(triu(ST)).mul(0.5));
   return [[L], [dL]];
 }
 ```
@@ -711,7 +712,7 @@ The `Kernel` class is single-output: `new Kernel(nargs, size, exp, reduction?)`.
 
 ## Common pitfalls
 
-- Forgetting `.ref` → double-consume → `ReferenceError` in tests
+- Forgetting `.dispose()` → memory leak (GPU buffers not freed)
 - Exporting a symbol from library but not `src/index.ts` → missing from published types
 - Changing WebGPU shaders without browser tests → silent breakage
 - **CPU backend GlobalView detection**: Collect both `AluOp.GlobalIndex` AND `AluOp.GlobalView`
@@ -748,7 +749,7 @@ The `Kernel` class is single-output: `new Kernel(nargs, size, exp, reduction?)`.
 3. Run the _full test suite_ locally (`pnpm vitest run`) after finishing code changes to verify
    there are no regressions.
 4. Update documentation when adding new features or APIs
-5. Add/adjust tests exercising `.ref` and `.dispose()` for new behavior — add focused unit tests for
+5. Add/adjust tests exercising `.dispose()` for new behavior — add focused unit tests for
    any bugfixes or edge cases
 6. Export new public symbols from `src/index.ts`
 7. Update `FEATURES.md` for user-visible changes
@@ -1056,12 +1057,12 @@ in native code (~1.5M iter/sec). See `codegenNativeScanGeneral()` in `src/backen
 
 This contract applies to both `lax.scan()` and `jit(() => lax.scan(...))()`:
 
-**Inputs — consumed:**
+**Inputs — NOT consumed:**
 
 ```ts
 const [carry, ys] = lax.scan(f, init, xs);
-// init and xs are consumed (refcount -1)
-// Use .ref if you need them after: lax.scan(f, init.ref, xs.ref)
+// init and xs are NOT consumed (non-consuming model)
+// Dispose them yourself when no longer needed
 ```
 
 **xs=null for carry-only scans:**
@@ -1083,37 +1084,14 @@ const [carry, nullYs] = lax.scan(f, init, xs);
 // Useful when you only need the final carry (e.g., Mandelbrot iteration count)
 ```
 
-**Body function — managed references:**
+**Body function — no .ref needed:**
 
-Scan _manages_ the lifecycle of `carry` and `x` — don't dispose them manually. However, standard
-consumption rules apply inside the body (same as regular functions):
-
-- **Single use:** `np.add(carry, x)` — no `.ref` needed, the operation consumes them.
-- **Multiple uses:** Use `.ref` to keep alive for additional uses.
+Operations do not consume inputs, so arrays can be freely reused inside the body:
 
 ```ts
-// ✓ Works: .ref keeps carry alive, then bare carry consumed in return
 const step = (carry, x) => {
-  const newCarry = np.add(carry.ref, x); // .ref: we'll use carry again
-  return [newCarry, carry]; // carry consumed here
-};
-
-// ✗ Fails: can't use carry in TWO separate operations after .ref
-const step = (carry, x) => {
-  const a = np.add(carry.ref, x); // first operation
-  const b = np.add(a, carry); // ERROR: second operation on carry
-  return [b, a.ref];
-};
-```
-
-**Workaround for complex bodies:** Use pytree carries so each field can be `.ref`'d independently:
-
-```ts
-const f = (carry: { a: np.Array; b: np.Array }, x) => {
-  // carry.a and carry.b are separate arrays with independent refcounts
-  const newA = np.add(carry.a.ref, carry.b.ref);
-  const newB = np.add(carry.b, np.array([1.0])); // carry.b consumed (last use)
-  return [{ a: newA, b: newB }, carry.a]; // carry.a consumed (last use)
+  const newCarry = np.add(carry, x);
+  return [newCarry, carry]; // carry used in both places — no .ref needed
 };
 ```
 
@@ -1131,9 +1109,8 @@ stackedYs.dispose(); // or skip if Y=null
 | Pattern      | Code                                   | Notes                           |
 | ------------ | -------------------------------------- | ------------------------------- |
 | Simple body  | `return [newCarry, y]`                 | Two distinct arrays             |
-| Passthrough  | `return [newCarry.ref, newCarry]`      | Same array in both              |
-| Pytree carry | `return [{ a: a.ref, b }, { out: a }]` | Mix of refs                     |
-| Keep inputs  | `scan(f, init.ref, xs.ref)`            | Don't consume inputs            |
+| Passthrough  | `return [newCarry, newCarry]`          | Same array in both              |
+| Pytree carry | `return [{ a: newA, b: newB }, newA]`  | Nested structure                |
 | Carry-only   | `scan(f, init, null, { length: N })`   | No xs allocation (saves memory) |
 | No Y output  | `return [newCarry, null]`              | No ys allocation (saves memory) |
 
@@ -1232,47 +1209,21 @@ JIT).
 **Transform sandwiches:** Compositions like `jit(grad(scan))` where transforms wrap each other. The
 test suite verifies these work correctly by comparing against reference implementations.
 
-### How consumption rules are enforced
+### How tracing works (non-consuming)
 
-The scan body's consumption rules work at both trace time and execution time via different
-mechanisms:
+The Jaxpr SSA graph records exactly which variables are used and how many times.
+`JaxprTrace.processPrimitive` adds equations to the graph using `builder.getVar(tracer)` — which
+maps tracer identity to Var, regardless of refcount. Since `processPrimitive` never disposes
+tracers, they can be used freely in multiple operations.
 
-**Trace time (JaxprTracer):** When `makeJaxpr` traces the body function, `carry` and `x` are
-`JaxprTracer` objects with explicit reference counting (`src/frontend/jaxpr.ts:567-590`):
-
-```typescript
-class JaxprTracer extends Tracer {
-  #rc: number = 1; // Reference count enforced even for tracers
-
-  get ref() {
-    if (this.#rc <= 0) throw new UseAfterFreeError(this);
-    this.#rc++;
-    return this;
-  }
-  dispose() {
-    if (this.#rc <= 0) throw new UseAfterFreeError(this);
-    this.#rc--;
-  }
-}
-```
-
-And `processPrimitive` consumes all input tracers:
-
-```typescript
-const avalsIn = tracers.map((t) => {
-  t.dispose(); // Standard consumption!
-  return t.aval;
-});
-```
+At execution time, `evalJaxpr` computes `usageCount` from the graph and auto-disposes intermediates
+at their last use. `jitCompile` emits precise `malloc`/`free`/`recycle` steps based on the graph
+structure. The result: **identical compiled programs** whether the user wrote `.ref` or not.
 
 **Execution time (array.ts):** The non-JIT `Primitive.Scan` impl uses `jitCompile(backend, jaxpr)`
 to compile the body, then calls `planScan()` + `executeScan()` — the same unified flow used by the
 JIT path. Both paths use `executeScan()` which handles all three execution paths (compiled-loop,
 preencoded-routine, fallback) with identical ownership semantics.
-
-**Why this matters:** Code that works during tracing (with `jit()`) will also work at execution time
-(without `jit()`), and vice versa. A body function that double-consumes a variable will fail during
-tracing, catching the bug early rather than silently producing incorrect gradients.
 
 ### Debugging scan paths
 
@@ -1391,7 +1342,7 @@ When an output carry slot directly references the input carry without a kernel p
 // Carry passthrough (WebGPU multi-kernel falls back):
 const body = (carry, x) => {
   const newA = carry.A.add(x);
-  return [{ A: newA, B: carry.B.ref }, newA]; // B is passthrough!
+  return [{ A: newA, B: carry.B }, newA]; // B is passthrough!
 };
 ```
 
@@ -1532,7 +1483,7 @@ This is why direct-write is disabled when any Y output is a passthrough from the
 // Multi-step body where step 2 reads the carry that step 1 writes to:
 const step = (carry, x) => {
   const a = carry.A.add(x); // Step 1: writes to carry.A
-  const b = carry.A.ref.mul(x); // Step 2: reads carry.A (needs OLD value!)
+  const b = carry.A.mul(x); // Step 2: reads carry.A (needs OLD value!)
   return [{ A: a, B: b }, null];
 };
 ```
@@ -1558,15 +1509,15 @@ Carry-only (Y=null) only eliminates the carry copy. Passthrough Y is ineligible 
 
 | Type             | Source                              | Use case                         |
 | ---------------- | ----------------------------------- | -------------------------------- |
-| `passthrough`    | Copy from carry input               | `return [newC, oldC.ref]`        |
-| `xs-passthrough` | Copy from xs slice at current iter  | `return [newC, x.ref]`           |
+| `passthrough`    | Copy from carry input               | `return [newC, oldC]`            |
+| `xs-passthrough` | Copy from xs slice at current iter  | `return [newC, x]`               |
 | `internal`       | Copy from internal buffer (compute) | `return [newC, someComputation]` |
 
 **Carry output sources (`CarryOutputSource` type):**
 
 | Type          | Source                    | Use case                                 |
 | ------------- | ------------------------- | ---------------------------------------- |
-| `passthrough` | Copy from carry input     | `return [oldC.ref, y]` (carry unchanged) |
+| `passthrough` | Copy from carry input     | `return [oldC, y]` (carry unchanged)     |
 | `internal`    | Copy from internal buffer | `return [computation, y]`                |
 
 ### WebGPU compiled-loop details
@@ -1856,11 +1807,11 @@ The JVP rule defines the derivative **in terms of other primitives**:
 
 ```typescript
 [Primitive.Cholesky]([a], [da]) {
-  const L = cholesky(a.ref);
-  da = da.ref.add(mT(da)).mul(0.5);  // Symmetrize
-  const W = triangularSolve(L.ref, da, { lower: true });
-  const ST = triangularSolve(L.ref, mT(W), { lower: true });
-  const dL = batchMatmulT(L.ref, triu(ST, 1).add(triu(ST)).mul(0.5));
+  const L = cholesky(a);
+  da = da.add(mT(da)).mul(0.5);  // Symmetrize
+  const W = triangularSolve(L, da, { lower: true });
+  const ST = triangularSolve(L, mT(W), { lower: true });
+  const dL = batchMatmulT(L, triu(ST, 1).add(triu(ST)).mul(0.5));
   return [[L], [dL]];
 }
 ```
@@ -1956,7 +1907,7 @@ In practice, this means only simple Cholesky-passthrough patterns like:
 ```ts
 const step = (carry, x) => {
   const L = lax.linalg.cholesky(x);
-  return [L.ref, L]; // L is both carry and y
+  return [L, L]; // L is both carry and y
 };
 ```
 

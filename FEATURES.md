@@ -3,8 +3,8 @@
 jax-js strives for _approximate_ API compatibility with the JAX python library (and through that,
 NumPy). But some features vary for a few reasons:
 
-1. **Data model:** jax-js has _ownership_ of arrays using the `.ref` system, which obviates the need
-   for APIs like `jit()`'s `donate_argnums` and `numpy.asarray()`.
+1. **Data model:** jax-js uses explicit `.dispose()` for memory management instead of Python's
+   garbage collection, which obviates the need for APIs like `numpy.asarray()`.
 2. **Language primitives:** JavaScript has no named arguments, so method call signatures may take
    objects instead of Python's keyword arguments. Also, PyTrees are translated in spirit to "JsTree"
    in jax-js, but their specification is different.
@@ -568,7 +568,7 @@ jax-js implements the same PRNG, with bitwise identical outputs. However, most s
 | `wrap_key_data` | ⚪️      | keys are just uint32 arrays   |
 | `fold_in`       | 🟠      |                               |
 | `split`         | 🟢      | not vmappable yet             |
-| `clone`         | ⚪️      | use `.ref`                    |
+| `clone`         | ⚪️      | arrays are not consumed; use `.ref` to share ownership |
 | `PRNGKey`       | ⚪️      | legacy                        |
 
 **Samplers:** These are all 🟠 assuming that sampling from distributions is usually easier than

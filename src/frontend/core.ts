@@ -708,7 +708,6 @@ export abstract class Tracer {
   /**
    * Access an array by reference, incrementing the reference count.
    *
-   * jax-js handles freeing arrays by using "move" semantics, like in Rust/C++.
    * Increment the reference count of this array.
    *
    * In most code, you don't need `.ref` because operations do NOT consume

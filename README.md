@@ -157,74 +157,39 @@ import { numpy as np, scipySpecial as special } from "@jax-js/jax";
 
 const x = np.arange(100).astype(np.float32); // array of integers [0..99]
 
-const y1 = x.ref.add(x.ref); // x + x
-const y2 = np.sin(x.ref); // sin(x)
-const y3 = np.tanh(x.ref).mul(5); // 5 * tanh(x)
-const y4 = special.erfc(x.ref); // erfc(x)
+const y1 = x.add(x); // x + x
+const y2 = np.sin(x); // sin(x)
+const y3 = np.tanh(x).mul(5); // 5 * tanh(x)
+const y4 = special.erfc(x); // erfc(x)
 ```
 
-Notice that in the above code, we used `x.ref`. This is because of the memory model, jax-js uses
-reference-counted _ownership_ to track when the memory of an Array can be freed. More on this below.
-
-### Reference counting
+### Memory management
 
 Big Arrays take up a lot of memory. Python ML libraries override the `__del__()` method to free
 memory, but JavaScript has no such API for running object destructors
 ([cf.](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/FinalizationRegistry)).
-This means that you have to track references manually. jax-js tries to make this as ergonomic as
-possible, so you don't accidentally leak memory in a loop.
 
-Every `jax.Array` has a reference count. This satisfies the following rules:
-
-- Whenever you create an Array, its reference count starts at `1`.
-- When an Array's reference count reaches `0`, it is freed and can no longer be used.
-- Given an Array `a`:
-  - Accessing `a.ref` returns `a` and changes its reference count by `+1`.
-  - Passing `a` into any function as argument changes its reference count by `-1`.
-  - Calling `a.dispose()` also changes its reference count by `-1`.
-
-What this means is that all functions in jax-js must _take ownership_ of their arguments as
-references. Whenever you would like to pass an Array as argument, you can pass it directly to
-dispose of it, or use `.ref` if you'd like to use it again later.
-
-**You must follow these rules on your own functions as well!** All combinators like `jvp`, `grad`,
-`jit` assume that you are following these conventions on how arguments are passed, and they will
-respect them as well.
+In jax-js, operations **do not consume** their inputs — you can freely reuse an array in multiple
+expressions without any special syntax. When you're done with an array, call `.dispose()` to free
+its memory, or use JavaScript's `using` keyword for automatic disposal:
 
 ```ts
-// Bad: Uses `x` twice, decrementing its reference count twice.
-function foo_bad(x: np.Array, y: np.Array) {
-  return x.add(x.mul(y));
-}
-
-// Good: The first usage of `x` is `x.ref`, adding +1 to refcount.
-function foo_good(x: np.Array, y: np.Array) {
-  return x.ref.add(x.mul(y));
+{
+  using x = np.array([1, 2, 3]);
+  const y = x.add(x).mul(x); // x used three times — no problem
+  // x is automatically disposed at end of block
 }
 ```
 
-Here's another example:
+For best performance, wrap compute-heavy code in `jit()`. The JIT compiler automatically manages
+intermediate buffers — allocating, reusing, and freeing them at the optimal points:
 
 ```ts
-// Bad: Doesn't consume `x` in the `if`-branch.
-function bar_bad(x: np.Array, skip: boolean) {
-  if (skip) return np.zeros(x.shape);
-  return x;
-}
-
-// Good: Consumes `x` the one time in each branch.
-function bar_good(x: np.Array, skip: boolean) {
-  if (skip) {
-    const ret = np.zeros(x.shape);
-    x.dispose();
-    return ret;
-  }
-  return x;
-}
+const f = jit((x: np.Array) => np.sqrt(x.mul(x).sum()));
+const result = f(x); // intermediates freed automatically inside jit
+result.dispose(); // caller disposes the output when done
+f.dispose(); // free captured constants when the function is no longer needed
 ```
-
-You can assume that every function in jax-js takes ownership properly, except with a couple of very
-rare exceptions that are documented.
 
 ### grad(), vmap() and jit()
 
@@ -236,7 +201,7 @@ import { numpy as np, grad, vmap } from "@jax-js/jax";
 
 const x = np.linspace(-10, 10, 1000);
 
-const y1 = vmap(grad(np.sin))(x.ref); // d/dx sin(x) = cos(x)
+const y1 = vmap(grad(np.sin))(x); // d/dx sin(x) = cos(x)
 const y2 = np.cos(x);
 
 np.allclose(y1, y2); // => true
