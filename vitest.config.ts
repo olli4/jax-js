@@ -1,7 +1,17 @@
+import path from "node:path";
+
 import { playwright } from "@vitest/browser-playwright";
 import { defineConfig } from "vitest/config";
 
 export default defineConfig({
+  resolve: {
+    alias: {
+      // During testing, resolve @jax-js/jax to the TypeScript source so that
+      // stack traces (e.g. from checkLeaks) show original file:line:col
+      // instead of dist/index.js positions.
+      "@jax-js/jax": path.resolve(__dirname, "src/index.ts"),
+    },
+  },
   esbuild: {
     supported: {
       using: false, // Needed to lower 'using' statements in tests.

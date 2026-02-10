@@ -1,5 +1,14 @@
-import { numpy as np } from "@jax-js/jax";
-import { expect } from "vitest";
+import { checkLeaks, numpy as np } from "@jax-js/jax";
+import { afterEach, beforeEach, expect } from "vitest";
+
+beforeEach(() => {
+  checkLeaks.start();
+});
+
+afterEach(() => {
+  const result = checkLeaks.stop();
+  expect(result.leaked, result.summary).toBe(0);
+});
 
 expect.extend({
   toBeAllclose(
