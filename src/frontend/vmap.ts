@@ -34,7 +34,14 @@ import {
   flatten as treeFlatten,
   unflatten as treeUnflatten,
 } from "../tree";
-import { ClosedJaxpr, Jaxpr, jaxprAsFun, makeJaxpr } from "./jaxpr";
+import { dispose as treeDispose } from "../tree";
+import {
+  _derivedCacheCleanups,
+  ClosedJaxpr,
+  Jaxpr,
+  jaxprAsFun,
+  makeJaxpr,
+} from "./jaxpr";
 import { jvp } from "./jvp";
 
 function mappedAval(batchDim: number, aval: AbstractValue) {
@@ -402,20 +409,40 @@ const vmapRules: Partial<{ [P in Primitive]: VmapRule<P> }> = {
   [Primitive.LU]: lastDimsBatcher(Primitive.LU, 2, 3),
   [Primitive.Jit](axisSize, args, dims, { name, jaxpr }) {
     const newJaxpr = vmapJaxpr(jaxpr, axisSize, dims);
-    const outs = bind(
-      Primitive.Jit,
-      [...newJaxpr.consts.map((c) => c.ref), ...args],
-      {
-        name: `${name}_vmap`,
-        jaxpr: newJaxpr.jaxpr,
-        numConsts: newJaxpr.consts.length,
-      },
-    );
+    const outs = bind(Primitive.Jit, [...newJaxpr.consts, ...args], {
+      name: `${name}_vmap`,
+      jaxpr: newJaxpr.jaxpr,
+      numConsts: newJaxpr.consts.length,
+    });
     return [outs, rep(outs.length, 0)];
   },
 };
 
 const vmapJaxprCache = new Map<Jaxpr, Map<string, ClosedJaxpr>>();
+
+/** Dispose all entries in the vmapJaxpr cache. Called by _disposeAllJitCaches. */
+export function _disposeVmapJaxprCache(): void {
+  for (const map of vmapJaxprCache.values()) {
+    for (const entry of map.values()) {
+      try {
+        entry.dispose();
+      } catch {
+        /* already freed */
+      }
+    }
+  }
+  vmapJaxprCache.clear();
+}
+_derivedCacheCleanups.push(_disposeVmapJaxprCache);
+
+// Clean up vmapJaxprCache entries when a jaxpr's ClosedJaxpr is disposed.
+ClosedJaxpr._disposeHooks.push((jaxpr: Jaxpr) => {
+  const cached = vmapJaxprCache.get(jaxpr);
+  if (cached) {
+    for (const entry of cached.values()) entry.dispose();
+    vmapJaxprCache.delete(jaxpr);
+  }
+});
 
 function vmapJaxpr(
   jaxpr: Jaxpr,
@@ -541,7 +568,11 @@ export function jacfwd(f: any) {
       throw new TypeError("jacfwd only supports 1D inputs");
     }
     const [size] = x.shape;
-    const pushfwd = (v: Tracer) => jvp(f, [x], [v])[1];
+    const pushfwd = (v: Tracer) => {
+      const [primals, tangents] = jvp(f, [x], [v]);
+      treeDispose(primals); // jacfwd only needs tangents
+      return tangents;
+    };
     return vmap(pushfwd, [0])(eye(size, undefined, { dtype: x.dtype }));
   };
 }

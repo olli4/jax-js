@@ -40,6 +40,8 @@ suite.each(devices)("device:%s", (device) => {
         const [values, indices] = lax.topK(x, 0);
         expect(values.shape).toEqual([0]);
         expect(indices.shape).toEqual([0]);
+        values.dispose();
+        indices.dispose();
       });
 
       test("works with 2D along either axis", () => {
@@ -57,7 +59,7 @@ suite.each(devices)("device:%s", (device) => {
           [2, 1],
         ]);
 
-        [values, indices] = lax.topK(x.ref, 1, 0);
+        [values, indices] = lax.topK(x, 1, 0);
         expect(values.js()).toEqual([[3, 5, 9]]);
         expect(indices.js()).toEqual([[0, 1, 1]]);
       });
@@ -73,6 +75,7 @@ suite.each(devices)("device:%s", (device) => {
         const x = np.array([1, 2, 3]);
         expect(() => lax.topK(x, -1)).toThrow();
         expect(() => lax.topK(x, 4)).toThrow();
+        x.dispose();
       });
     });
   }

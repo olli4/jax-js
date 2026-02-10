@@ -30,6 +30,7 @@ import {
   fullRaise,
   gather,
   idiv,
+  isTopLevel,
   less,
   log,
   lu,
@@ -53,7 +54,13 @@ import {
   triangularSolve,
   where,
 } from "./core";
-import { ClosedJaxpr, Jaxpr, jaxprAsFun, makeJaxpr } from "./jaxpr";
+import {
+  _derivedCacheCleanups,
+  ClosedJaxpr,
+  Jaxpr,
+  jaxprAsFun,
+  makeJaxpr,
+} from "./jaxpr";
 import { moveaxis } from "./vmap";
 
 class JVPTracer extends Tracer {
@@ -195,7 +202,7 @@ const jvpRules: { [P in Primitive]: JvpRule<P> } = {
   [Primitive.Neg]: linearTangentsJvp(Primitive.Neg),
   [Primitive.Reciprocal]([x], [dx]) {
     // d(1/x) = -x^-2 * dx
-    const xRecip = reciprocal(x.ref);
+    const xRecip = reciprocal(x);
     return [[xRecip.ref], [neg(xRecip.ref.mul(xRecip)).mul(dx)]];
   },
   [Primitive.Floor]: zeroTangentsJvp(Primitive.Floor),
@@ -337,7 +344,7 @@ const jvpRules: { [P in Primitive]: JvpRule<P> } = {
     // If L = cholesky(A), so that A = L @ L^T, then
     // dL = L @ tril(S - 0.5 * diag(S)),
     //   where S = L^{-1} @ dA @ L^{-T}
-    const L = cholesky(a.ref);
+    const L = cholesky(a);
     da = da.ref.add(mT(da)).mul(0.5); // Symmetrize dA for grad
     const W = triangularSolve(L.ref, da, { lower: true }); // (L^-1 @ dA.T).T = dA @ L^-T
     const ST = triangularSolve(L.ref, mT(W), { lower: true });
@@ -395,7 +402,7 @@ const jvpRules: { [P in Primitive]: JvpRule<P> } = {
     const newJaxpr = jvpJaxpr(jaxpr);
     const outs = bind(
       Primitive.Jit,
-      [...newJaxpr.consts.map((c) => c.ref), ...primals, ...tangents],
+      [...newJaxpr.consts, ...primals, ...tangents],
       {
         name: `${name}_jvp`,
         jaxpr: newJaxpr.jaxpr,
@@ -411,6 +418,28 @@ const jvpRules: { [P in Primitive]: JvpRule<P> } = {
 };
 
 const jvpJaxprCache = new Map<Jaxpr, ClosedJaxpr>();
+
+/** Dispose all entries in the jvpJaxpr cache. Called by _disposeAllJitCaches. */
+export function _disposeJvpJaxprCache(): void {
+  for (const cached of jvpJaxprCache.values()) {
+    try {
+      cached.dispose();
+    } catch {
+      /* already freed */
+    }
+  }
+  jvpJaxprCache.clear();
+}
+_derivedCacheCleanups.push(_disposeJvpJaxprCache);
+
+// Clean up jvpJaxprCache entries when a jaxpr's ClosedJaxpr is disposed.
+ClosedJaxpr._disposeHooks.push((jaxpr: Jaxpr) => {
+  const cached = jvpJaxprCache.get(jaxpr);
+  if (cached) {
+    cached.dispose();
+    jvpJaxprCache.delete(jaxpr);
+  }
+});
 
 function jvpJaxpr(jaxpr: Jaxpr): ClosedJaxpr {
   if (jvpJaxprCache.has(jaxpr)) {
@@ -468,11 +497,54 @@ export function jvp<F extends (...x: any[]) => any>(
     [flatFun, outTree] = flattenFun(f, inTree);
   }
 
-  const [primalsOutFlat, tangentsOutFlat] = jvpFlat(
-    flatFun,
-    primalsFlat,
-    tangentsFlat,
-  );
+  // At top level, pre-wrap non-Tracer values with pureArray to track
+  // ownership.  Inside tracing (e.g. makeJaxpr) the created Arrays become
+  // jaxpr consts and must NOT be disposed here.
+  const topLevel = isTopLevel();
+  let pFlat: TracerValue[] = primalsFlat;
+  let tFlat: TracerValue[] = tangentsFlat;
+  const ownedP: boolean[] = [];
+  const ownedT: boolean[] = [];
+  if (topLevel) {
+    pFlat = primalsFlat.map((x) => {
+      if (x instanceof Tracer) {
+        ownedP.push(false);
+        return x;
+      }
+      ownedP.push(true);
+      return pureArray(x);
+    });
+    tFlat = tangentsFlat.map((x) => {
+      if (x instanceof Tracer) {
+        ownedT.push(false);
+        return x;
+      }
+      ownedT.push(true);
+      return pureArray(x);
+    });
+  }
+
+  const [primalsOutFlat, tangentsOutFlat] = jvpFlat(flatFun, pFlat, tFlat);
+
+  // Dispose pre-wrapped arrays that jvpFlat didn't consume.
+  if (topLevel) {
+    for (let i = 0; i < pFlat.length; i++) {
+      if (ownedP[i])
+        try {
+          (pFlat[i] as Tracer).dispose();
+        } catch {
+          /* already consumed */
+        }
+    }
+    for (let i = 0; i < tFlat.length; i++) {
+      if (ownedT[i])
+        try {
+          (tFlat[i] as Tracer).dispose();
+        } catch {
+          /* already consumed */
+        }
+    }
+  }
   if (outTree.value === undefined) {
     throw new Error("outTree was not set in jvp");
   }

@@ -1104,7 +1104,7 @@ export class Array extends Tracer {
       [Primitive.TriangularSolve]: Array.#routine(Primitive.TriangularSolve),
       [Primitive.Cholesky]: Array.#routine(Primitive.Cholesky),
       [Primitive.LU]: Array.#routine(Primitive.LU),
-      [Primitive.Jit](args, { jaxpr }) {
+      [Primitive.Jit](args, { jaxpr, numConsts }) {
         if (jaxpr.inBinders.length !== args.length) {
           throw new Error(
             `jit expects ${jaxpr.inBinders.length} args, got ${args.length}`,
@@ -1112,6 +1112,10 @@ export class Array extends Tracer {
         }
 
         const { backend, committed } = Array.#computeBackend("jit", args);
+        // Protect ClosedJaxpr-owned consts from _putSync disposal.
+        // Call-sites pass consts without .ref; we bump rc here so
+        // _putSync on a different backend won't free the original.
+        for (let i = 0; i < numConsts; i++) args[i].ref;
         args = args.map((ar) => ar._putSync(backend));
 
         const jp = jitCompile(backend, jaxpr);

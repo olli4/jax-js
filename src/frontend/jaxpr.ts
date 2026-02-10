@@ -1128,15 +1128,11 @@ export function jit<F extends (...args: any[]) => any>(
       makeJaxpr(f, opts)(...jaxprArgs),
     );
 
-    const outs = bind(
-      Primitive.Jit,
-      [...jaxpr.consts.map((c) => c.ref), ...argsFlat],
-      {
-        name: f.name || "closure",
-        jaxpr: jaxpr.jaxpr,
-        numConsts: jaxpr.consts.length,
-      },
-    );
+    const outs = bind(Primitive.Jit, [...jaxpr.consts, ...argsFlat], {
+      name: f.name || "closure",
+      jaxpr: jaxpr.jaxpr,
+      numConsts: jaxpr.consts.length,
+    });
     return treeUnflatten(outTree, outs);
   }) as OwnedFunction<F>;
 
