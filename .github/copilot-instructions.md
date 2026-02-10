@@ -716,8 +716,6 @@ The `Kernel` class is single-output: `new Kernel(nargs, size, exp, reduction?)`.
 
 ## Known flaky tests
 
-- **LU JVP finite-differences** (`test/lax-linalg.test.ts`): Occasionally fails with precision
-  errors at the edge of f32 machine epsilon. Not a bug — inherent to finite-difference verification.
 - **Deno WebGPU tests** (`test/deno/`): When running all Deno test files together in a single
   `deno test` invocation, GPU state pollution between files causes memory leak detection failures.
   The `test:deno` script runs each file as a separate `deno test` command (chained with `&&`).
