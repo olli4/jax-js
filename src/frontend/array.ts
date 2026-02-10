@@ -13,6 +13,12 @@ import {
   Reduction,
 } from "../alu";
 import { Backend, Device, Executable, getBackend, Slot } from "../backend";
+import {
+  _lastRefMap,
+  _leakTrackingEnabled,
+  _leakTrackingMap,
+  _trackRefsEnabled,
+} from "./check-leaks";
 import { Routine } from "../routine";
 import { Pair, ShapeTracker, unravelAlu } from "../shape";
 import {
@@ -198,6 +204,12 @@ export class Array extends Tracer {
     } else if (this.#source instanceof AluExp) {
       throw new Error("internal: AluExp source cannot have pending executes");
     }
+
+    // Leak tracking: record this Array and capture stack frames (V8 defers
+    // the expensive .stack string formatting until first access — cold path).
+    if (_leakTrackingEnabled) {
+      _leakTrackingMap.set(this, new Error());
+    }
   }
 
   /** @ignore */
@@ -234,6 +246,7 @@ export class Array extends Tracer {
   get ref() {
     this.#check();
     this.#rc++;
+    if (_trackRefsEnabled) _lastRefMap.set(this, new Error());
     return this;
   }
 
@@ -245,6 +258,9 @@ export class Array extends Tracer {
   dispose() {
     this.#check();
     if (--this.#rc === 0) {
+      // Leak tracking: remove from map (no-op when map is empty / tracking off).
+      if (_leakTrackingMap.size > 0) _leakTrackingMap.delete(this);
+
       // Free any pending executables that haven't been submitted yet.
       for (const exe of this.#pending) exe.updateRc(-1);
       // If this has an array source, free it from the backend.

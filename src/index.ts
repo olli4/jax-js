@@ -1,6 +1,11 @@
 import { DType } from "./alu";
 import { defaultDevice, Device, devices, getBackend, init } from "./backend";
 import { Array, ArrayLike } from "./frontend/array";
+import {
+  checkLeaks,
+  type LeakReport,
+  type SnapshotEntry,
+} from "./frontend/check-leaks";
 import * as jaxprModule from "./frontend/jaxpr";
 import { ClosedJaxpr, Jaxpr, OwnedFunction } from "./frontend/jaxpr";
 import * as jvpModule from "./frontend/jvp";
@@ -18,6 +23,9 @@ import { setDebug } from "./utils";
 import "./polyfills";
 
 export {
+  checkLeaks,
+  type LeakReport,
+  type SnapshotEntry,
   init,
   Array,
   ClosedJaxpr,

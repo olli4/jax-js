@@ -195,6 +195,9 @@ export interface Backend {
   /** Prepare an advanced routine to be executed later, blocking variant. */
   prepareRoutineSync(routine: Routine): Executable;
 
+  /** Return the number of live (allocated, not yet freed) slots. */
+  slotCount(): number;
+
   /**
    * Run a backend operation that was previously prepared.
    *

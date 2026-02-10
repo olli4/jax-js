@@ -139,6 +139,10 @@ export class WebGPUBackend implements Backend {
     }
   }
 
+  slotCount(): number {
+    return this.buffers.size;
+  }
+
   async read(
     slot: Slot,
     start?: number,
