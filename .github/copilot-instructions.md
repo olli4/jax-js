@@ -253,6 +253,66 @@ pool/recycler needs deterministic buffer return to maintain peak-memory guarante
 Canonical examples: `test/refcount.test.ts`, `test/leak-diagnostic.test.ts`,
 `test/deno/webgpu.test.ts`.
 
+### `using` declarations (TC39 Explicit Resource Management)
+
+jax-js supports the `using` keyword
+([TC39 proposal](https://github.com/tc39/proposal-explicit-resource-management)) via
+`[Symbol.dispose]()` on Arrays and jit functions. A polyfill in `src/polyfills.ts` ensures
+`Symbol.dispose` exists in environments that don't have it yet.
+
+**Arrays — auto-dispose at block end:**
+
+```ts
+{
+  using x = np.array([1, 2, 3]);
+  using y = np.array([4, 5, 6]);
+  const z = x.add(y);
+  console.log(z.js()); // [5, 7, 9]
+  z.dispose();
+  // x and y automatically disposed here
+}
+```
+
+**JIT functions — auto-dispose captured constants:**
+
+```ts
+{
+  using f = jit((x: np.Array) => x.mul(x).sum());
+  const result = f(np.array([1, 2, 3]));
+  console.log(result.js()); // 14
+  result.dispose();
+  // f's cached ClosedJaxpr consts are freed here
+}
+```
+
+**Linearize/VJP results — auto-dispose captured forward-pass intermediates:**
+
+```ts
+{
+  const [y, fLin] = linearize((x) => np.sin(x), [np.array([1.0])]);
+  using _disposeLin = fLin; // dispose when done
+  const dy = fLin(np.array([1.0]));
+  dy.dispose();
+  y.dispose();
+  // fLin's forward-pass intermediates freed here
+}
+```
+
+**When to use `using` vs `.dispose()`:**
+
+| Pattern                              | Recommendation                                 |
+| ------------------------------------ | ---------------------------------------------- |
+| Short-lived arrays in a function     | `using` — cleaner, exception-safe              |
+| JIT functions used across many calls | `.dispose()` when truly done                   |
+| Loop bodies                          | `jit()` manages intermediates automatically    |
+| Test cleanup                         | `using` or `onTestFinished(() => x.dispose())` |
+
+**When NOT to use `using`:**
+
+- Inside `jit()` bodies — the compiler manages lifetimes automatically
+- For arrays you want to return from a function — `using` would dispose before return
+- For arrays stored in data structures for later use
+
 ### Memory lifecycle
 
 A **Slot** is jax-js's internal handle to a backend memory allocation (WASM pointer or GPU buffer).
@@ -847,11 +907,12 @@ The `Kernel` class is single-output: `new Kernel(nargs, size, exp, reduction?)`.
   `deno test` invocation, GPU state pollution between files causes memory leak detection failures.
   The `test:deno` script runs each file as a separate `deno test` command (chained with `&&`).
 
-**Current test status (Feb 2026):** 1152 passed, 0 failed, 744 skipped. The LU JVP finite-difference
-test was previously failing because the WASM LU routine uses native f32 arithmetic (upstream fell
-back to CPU with f64 precision); fixed by using larger eps and looser tolerance. All
-previously-failing cross-device tests (FFT, random, linalg on WASM after CPU) are fixed — see
-`_put`/`_putSync` in [Common pitfalls](#common-pitfalls).
+**Current test status (Feb 2026):** 1163 passed, 0 failed, 745 skipped. All tests pass with global
+`checkLeaks` leak detection enabled (`test/setup.ts`). The LU JVP finite-difference test was
+previously failing because the WASM LU routine uses native f32 arithmetic (upstream fell back to CPU
+with f64 precision); fixed by using larger eps and looser tolerance. All previously-failing
+cross-device tests (FFT, random, linalg on WASM after CPU) are fixed — see `_put`/`_putSync` in
+[Common pitfalls](#common-pitfalls).
 
 > ⚠️ **IMPORTANT: Deno WebGPU test isolation** - Due to Deno's module caching and GPU state
 > persistence between test files, running all Deno tests together in a single process causes
@@ -2626,9 +2687,16 @@ The PETracer cascade in `linearize.ts` is the most delicate part of the ownershi
 to known values and Const recipe values but NOT to `JaxprEqn.tracersIn`. Getting this wrong causes
 either double-free (cascade too aggressively) or leaks (cascade too conservatively).
 
+**Unreachable Const PETracers (fixed):** When `hasAux` captures aux values that reference input
+arrays (e.g., `x.mul(x)` in aux), `instantiateConst` creates Const PETracers that `.ref` the input.
+If these PETracers are unreachable from `tracersOut` (because aux values aren't in the jaxpr
+outputs), `partialEvalGraphToJaxpr` never processes them, leaving dangling `.ref` calls. Fixed by
+tracking all Const PETracers in `PartialEvalTrace.allConstPETracers` and disposing unreachable ones
+in `partialEvalFlat` after `partialEvalGraphToJaxpr` returns.
+
 The current design was arrived at by testing against the full suite including `jvp(grad(sin))`,
-`hessian`, and all scan/grad compositions. Any future change to how `PartialEvalTracer` creates
-recipes or tracks values should be tested against these cases.
+`hessian`, all scan/grad compositions, and `vmap(grad(...))` patterns. Any future change to how
+`PartialEvalTracer` creates recipes or tracks values should be tested against these cases.
 
 ### JVPTracer `#rc` subtlety
 
@@ -2756,43 +2824,89 @@ JAX's immutable-array design.
 
 ### `checkLeaks` diagnostic (implemented)
 
-A zero-overhead leak detection tool. When active, it snapshots backend slot counts and tracks Array
-creations with stack traces. The `leaked` count uses the same `slotCount()` metric as the
-traditional manual pattern, so it exactly matches existing leak detection behavior.
+A zero-overhead leak detection tool. When active, it snapshots backend slot counts across ALL
+devices and tracks Array creations with lazy Error objects for stack traces. The `leaked` count uses
+backend `slotCount()` deltas, so it exactly matches existing leak detection behavior. Used in the
+global test setup (`test/setup.ts`) to wrap every test with automatic leak checking.
 
 ```ts
 import { checkLeaks } from "@jax-js/jax";
 
 checkLeaks.start(); // snapshot slot count + enable stack capture
 // ... user code ...
-const report = checkLeaks.stop(); // diff, report undisposed arrays with creation locations
+const report = checkLeaks.stop({ autoDispose: true }); // diff, auto-cleanup, report
 // report.leaked: number of leaked backend slots
 // report.details: ["float32[512,512] created at model.ts:42", ...]
-// report.summary: human-readable message with guidance
+// report.summary: human-readable message with diagnostics
 ```
+
+**Options:**
+
+- `checkLeaks.start({ trackRefs: true })` — also track `.ref` call sites; the report shows
+  `↳ last .ref at <location>` for arrays with rc≥2 leaks.
+- `checkLeaks.stop({ autoDispose: true })` — before counting leaks: (1) flush all jit caches via
+  `_disposeAllJitCaches()`, (2) dispose OwnedFunctions (vjp/linearize closures), (3) multi-pass
+  dispose of all tracked arrays (handles rc>1 from `instantiateConst` inside `vmap(grad(...))`).
+- `checkLeaks.snapshot()` — return a snapshot of tracked arrays mid-session without stopping.
 
 **Key files:**
 
-| File                           | Purpose                                            |
-| ------------------------------ | -------------------------------------------------- |
-| `src/frontend/check-leaks.ts`  | Core module: `checkLeaks` object + `LeakReport`    |
-| `src/frontend/array.ts`        | Hooks in constructor (track) and dispose (untrack) |
-| `test/check-leaks.test.ts`     | 7 dedicated tests                                  |
-| `test/leak-diagnostic.test.ts` | 9 scan leak tests using `checkLeaks`               |
-| `test/deno/harness.ts`         | Deno `withLeakCheck()` enhanced with `checkLeaks`  |
+| File                           | Purpose                                                           |
+| ------------------------------ | ----------------------------------------------------------------- |
+| `src/frontend/check-leaks.ts`  | Core module: `checkLeaks` object, registry, `LeakReport`          |
+| `src/frontend/array.ts`        | Hooks in constructor (track) and dispose (untrack)                |
+| `src/frontend/jit.ts`          | Registers `_clearJitCompileCache` via `_registerJitCacheDisposer` |
+| `src/frontend/jaxpr.ts`        | Registers per-function jit disposers in `_jitFunctionDisposers`   |
+| `test/check-leaks.test.ts`     | 9 dedicated tests                                                 |
+| `test/setup.ts`                | Global beforeEach/afterEach leak checking for all tests           |
+| `test/leak-diagnostic.test.ts` | 9 scan leak tests using `checkLeaks`                              |
 
-**Design:** Uses `slotCount()` from the default backend as ground truth (not a Map of tracked JS
-objects). The tracking map provides diagnostic details (array description + creation location) but
-is not used for the leak count. This avoids false positives from internal AluExp-backed arrays that
-have no backend Slot.
+**Architecture — JIT cache disposal:**
+
+Module-level `jit()` functions (like `fmod = jit(...)` in numpy.ts, `fftUpdate = jit(...)` in
+numpy-fft.ts) create cached `ClosedJaxpr` objects with const arrays. These must be freed between
+tests. Two mechanisms handle this:
+
+1. **`_registerJitCacheDisposer(fn)`** — called at module load by `jit.ts` to register the global
+   `_clearJitCompileCache` function. Clears the `jitCompileCache` Map.
+2. **`_jitFunctionDisposers`** — a `Set<() => void>` in `check-leaks.ts`. Each `jit()` call in
+   `jaxpr.ts` registers `result.dispose` (which disposes ClosedJaxpr consts + clears cache).
+
+Both are called by `_disposeAllJitCaches()` during `checkLeaks.stop()`. The import direction is
+safe: `jit.ts → check-leaks.ts` and `jaxpr.ts → check-leaks.ts` (check-leaks only imports from
+`../backend`, no cycles).
+
+**Multi-pass autoDispose:**
+
+The `autoDispose` option runs up to 3 passes of `.dispose()` on all tracked arrays. This handles
+arrays with rc>1 that arise when `instantiateConst` adds `.ref` calls during PE tracing inside
+composed transforms like `vmap(grad(...))`. The `disposePeIntermediates` function skips disposal
+when `insideTrace()` is true (to avoid disposing outer-trace tracers), so these extra refs aren't
+balanced. Multi-pass autoDispose compensates by repeatedly disposing until all arrays reach rc=0.
+
+**Unreachable Const PETracer disposal:**
+
+When `hasAux` is used with `vjp`/`linearize`, aux computations may call `instantiateConst` on input
+arrays, creating Const PETracers. If the aux outputs aren't in the jaxpr graph (they're captured
+separately), these Const PETracers are unreachable from `tracersOut` and never processed by
+`partialEvalGraphToJaxpr`. The `.ref` from `instantiateConst` is never balanced.
+
+Fixed by tracking all Const PETracers in `PartialEvalTrace.allConstPETracers` (via
+`main.globalData`) and disposing any still-alive ones after `partialEvalGraphToJaxpr` returns.
+
+**Design:** Uses `slotCount()` across ALL backends as ground truth. The tracking Map provides
+diagnostic details (array description + creation location via lazy Error objects) but is not used
+for the leak count. This avoids false positives from internal AluExp-backed arrays that have no
+backend Slot.
 
 **Limitations:**
 
-- Only tracks the default backend (matches old `slotCount()` pattern).
-- `grad()` creates internal Slot allocations that appear as leaks if wrapped — only use `checkLeaks`
-  around code that properly disposes all outputs.
-- Anonymous constants in scan/jit bodies may show in the tracking map but don't affect the
-  slot-based leak count.
+- `checkLeaks` wraps every test via `test/setup.ts`. Tests with inner `checkLeaks.start()/stop()`
+  calls must be removed (they conflict with the global wrapper). See autoref.test.ts,
+  recycle.test.ts for examples of tests that had inner calls removed.
+- Anonymous constants in scan/jit bodies (e.g., `np.array([2, 3])` inline) get rc=2 from
+  `getOrMakeConstTracer`'s `.ref`. After `_disposeAllJitCaches`, rc drops to 1. Multi-pass
+  autoDispose handles the final dispose.
 
 **Why this is better than `tidy()`:** Zero overhead in production. Educates users toward `jit()`
 rather than providing a weaker alternative. Keeps the API surface JAX-compatible.
@@ -2810,8 +2924,9 @@ rather than providing a weaker alternative. Keeps the API surface JAX-compatible
 
 ## Future Work
 
-| Priority | Feature                                   | Notes                                                     |
-| -------- | ----------------------------------------- | --------------------------------------------------------- |
-| ~~High~~ | ~~`checkLeaks` diagnostic~~               | ✅ Implemented in `src/frontend/check-leaks.ts`           |
-| Medium   | Anonymous constant leak fix               | Distinguish user-held vs anonymous consts in scan tracing |
-| Low      | `using` declaration examples in tutorials | Show `Symbol.dispose` patterns in README/demos            |
+| Priority | Feature                             | Notes                                                     |
+| -------- | ----------------------------------- | --------------------------------------------------------- |
+| ~~High~~ | ~~`checkLeaks` diagnostic~~         | ✅ Implemented in `src/frontend/check-leaks.ts`           |
+| ~~High~~ | ~~unreachable Const PETracer leak~~ | ✅ Fixed via `allConstPETracers` tracking in PE trace     |
+| Medium   | Anonymous constant leak fix         | Distinguish user-held vs anonymous consts in scan tracing |
+| ~~Low~~  | ~~`using` declaration examples~~    | ✅ Documented in copilot-instructions + README            |
