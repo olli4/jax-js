@@ -57,11 +57,13 @@ suite.each(devicesWithLinalg)("device:%s", (device) => {
         [4.0, 5.0, 6.0],
       ]);
       expect(() => lax.linalg.cholesky(x).js()).toThrow();
+      x.dispose();
     });
 
     test("throws on non-2D array", () => {
       const x = np.array([1.0, 2.0, 3.0]);
       expect(() => lax.linalg.cholesky(x).js()).toThrow();
+      x.dispose();
     });
 
     test("works with jvp", () => {
@@ -166,7 +168,9 @@ suite.each(devicesWithLinalg)("device:%s", (device) => {
 
       // Verify dlu by finite differences
       const eps = 1e-4;
-      const lu2 = lax.linalg.lu(A.add(dA.mul(eps)))[0];
+      const [lu2, _pivots, _perm] = lax.linalg.lu(A.add(dA.mul(eps)));
+      _pivots.dispose();
+      _perm.dispose();
       const dlu_fd = lu2.sub(lu).div(eps);
       expect(dlu).toBeAllclose(dlu_fd, { rtol: 1e-2, atol: 1e-3 });
     });
@@ -245,6 +249,7 @@ suite.each(devicesWithLinalg)("device:%s", (device) => {
         expected[i][0] = (fp - fm) / (2 * eps);
       }
       expect(db).toBeAllclose(expected, { rtol: 1e-2, atol: 1e-3 });
+      L.dispose();
     });
 
     test("behavior with transposed A", () => {

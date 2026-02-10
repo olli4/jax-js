@@ -153,13 +153,15 @@ test("should handle initializers (constant weights)", async () => {
   });
 
   const onnxModel = new ONNXModel(toBinary(ModelProtoSchema, model));
-  onTestFinished(() => onnxModel.dispose());
 
   // Only need to provide A since B is an initializer
   const a = np.array([1, 2, 3]);
   const result = onnxModel.run({ A: a });
 
   expect(await result.C.data()).toEqual(new Float32Array([101, 202, 303]));
+  // Dispose model (and its initializer arrays) before afterEach leak check.
+  // onTestFinished runs AFTER afterEach, so we must dispose explicitly here.
+  onnxModel.dispose();
 });
 
 test("should evaluate MatMul", async () => {

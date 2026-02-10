@@ -6,9 +6,10 @@ import {
   jit,
   jvp,
   numpy as np,
+  valueAndGrad,
   vmap,
 } from "@jax-js/jax";
-import { beforeEach, expect, onTestFinished, suite, test } from "vitest";
+import { beforeEach, expect, suite, test } from "vitest";
 
 const devicesAvailable = await init();
 
@@ -386,7 +387,8 @@ suite.each(devices)("device:%s", (device) => {
       const y = np.array([0, 5, 6]);
       const f = ({ x, y }: { x: np.Array; y: np.Array }) =>
         np.where(np.equal(x, y), 1, 0).sum();
-      const grads = grad(f)({ x, y });
+      const [value, grads] = valueAndGrad(f)({ x, y });
+      value.dispose();
       expect(grads.x.js()).toEqual([0, 0, 0]);
       expect(grads.y.js()).toEqual([0, 0, 0]);
     });
@@ -468,6 +470,7 @@ suite.each(devices)("device:%s", (device) => {
       expect(() => np.reshape(x, [2, 2, 2])).toThrow(Error);
       expect(() => np.reshape(x, [3, -1])).toThrow(Error);
       expect(() => np.reshape(x, [-1, -1])).toThrow(Error);
+      x.dispose();
     });
 
     test("composes with jvp", () => {
@@ -643,6 +646,7 @@ suite.each(devices)("device:%s", (device) => {
       const y = np.zeros([1, 4, 5, 6]);
       const z = np.dot(x, y);
       expect(z.shape).toEqual([2, 3, 4, 1, 4, 6]);
+      z.dispose();
     });
 
     if (device !== "cpu") {
@@ -744,11 +748,6 @@ suite.each(devices)("device:%s", (device) => {
       const M = np.arange(16).reshape([4, 4]);
       const x = np.arange(4);
       const y = np.array([5, 4, 3, 2]);
-      onTestFinished(() => {
-        M.dispose();
-        x.dispose();
-        y.dispose();
-      });
 
       // Vector product
       expect(np.einsum("i,i", x.ref, y.ref).js()).toEqual(16);
@@ -792,7 +791,6 @@ suite.each(devices)("device:%s", (device) => {
         [1, 2, 3],
         [4, 5, 6],
       ]);
-      onTestFinished(() => y2.dispose());
       const transposeExpected = [
         [1, 4],
         [2, 5],
@@ -812,10 +810,6 @@ suite.each(devices)("device:%s", (device) => {
       // Tensor products
       const tx = np.arange(30).reshape([2, 3, 5]);
       const ty = np.arange(60).reshape([3, 4, 5]);
-      onTestFinished(() => {
-        tx.dispose();
-        ty.dispose();
-      });
       const tensorExpected = [
         [3340, 3865, 4390, 4915],
         [8290, 9940, 11590, 13240],
@@ -839,12 +833,6 @@ suite.each(devices)("device:%s", (device) => {
         [2, 4, 6],
         [3, 5, 7],
       ]);
-      onTestFinished(() => {
-        w.dispose();
-        cx.dispose();
-        cy.dispose();
-        z.dispose();
-      });
       const chainedExpected = [
         [481, 831, 1181],
         [651, 1125, 1599],
@@ -857,6 +845,18 @@ suite.each(devices)("device:%s", (device) => {
           .einsum(w.ref, [0, 1], cx.ref, [1, 2], cy.ref, [2, 3], z.ref, [3, 4])
           .js(),
       ).toEqual(chainedExpected);
+
+      // Dispose arrays that were kept alive via .ref
+      M.dispose();
+      x.dispose();
+      y.dispose();
+      y2.dispose();
+      tx.dispose();
+      ty.dispose();
+      w.dispose();
+      cx.dispose();
+      cy.dispose();
+      z.dispose();
     });
 
     test("shape tests", () => {
@@ -972,6 +972,9 @@ suite.each(devices)("device:%s", (device) => {
       expect(X.shape).toEqual([3, 2, 4]);
       expect(Y.shape).toEqual([3, 2, 4]);
       expect(Z.shape).toEqual([3, 2, 4]);
+      X.dispose();
+      Y.dispose();
+      Z.dispose();
     });
   });
 
@@ -1062,14 +1065,14 @@ suite.each(devices)("device:%s", (device) => {
         [x],
         [np.ones([3])],
       );
-      expect(y).toBeAllclose([1, 0.5, 1 / 3]);
-      expect(dy).toBeAllclose([-1, -0.25, -1 / 9]);
+      expect(y.js()).toBeAllclose([1, 0.5, 1 / 3]);
+      expect(dy.js()).toBeAllclose([-1, -0.25, -1 / 9]);
     });
 
     test("can be used in grad", () => {
       const x = np.array([1, 2, 3]);
       const dx = grad((x: np.Array) => np.reciprocal(x).sum())(x);
-      expect(dx).toBeAllclose([-1, -0.25, -1 / 9]);
+      expect(dx.js()).toBeAllclose([-1, -0.25, -1 / 9]);
     });
 
     test("called via Array.div() and jax.numpy.divide()", () => {
@@ -1138,6 +1141,8 @@ suite.each(devices)("device:%s", (device) => {
       const { x: dx, y: dy } = vmap(
         grad(({ x, y }: { x: np.Array; y: np.Array }) => np.fmod(x, y)),
       )({ x, y });
+      x.dispose();
+      y.dispose();
       expect(dx.js()).toEqual([1, 1, 1, 1]);
       expect(dy.js()).toEqual([
         -Math.trunc(5 / 3),
@@ -1163,6 +1168,8 @@ suite.each(devices)("device:%s", (device) => {
       const { x: dx, y: dy } = vmap(
         grad(({ x, y }: { x: np.Array; y: np.Array }) => np.remainder(x, y)),
       )({ x, y });
+      x.dispose();
+      y.dispose();
       expect(dx.js()).toEqual([1, 1, 1, 1]);
       expect(dy.js()).toEqual([
         -Math.floor(5 / 3),
@@ -1455,13 +1462,15 @@ suite.each(devices)("device:%s", (device) => {
     test("raises TypeError on axis mismatch", () => {
       const a = np.zeros([1, 2, 3]);
       expect(() => np.pad(a, [])).toThrow(Error);
-      expect(() => np.pad(a, [[0, 1]])).not.toThrow(Error);
+      expect(() => np.pad(a, [[0, 1]]).dispose()).not.toThrow(Error);
+      const a2 = np.zeros([1, 2, 3]);
       expect(() =>
-        np.pad(a, [
+        np.pad(a2, [
           [0, 1],
           [1, 2],
         ]),
       ).toThrow(Error);
+      a2.dispose();
     });
 
     test("pad handles backprop", () => {
@@ -1548,6 +1557,7 @@ suite.each(devices)("device:%s", (device) => {
       const x = np.arange(5);
       expect(() => np.split(x, 2)).toThrow(Error);
       expect(() => np.split(x, 3)).toThrow(Error);
+      x.dispose();
     });
 
     test("works with negative axis", () => {
@@ -2101,20 +2111,24 @@ suite.each(devices)("device:%s", (device) => {
       ]);
       const y = np.expandDims(x.ref, 0);
       expect(y.shape).toEqual([1, 2, 3]);
+      y.dispose();
 
       const z = np.expandDims(x, 2);
       expect(z.shape).toEqual([2, 3, 1]);
+      z.dispose();
     });
 
     test("throws on out of bounds axis", () => {
       const x = np.array([1, 2, 3]);
       expect(() => np.expandDims(x, 3)).toThrow(Error);
       expect(() => np.expandDims(x, -4)).toThrow(Error);
+      x.dispose();
     });
 
     test("throws on repeated axis", () => {
       const x = np.array([1, 2, 3]);
       expect(() => np.expandDims(x, [0, 0])).toThrow(Error);
+      x.dispose();
     });
 
     test("works with jvp", () => {
@@ -2126,6 +2140,8 @@ suite.each(devices)("device:%s", (device) => {
       );
       expect(y.shape).toEqual([1, 3]);
       expect(dy.shape).toEqual([1, 3]);
+      y.dispose();
+      dy.dispose();
     });
 
     test("works with grad", () => {
@@ -2206,6 +2222,7 @@ suite.each(devices)("device:%s", (device) => {
         const y = np.sort(x);
         expect(y.shape).toEqual([3, 0]);
         expect(y.dtype).toBe(np.float32);
+        y.dispose();
       });
 
       test("can sort 8192 elements", async () => {
@@ -2259,7 +2276,8 @@ suite.each(devices)("device:%s", (device) => {
       test("produces zero gradient", () => {
         const x = np.array([3, 1, 2]);
         const f = (x: np.Array) => np.argsort(x).astype(np.float32).sum();
-        const dx = grad(f)(x);
+        const [value, dx] = valueAndGrad(f)(x);
+        value.dispose();
         expect(dx.js()).toEqual([0, 0, 0]);
       });
 

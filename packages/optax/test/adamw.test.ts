@@ -16,6 +16,8 @@ test("adamw optimizer", () => {
 
   expect(params.shape).toEqual([3]);
   expect(params.dtype).toEqual(np.float32);
+  params.dispose();
+  tree.dispose(optState);
 });
 
 test("adamw with custom weight decay", () => {
@@ -32,6 +34,8 @@ test("adamw with custom weight decay", () => {
 
   expect(params.shape).toEqual([3]);
   expect(params.dtype).toEqual(np.float32);
+  params.dispose();
+  tree.dispose(optState);
 });
 
 test("adamw with nesterov", () => {
@@ -48,6 +52,8 @@ test("adamw with nesterov", () => {
 
   expect(params.shape).toEqual([3]);
   expect(params.dtype).toEqual(np.float32);
+  params.dispose();
+  tree.dispose(optState);
 });
 
 test("adamw with callable mask", () => {
@@ -72,4 +78,6 @@ test("adamw with callable mask", () => {
 
   expect(params.shape).toEqual([3]);
   expect(params.dtype).toEqual(np.float32);
+  params.dispose();
+  tree.dispose(optState);
 });

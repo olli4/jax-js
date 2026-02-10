@@ -36,7 +36,9 @@ suite("jax.jvp()", () => {
     const f = (x: np.Array) => np.sum(x);
     const x = np.array([1, 2, 3]);
     expect(f(x.ref)).toBeAllclose(6);
-    expect(jvp(f, [x], [np.array([1, 1, 1])])[1]).toBeAllclose(3);
+    const [primal, tangent] = jvp(f, [x], [np.array([1, 1, 1])]);
+    primal.dispose();
+    expect(tangent).toBeAllclose(3);
   });
 
   test("can compute jvp of products", () => {

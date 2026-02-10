@@ -45,7 +45,7 @@ suite.each(devices)("device:%s", (device) => {
 
     test("generate uniform random", () => {
       const key = random.key(42);
-      const [a, b, c] = random.split(key, 3);
+      const [a, b, c] = [...random.split(key, 3)];
 
       const x = random.uniform(a);
       expect(x.js()).toBeWithinRange(0, 1);
@@ -213,11 +213,15 @@ suite.each(devices)("device:%s", (device) => {
           [4.0, 5.0, 6.0],
         ]); // shape [2, 3]
 
+        // categorical is jit-wrapped; the shape check throws during tracing,
+        // BEFORE any concrete args are consumed.
         expect(() => {
           random.categorical(key, logits, { shape: [10, 5] }); // suffix [5] != batchShape [2]
         }).toThrow(
           /Incompatible array broadcast shapes|not broadcast-compatible/i,
         );
+        key.dispose();
+        logits.dispose();
       });
 
       test("shape doesn't dominate batch shape throws error", () => {
@@ -225,9 +229,12 @@ suite.each(devices)("device:%s", (device) => {
         const logits = np.ones([4, 5]); // batchShape = [4] (axis=-1)
 
         // [1] broadcasts with [4] → [4], but [4] != [1], so our error fires
+        // jit-wrapped: shape check throws during tracing, before consuming.
         expect(() => {
           random.categorical(key, logits, { shape: [1] });
         }).toThrow(/not broadcast-compatible/);
+        key.dispose();
+        logits.dispose();
       });
 
       test("multi-dimensional shape prefix", () => {
@@ -276,9 +283,12 @@ suite.each(devices)("device:%s", (device) => {
           const logits = np.array([1.0, 2.0, 3.0]); // 3 categories
 
           // Trying to sample 5 without replacement should fail
+          // jit-wrapped: throws during tracing, before consuming.
           expect(() => {
             random.categorical(key, logits, { shape: [5], replace: false });
           }).toThrow(/cannot exceed/);
+          key.dispose();
+          logits.dispose();
         });
 
         test("batched without replacement", () => {
@@ -336,6 +346,7 @@ suite.each(devices)("device:%s", (device) => {
         // Default shape removes axis
         const s1 = random.categorical(random.key(100), logits.ref, { axis: 1 });
         expect(s1.shape).toEqual([2, 3]);
+        s1.dispose();
 
         // With shape prefix
         const s2 = random.categorical(random.key(101), logits.ref, {
@@ -343,13 +354,15 @@ suite.each(devices)("device:%s", (device) => {
           shape: [10, 2, 3],
         });
         expect(s2.shape).toEqual([10, 2, 3]);
+        s2.dispose();
 
         // Negative axis (-2 means axis=1)
-        const s3 = random.categorical(random.key(102), logits.ref, {
+        const s3 = random.categorical(random.key(102), logits, {
           axis: -2,
           shape: [4, 2, 3],
         });
         expect(s3.shape).toEqual([4, 2, 3]);
+        s3.dispose();
       });
     });
 

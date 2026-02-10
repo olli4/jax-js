@@ -1,4 +1,4 @@
-import { numpy as np } from "@jax-js/jax";
+import { numpy as np, tree } from "@jax-js/jax";
 import {
   addDecayedWeights,
   scaleByLearningRate,
@@ -22,6 +22,8 @@ test("scaleByLearningRate function", () => {
 
   // Should scale by -0.1 (negative learning rate)
   expect(newUpdates).toBeAllclose([-0.01, -0.02, -0.03]);
+  params.dispose();
+  updates.dispose();
 });
 
 test("addDecayedWeights function with scalar", () => {
@@ -39,6 +41,8 @@ test("addDecayedWeights function with scalar", () => {
 
   // Should add weight decay: [0.1 + 0.01*1, 0.2 + 0.01*2, 0.3 + 0.01*3]
   expect(newUpdates).toBeAllclose([0.11, 0.22, 0.33]);
+  params.dispose();
+  updates.dispose();
 });
 
 test("addDecayedWeights function with schedule", () => {
@@ -57,6 +61,9 @@ test("addDecayedWeights function with schedule", () => {
   // Second update (step 1): weight_decay = 0.02
   [newUpdates, newState] = transform.update(updates.ref, newState, params.ref);
   expect(newUpdates).toBeAllclose([0.12, 0.24, 0.36]);
+  params.dispose();
+  updates.dispose();
+  tree.dispose(newState);
 });
 
 test("addDecayedWeights function with mask", () => {
@@ -76,6 +83,8 @@ test("addDecayedWeights function with mask", () => {
 
   // Should add weight decay only where mask = 1: [0.1 + 0.01*1, 0.2 + 0, 0.3 + 0.01*3]
   expect(newUpdates).toBeAllclose([0.11, 0.2, 0.33]);
+  params.dispose();
+  updates.dispose();
 });
 
 test("addDecayedWeights throws error when params is undefined", () => {
@@ -87,6 +96,8 @@ test("addDecayedWeights throws error when params is undefined", () => {
   expect(() => {
     transform.update(updates.ref, state, undefined);
   }).toThrow("addDecayedWeights requires params to be provided");
+  updates.dispose(); // undo unconsumed .ref
+  updates.dispose(); // dispose original
 });
 
 test("scaleBySchedule function with dynamic learning rate", () => {
@@ -105,6 +116,9 @@ test("scaleBySchedule function with dynamic learning rate", () => {
   // Second update (step 1)
   [newUpdates, newState] = transform.update(updates.ref, newState, params.ref);
   expect(newUpdates).toBeAllclose([0.09, 0.18, 0.27]); // 0.9 * updates
+  params.dispose();
+  updates.dispose();
+  tree.dispose(newState);
 });
 
 test("trace transformation", () => {
@@ -121,6 +135,9 @@ test("trace transformation", () => {
   // Second update: trace = updates + 0.9 * prev_trace
   [newUpdates, newState] = transform.update(updates.ref, newState, params.ref);
   expect(newUpdates).toBeAllclose([0.19, 0.38, 0.57]); // 0.1 + 0.9*0.1, etc.
+  params.dispose();
+  updates.dispose();
+  tree.dispose(newState);
 });
 
 test("trace transformation with nesterov", () => {
@@ -138,4 +155,8 @@ test("trace transformation with nesterov", () => {
   [newUpdates, newState] = transform.update(updates.ref, newState, params.ref);
   expect(newUpdates.shape).toEqual([3]);
   expect(newUpdates.dtype).toEqual(np.float32);
+  newUpdates.dispose();
+  params.dispose();
+  updates.dispose();
+  tree.dispose(newState);
 });

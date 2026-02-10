@@ -539,6 +539,9 @@ export function jaxprAsFun(jaxpr: Jaxpr): (...args: Tracer[]) => Tracer[] {
 
 /** Jaxpr with a collection of associated, traced constants. */
 export class ClosedJaxpr {
+  /** Callbacks invoked when dispose() is called, for cleaning up derived caches. */
+  static _disposeHooks: ((jaxpr: Jaxpr) => void)[] = [];
+
   constructor(
     readonly jaxpr: Jaxpr,
     readonly consts: Tracer[],
@@ -557,6 +560,7 @@ export class ClosedJaxpr {
   /** Dispose of the constants in this Jaxpr. */
   dispose() {
     for (const c of this.consts) c.dispose();
+    for (const hook of ClosedJaxpr._disposeHooks) hook(this.jaxpr);
   }
 }
 
@@ -1127,6 +1131,34 @@ export function makeJaxpr(
   };
 }
 
+/** Global registry of all jit caches, for test-time cleanup. */
+const _jitCaches = new Set<Map<string, { jaxpr: ClosedJaxpr; treedef: any }>>();
+
+/** Callbacks for clearing derived caches (jvpJaxpr, transposeJaxpr, vmapJaxpr). */
+export const _derivedCacheCleanups: (() => void)[] = [];
+
+/** Dispose all jit caches and free their constants. Used by checkLeaks. */
+export function _disposeAllJitCaches(): void {
+  for (const cache of _jitCaches) {
+    for (const { jaxpr } of cache.values()) {
+      // Fire hooks for derived cache cleanup (jvp/transpose/vmap caches).
+      for (const hook of ClosedJaxpr._disposeHooks) hook(jaxpr.jaxpr);
+      // Dispose consts, skipping any already freed by user code.
+      for (const c of jaxpr.consts) {
+        try {
+          c.dispose();
+        } catch {
+          /* const was already disposed externally */
+        }
+      }
+    }
+    cache.clear();
+  }
+  // Also clear all derived caches — PE-derived sub-jaxprs may hold entries
+  // not reachable through the dispose-hook cascade above.
+  for (const cleanup of _derivedCacheCleanups) cleanup();
+}
+
 export function jit<F extends (...args: any[]) => any>(
   f: F,
   opts?: JitOpts,
@@ -1134,6 +1166,7 @@ export function jit<F extends (...args: any[]) => any>(
   (...args: MapJsTree<Parameters<F>, Array, ArrayLike>) => ReturnType<F>
 > {
   const cache = new Map<string, ReturnType<ReturnType<typeof makeJaxpr>>>();
+  _jitCaches.add(cache);
   const staticArgnums = new Set(opts?.staticArgnums ?? []);
 
   const result = ((...args) => {
@@ -1148,15 +1181,11 @@ export function jit<F extends (...args: any[]) => any>(
       makeJaxpr(f, opts)(...jaxprArgs),
     );
 
-    const outs = bind(
-      Primitive.Jit,
-      [...jaxpr.consts.map((c) => c.ref), ...argsFlat],
-      {
-        name: f.name || "closure",
-        jaxpr: jaxpr.jaxpr,
-        numConsts: jaxpr.consts.length,
-      },
-    );
+    const outs = bind(Primitive.Jit, [...jaxpr.consts, ...argsFlat], {
+      name: f.name || "closure",
+      jaxpr: jaxpr.jaxpr,
+      numConsts: jaxpr.consts.length,
+    });
     return treeUnflatten(outTree, outs);
   }) as OwnedFunction<F>;
 
@@ -1164,6 +1193,8 @@ export function jit<F extends (...args: any[]) => any>(
     for (const { jaxpr } of cache.values()) {
       jaxpr.dispose();
     }
+    cache.clear();
+    _jitCaches.delete(cache);
   };
 
   return result;

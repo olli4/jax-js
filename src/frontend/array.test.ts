@@ -72,7 +72,7 @@ suite.each(devices)("device:%s", (device) => {
     // Multiply them together -- outer products of a[i] and b[i].
     const c = a.mul(b);
     expect(c.shape).toEqual([2, 3, 2]);
-    expect(c.ref.js()).toEqual([
+    expect(c.js()).toEqual([
       [
         [10, 220],
         [5, 110],
@@ -122,7 +122,7 @@ suite.each(devices)("device:%s", (device) => {
     expect(a.dtype).toEqual("bool");
 
     expect(a.ref.dataSync()).toEqual(new Int32Array([1, 0, 1]));
-    expect(a.ref.js()).toEqual([true, false, true]);
+    expect(a.js()).toEqual([true, false, true]);
 
     const b = array([1, 3, 4]);
     expect(b.ref.greater(2).js()).toEqual([false, true, true]);
@@ -245,14 +245,17 @@ suite.each(devices)("device:%s", (device) => {
   }
 
   test("iterate over an array", () => {
-    const [a, b] = array([
-      [1, 2, 3],
-      [4, 5, 6],
-    ]);
+    const [a, b] = [
+      ...array([
+        [1, 2, 3],
+        [4, 5, 6],
+      ]),
+    ];
     expect(a.js()).toEqual([1, 2, 3]);
     expect(b.js()).toEqual([4, 5, 6]);
 
-    const [[x, y], z] = array([1, 2, 3, 4]).reshape([2, 2]);
+    const [inner, z] = [...array([1, 2, 3, 4]).reshape([2, 2])];
+    const [x, y] = [...inner];
     expect(x.js()).toEqual(1);
     expect(y.js()).toEqual(2);
     expect(z.js()).toEqual([3, 4]);

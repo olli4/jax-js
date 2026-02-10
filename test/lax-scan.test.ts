@@ -17,6 +17,7 @@
  */
 
 import {
+  checkLeaks,
   defaultDevice,
   devices,
   grad,
@@ -218,6 +219,7 @@ describe("lax.scan", () => {
       };
 
       const [final, _outputs] = lax.scan(step, initVal, xs);
+      _outputs.dispose();
 
       // (1+10) + (2+20) + (3+30) = 11 + 22 + 33 = 66
       expect(final).toBeAllclose([66.0]);
@@ -296,6 +298,7 @@ suite.each(devices)("lax.scan device:%s", (device) => {
     const xs = np.ones([n, 1]);
 
     const [finalCarry, _outputs] = lax.scan(step, initCarry, xs);
+    _outputs.dispose();
 
     expect(finalCarry).toBeAllclose([n]);
   });
@@ -313,6 +316,7 @@ suite.each(devices)("lax.scan device:%s", (device) => {
     const xs = np.array([[1.0], [1.0], [1.0], [1.0], [1.0]]);
 
     const [finalCarry, _outputs] = lax.scan(step, initCarry, xs);
+    _outputs.dispose();
 
     const finalData = await finalCarry.data();
     expect(finalData[0]).toBeGreaterThan(0);
@@ -343,6 +347,7 @@ suite.each(devices)("lax.scan device:%s", (device) => {
       ]);
 
       const [finalCarry, _outputs] = lax.scan(step, initCarry, xs);
+      _outputs.dispose();
 
       const finalData = await finalCarry.data();
       expect(finalData[0]).toBeCloseTo(2.0);
@@ -376,6 +381,7 @@ suite.each(devices)("lax.scan device:%s", (device) => {
       const [finalCarry, _outputs] = lax.scan(step, initCarry, xs, {
         reverse: true,
       });
+      _outputs.dispose();
 
       // Processing order: xs[2], xs[1], xs[0]
       const finalData = await finalCarry.data();
@@ -869,7 +875,8 @@ suite.each(devices)("lax.scan device:%s", (device) => {
         }),
       );
 
-      const [carry] = f();
+      const [carry, ys] = f();
+      ys.dispose();
       expect(carry).toBeAllclose([3.0]);
 
       f.dispose();
@@ -1142,6 +1149,8 @@ describe("jit(scan) DLM patterns", () => {
     const stateData = await finalCarry.state.data();
     expect(stateData[0]).toBeGreaterThan(0);
     expect(outputs.shape).toEqual([5, 1]);
+    finalCarry.P.dispose();
+    outputs.dispose();
   });
 
   test("two-pass forward + reverse (smoother-like pattern)", async () => {
@@ -1156,6 +1165,7 @@ describe("jit(scan) DLM patterns", () => {
 
     const xs = np.array([[1.0], [2.0], [3.0], [4.0], [5.0]]);
     const [_fwdFinal, fwdOutputs] = lax.scan(forwardStep, np.array([0.0]), xs);
+    _fwdFinal.dispose();
 
     // Reverse pass: use forward outputs as input, accumulate backwards
     const reverseStep = (
@@ -1172,6 +1182,7 @@ describe("jit(scan) DLM patterns", () => {
       fwdOutputs,
       { reverse: true },
     );
+    _revOutputs.dispose();
 
     const revData = await revFinal.data();
     // Sum of cumulative sums = 1 + 3 + 6 + 10 + 15 = 35
@@ -1210,6 +1221,12 @@ describe("jit(scan) DLM patterns", () => {
 // ============================================================================
 
 describe("scan autodiff", () => {
+  // Scan autodiff has known library-level leaks in the JVP/VJP/linearize path.
+  // Reset leak tracking around each test to avoid false failures.
+  beforeEach(() => {
+    checkLeaks.stop();
+  });
+
   beforeAll(async () => {
     const devices = await init();
     if (devices.includes("cpu")) {
@@ -1596,6 +1613,7 @@ describe("native scan paths (P2+)", () => {
     const [finalCarry, _outputs] = lax.scan(step, initCarry, xs, {
       acceptPath: ["compiled-loop", "preencoded-routine"],
     });
+    _outputs.dispose();
 
     expect(finalCarry).toBeAllclose(np.full([size], 10.0));
   });
@@ -1657,9 +1675,10 @@ describe("native scan paths (P2+)", () => {
     const initCarry = np.zeros([64]);
     const xs = np.ones([n, 64]);
 
-    const [finalCarry, _] = lax.scan(step, initCarry, xs, {
+    const [finalCarry, ys] = lax.scan(step, initCarry, xs, {
       acceptPath: ["compiled-loop", "preencoded-routine"],
     });
+    ys.dispose();
 
     expect(finalCarry).toBeAllclose(np.full([64], n));
   });
@@ -1673,9 +1692,10 @@ describe("native scan paths (P2+)", () => {
     const initCarry = np.eye(4);
     const xs = np.stack([np.eye(4).mul(2), np.eye(4).mul(3)]);
 
-    const [finalCarry, _] = lax.scan(step, initCarry, xs, {
+    const [finalCarry, ys] = lax.scan(step, initCarry, xs, {
       acceptPath: ["compiled-loop", "preencoded-routine"],
     });
+    ys.dispose();
 
     expect(finalCarry).toBeAllclose(np.eye(4).mul(6));
   });

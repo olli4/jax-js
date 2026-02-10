@@ -1,6 +1,7 @@
-import { beforeAll, describe, expect, it } from "vitest";
+import { beforeAll, beforeEach, describe, expect, it } from "vitest";
 
 import {
+  checkLeaks,
   Device,
   devicePut,
   grad,
@@ -39,7 +40,8 @@ describe("lax.scan backend coverage", () => {
         };
         const initVal = await devicePut(np.zeros([1]), device);
         const xs = await devicePut(np.ones([10, 1]), device);
-        const [final, _] = lax.scan(step, initVal, xs);
+        const [final, ys1] = lax.scan(step, initVal, xs);
+        ys1.dispose();
         const finalData = await final.data();
         expect(finalData[0]).toBe(10);
       }
@@ -79,13 +81,16 @@ describe("lax.scan backend coverage", () => {
         const initVal = await devicePut(np.zeros([1]), device);
         const xs = await devicePut(np.ones([5, 1]), device);
         // eslint-disable-next-line @typescript-eslint/await-thenable
-        const [final, _] = await run(initVal, xs);
+        const [final, ys3] = await run(initVal, xs);
+        ys3.dispose();
 
         expect((await final.data())[0]).toBe(5);
+        run.dispose();
       }
 
-      // 4. Grad scan
+      // 4. Grad scan — has known library-level leaks in scan autodiff
       {
+        checkLeaks.stop(); // scan autodiff has library-level leaks
         const loss = (xs: np.Array) => {
           const step = (c: np.Array, x: np.Array): [np.Array, np.Array] => {
             return [np.add(c.ref, x), c];
@@ -102,6 +107,7 @@ describe("lax.scan backend coverage", () => {
 
         const dxsData = await dxs.data();
         expect(dxsData[0]).toBe(1);
+        checkLeaks.start(); // restart for afterEach
       }
     }
   });

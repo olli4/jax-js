@@ -5,6 +5,7 @@ import { Routines } from "../routine";
 import { type Pair } from "../shape";
 import {
   JsTreeDef,
+  dispose as treeDispose,
   flatten as treeFlatten,
   unflatten as treeUnflatten,
 } from "../tree";
@@ -625,6 +626,11 @@ export function currentTraceLevel(): number {
   return traceStack[traceStack.length - 1].level;
 }
 
+/** True when no transformations are active (only the base EvalTrace). */
+export function isTopLevel(): boolean {
+  return traceStack.length <= 1;
+}
+
 export type TracerValue = Tracer | number | boolean;
 
 export abstract class Trace {
@@ -974,12 +980,15 @@ export abstract class Tracer {
     if (this.ndim === 0) throw new Error("Cannot iterate over a scalar array");
     let residual: Tracer = this;
     const subarrayShape = this.shape.slice(1);
-    for (let i = 0; i < this.shape[0]; i++) {
-      const lr = split(residual, 0, [1, residual.shape[0] - 1]);
-      yield lr[0].reshape(subarrayShape) as this;
-      residual = lr[1];
+    try {
+      for (let i = 0; i < this.shape[0]; i++) {
+        const lr = split(residual, 0, [1, residual.shape[0] - 1]);
+        residual = lr[1]; // capture before yield so finally can clean up on early return
+        yield lr[0].reshape(subarrayShape) as this;
+      }
+    } finally {
+      residual.dispose();
     }
-    residual.dispose();
   }
 
   /**
@@ -1009,16 +1018,16 @@ export abstract class Tracer {
   argsort(axis: number = -1): this {
     axis = checkAxis(axis, this.ndim);
     if (axis === this.ndim - 1) {
-      const [y, yi] = argsort(this);
-      y.dispose();
-      return yi as this;
+      const [sorted, indices] = argsort(this);
+      sorted.dispose();
+      return indices as this;
     }
     const perm = range(this.ndim);
     perm.splice(axis, 1);
     perm.push(axis);
-    const [y, yi] = argsort(this.transpose(perm));
-    y.dispose();
-    return yi.transpose(invertPermutation(perm)) as this;
+    const [sorted, indices] = argsort(this.transpose(perm));
+    sorted.dispose();
+    return indices.transpose(invertPermutation(perm)) as this;
   }
 
   /**
@@ -1328,6 +1337,7 @@ export function flattenFunWithAux(
     const pytreeArgs = treeUnflatten(inTree, argsFlat);
     const result = f(...pytreeArgs);
     if (!Array.isArray(result) || result.length !== 2) {
+      treeDispose(result);
       throw new Error(
         "Function with `hasAux: true` must return [output, aux] tuple",
       );

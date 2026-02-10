@@ -57,7 +57,7 @@ suite.each(devices)("device:%s", (device) => {
           [2, 1],
         ]);
 
-        [values, indices] = lax.topK(x.ref, 1, 0);
+        [values, indices] = lax.topK(x, 1, 0);
         expect(values.js()).toEqual([[3, 5, 9]]);
         expect(indices.js()).toEqual([[0, 1, 1]]);
       });
@@ -70,9 +70,14 @@ suite.each(devices)("device:%s", (device) => {
       });
 
       test("throws for invalid k", () => {
-        const x = np.array([1, 2, 3]);
+        // topK validates k before consuming the input array, so on throw
+        // the input is NOT consumed. Use bare x (no .ref) and dispose after.
+        let x = np.array([1, 2, 3]);
         expect(() => lax.topK(x, -1)).toThrow();
+        x.dispose();
+        x = np.array([1, 2, 3]);
         expect(() => lax.topK(x, 4)).toThrow();
+        x.dispose();
       });
     });
   }

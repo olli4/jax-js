@@ -275,6 +275,7 @@ suite.each(devices)("device:%s", (device) => {
 
       const out = nn.dotProductAttention(query, key, value);
       expect(out.shape).toEqual([2, 1, 4]);
+      out.dispose();
     });
 
     test("attention with custom scale", () => {
@@ -395,6 +396,7 @@ suite.each(devices)("device:%s", (device) => {
 
       const out = nn.dotProductAttention(query, key, value);
       expect(out.shape).toEqual([1, 2, 2, 2]);
+      out.dispose();
     });
 
     test("grouped-query attention (GQA)", () => {
@@ -407,6 +409,7 @@ suite.each(devices)("device:%s", (device) => {
 
       const out = nn.dotProductAttention(query, key, value);
       expect(out.shape).toEqual([1, 2, 4, 2]);
+      out.dispose();
     });
 
     test("multi-query attention (MQA)", () => {
@@ -419,6 +422,7 @@ suite.each(devices)("device:%s", (device) => {
 
       const out = nn.dotProductAttention(query, key, value);
       expect(out.shape).toEqual([1, 2, 4, 2]);
+      out.dispose();
     });
 
     test("attention is differentiable", () => {

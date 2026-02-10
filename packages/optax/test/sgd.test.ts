@@ -1,4 +1,4 @@
-import { grad, numpy as np } from "@jax-js/jax";
+import { grad, numpy as np, tree } from "@jax-js/jax";
 import { applyUpdates, sgd, squaredError } from "@jax-js/optax";
 import { expect, test } from "vitest";
 
@@ -38,6 +38,8 @@ test("sgd with momentum", () => {
 
   expect(params.shape).toEqual([3]);
   expect(params.dtype).toEqual(np.float32);
+  params.dispose();
+  tree.dispose(optState);
 });
 
 test("sgd with nesterov momentum", () => {
@@ -61,4 +63,6 @@ test("sgd with nesterov momentum", () => {
 
   expect(params.shape).toEqual([3]);
   expect(params.dtype).toEqual(np.float32);
+  params.dispose();
+  tree.dispose(optState);
 });

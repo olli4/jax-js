@@ -129,9 +129,11 @@ suite.each(devices)("device:%s", (device) => {
         const y = np.zeros([1, 1, kDim, kDim]);
         const dx = grad(f)(x.ref, y.ref);
         expect(dx.shape).toEqual(x.shape);
+        dx.dispose();
 
         const dy = grad(g)(y, x);
         expect(dy.shape).toEqual(y.shape);
+        dy.dispose();
       }
     }
   });
@@ -179,6 +181,7 @@ suite.each(devices)("device:%s", (device) => {
       featureGroupCount: 2,
     });
     expect(result.shape).toEqual([2, 6, 6, 6]);
+    result.dispose();
 
     // Test with 4 groups (depthwise-like): 4 channels, each convolved separately
     const x2 = np.zeros([1, 4, 5, 5]);
@@ -187,6 +190,7 @@ suite.each(devices)("device:%s", (device) => {
       featureGroupCount: 4,
     });
     expect(result2.shape).toEqual([1, 8, 5, 5]);
+    result2.dispose();
   });
 
   test("grouped convolution values", () => {
@@ -261,6 +265,7 @@ suite.each(devices)("device:%s", (device) => {
     const sumF = (x: np.Array, y: np.Array) => f(x, y).sum();
     const dx = grad(sumF)(x.ref, y.ref);
     expect(dx.shape).toEqual([1, 3, 5]);
+    dx.dispose();
 
     // Gradient w.r.t. kernel
     const dy = grad((y: np.Array, x: np.Array) => sumF(x, y))(y, x);
