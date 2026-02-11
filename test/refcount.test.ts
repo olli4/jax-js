@@ -47,6 +47,7 @@ suite("refCount property", () => {
     const x = np.array([1, 2, 3]);
     expect(x.refCount).toBe(1);
     x.dispose();
+    // eslint-disable-next-line @jax-js/no-use-after-consume -- intentional: testing refCount after dispose
     expect(x.refCount).toBe(0);
   });
 
@@ -54,6 +55,7 @@ suite("refCount property", () => {
     const x = np.array([1, 2, 3]);
     x.dispose();
     // Should not throw - refCount is readable for debugging
+    // eslint-disable-next-line @jax-js/no-use-after-consume -- intentional: testing refCount after dispose
     expect(x.refCount).toBe(0);
   });
 });

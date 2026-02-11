@@ -2239,8 +2239,8 @@ suite.each(devices)("device:%s", (device) => {
       test("argsorts 1D array", () => {
         const x = np.array([3, 1, 4, 2, 5]);
         const idx = np.argsort(x);
-        expect(idx.js()).toEqual([1, 3, 0, 2, 4]);
         expect(idx.dtype).toBe("int32");
+        expect(idx.js()).toEqual([1, 3, 0, 2, 4]);
       });
 
       test("argsorts 2D array", () => {

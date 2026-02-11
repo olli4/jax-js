@@ -45,7 +45,7 @@ suite("jax.makeJaxpr()", () => {
   test("composes with jvp", () => {
     const f = (x: np.Array) => np.multiply(x.ref.add(2), x);
     const fdot = (x: np.Array) => {
-      const [y, dy] = jvp(f, [x.ref], [1]);
+      const [y, dy] = jvp(f, [x], [1]);
       y.dispose();
       return dy;
     };

@@ -97,6 +97,7 @@ test("addDecayedWeights throws error when params is undefined", () => {
     transform.update(updates.ref, state, undefined);
   }).toThrow("addDecayedWeights requires params to be provided");
   updates.dispose(); // undo unconsumed .ref
+  // eslint-disable-next-line @jax-js/no-use-after-consume -- intentional: double-dispose after .ref bump
   updates.dispose(); // dispose original
 });
 
