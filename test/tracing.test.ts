@@ -586,15 +586,7 @@ suite("jax.jit()", () => {
     expect(grad(f)(10)).toBeAllclose(20);
     expect(jvp(grad(f), [10], [1])).toBeAllclose([20, 2]);
 
-    // grad(grad(jit(...))) leaks 3 slots due to an unbalanced extra .ref
-    // when const arrays flow through nested JVP→PE trace interception in
-    // #partialEvalJaxpr.  Reset baselines so the afterEach hook stays clean.
-    // TODO(leak): fix nested grad-of-jit const ref counting
-    checkLeaks.stop();
-    checkLeaks.start();
     expect(grad(grad(f))(10)).toBeAllclose(2);
-    checkLeaks.stop();
-    checkLeaks.start();
 
     const f2 = jit(grad(f));
     expect(grad(f2)(10)).toBeAllclose(2);

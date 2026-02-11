@@ -108,7 +108,17 @@ function partialEvalFlat(
     fullRaise(trace, out),
   );
 
-  const pvalsOut = tracersOut.map((t) => t.pval); // Ownership either transferred here, or in the next line.
+  const pvalsOut = tracersOut.map((t) => {
+    if (t.pval.isKnown) {
+      // Transfer ownership from the PE tracer to the returned PartialVal.
+      // fullLower() refs the value and disposes the PE wrapper, so the
+      // value's RC is unchanged and the wrapper is properly cleaned up.
+      // Without this, the PE wrapper is abandoned (never disposed) and
+      // the value leaks — JavaScript has no destructor to clean it up.
+      return PartialVal.known(t.fullLower());
+    }
+    return t.pval;
+  });
   const unknownTracersOut = tracersOut.filter((t) => !t.pval.isKnown);
   const jaxpr = partialEvalGraphToJaxpr(unknownTracersIn, unknownTracersOut);
   return { jaxpr, pvalsOut };
@@ -248,6 +258,18 @@ class PartialEvalTracer extends Tracer {
     this.#rc = 1;
   }
 
+  /**
+   * Whether this PET borrows an externally-owned value.
+   * True for PETs created by newArg (wrapping user inputs).
+   * False for PETs created by pure/lift (wrapping intermediates).
+   */
+  borrowed = false;
+
+  /** Current PET reference count (for internal lifecycle decisions). */
+  get refCount(): number {
+    return this.#rc;
+  }
+
   get aval(): AbstractValue {
     return this.pval.aval;
   }
@@ -297,7 +319,11 @@ class PartialEvalTracer extends Tracer {
 
 class PartialEvalTrace extends Trace {
   newArg(pval: PartialVal) {
-    if (pval.isKnown) return new PartialEvalTracer(this, pval, null);
+    if (pval.isKnown) {
+      const pet = new PartialEvalTracer(this, pval, null);
+      pet.borrowed = true; // Value is externally owned (user input)
+      return pet;
+    }
     return new PartialEvalTracer(this, pval, { type: "LambdaBinding" });
   }
 
@@ -392,11 +418,24 @@ class PartialEvalTrace extends Trace {
 
     const outs1Res = bind(
       Primitive.Jit,
-      // fullLower() transfers ownership from the PET to the lowered val
-      // (PET reaches rc=0, disposing itself and releasing val via ref-then-
-      // dispose which cancels out). The extra .ref gives bind a reference to
-      // consume, keeping val.rc at its original level after the call.
-      knownTracers.map((t) => t.fullLower().ref),
+      knownTracers.map((t) => {
+        const rc = t.refCount;
+        const val = t.fullLower();
+        // fullLower() ref's the value and disposes the PET wrapper.
+        //
+        // When PET.#rc == 1: dispose reaches 0, val IS disposed, so
+        //   val.ref(+1) and val.dispose(-1) cancel → val at original rc.
+        //   bind will consume the arg. For borrowed PETs (externally-owned
+        //   user inputs like hasAux primals), add .ref so bind's consumption
+        //   doesn't free the external owner's value. For non-borrowed PETs
+        //   (intermediates), let bind consume the creation ref.
+        //
+        // When PET.#rc > 1: dispose does NOT reach 0, val is NOT disposed, so
+        //   val.ref(+1) is unbalanced → val at original+1.
+        //   bind consumes that extra ref, leaving val at original. Correct.
+        //   Adding .ref here would create an unbalanced ref → memory leak.
+        return rc === 1 && t.borrowed ? val.ref : val;
+      }),
       { name: `${name}_peval`, jaxpr: jaxpr1, numConsts: 0 },
     );
     const outs1 = outs1Res.slice(0, jaxpr1.outs.length - numRes);
@@ -423,7 +462,6 @@ class PartialEvalTrace extends Trace {
     });
     recipe.tracerRefsOut = outs2.map((t) => new WeakRef(t));
 
-    // Stitch the known and unknown output tracers together, both with Jit.
     let i = 0;
     let j = 0;
     return outUnknowns.map((unk) => (unk ? outs2[j++] : outs1[i++]));
