@@ -1,4 +1,5 @@
 import js from "@eslint/js";
+import jaxJs from "@jax-js/eslint-plugin";
 import { defineConfig, globalIgnores } from "eslint/config";
 import * as eslintImport from "eslint-plugin-import";
 import globals from "globals";
@@ -8,6 +9,7 @@ export default defineConfig([
   globalIgnores(["**/dist/", "docs/", "website/", "coverage/"]),
   js.configs.recommended,
   ts.configs.recommendedTypeChecked,
+  jaxJs.configs!.recommended,
   {
     files: ["**/*.{js,mjs,cjs,ts}"],
     languageOptions: { globals: globals.browser },

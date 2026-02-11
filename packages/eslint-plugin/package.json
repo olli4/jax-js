@@ -1,0 +1,29 @@
+{
+  "name": "@jax-js/eslint-plugin",
+  "version": "0.1.0",
+  "description": "ESLint rules for jax-js array lifetime management",
+  "keywords": [
+    "eslint",
+    "eslintplugin",
+    "jax-js",
+    "memory-leak",
+    "array-lifetime"
+  ],
+  "license": "MIT",
+  "type": "module",
+  "main": "src/index.ts",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "sync": "tsx scripts/sync-api.ts"
+  },
+  "peerDependencies": {
+    "eslint": ">=9.0.0"
+  },
+  "devDependencies": {
+    "eslint": "^9.31.0",
+    "vitest": "^4.0.9",
+    "typescript": "~5.9.3"
+  }
+}
