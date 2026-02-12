@@ -46,23 +46,25 @@ function validateKeyShape(key: Array, scalar = false): number[] {
 
 function getK01(key: Array): [Array, Array] {
   const keyShape = validateKeyShape(key, true);
-  let [k0, k1] = core.split(key, -1, [1, 1]) as [Array, Array];
-  k0 = k0.reshape(keyShape); // Remove the last dimension of size 1
-  k1 = k1.reshape(keyShape);
+  const splits = core.split(key, -1, [1, 1]) as [Array, Array];
+  const k0 = splits[0].reshape(keyShape); // Remove the last dimension of size 1
+  const k1 = splits[1].reshape(keyShape);
+  splits[0].dispose(); // Free the original split views (k0/k1 are new reshape views)
+  splits[1].dispose();
   return [k0, k1];
 }
 
 /** Create a pseudo-random number generator (PRNG) key from 32-bit integer seed. */
 export function key(seed: ArrayLike): Array {
-  seed = array(seed, { dtype: DType.Uint32 });
-  if (seed.ndim !== 0) {
+  using seedArr = array(seed, { dtype: DType.Uint32 });
+  if (seedArr.ndim !== 0) {
     throw new Error(
-      `key: seed must be a scalar integer, but got shape ${seed.shape}` +
+      `key: seed must be a scalar integer, but got shape ${seedArr.shape}` +
         ` - use jax.vmap for batching.`,
     );
   }
   // To match JAX, put the 32-bit seed into a 64-bit key like `[0, seed]`.
-  const key = stack([0, seed]);
+  const key = stack([0, seedArr]);
   // HACK: Ensure the key is realized, so it doesn't generate a bunch of kernels
   // specialized to different constant key values.
   if (key instanceof Array) key._realizeSource();
@@ -81,22 +83,25 @@ export function split(key: Array, num: number | number[] = 2): Array {
   }
 
   const [k0, k1] = getK01(key);
-  return stack(
-    // It's inefficient to calculate the PRNG key twice, then join the halves
-    // together. But this allows us to avoid refactoring AluExp to support
-    // multiple outputs, while remaining consistent with JAX.
-    [
-      randomBits(k0, k1, shape, 0) as Array,
-      randomBits(k0, k1, shape, 1) as Array,
-    ],
-    -1,
-  );
+  try {
+    using r0 = randomBits(k0, k1, shape, 0) as Array;
+    using r1 = randomBits(k0, k1, shape, 1) as Array;
+    return stack([r0, r1], -1);
+  } finally {
+    k0.dispose();
+    k1.dispose();
+  }
 }
 
 /** Sample uniform bits in the form of unsigned integers. */
 export function bits(key: Array, shape: number[] = []): Array {
   const [k0, k1] = getK01(key);
-  return randomBits(k0, k1, shape) as Array;
+  try {
+    return randomBits(k0, k1, shape) as Array;
+  } finally {
+    k0.dispose();
+    k1.dispose();
+  }
 }
 
 /**
@@ -113,12 +118,11 @@ export const uniform = jit(
       throw new Error(`Invalid range: [${minval}, ${maxval}).`);
     }
     // Float32 has sign bit, 8 bits of exponent, and 23 bits of mantissa.
-    const mantissa = bits(key, shape).div(
-      array(1 << 9, { dtype: DType.Uint32, device: key.device }),
-    );
-    const float12 = mantissa.add(
-      array(0x3f800000, { dtype: DType.Uint32, device: key.device }),
-    ); // Add 1.0 in IEEE 754, now it's a float in [1, 2).
+    // Use `using` to dispose these anonymous typed consts after tracing captures them.
+    using divisor = array(1 << 9, { dtype: DType.Uint32, device: key.device });
+    using bias = array(0x3f800000, { dtype: DType.Uint32, device: key.device });
+    const mantissa = bits(key, shape).div(divisor);
+    const float12 = mantissa.add(bias); // Add 1.0 in IEEE 754, now it's a float in [1, 2).
     const rand = bitcast(float12, DType.Float32).sub(1) as Array; // [0, 1) range
     if (minval === 0 && maxval === 1) {
       return rand;
@@ -141,7 +145,8 @@ export function bernoulli(
   shape: number[] = [],
 ): Array {
   p = fudgeArray(p);
-  return uniform(key, shape).less(p);
+  using u = uniform(key, shape);
+  return u.less(p);
 }
 
 /**

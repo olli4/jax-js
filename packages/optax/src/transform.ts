@@ -40,30 +40,61 @@ export function scaleByAdam({
       return { count: u32(0), mu, nu };
     },
     update(updates, state, params) {
-      let { count, mu, nu } = state as {
+      const {
+        count: oldCount,
+        mu: oldMu,
+        nu: oldNu,
+      } = state as {
         count: np.Array;
         mu: JsTree<np.Array>;
         nu: JsTree<np.Array>;
       };
-      mu = treeUpdateMoment(updates, mu, b1, 1);
-      nu = treeUpdateMoment(updates, nu, b2, 2);
-      count = count.add(1);
+      const mu = treeUpdateMoment(updates, oldMu, b1, 1);
+      const nu = treeUpdateMoment(updates, oldNu, b2, 2);
+      const count = oldCount.add(1);
+      tree.dispose(oldMu);
+      tree.dispose(oldNu);
+      oldCount.dispose();
       let muHat: typeof mu;
       if (nesterov) {
+        const countP1 = count.add(1);
+        const muBC = treeBiasCorrection(mu, b1, countP1);
+        const updBC = treeBiasCorrection(updates, b1, count);
+        countP1.dispose();
         muHat = tree.map(
-          (m: np.Array, g: np.Array) => m.mul(b1).add(g.mul(1 - b1)),
-          treeBiasCorrection(mu, b1, count.add(1)),
-          treeBiasCorrection(updates, b1, count),
+          (m: np.Array, g: np.Array) => {
+            const mScaled = m.mul(b1);
+            const gScaled = g.mul(1 - b1);
+            const result = mScaled.add(gScaled);
+            mScaled.dispose();
+            gScaled.dispose();
+            return result;
+          },
+          muBC,
+          updBC,
         );
+        tree.dispose(muBC);
+        tree.dispose(updBC);
       } else {
         muHat = treeBiasCorrection(mu, b1, count);
       }
       const nuHat = treeBiasCorrection(nu, b2, count);
       updates = tree.map(
-        (m: np.Array, v: np.Array) => m.div(np.sqrt(v.add(epsRoot)).add(eps)),
+        (m: np.Array, v: np.Array) => {
+          const vEps = v.add(epsRoot);
+          const sqrtV = np.sqrt(vEps);
+          vEps.dispose();
+          const denom = sqrtV.add(eps);
+          sqrtV.dispose();
+          const result = m.div(denom);
+          denom.dispose();
+          return result;
+        },
         muHat,
         nuHat,
       ) as typeof updates;
+      tree.dispose(muHat);
+      tree.dispose(nuHat);
       return [updates, { count, mu, nu }];
     },
   };
@@ -89,6 +120,7 @@ export function scaleBySchedule(stepSizeFn: Schedule): GradientTransformation {
     update(updates, state, _params) {
       const { count } = state as { count: np.Array };
       const countInt = count.item();
+      count.dispose();
       const stepSize = stepSizeFn(countInt);
       updates = tree.map((g: np.Array) => g.mul(stepSize), updates);
       return [updates, { count: u32(countInt + 1) }];
@@ -117,11 +149,14 @@ export function clipByGlobalNorm(maxNorm: number): GradientTransformation {
       const gNorm = treeNorm(updates);
       const trigger = np.less(gNorm, maxNorm);
 
-      const clippedUpdates = tree.map(
-        (t: np.Array) =>
-          np.where(trigger, t, t.div(gNorm).mul(maxNorm)),
-        updates,
-      );
+      const clippedUpdates = tree.map((t: np.Array) => {
+        const scaled = t.div(gNorm);
+        const clipped = scaled.mul(maxNorm);
+        scaled.dispose();
+        const result = np.where(trigger, t, clipped);
+        clipped.dispose();
+        return result;
+      }, updates);
 
       trigger.dispose();
       gNorm.dispose();
@@ -165,6 +200,7 @@ export function addDecayedWeights({
         const { count } = state as { count: np.Array };
         const countInt = count.item();
         currentWeightDecay = (weightDecay as Schedule)(countInt);
+        count.dispose();
         newState = { count: u32(countInt + 1) };
       } else {
         currentWeightDecay = weightDecay as number;
@@ -176,15 +212,22 @@ export function addDecayedWeights({
       }
 
       let decayedParams: JsTree<np.Array>;
+      let maskTreeToDispose: JsTree<np.Array> | null = null;
       if (mask) {
-        const maskTree =
-          typeof mask === "function" ? mask(updates) : mask;
+        const maskTree = typeof mask === "function" ? mask(updates) : mask;
+        if (typeof mask === "function") maskTreeToDispose = maskTree;
 
         decayedParams = tree.map(
-          (p: np.Array, m: np.Array) => p.mul(m).mul(currentWeightDecay),
+          (p: np.Array, m: np.Array) => {
+            const pm = p.mul(m);
+            const result = pm.mul(currentWeightDecay);
+            pm.dispose();
+            return result;
+          },
           params,
           maskTree,
         );
+        if (maskTreeToDispose) tree.dispose(maskTreeToDispose);
       } else {
         decayedParams = tree.map(
           (p: np.Array) => p.mul(currentWeightDecay),
@@ -197,6 +240,7 @@ export function addDecayedWeights({
         updates,
         decayedParams,
       ) as typeof updates;
+      tree.dispose(decayedParams);
 
       return [updates, newState];
     },
@@ -223,22 +267,35 @@ export function trace({
 
       // new_trace = g + decay * t
       const newTrace = tree.map(
-        (g: np.Array, t: np.Array) => g.add(t.mul(decay)),
+        (g: np.Array, t: np.Array) => {
+          const scaled = t.mul(decay);
+          const result = g.add(scaled);
+          scaled.dispose();
+          return result;
+        },
         updates,
         prevTrace,
       );
+      tree.dispose(prevTrace);
 
       let finalUpdates: typeof updates;
       if (nesterov) {
         // Nesterov: updates = g + decay * new_trace
         finalUpdates = tree.map(
-          (g: np.Array, t: np.Array) => g.add(t.mul(decay)),
+          (g: np.Array, t: np.Array) => {
+            const scaled = t.mul(decay);
+            const result = g.add(scaled);
+            scaled.dispose();
+            return result;
+          },
           updates,
           newTrace,
         ) as typeof updates;
       } else {
         // Standard momentum: updates = new_trace
-        finalUpdates = newTrace as typeof updates;
+        // Ref the tree so chain can safely dispose intermediate updates
+        // without affecting the state's reference.
+        finalUpdates = tree.ref(newTrace) as typeof updates;
       }
 
       return [finalUpdates, { trace: newTrace }];

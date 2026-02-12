@@ -19,11 +19,12 @@ suite("refcount through grad", () => {
     const f = (x: np.Array) => x.mul(x).sum();
     const df = grad(f);
 
-    const x = np.array([1, 2, 3, 4]);
-    expect(df(x).js()).toEqual([2, 4, 6, 8]);
+    using x = np.array([1, 2, 3, 4]);
+    using r1 = df(x);
+    expect(r1.js()).toEqual([2, 4, 6, 8]);
     // grad does NOT consume x — it's still alive
-    expect(df(x).js()).toEqual([2, 4, 6, 8]);
-    x.dispose();
+    using r2 = df(x);
+    expect(r2.js()).toEqual([2, 4, 6, 8]);
   });
 });
 

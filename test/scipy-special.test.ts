@@ -31,43 +31,41 @@ suite.each(devices)("device:%s", (device) => {
     ];
 
     test("erf values", () => {
-      const x = np.array(erfValues[0]);
-      const y = special.erf(x);
+      using x = np.array(erfValues[0]);
+      using y = special.erf(x);
       expect(y).toBeAllclose(erfValues[1]);
     });
 
     test("erfc values", () => {
-      const x = np.array(erfValues[0]);
-      const y = special.erfc(x);
+      using x = np.array(erfValues[0]);
+      using y = special.erfc(x);
       const expected = erfValues[1].map((v) => 1 - v);
       expect(y).toBeAllclose(expected);
     });
 
     test("erf derivative", () => {
-      const x = np.linspace(-3, 3, 10);
-      const dy = vmap(grad(special.erf))(x);
-      const expected = np.multiply(
-        2 / Math.sqrt(Math.PI),
-        np.exp(np.negative(np.square(x))),
-      );
+      using x = np.linspace(-3, 3, 10);
+      using dy = vmap(grad(special.erf))(x);
+      using negSq = np.negative(np.square(x));
+      using expNegSq = np.exp(negSq);
+      using expected = np.multiply(2 / Math.sqrt(Math.PI), expNegSq);
       expect(dy).toBeAllclose(expected);
     });
 
     test("erfc derivative", () => {
-      const x = np.linspace(-3, 3, 10);
-      const dy = vmap(grad(special.erfc))(x);
-      const expected = np.multiply(
-        -2 / Math.sqrt(Math.PI),
-        np.exp(np.negative(np.square(x))),
-      );
+      using x = np.linspace(-3, 3, 10);
+      using dy = vmap(grad(special.erfc))(x);
+      using negSq = np.negative(np.square(x));
+      using expNegSq = np.exp(negSq);
+      using expected = np.multiply(-2 / Math.sqrt(Math.PI), expNegSq);
       expect(dy).toBeAllclose(expected);
     });
   });
 
   suite("jax.scipySpecial.logit()", () => {
     test("logit values", () => {
-      const x = np.array([0.01, 0.1, 0.25, 0.5, 0.75, 0.9, 0.99]);
-      const y = special.logit(x);
+      using x = np.array([0.01, 0.1, 0.25, 0.5, 0.75, 0.9, 0.99]);
+      using y = special.logit(x);
       const expected = [
         -4.59511985, -2.19722458, -1.09861229, 0, 1.09861229, 2.19722458,
         4.59511985,

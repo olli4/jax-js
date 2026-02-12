@@ -22,62 +22,71 @@ suite.each(devices)("device:%s", (device) => {
   });
 
   test("1d convolution", () => {
-    const x = np.array([[[1, 2, 3, 4, 5]]]);
-    const y = np.array([[[2, 0.5, -1]]]);
-    const result = lax.convGeneralDilated(x, y, [1], "VALID");
+    using x = np.array([[[1, 2, 3, 4, 5]]]);
+    using y = np.array([[[2, 0.5, -1]]]);
+    using result = lax.convGeneralDilated(x, y, [1], "VALID");
     expect(result.js()).toEqual([[[0, 1.5, 3]]]);
 
-    const result2 = lax.convGeneralDilated(x, y, [1], "SAME");
+    using result2 = lax.convGeneralDilated(x, y, [1], "SAME");
     expect(result2.js()).toEqual([[[-1.5, 0, 1.5, 3, 10.5]]]);
   });
 
   test("padding 'SAME' and 'SAME_LOWER'", () => {
-    const x = np.ones([1, 1, 5]);
-    const y = np.ones([1, 1, 4]);
-    const resultSame = lax.convGeneralDilated(x, y, [1], "SAME");
-    expect(resultSame.slice(0, 0).js()).toEqual([3, 4, 4, 3, 2]);
-    const resultSameLower = lax.convGeneralDilated(x, y, [1], "SAME_LOWER");
-    expect(resultSameLower.slice(0, 0).js()).toEqual([2, 3, 4, 4, 3]);
+    using x = np.ones([1, 1, 5]);
+    using y = np.ones([1, 1, 4]);
+    using resultSame = lax.convGeneralDilated(x, y, [1], "SAME");
+    {
+      using _s = resultSame.slice(0, 0);
+      expect(_s.js()).toEqual([3, 4, 4, 3, 2]);
+    }
+    using resultSameLower = lax.convGeneralDilated(x, y, [1], "SAME_LOWER");
+    {
+      using _s = resultSameLower.slice(0, 0);
+      expect(_s.js()).toEqual([2, 3, 4, 4, 3]);
+    }
   });
 
   test("2d convolution", () => {
-    const x = np
-      .array([
-        [3, 1, 5],
-        [2, 2, 9],
-      ])
-      .reshape([1, 1, 2, 3]);
-    const y = np
-      .array([
-        [1, 2],
-        [3, 4],
-      ])
-      .reshape([1, 1, 2, 2]);
-    const result = lax.convGeneralDilated(x, y, [1, 1], "VALID");
-    expect(result.slice(0, 0).js()).toEqual([[19, 53]]);
+    const _rawX = np.array([
+      [3, 1, 5],
+      [2, 2, 9],
+    ]);
+    using x = _rawX.reshape([1, 1, 2, 3]);
+    _rawX.dispose();
+    const _rawY = np.array([
+      [1, 2],
+      [3, 4],
+    ]);
+    using y = _rawY.reshape([1, 1, 2, 2]);
+    _rawY.dispose();
+    using result = lax.convGeneralDilated(x, y, [1, 1], "VALID");
+    {
+      using _s = result.slice(0, 0);
+      expect(_s.js()).toEqual([[19, 53]]);
+    }
   });
 
   test("conv works with jit", () => {
-    const convFn = jit((a: np.Array, b: np.Array) =>
+    using convFn = jit((a: np.Array, b: np.Array) =>
       lax.convGeneralDilated(a, b, [1], "SAME"),
     );
-    const x = np.array([[[1, 2, 3, 4, 5]]]);
-    const y = np.array([[[2, 0.5, -1]]]);
-    const result = convFn(x, y);
+    using x = np.array([[[1, 2, 3, 4, 5]]]);
+    using y = np.array([[[2, 0.5, -1]]]);
+    using result = convFn(x, y);
     expect(result.js()).toEqual([[[-1.5, 0, 1.5, 3, 10.5]]]);
   });
 
   test("0d convolution", () => {
-    const x = np.array([
+    using x = np.array([
       [1, 2],
       [3, 4],
       [5, 8],
     ]);
-    const y = np.array([
+    using y = np.array([
       [6, 4],
       [3, 2],
     ]);
-    const result = lax.convGeneralDilated(x, y, [], "VALID");
+    using result = lax.convGeneralDilated(x, y, [], "VALID");
     expect(result.js()).toEqual([
       [14, 7],
       [34, 17],
@@ -86,34 +95,43 @@ suite.each(devices)("device:%s", (device) => {
   });
 
   test("grad of 0d convolution", () => {
-    const x = np.array([
+    using x = np.array([
       [1, 2],
       [3, 4],
       [5, 8],
     ]);
-    const y = np.array([
+    using y = np.array([
       [6, 4],
       [3, 2],
     ]);
     const f = (x: np.Array, y: np.Array) =>
       lax.convGeneralDilated(x, y, [], "VALID").sum();
-    expect(grad(f)(x, y).js()).toEqual([
-      [9, 6],
-      [9, 6],
-      [9, 6],
-    ]);
+    {
+      using _gr = grad(f)(x, y);
+      expect(_gr.js()).toEqual([
+        [9, 6],
+        [9, 6],
+        [9, 6],
+      ]);
+    }
   });
 
   test("grad of 1d convolution", () => {
     const f = (x: np.Array, y: np.Array) =>
       lax.convGeneralDilated(x, y, [1], "SAME").slice(0, 0, 3);
-    const x = np.array([[[1, 2, 3, 4, 5, 6, 7]]]);
-    const y = np.array([[[2, 0.5, -1]]]);
-    const dx = grad(f)(x, y);
-    expect(dx.slice(0, 0).js()).toEqual([0, 0, 2, 0.5, -1, 0, 0]);
+    using x = np.array([[[1, 2, 3, 4, 5, 6, 7]]]);
+    using y = np.array([[[2, 0.5, -1]]]);
+    using dx = grad(f)(x, y);
+    {
+      using _s = dx.slice(0, 0);
+      expect(_s.js()).toEqual([0, 0, 2, 0.5, -1, 0, 0]);
+    }
 
-    const dy = grad((y: np.Array, x: np.Array) => f(x, y))(y, x);
-    expect(dy.slice(0, 0).js()).toEqual([3, 4, 5]);
+    using dy = grad((y: np.Array, x: np.Array) => f(x, y))(y, x);
+    {
+      using _s = dy.slice(0, 0);
+      expect(_s.js()).toEqual([3, 4, 5]);
+    }
   });
 
   test("grad shape test with stride 2", () => {
@@ -125,30 +143,30 @@ suite.each(devices)("device:%s", (device) => {
     for (const xDim of [1, 3, 8, 12, 15]) {
       for (const kDim of [1, 3, 4]) {
         if (xDim < kDim) continue;
-        const x = np.zeros([3, 1, xDim, xDim]);
-        const y = np.zeros([1, 1, kDim, kDim]);
-        const dx = grad(f)(x, y);
+        using x = np.zeros([3, 1, xDim, xDim]);
+        using y = np.zeros([1, 1, kDim, kDim]);
+        using dx = grad(f)(x, y);
         expect(dx.shape).toEqual(x.shape);
 
-        const dy = grad(g)(y, x);
+        using dy = grad(g)(y, x);
         expect(dy.shape).toEqual(y.shape);
       }
     }
   });
 
   test("max-pooling and min-pooling", () => {
-    const x = np.array([
+    using x = np.array([
       [1, 2, 3, 4],
       [5, 6, 7, 8],
       [9, 10, 11, 12],
     ]);
-    const result = lax.reduceWindow(x, np.max, [2, 2], [1, 2]);
+    using result = lax.reduceWindow(x, np.max, [2, 2], [1, 2]);
     expect(result.js()).toEqual([
       [6, 8],
       [10, 12],
     ]);
 
-    const resultMin = lax.reduceWindow(x, np.min, [2, 2], [1, 2]);
+    using resultMin = lax.reduceWindow(x, np.min, [2, 2], [1, 2]);
     expect(resultMin.js()).toEqual([
       [1, 3],
       [5, 7],
@@ -156,34 +174,41 @@ suite.each(devices)("device:%s", (device) => {
   });
 
   test("grad of max-pool 2d", () => {
-    const x = np.array([
+    using x = np.array([
       [1, 5, 3, 4],
       [1, 2, 3, 4],
     ]);
     const maxPool2x2Sum = (x: np.Array) =>
       lax.reduceWindow(x, np.max, [2, 2], [2, 2]).sum();
 
-    expect(maxPool2x2Sum(x).js()).toEqual(9); // 5 + 4
-    expect(grad(maxPool2x2Sum)(x).js()).toEqual([
-      [0, 1, 0, 0.5],
-      [0, 0, 0, 0.5],
-    ]);
+    {
+      using _jit = jit(maxPool2x2Sum);
+      using _r = _jit(x);
+      expect(_r.js()).toEqual(9);
+    } // 5 + 4
+    {
+      using _gr = grad(maxPool2x2Sum)(x);
+      expect(_gr.js()).toEqual([
+        [0, 1, 0, 0.5],
+        [0, 0, 0, 0.5],
+      ]);
+    }
   });
 
   test("grouped convolution shape", () => {
     // Test with 2 groups: input has 4 channels, output has 6 channels
     // Each group: 2 input channels -> 3 output channels
-    const x = np.zeros([2, 4, 8, 8]); // [N, C_in, H, W]
-    const y = np.zeros([6, 2, 3, 3]); // [C_out, C_in/G, kH, kW]
-    const result = lax.convGeneralDilated(x, y, [1, 1], "VALID", {
+    using x = np.zeros([2, 4, 8, 8]); // [N, C_in, H, W]
+    using y = np.zeros([6, 2, 3, 3]); // [C_out, C_in/G, kH, kW]
+    using result = lax.convGeneralDilated(x, y, [1, 1], "VALID", {
       featureGroupCount: 2,
     });
     expect(result.shape).toEqual([2, 6, 6, 6]);
 
     // Test with 4 groups (depthwise-like): 4 channels, each convolved separately
-    const x2 = np.zeros([1, 4, 5, 5]);
-    const y2 = np.zeros([8, 1, 3, 3]); // 2 output channels per group
-    const result2 = lax.convGeneralDilated(x2, y2, [1, 1], "SAME", {
+    using x2 = np.zeros([1, 4, 5, 5]);
+    using y2 = np.zeros([8, 1, 3, 3]); // 2 output channels per group
+    using result2 = lax.convGeneralDilated(x2, y2, [1, 1], "SAME", {
       featureGroupCount: 4,
     });
     expect(result2.shape).toEqual([1, 8, 5, 5]);
@@ -193,21 +218,21 @@ suite.each(devices)("device:%s", (device) => {
     // 2 groups, each doing independent 1d convolution
     // Group 1: channel 0 with kernel 0
     // Group 2: channel 1 with kernel 1
-    const x = np
-      .array([
-        [[1, 2, 3, 4]], // channel 0
-        [[5, 6, 7, 8]], // channel 1
-      ])
-      .reshape([1, 2, 4]); // [N=1, C_in=2, W=4]
+    const _rawX = np.array([
+      [[1, 2, 3, 4]], // channel 0
+      [[5, 6, 7, 8]], // channel 1
+    ]);
+    using x = _rawX.reshape([1, 2, 4]); // [N=1, C_in=2, W=4]
+    _rawX.dispose();
 
-    const y = np
-      .array([
-        [[1, 0, -1]], // kernel for group 0 -> out channel 0
-        [[1, 1, 1]], // kernel for group 1 -> out channel 1
-      ])
-      .reshape([2, 1, 3]); // [C_out=2, C_in/G=1, kW=3]
+    const _rawY = np.array([
+      [[1, 0, -1]], // kernel for group 0 -> out channel 0
+      [[1, 1, 1]], // kernel for group 1 -> out channel 1
+    ]);
+    using y = _rawY.reshape([2, 1, 3]); // [C_out=2, C_in/G=1, kW=3]
+    _rawY.dispose();
 
-    const result = lax.convGeneralDilated(x, y, [1], "VALID", {
+    using result = lax.convGeneralDilated(x, y, [1], "VALID", {
       featureGroupCount: 2,
     });
     // Group 0: [1,2,3,4] conv [1,0,-1] = [1-3, 2-4] = [-2, -2]
@@ -227,24 +252,24 @@ suite.each(devices)("device:%s", (device) => {
     const f = (x: np.Array, y: np.Array) =>
       lax.convGeneralDilated(x, y, [1], "VALID", { featureGroupCount: 3 });
 
-    const x = np
-      .array([
-        [[1, 2, 3, 4, 5]], // channel 0
-        [[2, 3, 4, 5, 6]], // channel 1
-        [[3, 4, 5, 6, 7]], // channel 2
-      ])
-      .reshape([1, 3, 5]); // [N=1, C=3, W=5]
+    const _rawX = np.array([
+      [[1, 2, 3, 4, 5]], // channel 0
+      [[2, 3, 4, 5, 6]], // channel 1
+      [[3, 4, 5, 6, 7]], // channel 2
+    ]);
+    using x = _rawX.reshape([1, 3, 5]); // [N=1, C=3, W=5]
+    _rawX.dispose();
 
-    const y = np
-      .array([
-        [[1, -1]], // kernel for channel 0
-        [[1, 0]], // kernel for channel 1
-        [[0, 1]], // kernel for channel 2
-      ])
-      .reshape([3, 1, 2]); // [C_out=3, C_in/G=1, kW=2]
+    const _rawY = np.array([
+      [[1, -1]], // kernel for channel 0
+      [[1, 0]], // kernel for channel 1
+      [[0, 1]], // kernel for channel 2
+    ]);
+    using y = _rawY.reshape([3, 1, 2]); // [C_out=3, C_in/G=1, kW=2]
+    _rawY.dispose();
 
     // Forward pass check
-    const result = f(x, y);
+    using result = f(x, y);
     expect(result.shape).toEqual([1, 3, 4]);
     // Channel 0: [1-2, 2-3, 3-4, 4-5] = [-1, -1, -1, -1]
     // Channel 1: [2, 3, 4, 5]
@@ -259,11 +284,11 @@ suite.each(devices)("device:%s", (device) => {
 
     // Gradient w.r.t. input
     const sumF = (x: np.Array, y: np.Array) => f(x, y).sum();
-    const dx = grad(sumF)(x, y);
+    using dx = grad(sumF)(x, y);
     expect(dx.shape).toEqual([1, 3, 5]);
 
     // Gradient w.r.t. kernel
-    const dy = grad((y: np.Array, x: np.Array) => sumF(x, y))(y, x);
+    using dy = grad((y: np.Array, x: np.Array) => sumF(x, y))(y, x);
     expect(dy.shape).toEqual([3, 1, 2]);
     // dy[0] = sum of x[0] windows = [1+2+3+4, 2+3+4+5] = [10, 14]
     // dy[1] = sum of x[1] windows = [2+3+4+5, 3+4+5+6] = [14, 18]
@@ -278,17 +303,17 @@ suite.each(devices)("device:%s", (device) => {
       lax.convGeneralDilated(x, y, [1], "VALID");
 
     // 3 different inputs to vmap over, each with shape [1, 1, 5]
-    const x = np.array([
+    using x = np.array([
       [[[1, 2, 3, 4, 5]]], // input 0: [N=1, C=1, W=5]
       [[[2, 3, 4, 5, 6]]], // input 1
       [[[3, 4, 5, 6, 7]]], // input 2
     ]); // shape [3, 1, 1, 5]
 
-    const y = np.array([[[2, 0.5, -1]]]); // shape [1, 1, 3] = [C_out=1, C_in=1, kW=3]
+    using y = np.array([[[2, 0.5, -1]]]); // shape [1, 1, 3] = [C_out=1, C_in=1, kW=3]
 
     // vmap over x (axis 0), keep y unbatched (null)
     const vmappedConv = vmap(conv1d, [0, null]);
-    const result = vmappedConv(x, y);
+    using result = vmappedConv(x, y);
 
     // Each input is convolved with the same kernel
     // [1,2,3,4,5] conv [2,0.5,-1] = [2+1-3, 4+1.5-4, 6+2-5] = [0, 1.5, 3]
@@ -308,7 +333,7 @@ suite.each(devices)("device:%s", (device) => {
       lax.convGeneralDilated(x, y, [1, 1], "VALID");
 
     // 2 different inputs, each with shape [N=1, C_in=1, H=2, W=3]
-    const x = np.array([
+    using x = np.array([
       [
         [
           [
@@ -328,7 +353,7 @@ suite.each(devices)("device:%s", (device) => {
     ]); // shape [2, 1, 1, 2, 3]
 
     // 2 different kernels, each with shape [C_out=1, C_in=1, kH=2, kW=2]
-    const y = np.array([
+    using y = np.array([
       [
         [
           [
@@ -349,7 +374,7 @@ suite.each(devices)("device:%s", (device) => {
 
     // vmap over both x and y (axis 0)
     const vmappedConv = vmap(conv2d, [0, 0]);
-    const result = vmappedConv(x, y);
+    using result = vmappedConv(x, y);
 
     // input 0 conv kernel 0: [[1+5, 2+6]] = [[6, 8]]
     // input 1 conv kernel 1: [[3+5, 4+6]] = [[8, 10]]
@@ -364,9 +389,9 @@ suite.each(devices)("device:%s", (device) => {
     padding: lax.PaddingType,
     expectedShape: number[],
   ) {
-    const x = np.zeros(xShape);
-    const k = np.zeros(kShape);
-    const result = lax.convTranspose(x, k, strides, padding);
+    using x = np.zeros(xShape);
+    using k = np.zeros(kShape);
+    using result = lax.convTranspose(x, k, strides, padding);
     expect(result.shape).toEqual(expectedShape);
     result.dispose();
   }
@@ -427,11 +452,14 @@ suite.each(devices)("device:%s", (device) => {
   test("convTranspose 1d 2x upscale", () => {
     // 2x upscaling with stride 2 and kernel [1, 1]
     // Stretched input: [1, 0, 2, 0, 3, 0] conv [1, 1] -> [1, 1, 2, 2, 3, 3]
-    const x = np.array([[[1, 2, 3]]]); // [N=1, C=1, W=3]
-    const k = np.array([[[1, 1]]]); // [C_out=1, C_in=1, kW=2]
+    using x = np.array([[[1, 2, 3]]]); // [N=1, C=1, W=3]
+    using k = np.array([[[1, 1]]]); // [C_out=1, C_in=1, kW=2]
 
-    const result = lax.convTranspose(x, k, [2], "SAME", {});
+    using result = lax.convTranspose(x, k, [2], "SAME", {});
     expect(result.shape).toEqual([1, 1, 6]);
-    expect(result.slice(0, 0).js()).toEqual([1, 1, 2, 2, 3, 3]);
+    {
+      using _s = result.slice(0, 0);
+      expect(_s.js()).toEqual([1, 1, 2, 2, 3, 3]);
+    }
   });
 });

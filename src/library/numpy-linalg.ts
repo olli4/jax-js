@@ -32,7 +32,10 @@ export function cholesky(
   a = fudgeArray(a);
   checkSquare("cholesky", a);
   if (symmetrizeInput) {
-    a = a.add(np.matrixTranspose(a)).mul(0.5);
+    using at = np.matrixTranspose(a);
+    using sum = a.add(at);
+    using sym = sum.mul(0.5);
+    return lax.linalg.cholesky(sym, { upper });
   }
   return lax.linalg.cholesky(a, { upper });
 }
@@ -41,12 +44,20 @@ export function cholesky(
 export function det(a: ArrayLike): Array {
   a = fudgeArray(a);
   const n = checkSquare("det", a);
-  const [lu, pivots, permutation] = lax.linalg.lu(a);
-
-  const parity = pivots.notEqual(np.arange(n)).astype(np.int32).sum(-1).mod(2);
-  const sign = parity.mul(-2).add(1); // (-1)^parity
-  const diag = lu.diagonal(0, -1, -2);
-  return np.prod(diag, -1).mul(sign);
+  const luResult = lax.linalg.lu(a);
+  using lu = luResult[0];
+  using pivots = luResult[1];
+  using _perm = luResult[2];
+  using indices = np.arange(n);
+  using neq = pivots.notEqual(indices);
+  using neqInt = neq.astype(np.int32);
+  using sumAxis = neqInt.sum(-1);
+  using parity = sumAxis.mod(2);
+  using neg2 = parity.mul(-2);
+  using sign = neg2.add(1); // (-1)^parity
+  using diag = lu.diagonal(0, -1, -2);
+  using prod = np.prod(diag, -1);
+  return prod.mul(sign);
 }
 
 export { diagonal } from "./numpy";
@@ -55,7 +66,8 @@ export { diagonal } from "./numpy";
 export function inv(a: ArrayLike): Array {
   a = fudgeArray(a);
   const n = checkSquare("inv", a);
-  return solve(a, np.eye(n));
+  using eye = np.eye(n);
+  return solve(a, eye);
 }
 
 /**
@@ -81,13 +93,13 @@ export function lstsq(a: ArrayLike, b: ArrayLike): Array {
     throw new Error(
       `lstsq: leading dimension of 'b' must match number of rows of 'a', got ${b.aval}`,
     );
-  const at = np.matrixTranspose(a);
+  using at = np.matrixTranspose(a);
   if (m <= n) {
     // Underdetermined or square system: A.T @ (A @ A.T)^-1 @ B
-    const aat = np.matmul(a, at); // A @ A.T, shape (M, M)
-    const l = cholesky(aat, { symmetrizeInput: false }); // L @ L.T = A @ A.T
-    const lb = triangularSolve(l, b, { leftSide: true, lower: true }); // L^-1 @ B
-    const llb = triangularSolve(l, lb, {
+    using aat = np.matmul(a, at); // A @ A.T, shape (M, M)
+    using l = cholesky(aat, { symmetrizeInput: false }); // L @ L.T = A @ A.T
+    using lb = triangularSolve(l, b, { leftSide: true, lower: true }); // L^-1 @ B
+    using llb = triangularSolve(l, lb, {
       leftSide: true,
       lower: true,
       transposeA: true,
@@ -95,16 +107,15 @@ export function lstsq(a: ArrayLike, b: ArrayLike): Array {
     return np.matmul(at, llb); // A.T @ (A @ A.T)^-1 @ B
   } else {
     // Overdetermined system: (A.T @ A)^-1 @ A.T @ B
-    const ata = np.matmul(at, a); // A.T @ A, shape (N, N)
-    const l = cholesky(ata, { symmetrizeInput: false }); // L @ L.T = A.T @ A
-    const atb = np.matmul(at, b); // A.T @ B
-    const lb = triangularSolve(l, atb, { leftSide: true, lower: true }); // L^-1 @ A.T @ B
-    const llb = triangularSolve(l, lb, {
+    using ata = np.matmul(at, a); // A.T @ A, shape (N, N)
+    using l = cholesky(ata, { symmetrizeInput: false }); // L @ L.T = A.T @ A
+    using atb = np.matmul(at, b); // A.T @ B
+    using lb = triangularSolve(l, atb, { leftSide: true, lower: true }); // L^-1 @ A.T @ B
+    return triangularSolve(l, lb, {
       leftSide: true,
       lower: true,
       transposeA: true,
     }); // (A.T @ A)^-1 @ A.T @ B
-    return llb;
   }
 }
 
@@ -117,8 +128,10 @@ export function matrixPower(a: ArrayLike, n: number): Array {
   a = fudgeArray(a);
   const m = checkSquare("matrixPower", a);
   if (n === 0) {
-    return np.broadcastTo(np.eye(m), a.shape);
+    using eye = np.eye(m);
+    return np.broadcastTo(eye, a.shape);
   }
+  const isInputOwned = n < 0;
   if (n < 0) {
     a = inv(a);
     n = -n;
@@ -126,11 +139,21 @@ export function matrixPower(a: ArrayLike, n: number): Array {
   let result: Array | null = null;
   let a2k = a; // a^(2^k)
   for (let k = 0; n; k++) {
-    if (k > 0) a2k = np.matmul(a2k, a2k);
-    if (n % 2 === 1)
+    if (k > 0) {
+      const prev = a2k;
+      a2k = np.matmul(a2k, a2k);
+      // Dispose old a2k unless it's the original input (not owned by us)
+      if (prev !== a || isInputOwned) prev[Symbol.dispose]();
+    }
+    if (n % 2 === 1) {
+      const prev = result;
       result = result === null ? a2k : np.matmul(result, a2k);
+      if (prev !== null && prev !== a2k) prev[Symbol.dispose]();
+    }
     n = Math.floor(n / 2);
   }
+  // Dispose a2k if it's not the result and it's not the input
+  if (a2k !== result && (a2k !== a || isInputOwned)) a2k[Symbol.dispose]();
   return result!;
 }
 
@@ -141,13 +164,25 @@ export { outer } from "./numpy";
 export function slogdet(a: ArrayLike): [Array, Array] {
   a = fudgeArray(a);
   const n = checkSquare("slogdet", a);
-  const [lu, pivots, permutation] = lax.linalg.lu(a);
-
-  let parity = pivots.notEqual(np.arange(n)).astype(np.int32).sum(-1);
-  const diag = lu.diagonal(0, -1, -2);
-  parity = parity.add(diag.less(0).astype(np.int32).sum(-1)).mod(2);
-  const logabsdet = np.log(np.abs(diag)).sum(-1);
-  const sign = parity.mul(-2).add(1); // (-1)^parity
+  const luResult = lax.linalg.lu(a);
+  using lu = luResult[0];
+  using pivots = luResult[1];
+  using _perm = luResult[2];
+  using indices = np.arange(n);
+  using neq = pivots.notEqual(indices);
+  using neqInt = neq.astype(np.int32);
+  using parityBase = neqInt.sum(-1);
+  using diag = lu.diagonal(0, -1, -2);
+  using diagNeg = diag.less(0);
+  using diagNegInt = diagNeg.astype(np.int32);
+  using diagNegSum = diagNegInt.sum(-1);
+  using parityTotal = parityBase.add(diagNegSum);
+  using parity = parityTotal.mod(2);
+  using neg2 = parity.mul(-2);
+  const sign = neg2.add(1); // (-1)^parity — returned, NOT using
+  using absDiag = np.abs(diag);
+  using logDiag = np.log(absDiag);
+  const logabsdet = logDiag.sum(-1); // returned, NOT using
   return [sign, logabsdet];
 }
 
@@ -167,40 +202,57 @@ export function solve(a: ArrayLike, b: ArrayLike): Array {
   const n = checkSquare("solve", a);
   if (b.ndim === 0) throw new Error(`solve: b cannot be scalar`);
   const bIs1d = b.ndim === 1;
-  if (bIs1d) {
-    b = b.reshape([...b.shape, 1]); // We'll remove this at the end.
-  }
-  if (b.shape[b.ndim - 2] !== n) {
-    throw new Error(
-      `solve: leading dimension of b must match size of a, got a=${a.aval}, b=${b.aval}`,
+  const d: Array[] = [];
+  try {
+    if (bIs1d) {
+      b = b.reshape([...b.shape, 1]);
+      d.push(b);
+    }
+    if (b.shape[b.ndim - 2] !== n) {
+      throw new Error(
+        `solve: leading dimension of b must match size of a, got a=${a.aval}, b=${b.aval}`,
+      );
+    }
+    const m = b.shape[b.ndim - 1];
+    const batchDims = generalBroadcast(
+      a.shape.slice(0, -2),
+      b.shape.slice(0, -2),
     );
-  }
-  const m = b.shape[b.ndim - 1];
-  const batchDims = generalBroadcast(
-    a.shape.slice(0, -2),
-    b.shape.slice(0, -2),
-  );
-  a = np.broadcastTo(a, [...batchDims, n, n]);
-  b = np.broadcastTo(b, [...batchDims, n, m]);
+    a = np.broadcastTo(a, [...batchDims, n, n]);
+    d.push(a);
+    b = np.broadcastTo(b, [...batchDims, n, m]);
+    d.push(b);
 
-  // Compute the LU decomposition with partial pivoting.
-  const [lu, pivots, permutation] = lax.linalg.lu(a);
+    // Compute the LU decomposition with partial pivoting.
+    const [lu, pivots, permutation] = lax.linalg.lu(a);
+    d.push(lu, pivots, permutation);
 
-  // L @ U @ x = P @ b
-  const P = np
-    .arange(n)
-    .equal(permutation.reshape([...permutation.shape, 1]))
-    .astype(b.dtype);
-  const LPb = triangularSolve(lu, np.matmul(P, b), {
-    leftSide: true,
-    lower: true,
-    unitDiagonal: true,
-  });
-  let x = triangularSolve(lu, LPb, { leftSide: true, lower: false });
-  if (bIs1d) {
-    x = np.squeeze(x, -1);
+    // L @ U @ x = P @ b
+    const arangeN = np.arange(n);
+    d.push(arangeN);
+    const permR = permutation.reshape([...permutation.shape, 1]);
+    d.push(permR);
+    const eq = arangeN.equal(permR);
+    d.push(eq);
+    const P = eq.astype(b.dtype);
+    d.push(P);
+    const Pb = np.matmul(P, b);
+    d.push(Pb);
+    const LPb = triangularSolve(lu, Pb, {
+      leftSide: true,
+      lower: true,
+      unitDiagonal: true,
+    });
+    d.push(LPb);
+    let x = triangularSolve(lu, LPb, { leftSide: true, lower: false });
+    if (bIs1d) {
+      d.push(x);
+      x = np.squeeze(x, -1);
+    }
+    return x;
+  } finally {
+    for (const v of d) v[Symbol.dispose]();
   }
-  return x;
 }
 
 export { tensordot } from "./numpy";

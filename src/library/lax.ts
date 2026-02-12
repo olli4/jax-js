@@ -80,23 +80,22 @@ export function dot(
   // Compute "free" dimensions: output shape is [...{lb/rb}, ...lf, ...rf].
   const lf = range(lhs.ndim).filter((a) => !lc.includes(a) && !lb.includes(a));
   const rf = range(rhs.ndim).filter((a) => !rc.includes(a) && !rb.includes(a));
-  const lhs2 = lhs.transpose([...lb, ...lf, ...lc]);
-  const rhs2 = rhs.transpose([...rb, ...rf, ...rc]);
+  using lhs2 = lhs.transpose([...lb, ...lf, ...lc]);
+  using rhs2 = rhs.transpose([...rb, ...rf, ...rc]);
 
   if (lc.length === 0) {
     // There is no contraction to perform, just do a product (not `dot`).
-    return core.mul(
-      lhs2.reshape([
-        ...lb.map((a) => lhs.shape[a]),
-        ...lf.map((a) => lhs.shape[a]),
-        ...rep(rf.length, 1),
-      ]),
-      rhs2.reshape([
-        ...rb.map((a) => rhs.shape[a]),
-        ...rep(lf.length, 1),
-        ...rf.map((a) => rhs.shape[a]),
-      ]),
-    ) as Array;
+    using lhsR = lhs2.reshape([
+      ...lb.map((a) => lhs.shape[a]),
+      ...lf.map((a) => lhs.shape[a]),
+      ...rep(rf.length, 1),
+    ]);
+    using rhsR = rhs2.reshape([
+      ...rb.map((a) => rhs.shape[a]),
+      ...rep(lf.length, 1),
+      ...rf.map((a) => rhs.shape[a]),
+    ]);
+    return core.mul(lhsR, rhsR) as Array;
   }
 
   // Otherwise, we need to do a `dot` contraction.
@@ -108,20 +107,19 @@ export function dot(
         ` ${JSON.stringify(dotShapeX)} != ${JSON.stringify(dotShapeY)}`,
     );
   }
-  return core.dot(
-    lhs2.reshape([
-      ...lb.map((a) => lhs.shape[a]),
-      ...lf.map((a) => lhs.shape[a]),
-      ...rep(rf.length, 1),
-      prod(dotShapeX),
-    ]),
-    rhs2.reshape([
-      ...rb.map((a) => rhs.shape[a]),
-      ...rep(lf.length, 1),
-      ...rf.map((a) => rhs.shape[a]),
-      prod(dotShapeY),
-    ]),
-  ) as Array;
+  using lhsR = lhs2.reshape([
+    ...lb.map((a) => lhs.shape[a]),
+    ...lf.map((a) => lhs.shape[a]),
+    ...rep(rf.length, 1),
+    prod(dotShapeX),
+  ]);
+  using rhsR = rhs2.reshape([
+    ...rb.map((a) => rhs.shape[a]),
+    ...rep(lf.length, 1),
+    ...rf.map((a) => rhs.shape[a]),
+    prod(dotShapeY),
+  ]);
+  return core.dot(lhsR, rhsR) as Array;
 }
 
 export type PaddingType = "VALID" | "SAME" | "SAME_LOWER" | Pair[];
@@ -230,9 +228,10 @@ export function convGeneralDilated(
         `rhs input channels=${C_in_per_group} must equal lhs input channels / groups=${C_in / G}`,
       );
     }
-    const lhsGrouped = moveaxis(lhs.reshape([N, G, C_in / G, ...xs]), 1, 0);
-    const rhsGrouped = rhs.reshape([G, C_out / G, C_in_per_group, ...ks]);
-    const result = core.conv(lhsGrouped, rhsGrouped, {
+    using lhsReshaped = lhs.reshape([N, G, C_in / G, ...xs]);
+    using lhsGrouped = moveaxis(lhsReshaped, 1, 0);
+    using rhsGrouped = rhs.reshape([G, C_out / G, C_in_per_group, ...ks]);
+    using result = core.conv(lhsGrouped, rhsGrouped, {
       vmapDims: 1, // Batch over G
       strides: windowStrides,
       padding,
@@ -240,7 +239,8 @@ export function convGeneralDilated(
       rhsDilation,
     }) as Array;
     const ys = result.shape.slice(3);
-    return (moveaxis(result, 0, 1) as Array).reshape([N, C_out, ...ys]);
+    using moved = moveaxis(result, 0, 1) as Array;
+    return moved.reshape([N, C_out, ...ys]);
   }
   return core.conv(lhs, rhs, {
     strides: windowStrides,
@@ -328,8 +328,8 @@ export function convTranspose(
   );
   if (transposeKernel) {
     // Flip spatial axes and swap C_out/C_in.
-    rhs = core.flip(rhs, range(2, rhs.ndim)) as Array;
-    rhs = moveaxis(rhs, 0, 1) as Array;
+    using flipped = core.flip(rhs, range(2, rhs.ndim)) as Array;
+    rhs = moveaxis(flipped, 0, 1) as Array;
   }
   return convGeneralDilated(lhs, rhs, rep(lhs.ndim - 2, 1), pads, {
     lhsDilation: strides,
@@ -379,12 +379,13 @@ export function reduceWindow(
     // Vmap the computation over any pre-pooled dimensions.
     computation = vmap(computation, 0) as any;
   }
-  return computation(
-    bind1(Primitive.Pool, [operand], {
-      window: windowDimensions,
-      strides: windowStrides,
-    }) as Array,
-  );
+  const pooled = bind1(Primitive.Pool, [operand], {
+    window: windowDimensions,
+    strides: windowStrides,
+  }) as Array;
+  const result = computation(pooled);
+  if (pooled !== result) pooled[Symbol.dispose]?.();
+  return result;
 }
 
 /** The error function: `erf(x) = 2/sqrt(pi) * int[0..x] exp(-t^2) dt`. */
@@ -435,19 +436,34 @@ export function topK(
   if (k === 0) {
     const outShape = x.shape.slice();
     outShape[axis] = 0;
-    const y = zerosLike(x.ref, { shape: outShape });
+    const y = zerosLike(x, { shape: outShape });
     const yi = zerosLike(x, { dtype: DType.Int32, shape: outShape });
     return [y, yi];
   }
 
   // We want to sort it in descending order, therefore we reverse before and
   // after argsort. This ensures that ties are resolved by smaller index.
-  x = core.flip(x, [axis]) as Array;
-  x = moveaxis(x, axis, -1) as Array;
-  const [y, yi] = core.argsort(x);
+  const flipped = core.flip(x, [axis]) as Array;
+  const moved = moveaxis(flipped, axis, -1) as Array;
+  const argsortResult = core.argsort(moved);
+  const y = argsortResult[0];
+  const yi = argsortResult[1];
   const extract = (a: core.Tracer) => {
-    a = a.slice(...rep(a.ndim - 1, [] as []), [-k]);
-    return core.flip(moveaxis(a, -1, axis), [axis]) as Array;
+    const sliced = a.slice(...rep(a.ndim - 1, [] as []), [-k]);
+    const movedBack = moveaxis(sliced, -1, axis);
+    const result = core.flip(movedBack, [axis]) as Array;
+    if (movedBack !== sliced) (movedBack as Array).dispose();
+    (sliced as Array).dispose();
+    return result;
   };
-  return [extract(y), extract(yi.neg().add(size - 1))];
+  const neg = yi.neg() as Array;
+  const adjusted = neg.add(size - 1) as Array;
+  const result: [Array, Array] = [extract(y), extract(adjusted)];
+  adjusted.dispose();
+  neg.dispose();
+  yi.dispose();
+  y.dispose();
+  if (moved !== flipped) (moved as Array).dispose();
+  flipped.dispose();
+  return result;
 }

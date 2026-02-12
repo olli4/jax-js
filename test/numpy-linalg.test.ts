@@ -3,6 +3,7 @@ import {
   Device,
   grad,
   init,
+  jit,
   jvp,
   numpy as np,
   random,
@@ -22,52 +23,71 @@ suite.each(devicesWithLinalg)("device:%s", (device) => {
 
   suite("numpy.linalg.cholesky()", () => {
     test("symmetrizes input by default", () => {
-      const x = np.array([
+      using x = np.array([
         [4.0, 2.01],
         [1.99, 5.0],
       ]);
-      const L = np.linalg.cholesky(x);
-      const reconstructed = np.matmul(L, L.transpose());
-      const symmetrized = x.add(x.transpose()).mul(0.5);
+      using L = np.linalg.cholesky(x);
+      const LT = L.transpose();
+      using reconstructed = np.matmul(L, LT);
+      LT.dispose();
+      const xT = x.transpose();
+      const xPlusXT = x.add(xT);
+      xT.dispose();
+      using symmetrized = xPlusXT.mul(0.5);
+      xPlusXT.dispose();
       expect(reconstructed).toBeAllclose(symmetrized);
     });
   });
 
   suite("numpy.linalg.det()", () => {
     test("computes determinant of simple matrix", () => {
-      const a = np.array([
+      using a = np.array([
         [4.0, 7.0],
         [2.0, 6.0],
       ]);
-      const detA = np.linalg.det(a);
+      using detA = np.linalg.det(a);
       expect(detA).toBeAllclose(10.0);
     });
 
     test("gradient of det is adjugate.mT", () => {
-      const a = random.uniform(random.key(0), [15, 15]);
+      const key0 = random.key(0);
+      using a = random.uniform(key0, [15, 15]);
+      key0.dispose();
       const g = valueAndGrad(np.linalg.det);
       const [detA, da] = g(a);
-      const adjA = np.linalg.inv(a).mul(detA);
-      expect(da).toBeAllclose(np.matrixTranspose(adjA), { rtol: 1e-3 });
+      using _detA = detA;
+      using _da = da;
+      const aInvDet = np.linalg.inv(a);
+      using adjA = aInvDet.mul(detA);
+      aInvDet.dispose();
+      using adjAT = np.matrixTranspose(adjA);
+      expect(da).toBeAllclose(adjAT, { rtol: 1e-3 });
     });
   });
 
   suite("numpy.linalg.inv()", () => {
     test("computes inverse of simple matrix", () => {
-      const a = np.array([
+      using a = np.array([
         [4.0, 7.0],
         [2.0, 6.0],
       ]);
-      const aInv = np.linalg.inv(a);
-      const identity = np.matmul(a, aInv);
-      expect(identity).toBeAllclose(np.eye(2));
+      using aInv = np.linalg.inv(a);
+      using identity = np.matmul(a, aInv);
+      using expected = np.eye(2);
+      expect(identity).toBeAllclose(expected);
     });
 
     test("computes inverse of batched matrices", () => {
-      const a = random.uniform(random.key(0), [2, 3, 4, 4]);
-      const aInv = np.linalg.inv(a);
-      const identity = np.matmul(a, aInv);
-      expect(identity).toBeAllclose(np.broadcastTo(np.eye(4), [2, 3, 4, 4]), {
+      const key0b = random.key(0);
+      using a = random.uniform(key0b, [2, 3, 4, 4]);
+      key0b.dispose();
+      using aInv = np.linalg.inv(a);
+      using identity = np.matmul(a, aInv);
+      const eye4 = np.eye(4);
+      using expected = np.broadcastTo(eye4, [2, 3, 4, 4]);
+      eye4.dispose();
+      expect(identity).toBeAllclose(expected, {
         atol: 1e-4,
       });
     });
@@ -76,133 +96,146 @@ suite.each(devicesWithLinalg)("device:%s", (device) => {
   suite("numpy.linalg.lstsq()", () => {
     test("solves overdetermined system (M > N)", () => {
       // 3x2 system: more equations than unknowns
-      const a = np.array([
+      using a = np.array([
         [1.0, 2.0],
         [3.0, 4.0],
         [5.0, 6.0],
       ]);
-      const b = np.array([[1.0], [2.0], [3.0]]);
-      const x = np.linalg.lstsq(a, b);
+      using b = np.array([[1.0], [2.0], [3.0]]);
+      using x = np.linalg.lstsq(a, b);
 
       // Verify solution minimizes ||Ax - b||
       // The normal equations: A^T A x = A^T b
-      const atA = np.matmul(a.transpose(), a);
-      const atb = np.matmul(a.transpose(), b);
-      const lhs = np.matmul(atA, x);
+      const aT = a.transpose();
+      using atA = np.matmul(aT, a);
+      using atb = np.matmul(aT, b);
+      aT.dispose();
+      using lhs = np.matmul(atA, x);
       expect(lhs).toBeAllclose(atb, { rtol: 1e-4, atol: 1e-4 });
     });
 
     test("solves underdetermined system (M < N)", () => {
       // 2x3 system: fewer equations than unknowns
-      const a = np.array([
+      using a = np.array([
         [1.0, 2.0, 3.0],
         [4.0, 5.0, 6.0],
       ]);
-      const b = np.array([[1.0], [2.0]]);
-      const x = np.linalg.lstsq(a, b);
+      using b = np.array([[1.0], [2.0]]);
+      using x = np.linalg.lstsq(a, b);
 
       // Verify Ax = b (should be exact for underdetermined systems)
-      const ax = np.matmul(a, x);
+      using ax = np.matmul(a, x);
       expect(ax).toBeAllclose(b, { rtol: 1e-4, atol: 1e-4 });
     });
 
     test("solves square system exactly", () => {
-      const a = np.array([
+      using a = np.array([
         [2.0, 1.0],
         [1.0, 3.0],
       ]);
-      const b = np.array([[5.0], [7.0]]);
-      const x = np.linalg.lstsq(a, b);
+      using b = np.array([[5.0], [7.0]]);
+      using x = np.linalg.lstsq(a, b);
 
       // Verify Ax = b
-      const ax = np.matmul(a, x);
+      using ax = np.matmul(a, x);
       expect(ax).toBeAllclose(b, { rtol: 1e-4, atol: 1e-4 });
     });
 
     test("handles multiple right-hand sides (M > N)", () => {
-      const a = np.array([
+      using a = np.array([
         [1.0, 2.0],
         [3.0, 4.0],
         [5.0, 6.0],
       ]);
-      const b = np.array([
+      using b = np.array([
         [1.0, 2.0],
         [3.0, 4.0],
         [5.0, 6.0],
       ]);
-      const x = np.linalg.lstsq(a, b);
+      using x = np.linalg.lstsq(a, b);
 
       // x should have shape (2, 2)
       expect(x.shape).toEqual([2, 2]);
 
       // Verify normal equations for each column
-      const atA = np.matmul(a.transpose(), a);
-      const atb = np.matmul(a.transpose(), b);
-      const lhs = np.matmul(atA, x);
+      const aT = a.transpose();
+      using atA = np.matmul(aT, a);
+      using atb = np.matmul(aT, b);
+      aT.dispose();
+      using lhs = np.matmul(atA, x);
       expect(lhs).toBeAllclose(atb, { rtol: 1e-4, atol: 1e-4 });
     });
 
     test("handles multiple right-hand sides (M < N)", () => {
-      const a = np.array([
+      using a = np.array([
         [1.0, 2.0, 3.0],
         [4.0, 5.0, 6.0],
       ]);
-      const b = np.array([
+      using b = np.array([
         [1.0, 2.0],
         [3.0, 4.0],
       ]);
-      const x = np.linalg.lstsq(a, b);
+      using x = np.linalg.lstsq(a, b);
 
       // x should have shape (3, 2)
       expect(x.shape).toEqual([3, 2]);
 
       // Verify Ax = b
-      const ax = np.matmul(a, x);
+      using ax = np.matmul(a, x);
       expect(ax).toBeAllclose(b, { rtol: 1e-4, atol: 1e-4 });
     });
 
     test("throws on non-2D coefficient matrix", () => {
-      const a = np.array([1.0, 2.0, 3.0]);
-      const b = np.array([1.0, 2.0, 3.0]);
+      using a = np.array([1.0, 2.0, 3.0]);
+      using b = np.array([1.0, 2.0, 3.0]);
       expect(() => np.linalg.lstsq(a, b).js()).toThrow();
     });
 
     test("throws on mismatched dimensions", () => {
-      const a = np.array([
+      using a = np.array([
         [1.0, 2.0],
         [3.0, 4.0],
       ]);
-      const b = np.array([1.0, 2.0, 3.0]); // Wrong size
+      using b = np.array([1.0, 2.0, 3.0]); // Wrong size
       expect(() => np.linalg.lstsq(a, b).js()).toThrow();
     });
 
     test("works with jvp on b (underdetermined)", () => {
-      const a = np.array([
+      using a = np.array([
         [1.0, 2.0, 3.0],
         [4.0, 5.0, 6.0],
       ]);
-      const b = np.array([[1.0], [2.0]]);
-      const db = np.array([[0.1], [0.1]]);
+      using b = np.array([[1.0], [2.0]]);
+      using db = np.array([[0.1], [0.1]]);
 
       const solve = (b: np.Array) => np.linalg.lstsq(a, b);
       const [x, dx] = jvp(solve, [b], [db]);
+      using _x = x;
+      using _dx = dx;
 
       // Verify dx by finite differences
       const eps = 1e-4;
-      const x2 = np.linalg.lstsq(a, b.add(db.mul(eps)));
-      const dx_fd = x2.sub(x).div(eps);
+      const dbScaled = db.mul(eps);
+      const bPerturbed = b.add(dbScaled);
+      dbScaled.dispose();
+      const x2 = np.linalg.lstsq(a, bPerturbed);
+      bPerturbed.dispose();
+      const diff = x2.sub(x);
+      x2.dispose();
+      using dx_fd = diff.div(eps);
+      diff.dispose();
       expect(dx).toBeAllclose(dx_fd, { rtol: 1e-2, atol: 1e-3 });
     });
 
     test("works with grad on b (underdetermined)", () => {
-      const a = np.array([
+      using a = np.array([
         [1.0, 2.0, 3.0],
         [4.0, 5.0, 6.0],
       ]);
-      const b = np.array([[1.0], [2.0]]);
+      using b = np.array([[1.0], [2.0]]);
 
       const f = (b: np.Array) => np.square(np.linalg.lstsq(a, b)).sum();
-      const db = grad(f)(b);
+      using db = grad(f)(b);
 
       // Verify gradient by finite differences
       const eps = 1e-4;
@@ -213,8 +246,24 @@ suite.each(devicesWithLinalg)("device:%s", (device) => {
         const bm = bData.map((row) => [...row]);
         bp[i][0] += eps;
         bm[i][0] -= eps;
-        const fp = f(np.array(bp)).js() as number;
-        const fm = f(np.array(bm)).js() as number;
+        const bpArr = np.array(bp);
+        const lstsqP = np.linalg.lstsq(a, bpArr);
+        bpArr.dispose();
+        const sqP = np.square(lstsqP);
+        lstsqP.dispose();
+        const fpArr = sqP.sum();
+        sqP.dispose();
+        const fp = fpArr.js() as number;
+        fpArr.dispose();
+        const bmArr = np.array(bm);
+        const lstsqM = np.linalg.lstsq(a, bmArr);
+        bmArr.dispose();
+        const sqM = np.square(lstsqM);
+        lstsqM.dispose();
+        const fmArr = sqM.sum();
+        sqM.dispose();
+        const fm = fmArr.js() as number;
+        fmArr.dispose();
         expected.push([(fp - fm) / (2 * eps)]);
       }
       expect(db).toBeAllclose(expected, { rtol: 1e-2, atol: 1e-3 });
@@ -223,11 +272,13 @@ suite.each(devicesWithLinalg)("device:%s", (device) => {
 
   suite("numpy.linalg.slogdet()", () => {
     test("computes slogdet of simple matrix", () => {
-      const a = np.array([
+      using a = np.array([
         [4.0, 7.0],
         [2.0, 6.0],
       ]);
       const [sign, logdet] = np.linalg.slogdet(a);
+      using _sign = sign;
+      using _logdet = logdet;
       expect(sign).toBeAllclose(1);
       expect(logdet).toBeAllclose(Math.log(10));
     });
@@ -235,23 +286,27 @@ suite.each(devicesWithLinalg)("device:%s", (device) => {
 
   suite("numpy.linalg.solve()", () => {
     test("solves simple Ax = b", () => {
-      const a = np.array([
+      using a = np.array([
         [3.0, 2.0],
         [1.0, 2.0],
       ]);
-      const b = np.array([5.0, 4.0]);
-      const x = np.linalg.solve(a, b);
+      using b = np.array([5.0, 4.0]);
+      using x = np.linalg.solve(a, b);
       expect(x).toBeAllclose([0.5, 1.75]);
     });
 
     test("solves random batched AX = B", () => {
-      const [k1, k2] = random.split(random.key(0), 2);
-      const a = random.uniform(k1, [10, 15, 15]);
-      const xTrue = random.uniform(k2, [10, 15, 5]);
-      const b = np.matmul(a, xTrue); // B = A @ X_true
+      using key = random.key(0);
+      using splits = random.split(key, 2);
+      const [k1, k2] = splits;
+      using _k1 = k1;
+      using _k2 = k2;
+      using a = random.uniform(k1, [10, 15, 15]);
+      using xTrue = random.uniform(k2, [10, 15, 5]);
+      using b = np.matmul(a, xTrue); // B = A @ X_true
       expect(b.shape).toEqual(xTrue.shape);
 
-      const xPred = np.linalg.solve(a, b);
+      using xPred = np.linalg.solve(a, b);
       expect(xPred.shape).toEqual(xTrue.shape);
       expect(xPred).toBeAllclose(xTrue, { rtol: 1e-2, atol: 1e-4 });
     });

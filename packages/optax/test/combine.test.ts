@@ -1,17 +1,19 @@
-import { numpy as np } from "@jax-js/jax";
+import { numpy as np, tree } from "@jax-js/jax";
 import { chain, scale } from "@jax-js/optax";
 import { expect, test } from "vitest";
 
 test("chain function combines transformations", () => {
-  const params = np.array([1.0, 2.0, 3.0]);
-  const updates = np.array([0.1, 0.2, 0.3]);
+  using params = np.array([1.0, 2.0, 3.0]);
+  using updates = np.array([0.1, 0.2, 0.3]);
 
   // Chain two simple transformations
   const combined = chain(scale(2.0), scale(0.5));
   const state = combined.init(params);
 
-  const [newUpdates, _newState] = combined.update(updates, state, params);
+  const [newUpdates, newState] = combined.update(updates, state, params);
+  tree.dispose(newState);
 
   // 2.0 * 0.5 = 1.0, so updates should be unchanged
   expect(newUpdates).toBeAllclose([0.1, 0.2, 0.3]);
+  tree.dispose(newUpdates);
 });

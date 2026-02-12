@@ -34,8 +34,11 @@ export function cholesky(
   a: ArrayLike,
   { upper = false }: { upper?: boolean } = {},
 ): Array {
-  const L = core.cholesky(a) as Array;
-  return upper ? moveaxis(L, -2, -1) : L;
+  if (upper) {
+    using L = core.cholesky(a) as Array;
+    return moveaxis(L, -2, -1);
+  }
+  return core.cholesky(a) as Array;
 }
 
 /**
@@ -102,19 +105,29 @@ export function triangularSolve(
 ): Array {
   a = fudgeArray(a);
   b = fudgeArray(b);
-  if (!leftSide) {
-    // Transpose everything so it becomes a left-side solve.
-    // Note that the `TriangularSolve` primitive automatically transposes the
-    // b and x (output) values.
-    transposeA = !transposeA;
-  } else {
-    b = moveaxis(b, -2, -1);
+  const d: Array[] = [];
+  try {
+    if (!leftSide) {
+      // Transpose everything so it becomes a left-side solve.
+      // Note that the `TriangularSolve` primitive automatically transposes the
+      // b and x (output) values.
+      transposeA = !transposeA;
+    } else {
+      b = moveaxis(b, -2, -1);
+      d.push(b);
+    }
+    if (transposeA) {
+      a = moveaxis(a, -2, -1);
+      d.push(a);
+      lower = !lower;
+    }
+    let x = core.triangularSolve(a, b, { lower, unitDiagonal }) as Array;
+    if (leftSide) {
+      d.push(x);
+      x = moveaxis(x, -2, -1);
+    }
+    return x;
+  } finally {
+    for (const v of d) v[Symbol.dispose]();
   }
-  if (transposeA) {
-    a = moveaxis(a, -2, -1);
-    lower = !lower;
-  }
-  let x = core.triangularSolve(a, b, { lower, unitDiagonal }) as Array;
-  if (leftSide) x = moveaxis(x, -2, -1);
-  return x;
 }

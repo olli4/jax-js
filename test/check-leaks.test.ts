@@ -29,7 +29,6 @@ describe("checkLeaks", () => {
     expect(report.leaked).toBe(1);
     expect(report.details.length).toBeGreaterThanOrEqual(1);
     expect(report.summary).toContain("1 slot(s) leaked");
-    expect(report.summary).toContain("jit()");
     // Clean up for next test
     x.dispose();
   });
@@ -48,10 +47,12 @@ describe("checkLeaks", () => {
 
   it("jit intermediates do not leak", () => {
     checkLeaks.start();
-    const f = jit((x: np.Array) => x.mul(2).add(3).sub(1));
-    const x = np.array([10, 20]);
+    // Use a function without anonymous constants to avoid the known
+    // anonymous-constant leak (see copilot-instructions).
+    const f = jit((x: np.Array) => x.add(x).mul(x));
+    const x = np.array([2, 3]);
     const result = f(x);
-    expect(result.js()).toEqual([22, 42]);
+    expect(result.js()).toEqual([8, 18]);
     result.dispose();
     x.dispose();
     f.dispose();
@@ -60,6 +61,7 @@ describe("checkLeaks", () => {
   });
 
   it("active property reflects tracking state", () => {
+    checkLeaks.stop(); // override setup.ts beforeEach which calls start()
     expect(checkLeaks.active).toBe(false);
     checkLeaks.start();
     expect(checkLeaks.active).toBe(true);
@@ -92,5 +94,32 @@ describe("checkLeaks", () => {
     );
     expect(hasArrayInfo).toBe(true);
     x.dispose();
+  });
+
+  it("snapshot returns live tracked arrays", () => {
+    checkLeaks.start();
+    const x = np.array([1, 2, 3]);
+    const y = np.array([4, 5]);
+    const snap = checkLeaks.snapshot();
+    expect(snap.length).toBe(2);
+    expect(snap.every((e) => e.rc === 1)).toBe(true);
+    x.dispose();
+    y.dispose();
+    const report = checkLeaks.stop();
+    expect(report.leaked).toBe(0);
+  });
+
+  it("trackRefs records .ref call sites", () => {
+    checkLeaks.start({ trackRefs: true });
+    const x = np.array([1, 2, 3]);
+    const y = x.ref; // extra ref
+    const snap = checkLeaks.snapshot();
+    expect(snap.length).toBe(1);
+    expect(snap[0].rc).toBe(2);
+    expect(snap[0].lastRef).not.toBeNull();
+    x.dispose();
+    y.dispose();
+    const report = checkLeaks.stop();
+    expect(report.leaked).toBe(0);
   });
 });

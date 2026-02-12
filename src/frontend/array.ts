@@ -26,7 +26,12 @@ import {
   rep,
   type ScanPath,
 } from "../utils";
-import { _leakTrackingEnabled, _leakTrackingMap } from "./check-leaks";
+import {
+  _lastRefMap,
+  _leakTrackingEnabled,
+  _leakTrackingMap,
+  _trackRefsEnabled,
+} from "./check-leaks";
 import {
   checkConvShape,
   pool,
@@ -34,11 +39,13 @@ import {
   prepareConv,
 } from "./convolution";
 import {
+  _peArrayCreationTracker,
   AbstractValue,
   CompareOp,
   exp as coreExp,
   mul as coreMul,
   getAval,
+  insideTrace,
   ndim,
   newMain,
   Primitive,
@@ -203,8 +210,17 @@ export class Array extends Tracer {
       throw new Error("internal: AluExp source cannot have pending executes");
     }
 
+    // Leak tracking: record this Array and capture stack frames (V8 defers
+    // the expensive .stack string formatting until first access — cold path).
     if (_leakTrackingEnabled) {
-      _leakTrackingMap.set(this, new Error().stack ?? "(no stack)");
+      _leakTrackingMap.set(this, new Error());
+    }
+
+    // Track Arrays created during PE scope for intermediate disposal.
+    // Anonymous constants (np.array([...]) inside grad body) bypass bind()
+    // and PE tracking, so this constructor hook catches them.
+    if (_peArrayCreationTracker) {
+      _peArrayCreationTracker.push(this);
     }
   }
 
@@ -242,6 +258,7 @@ export class Array extends Tracer {
   get ref() {
     this.#check();
     this.#rc++;
+    if (_trackRefsEnabled) _lastRefMap.set(this, new Error());
     return this;
   }
 
@@ -253,7 +270,8 @@ export class Array extends Tracer {
   dispose() {
     this.#check();
     if (--this.#rc === 0) {
-      if (_leakTrackingEnabled) _leakTrackingMap.delete(this);
+      // Leak tracking: remove from map (no-op when map is empty / tracking off).
+      if (_leakTrackingMap.size > 0) _leakTrackingMap.delete(this);
       // Free any pending executables that haven't been submitted yet.
       for (const exe of this.#pending) exe.updateRc(-1);
       // If this has an array source, free it from the backend.
@@ -263,8 +281,21 @@ export class Array extends Tracer {
     }
   }
 
+  /**
+   * Override Tracer's no-op to actually dispose concrete Arrays.
+   *
+   * During PE tracing, concrete Arrays are created by PE's all-known evaluation
+   * path and tracked in knownIntermediates. Their lifecycle is managed by
+   * disposePeIntermediates after PE completes. If `using` declarations in JVP
+   * helpers also dispose these arrays, the double-dispose causes
+   * UseAfterFreeError when the ClosedJaxpr later accesses its consts.
+   *
+   * We detect PE scope via _peArrayCreationTracker (non-null when inside PE).
+   * JVP-only traces (no PE) still dispose normally — those intermediates have
+   * real Slots that need cleanup.
+   */
   [Symbol.dispose]() {
-    this.dispose();
+    if (!_peArrayCreationTracker && this.#rc > 0) this.dispose();
   }
 
   /** Get the pending executes as a list, trimming if already submitted. */
@@ -406,7 +437,10 @@ export class Array extends Tracer {
       }
     }
     newShape.push(-1);
-    return this.#transpose(keptAxes.concat(shiftedAxes)).reshape(newShape);
+    const transposed = this.#transpose(keptAxes.concat(shiftedAxes));
+    const result = transposed.reshape(newShape);
+    transposed.dispose();
+    return result;
   }
 
   #transpose(perm: number[]): Array {
@@ -501,7 +535,10 @@ export class Array extends Tracer {
     const weakType = castWeakType && !strongTypeOutput;
 
     const { backend, committed } = Array.#computeBackend(name, arrays);
+    const originalArrays = [...arrays];
     arrays = arrays.map((ar) => ar._putSync(backend));
+    // Track pre-broadcast arrays to dispose broadcast views afterward.
+    const preBroadcast = [...arrays];
     arrays = Array.#broadcastArrays(arrays);
     const newShape = [...arrays[0].shape];
 
@@ -517,6 +554,12 @@ export class Array extends Tracer {
       if (arrays.every((ar) => deepEqual(ar.#st, arrays[0].#st))) {
         // All are AluExp and have the same shape tracker.
         const exp = custom(sources);
+        // Dispose broadcast views (no-op for AluExp-backed, safe).
+        for (let i = 0; i < arrays.length; i++)
+          if (arrays[i] !== preBroadcast[i]) arrays[i].dispose();
+        // Dispose _putSync copies that differ from original input arrays.
+        for (let i = 0; i < originalArrays.length; i++)
+          if (preBroadcast[i] !== originalArrays[i]) preBroadcast[i].dispose();
         return new Array({
           source: exp.simplify(),
           st: arrays[0].#st,
@@ -535,6 +578,12 @@ export class Array extends Tracer {
         }),
       );
       const st = ShapeTracker.fromShape(newShape);
+      // Dispose broadcast views (no-op for AluExp-backed, safe).
+      for (let i = 0; i < arrays.length; i++)
+        if (arrays[i] !== preBroadcast[i]) arrays[i].dispose();
+      // Dispose _putSync copies that differ from original input arrays.
+      for (let i = 0; i < originalArrays.length; i++)
+        if (preBroadcast[i] !== originalArrays[i]) preBroadcast[i].dispose();
       return new Array({
         source: exp.simplify(),
         st,
@@ -582,6 +631,13 @@ export class Array extends Tracer {
     const pending = new Set([...arrays.flatMap((ar) => ar.#pending)]);
     for (const exe of pending) exe.updateRc(+1);
     pending.add(new PendingExecute(backend, kernel, inputs, [output]));
+
+    // Dispose broadcast views created by #broadcastArrays.
+    for (let i = 0; i < arrays.length; i++)
+      if (arrays[i] !== preBroadcast[i]) arrays[i].dispose();
+    // Dispose _putSync copies that differ from original input arrays.
+    for (let i = 0; i < originalArrays.length; i++)
+      if (preBroadcast[i] !== originalArrays[i]) preBroadcast[i].dispose();
 
     return new Array({
       source: output,
@@ -716,7 +772,7 @@ export class Array extends Tracer {
     this.#check();
     if (!(this.#source instanceof AluExp))
       throw new Error("internal: #dataInline called on non-AluExp source");
-    const ar = this.#newArrayFrom({ backend: getBackend("cpu") });
+    using ar = this.#newArrayFrom({ backend: getBackend("cpu") });
     return ar.dataSync();
   }
 
@@ -956,7 +1012,10 @@ export class Array extends Tracer {
       },
       [Primitive.Reduce]([x], { op, axis }) {
         if (axis.length === 0) return [x];
-        return [x.#moveAxesDown(axis).#reduce(op)];
+        const moved = x.#moveAxesDown(axis);
+        const result = moved.#reduce(op);
+        moved.dispose();
+        return [result];
       },
       [Primitive.Pool]([x], { window, strides }) {
         const st = pool(x.#st, window, strides);
@@ -966,7 +1025,10 @@ export class Array extends Tracer {
         const n = inShape.length;
         let st = poolTranspose(x.#st, inShape, window, strides);
         st = st.reshape([...st.shape.slice(0, n), prod(st.shape.slice(n))]);
-        return [x.#reshape(st).#reduce(AluOp.Add)];
+        const reshaped = x.#reshape(st);
+        const result = reshaped.#reduce(AluOp.Add);
+        reshaped.dispose();
+        return [result];
       },
       [Primitive.Dot]([x, y]) {
         return [
@@ -981,14 +1043,17 @@ export class Array extends Tracer {
       [Primitive.Conv]([x, y], params) {
         checkConvShape(x.shape, y.shape, params);
         const [stX, stY] = prepareConv(x.#st, y.#st, params);
-        return [
-          Array.#naryCustom(
-            "conv",
-            ([x, y]: AluExp[]) => AluExp.mul(x, y),
-            [x.#reshape(stX), y.#reshape(stY)],
-            { reduceAxis: true },
-          ),
-        ];
+        const xView = x.#reshape(stX);
+        const yView = y.#reshape(stY);
+        const result = Array.#naryCustom(
+          "conv",
+          ([x, y]: AluExp[]) => AluExp.mul(x, y),
+          [xView, yView],
+          { reduceAxis: true },
+        );
+        xView.dispose();
+        yView.dispose();
+        return [result];
       },
       [Primitive.Compare]([x, y], { op }) {
         const custom = ([x, y]: AluExp[]) => aluCompare(x, y, op);
@@ -1021,7 +1086,9 @@ export class Array extends Tracer {
           cum += sizes[i];
         }
         const custom = (exps: AluExp[]) => exps.reduce(AluExp.add);
-        return [Array.#naryCustom("concatenate", custom, xsPadded)];
+        const result = Array.#naryCustom("concatenate", custom, xsPadded);
+        for (const p of xsPadded) p.dispose();
+        return [result];
       },
       [Primitive.Split]([x], { axis, sizes }) {
         const outputs: Array[] = [];
@@ -1044,15 +1111,23 @@ export class Array extends Tracer {
           dtype: DType.Uint32,
           device: k0.device,
         }).reshape(genShape);
-        k0 = k0.#reshape(
+        const k0View = k0.#reshape(
           k0.#st.reshape(keyShape.concat(rep(genShape.length, 1))),
         );
-        k1 = k1.#reshape(
+        const k1View = k1.#reshape(
           k1.#st.reshape(keyShape.concat(rep(genShape.length, 1))),
         );
         const custom = ([k0, k1, c0, c1]: AluExp[]) =>
           AluExp.threefry2x32(k0, k1, c0, c1, mode);
-        return [Array.#naryCustom("random_bits", custom, [k0, k1, c0, c1])];
+        const result = Array.#naryCustom("random_bits", custom, [
+          k0View,
+          k1View,
+          c0,
+          c1,
+        ]);
+        k0View.dispose();
+        k1View.dispose();
+        return [result];
       },
       [Primitive.Gather]([x, ...indices], { axis, outDim }) {
         return [x.#gather(indices, axis, outDim)];
@@ -1590,11 +1665,22 @@ function dataToJs(
 }
 
 /** If x is a value, lift it into an array, otherwise leave it be. */
+/**
+ * WeakSet tracking arrays created by pureArray from raw (non-Tracer) values.
+ * These arrays are "anonymous" — created transiently by fudgeArray/pureArray
+ * inside library functions, with no user code holding a reference.
+ * getOrMakeConstTracer checks this to avoid calling .ref on anonymous consts,
+ * which would leak when the ClosedJaxpr is disposed.
+ */
+export const anonymousConstArrays = new WeakSet<Array>();
+
 export function pureArray(x: TracerValue): Tracer {
   if (x instanceof Tracer) {
     return x;
   } else {
-    return array(x);
+    const arr = array(x);
+    anonymousConstArrays.add(arr as Array);
+    return arr;
   }
 }
 
@@ -1821,9 +1907,15 @@ export function tri(
   if (!Number.isInteger(k)) {
     throw new Error(`tri: k must be an integer, got ${k}`);
   }
-  const rows = arange(k, n + k, 1, { dtype: DType.Int32, device });
-  const cols = arange(0, m, 1, { dtype: DType.Int32, device });
-  return rows.reshape([n, 1]).greaterEqual(cols).astype(dtype);
+  using rows = arange(k, n + k, 1, { dtype: DType.Int32, device });
+  using cols = arange(0, m, 1, { dtype: DType.Int32, device });
+  using rowsReshaped = rows.reshape([n, 1]);
+  // Don't use `using` on ge — astype() returns `this` for same dtype,
+  // so `using ge` would dispose the returned value on block exit.
+  const ge = rowsReshaped.greaterEqual(cols);
+  if (ge.dtype === dtype) return ge;
+  using _ge = ge;
+  return ge.astype(dtype);
 }
 
 /** Return the lower triangle of an array. Must be of dimension >= 2. */
@@ -1833,7 +1925,9 @@ export function tril(a: ArrayLike, k: number = 0): Array {
   }
   a = fudgeArray(a);
   const [n, m] = a.shape.slice(-2);
-  return where(tri(n, m, k, { dtype: DType.Bool }), a, zerosLike(a)) as Array;
+  using mask = tri(n, m, k, { dtype: DType.Bool });
+  using zeros = zerosLike(a);
+  return where(mask, a, zeros) as Array;
 }
 
 /** Return the upper triangle of an array. Must be of dimension >= 2. */
@@ -1843,11 +1937,9 @@ export function triu(a: ArrayLike, k: number = 0): Array {
   }
   a = fudgeArray(a);
   const [n, m] = a.shape.slice(-2);
-  return where(
-    tri(n, m, k - 1, { dtype: DType.Bool }),
-    zerosLike(a),
-    a,
-  ) as Array;
+  using mask = tri(n, m, k - 1, { dtype: DType.Bool });
+  using zeros = zerosLike(a);
+  return where(mask, zeros, a) as Array;
 }
 
 /**

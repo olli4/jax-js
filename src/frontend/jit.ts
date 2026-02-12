@@ -23,6 +23,7 @@ import {
   rep,
 } from "../utils";
 import { aluCompare, PendingExecute } from "./array";
+import { _registerJitCacheDisposer } from "./check-leaks";
 import { pool, poolTranspose, prepareConv } from "./convolution";
 import {
   Primitive,
@@ -472,6 +473,18 @@ type JitValue =
   | { type: "red"; exp: AluExp; reduction: Reduction; args: JitId[] }; // Reduction + epilogue
 
 const jitCompileCache = new Map<string, JitProgram>();
+
+/**
+ * Clear the internal JIT compilation cache. Called by `_disposeAllJitCaches()`
+ * in jaxpr.ts during leak checking.
+ * @internal
+ */
+export function _clearJitCompileCache(): void {
+  jitCompileCache.clear();
+}
+
+// Register with jaxpr.ts so checkLeaks.stop() can flush this cache.
+_registerJitCacheDisposer(_clearJitCompileCache);
 
 export function jitCompile(backend: Backend, jaxpr: Jaxpr): JitProgram {
   const cacheKey = backend.type + "," + FpHash.hash(jaxpr);

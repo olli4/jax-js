@@ -16,9 +16,18 @@ import {
   unzip2,
   zip,
 } from "../utils";
-import { array, Array, ArrayLike, pureArray } from "./array";
+import {
+  anonymousConstArrays,
+  Array,
+  array,
+  ArrayLike,
+  pureArray,
+} from "./array";
+import { _jitFunctionDisposers } from "./check-leaks";
 import { checkConvShape, checkPoolShape } from "./convolution";
 import {
+  _peArrayCreationTracker,
+  _setPACT,
   AbstractValue,
   bind,
   flattenFun,
@@ -44,7 +53,10 @@ import {
  * by the function after the last time it is called.
  */
 // eslint-disable-next-line @typescript-eslint/no-unsafe-function-type
-export type OwnedFunction<F extends Function> = F & { dispose: () => void };
+export type OwnedFunction<F extends Function> = F & {
+  dispose: () => void;
+  [Symbol.dispose]: () => void;
+};
 
 /** Variable in a Jaxpr expression. */
 export class Var {
@@ -506,7 +518,7 @@ export function evalJaxpr(jaxpr: Jaxpr, args: Tracer[]): Tracer[] {
 
   const write = (v: Var, val: Tracer) => {
     if (env.has(v)) throw new Error(`Variable already bound: ${v}`);
-    let refCount = usageCount.get(v) ?? 0;
+    const refCount = usageCount.get(v) ?? 0;
     if (refCount) {
       env.set(v, val);
       remainingRefs.set(v, refCount);
@@ -597,9 +609,6 @@ class JaxprTracer extends Tracer {
   dispose() {
     this.#rc--;
   }
-  [Symbol.dispose]() {
-    this.dispose();
-  }
   /** Number of live references the user holds (1 + .ref count − .dispose count). */
   get refCount(): number {
     return this.#rc;
@@ -625,15 +634,27 @@ class JaxprTrace extends Trace {
 
   /** Register a constant / literal in this Jaxpr. */
   getOrMakeConstTracer(val: TracerValue): JaxprTracer {
+    // If val is a raw value (number/boolean), pureArray creates a fresh Array that
+    // nobody else references — the builder becomes the sole owner (no .ref needed).
+    let ownedByBuilder = false;
     if (!(val instanceof Tracer)) {
       val = pureArray(val);
+      ownedByBuilder = true;
+    } else if (val instanceof Array && anonymousConstArrays.has(val)) {
+      // Array was created by pureArray/fudgeArray from a raw value inside a
+      // library function (e.g., subtract(1, x)). Nobody else holds a reference.
+      // Treat as builder-owned so disposal frees it completely.
+      ownedByBuilder = true;
+      anonymousConstArrays.delete(val);
     }
     let tracer = this.builder.constTracers.get(val);
     if (tracer === undefined) {
       tracer = this.builder.newTracer(this, ShapedArray.fromAval(getAval(val)));
-      // Take a ref so ClosedJaxpr owns the const independently of the caller.
-      // This protects the const from PETracer cascade in linearize transforms.
-      val.ref;
+      if (!ownedByBuilder) {
+        // Take a ref so ClosedJaxpr owns the const independently of the caller.
+        // This protects the const from PETracer cascade in linearize transforms.
+        val.ref;
+      }
       this.builder.addConst(tracer, val);
     } else {
       tracer.trackLiftedConstant();
@@ -734,6 +755,11 @@ function _inlineLiterals({ jaxpr, consts }: ClosedJaxpr): ClosedJaxpr {
     if (ndim(consts[i]) === 0 && consts[i] instanceof Array) {
       const ar = consts[i] as Array;
       literals.set(jaxpr.inBinders[i], new Lit(ar.aval, ar.dataSync()[0]));
+      // Release this const — it was inlined as a Lit and is no longer needed.
+      // For user-held consts this undoes the .ref from getOrMakeConstTracer
+      // (leaving the user's reference). For builder-owned consts (pureArray)
+      // this frees the sole reference.
+      ar.dispose();
     } else {
       constBinders.push(jaxpr.inBinders[i]);
       newConsts.push(consts[i]);
@@ -1126,7 +1152,20 @@ export function makeJaxpr(
     const tracersIn = avalsIn.map((aval) =>
       trace.newArg(typeof aval === "object" ? aval : pureArray(aval)),
     );
-    const outs = fFlat(...tracersIn);
+
+    // Save/restore _peArrayCreationTracker so that Arrays created during
+    // inner makeJaxpr tracing (e.g., zerosLike tangents from JVP rules)
+    // don't leak into an outer partialEvalFlat's tracker.  These inner
+    // Arrays become ClosedJaxpr consts (with .ref ownership) and must not
+    // be disposed by the outer PE's disposePeIntermediates.
+    const prevTracker = _peArrayCreationTracker;
+    _setPACT(null);
+    let outs: any;
+    try {
+      outs = fFlat(...tracersIn);
+    } finally {
+      _setPACT(prevTracker);
+    }
     const tracersOut = outs.map(
       (out: Tracer) => fullRaise(trace, out) as JaxprTracer,
     );
@@ -1164,15 +1203,11 @@ export function jit<F extends (...args: any[]) => any>(
       return makeJaxpr(f, opts)(...jaxprArgs);
     });
 
-    const outs = bind(
-      Primitive.Jit,
-      [...jaxpr.consts, ...argsFlat],
-      {
-        name: f.name || "closure",
-        jaxpr: jaxpr.jaxpr,
-        numConsts: jaxpr.consts.length,
-      },
-    );
+    const outs = bind(Primitive.Jit, [...jaxpr.consts, ...argsFlat], {
+      name: f.name || "closure",
+      jaxpr: jaxpr.jaxpr,
+      numConsts: jaxpr.consts.length,
+    });
     return treeUnflatten(outTree, outs);
   }) as OwnedFunction<F>;
 
@@ -1180,8 +1215,14 @@ export function jit<F extends (...args: any[]) => any>(
     for (const { jaxpr } of cache.values()) {
       jaxpr.dispose();
     }
+    cache.clear();
   };
+  result[Symbol.dispose] = result.dispose;
+
+  // Register for bulk disposal during leak detection. The dispose callback
+  // frees ClosedJaxpr consts and clears the cache — the next call will
+  // re-trace and create fresh consts.
+  _jitFunctionDisposers.add(result.dispose);
 
   return result;
 }
-

@@ -80,13 +80,20 @@ test("should evaluate a simple Add operation", async () => {
   const onnxModel = new ONNXModel(toBinary(ModelProtoSchema, model));
   onTestFinished(() => onnxModel.dispose());
 
-  const a = np.array([1, 2, 3, 4, 5, 6]).reshape([2, 3]);
-  const b = np.array([10, 20, 30, 40, 50, 60]).reshape([2, 3]);
+  using a = np.array([
+    [1, 2, 3],
+    [4, 5, 6],
+  ]);
+  using b = np.array([
+    [10, 20, 30],
+    [40, 50, 60],
+  ]);
   const result = onnxModel.run({ A: a, B: b });
 
   expect(await result.C.data()).toEqual(
     new Float32Array([11, 22, 33, 44, 55, 66]),
   );
+  result.C.dispose();
 });
 
 test("should evaluate Add followed by Mul", async () => {
@@ -120,13 +127,23 @@ test("should evaluate Add followed by Mul", async () => {
   const onnxModel = new ONNXModel(toBinary(ModelProtoSchema, model));
   onTestFinished(() => onnxModel.dispose());
 
-  const a = np.array([1, 2, 3, 4]).reshape([2, 2]);
-  const b = np.array([10, 20, 30, 40]).reshape([2, 2]);
-  const c = np.array([2, 2, 2, 2]).reshape([2, 2]);
+  using a = np.array([
+    [1, 2],
+    [3, 4],
+  ]);
+  using b = np.array([
+    [10, 20],
+    [30, 40],
+  ]);
+  using c = np.array([
+    [2, 2],
+    [2, 2],
+  ]);
   const result = onnxModel.run({ A: a, B: b, C: c });
 
   // (1+10)*2=22, (2+20)*2=44, (3+30)*2=66, (4+40)*2=88
   expect(await result.D.data()).toEqual(new Float32Array([22, 44, 66, 88]));
+  result.D.dispose();
 });
 
 test("should handle initializers (constant weights)", async () => {
@@ -153,13 +170,14 @@ test("should handle initializers (constant weights)", async () => {
   });
 
   const onnxModel = new ONNXModel(toBinary(ModelProtoSchema, model));
-  onTestFinished(() => onnxModel.dispose());
 
   // Only need to provide A since B is an initializer
-  const a = np.array([1, 2, 3]);
+  using a = np.array([1, 2, 3]);
   const result = onnxModel.run({ A: a });
 
   expect(await result.C.data()).toEqual(new Float32Array([101, 202, 303]));
+  result.C.dispose();
+  onnxModel.dispose();
 });
 
 test("should evaluate MatMul", async () => {
@@ -186,13 +204,21 @@ test("should evaluate MatMul", async () => {
 
   // A = [[1, 2, 3], [4, 5, 6]]
   // B = [[1, 2], [3, 4], [5, 6]]
-  const a = np.array([1, 2, 3, 4, 5, 6]).reshape([2, 3]);
-  const b = np.array([1, 2, 3, 4, 5, 6]).reshape([3, 2]);
+  using a = np.array([
+    [1, 2, 3],
+    [4, 5, 6],
+  ]);
+  using b = np.array([
+    [1, 2],
+    [3, 4],
+    [5, 6],
+  ]);
   const result = onnxModel.run({ A: a, B: b });
 
   // C = [[1*1+2*3+3*5, 1*2+2*4+3*6], [4*1+5*3+6*5, 4*2+5*4+6*6]]
   //   = [[22, 28], [49, 64]]
   expect(await result.C.data()).toEqual(new Float32Array([22, 28, 49, 64]));
+  result.C.dispose();
 });
 
 test("should evaluate Relu", async () => {
@@ -216,10 +242,11 @@ test("should evaluate Relu", async () => {
   const onnxModel = new ONNXModel(toBinary(ModelProtoSchema, model));
   onTestFinished(() => onnxModel.dispose());
 
-  const x = np.array([-3, -1, 0, 1, 2, 3]);
+  using x = np.array([-3, -1, 0, 1, 2, 3]);
   const result = onnxModel.run({ X: x });
 
   expect(await result.Y.data()).toEqual(new Float32Array([0, 0, 0, 1, 2, 3]));
+  result.Y.dispose();
 });
 
 test("should evaluate Reshape", async () => {
@@ -251,11 +278,15 @@ test("should evaluate Reshape", async () => {
   const onnxModel = new ONNXModel(toBinary(ModelProtoSchema, model));
   onTestFinished(() => onnxModel.dispose());
 
-  const x = np.array([1, 2, 3, 4, 5, 6]).reshape([2, 3]);
+  using x = np.array([
+    [1, 2, 3],
+    [4, 5, 6],
+  ]);
   const result = onnxModel.run({ X: x });
 
   expect(result.Y.shape).toEqual([3, 2]);
   expect(await result.Y.data()).toEqual(new Float32Array([1, 2, 3, 4, 5, 6]));
+  result.Y.dispose();
 });
 
 test("should evaluate a chain: Add -> Relu -> MatMul", async () => {
@@ -295,15 +326,22 @@ test("should evaluate a chain: Add -> Relu -> MatMul", async () => {
   onTestFinished(() => onnxModel.dispose());
 
   // A + B has some negative values that Relu will zero out
-  const a = np.array([-5, 2, 3, 4, -1, 6]).reshape([2, 3]);
-  const b = np.array([1, -5, 1, -10, 2, -10]).reshape([2, 3]);
+  using a = np.array([
+    [-5, 2, 3],
+    [4, -1, 6],
+  ]);
+  using b = np.array([
+    [1, -5, 1],
+    [-10, 2, -10],
+  ]);
   // sum = [[-4, -3, 4], [-6, 1, -4]]
   // relu = [[0, 0, 4], [0, 1, 0]]
-  const c = np.array([1, 1, 1]).reshape([3, 1]);
+  using c = np.array([[1], [1], [1]]);
   // Y = [[0+0+4], [0+1+0]] = [[4], [1]]
 
   const result = onnxModel.run({ A: a, B: b, C: c });
 
   expect(result.Y.shape).toEqual([2, 1]);
   expect(await result.Y.data()).toEqual(new Float32Array([4, 1]));
+  result.Y.dispose();
 });

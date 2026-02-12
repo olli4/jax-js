@@ -62,7 +62,10 @@ export function relu6(x: ArrayLike): Array {
  * Reference: https://en.wikipedia.org/wiki/Sigmoid_function
  */
 export function sigmoid(x: ArrayLike): Array {
-  return reciprocal(exp(negative(x)).add(1));
+  using neg = negative(x);
+  using e = exp(neg);
+  using sum = e.add(1);
+  return reciprocal(sum);
 }
 
 /**
@@ -72,7 +75,9 @@ export function sigmoid(x: ArrayLike): Array {
  * Reference: https://en.wikipedia.org/wiki/Softplus
  */
 export function softplus(x: ArrayLike): Array {
-  return log(exp(x).add(1));
+  using e = exp(x);
+  using sum = e.add(1);
+  return log(sum);
 }
 
 /**
@@ -109,7 +114,9 @@ export const sparseSigmoid = jit((x: Array): Array => {
  */
 export function softSign(x: ArrayLike): Array {
   x = fudgeArray(x);
-  return x.div(absolute(x).add(1));
+  using absX = absolute(x);
+  using denom = absX.add(1);
+  return x.div(denom);
 }
 
 /**
@@ -133,7 +140,9 @@ export { silu as swish };
  * `log_sigmoid(x) = log(sigmoid(x)) = -log(1 + exp(-x))`.
  */
 export function logSigmoid(x: ArrayLike): Array {
-  return negative(softplus(negative(x)));
+  using neg = negative(x);
+  using sp = softplus(neg);
+  return negative(sp);
 }
 
 /**
@@ -148,18 +157,23 @@ export function leakyRelu(
   negativeSlope: ArrayLike = 0.01,
 ): Array {
   x = fudgeArray(x);
-  return where(less(x, 0), x.mul(negativeSlope), x);
+  using cond = less(x, 0);
+  using scaled = x.mul(negativeSlope);
+  return where(cond, scaled, x);
 }
 
 /** Hard sigmoid activation function: `relu6(x+3)/6`. */
 export function hardSigmoid(x: ArrayLike): Array {
-  return relu6(add(x, 3)).mul(1 / 6);
+  using sum = add(x, 3);
+  using r = relu6(sum);
+  return r.mul(1 / 6);
 }
 
 /** Hard SiLU (swish) activation function: `x * hardSigmoid(x)`. */
 export function hardSilu(x: ArrayLike): Array {
   x = fudgeArray(x);
-  return x.mul(hardSigmoid(x));
+  using hs = hardSigmoid(x);
+  return x.mul(hs);
 }
 
 export { hardSilu as hardSwish };
@@ -177,7 +191,11 @@ export function hardTanh(x: ArrayLike): Array {
  */
 export function elu(x: ArrayLike, alpha: ArrayLike = 1.0): Array {
   x = fudgeArray(x);
-  return where(less(x, 0), exp(x).sub(1).mul(alpha), x);
+  using cond = less(x, 0);
+  using e = exp(x);
+  using em1 = e.sub(1);
+  using scaled = em1.mul(alpha);
+  return where(cond, scaled, x);
 }
 
 /**
@@ -188,7 +206,12 @@ export function elu(x: ArrayLike, alpha: ArrayLike = 1.0): Array {
  */
 export function celu(x: ArrayLike, alpha: ArrayLike = 1.0): Array {
   x = fudgeArray(x);
-  return where(less(x, 0), exp(x.div(alpha)).sub(1).mul(alpha), x);
+  using cond = less(x, 0);
+  using ratio = x.div(alpha);
+  using e = exp(ratio);
+  using em1 = e.sub(1);
+  using scaled = em1.mul(alpha);
+  return where(cond, scaled, x);
 }
 
 /**
@@ -225,9 +248,7 @@ export const gelu = jit(
       return x
         .mul(0.5)
         .mul(
-          tanh(
-            x.mul(x.mul(x).mul(0.044715).add(1)).mul(SQRT_2_OVER_PI),
-          ).add(1),
+          tanh(x.mul(x.mul(x).mul(0.044715).add(1)).mul(SQRT_2_OVER_PI)).add(1),
         );
     } else {
       return x.mul(0.5).mul(erfc(negative(x.mul(Math.SQRT1_2))));
@@ -252,9 +273,10 @@ export function glu(x: ArrayLike, axis: number = -1): Array {
     );
   }
   const slice = x.shape.map<Pair>((a) => [0, a]);
-  const a = shrink(x, slice.toSpliced(axis, 1, [0, size / 2])) as Array;
-  const b = shrink(x, slice.toSpliced(axis, 1, [size / 2, size])) as Array;
-  return a.mul(sigmoid(b));
+  using a = shrink(x, slice.toSpliced(axis, 1, [0, size / 2])) as Array;
+  using b = shrink(x, slice.toSpliced(axis, 1, [size / 2, size])) as Array;
+  using sig = sigmoid(b);
+  return a.mul(sig);
 }
 
 /**
@@ -265,7 +287,11 @@ export function glu(x: ArrayLike, axis: number = -1): Array {
  */
 export function squareplus(x: ArrayLike, b: ArrayLike = 4.0): Array {
   x = fudgeArray(x);
-  return x.add(sqrt(square(x).add(b))).mul(0.5);
+  using sq = square(x);
+  using sumSq = sq.add(b);
+  using sr = sqrt(sumSq);
+  using sum = x.add(sr);
+  return sum.mul(0.5);
 }
 
 /**
@@ -276,7 +302,9 @@ export function squareplus(x: ArrayLike, b: ArrayLike = 4.0): Array {
  */
 export function mish(x: ArrayLike): Array {
   x = fudgeArray(x);
-  return x.mul(tanh(softplus(x)));
+  using sp = softplus(x);
+  using t = tanh(sp);
+  return x.mul(t);
 }
 
 /**
@@ -294,9 +322,12 @@ export function softmax(x: ArrayLike, axis: Axis = -1): Array {
     return onesLike(x); // scalar case, return ones
   }
 
-  const xMax = max(x, axis, { keepdims: true });
-  const unnormalized = exp(x.sub(stopGradient(xMax)));
-  return unnormalized.div(unnormalized.sum(axis, { keepdims: true }));
+  using xMax = max(x, axis, { keepdims: true });
+  const sg = stopGradient(xMax);
+  using shifted = x.sub(sg);
+  using unnormalized = exp(shifted);
+  using denom = unnormalized.sum(axis, { keepdims: true });
+  return unnormalized.div(denom);
 }
 
 /**
@@ -314,9 +345,12 @@ export function logSoftmax(x: ArrayLike, axis: Axis = -1): Array {
     return zerosLike(x); // scalar case, return log(1)
   }
 
-  const xMax = max(x, axis, { keepdims: true }); // keep dims
-  const shifted = x.sub(stopGradient(xMax));
-  const shiftedLogsumexp = log(exp(shifted).sum(axis, { keepdims: true }));
+  using xMax = max(x, axis, { keepdims: true }); // keep dims
+  const sg = stopGradient(xMax);
+  using shifted = x.sub(sg);
+  using expShifted = exp(shifted);
+  using sumExp = expShifted.sum(axis, { keepdims: true });
+  using shiftedLogsumexp = log(sumExp);
   return shifted.sub(shiftedLogsumexp);
 }
 
@@ -337,10 +371,16 @@ export function logsumexp(
   axis = normalizeAxis(axis, x.ndim);
   if (axis.length === 0) return x;
 
-  const xMax = stopGradient(max(x, axis, { keepdims: true })) as Array;
-  const shifted = x.sub(xMax);
-  const result = xMax.add(log(exp(shifted).sum(axis, { keepdims: true })));
-  return opts?.keepdims ? result : squeeze(result, axis);
+  using rawMax = max(x, axis, { keepdims: true });
+  const xMax = stopGradient(rawMax) as Array;
+  using shifted = x.sub(xMax);
+  using expShifted = exp(shifted);
+  using sumExp = expShifted.sum(axis, { keepdims: true });
+  using logSum = log(sumExp);
+  const result = xMax.add(logSum);
+  if (opts?.keepdims) return result;
+  using resultToSqueeze = result;
+  return squeeze(resultToSqueeze, axis);
 }
 
 /** Log-mean-exp reduction, like `jax.nn.logsumexp()` but subtracts `log(n)`. */
@@ -353,7 +393,8 @@ export function logmeanexp(
   axis = normalizeAxis(axis, x.ndim);
   if (axis.length === 0) return x;
   const n = axis.reduce((acc, a) => acc * x.shape[a], 1);
-  return logsumexp(x, axis, opts).sub(Math.log(n));
+  using lse = logsumexp(x, axis, opts);
+  return lse.sub(Math.log(n));
 }
 
 /**
@@ -377,19 +418,43 @@ export function standardize(
   axis = normalizeAxis(axis, x.ndim);
   if (axis.length === 0) return x;
 
-  const mu =
-    opts.mean !== undefined
-      ? fudgeArray(opts.mean)
-      : x.mean(axis, { keepdims: true });
+  const d: Array[] = [];
+  try {
+    const mu =
+      opts.mean !== undefined
+        ? fudgeArray(opts.mean)
+        : (() => {
+            const m = x.mean(axis, { keepdims: true });
+            d.push(m);
+            return m;
+          })();
 
-  // Like JAX, we'll use the Var[X] = E[X^2] - (E[X])^2 formula for this one.
-  // It's supposed to be better in the case of neural network activations.
-  const sigma2 =
-    opts.variance !== undefined
-      ? fudgeArray(opts.variance)
-      : square(x).mean(axis, { keepdims: true }).sub(square(mu));
+    // Like JAX, we'll use the Var[X] = E[X^2] - (E[X])^2 formula for this one.
+    // It's supposed to be better in the case of neural network activations.
+    let sigma2: Array;
+    if (opts.variance !== undefined) {
+      sigma2 = fudgeArray(opts.variance);
+    } else {
+      const sq = square(x);
+      d.push(sq);
+      const sqMean = sq.mean(axis, { keepdims: true });
+      d.push(sqMean);
+      const muSq = square(mu);
+      d.push(muSq);
+      sigma2 = sqMean.sub(muSq);
+      d.push(sigma2);
+    }
 
-  return x.sub(mu).div(sqrt(sigma2.add(opts.epsilon ?? 1e-5)));
+    const centered = x.sub(mu);
+    d.push(centered);
+    const denom = sigma2.add(opts.epsilon ?? 1e-5);
+    d.push(denom);
+    const sqrtDenom = sqrt(denom);
+    d.push(sqrtDenom);
+    return centered.div(sqrtDenom);
+  } finally {
+    for (const v of d) v[Symbol.dispose]();
+  }
 }
 
 /**
@@ -490,75 +555,117 @@ export function dotProductAttention(
     );
 
   const isRank3 = query.ndim === 3;
-  if (isRank3) {
-    query = expandDims(query, 0);
-    key = expandDims(key, 0);
-    value = expandDims(value, 0);
-  }
-
-  const [B, L, N, H] = query.shape;
-  if (key.shape[0] !== B || key.shape[3] !== H)
-    throw new Error(
-      `dotProductAttention: query and key shapes mismatch, ` +
-        `got Q=${query.aval}, K=${key.aval}`,
-    );
-
-  const S = key.shape[1];
-  const K = key.shape[2];
-
-  if (N < K || (N != K && N % K !== 0))
-    throw new Error(
-      `dotProductAttention: number of query heads N=${N} must be ` +
-        `divisible by number of key/value heads K=${K} for GQA`,
-    );
-  const G = N / K; // number of query groups
-  key = tile(key, [1, 1, G, 1]);
-  value = tile(value, [1, 1, G, 1]);
-
-  const scale = opts.scale ?? 1 / Math.sqrt(H);
-  let scores = einsum("BLNH,BSNH->BNLS", query, key).mul(scale);
-  if (opts.bias !== undefined) {
-    scores = scores.add(opts.bias);
-  }
-  if (opts.mask !== undefined) {
-    scores = where(opts.mask, scores, -Infinity);
-  }
-  if (opts.isCausal) {
-    // Causal mask: position i can only attend to positions j <= i
-    // tri(L, S) creates a lower triangular boolean mask of shape [L, S]
-    const causalMask = tri(L, S, 0, { dtype: DType.Bool });
-    scores = where(causalMask, scores, -Infinity);
-  }
-  if (opts.localWindowSize !== undefined) {
-    const [before, after] =
-      typeof opts.localWindowSize === "number"
-        ? [opts.localWindowSize, opts.localWindowSize]
-        : opts.localWindowSize;
-    if (
-      before < 0 ||
-      after < 0 ||
-      !Number.isInteger(before) ||
-      !Number.isInteger(after)
-    ) {
-      throw new Error(
-        `dotProductAttention: localWindowSize values must be non-negative, ` +
-          `got ${opts.localWindowSize}`,
-      );
+  const d: Array[] = [];
+  try {
+    if (isRank3) {
+      query = expandDims(query, 0);
+      d.push(query);
+      key = expandDims(key, 0);
+      d.push(key);
+      value = expandDims(value, 0);
+      d.push(value);
     }
-    const localMask = tri(L, S, after, { dtype: DType.Bool }).mul(
-      tri(L, S, -before - 1, { dtype: DType.Bool }).notEqual(true),
-    );
-    scores = where(localMask, scores, -Infinity);
+
+    const [B, L, N, H] = query.shape;
+    if (key.shape[0] !== B || key.shape[3] !== H)
+      throw new Error(
+        `dotProductAttention: query and key shapes mismatch, ` +
+          `got Q=${query.aval}, K=${key.aval}`,
+      );
+
+    const S = key.shape[1];
+    const K = key.shape[2];
+
+    if (N < K || (N != K && N % K !== 0))
+      throw new Error(
+        `dotProductAttention: number of query heads N=${N} must be ` +
+          `divisible by number of key/value heads K=${K} for GQA`,
+      );
+    const G = N / K; // number of query groups
+    key = tile(key, [1, 1, G, 1]);
+    d.push(key);
+    value = tile(value, [1, 1, G, 1]);
+    d.push(value);
+
+    const scale = opts.scale ?? 1 / Math.sqrt(H);
+    const rawScores = einsum("BLNH,BSNH->BNLS", query, key);
+    d.push(rawScores);
+    let scores = rawScores.mul(scale);
+    if (opts.bias !== undefined) {
+      d.push(scores);
+      scores = scores.add(opts.bias);
+    }
+    if (opts.mask !== undefined) {
+      d.push(scores);
+      scores = where(opts.mask, scores, -Infinity);
+    }
+    if (opts.isCausal) {
+      const causalMask = tri(L, S, 0, { dtype: DType.Bool });
+      d.push(causalMask);
+      d.push(scores);
+      scores = where(causalMask, scores, -Infinity);
+    }
+    if (opts.localWindowSize !== undefined) {
+      const [before, after] =
+        typeof opts.localWindowSize === "number"
+          ? [opts.localWindowSize, opts.localWindowSize]
+          : opts.localWindowSize;
+      if (
+        before < 0 ||
+        after < 0 ||
+        !Number.isInteger(before) ||
+        !Number.isInteger(after)
+      ) {
+        throw new Error(
+          `dotProductAttention: localWindowSize values must be non-negative, ` +
+            `got ${opts.localWindowSize}`,
+        );
+      }
+      const triAfter = tri(L, S, after, { dtype: DType.Bool });
+      d.push(triAfter);
+      const triBefore = tri(L, S, -before - 1, { dtype: DType.Bool });
+      d.push(triBefore);
+      const triBeforeNot = triBefore.notEqual(true);
+      d.push(triBeforeNot);
+      const localMask = triAfter.mul(triBeforeNot);
+      d.push(localMask);
+      d.push(scores);
+      scores = where(localMask, scores, -Infinity);
+    }
+    if (opts.querySeqLengths !== undefined) {
+      const sl = expandDims(opts.querySeqLengths, [-1, -2, -3]);
+      d.push(sl);
+      const ar = arange(L);
+      d.push(ar);
+      const arR = ar.reshape([1, 1, L, 1]);
+      d.push(arR);
+      const cond = arR.less(sl);
+      d.push(cond);
+      d.push(scores);
+      scores = where(cond, scores, -Infinity);
+    }
+    if (opts.keyValueSeqLengths !== undefined) {
+      const sl = expandDims(opts.keyValueSeqLengths, [-1, -2, -3]);
+      d.push(sl);
+      const ar = arange(S);
+      d.push(ar);
+      const arR = ar.reshape([1, 1, 1, S]);
+      d.push(arR);
+      const cond = arR.less(sl);
+      d.push(cond);
+      d.push(scores);
+      scores = where(cond, scores, -Infinity);
+    }
+    d.push(scores);
+    const attn = softmax(scores, -1);
+    d.push(attn); // BNLS
+    const out = einsum("BNLS,BSNH->BLNH", attn, value);
+    if (isRank3) {
+      d.push(out);
+      return out.reshape([L, N, H]);
+    }
+    return out;
+  } finally {
+    for (const v of d) v[Symbol.dispose]();
   }
-  if (opts.querySeqLengths !== undefined) {
-    const sl = expandDims(opts.querySeqLengths, [-1, -2, -3]); // [B, 1, 1, 1]
-    scores = where(arange(L).reshape([1, 1, L, 1]).less(sl), scores, -Infinity);
-  }
-  if (opts.keyValueSeqLengths !== undefined) {
-    const sl = expandDims(opts.keyValueSeqLengths, [-1, -2, -3]); // [B, 1, 1, 1]
-    scores = where(arange(S).reshape([1, 1, 1, S]).less(sl), scores, -Infinity);
-  }
-  const attn = softmax(scores, -1); // BNLS
-  const out = einsum("BNLS,BSNH->BLNH", attn, value);
-  return isRank3 ? out.reshape([L, N, H]) : out;
 }

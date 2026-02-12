@@ -167,7 +167,7 @@ function executeNode(node: NodeProto, vars: Map<string, Operand>): Operand[] {
         `Missing input '${name}' for node '${node.name}' (op: ${opType})`,
       );
     }
-    inputs.push(operandRef(operand));
+    inputs.push(operand);
   }
   const attrs = parseAttributes(node);
   return handler(inputs, attrs);
@@ -305,7 +305,7 @@ function modelAsJaxFunction(
       }
       for (const name of inputNames) {
         validateTensorShape(name, inputs[name].shape, valueInfo);
-        vars.set(name, inputs[name]);
+        vars.set(name, operandRef(inputs[name]));
       }
 
       for (const node of graph.node) {

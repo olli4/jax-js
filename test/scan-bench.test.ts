@@ -21,10 +21,10 @@ async function timeMs(fn: () => void, warmup = 3, runs = 10): Promise<number> {
 describe("scan performance benchmarks", () => {
   it("cumsum: N=100, SIZE=64", async () => {
     await init();
-    const device = defaultDevice();
     const N = 100;
     const SIZE = 64;
-    const xs = np.ones([N, SIZE]);
+    using xs = np.ones([N, SIZE]);
+    using initCarry = np.zeros([SIZE]);
 
     const scanAuto = jit((xs: any) => {
       return lax.scan(
@@ -32,7 +32,7 @@ describe("scan performance benchmarks", () => {
           const newCarry = carry.add(x);
           return [newCarry, newCarry];
         },
-        np.zeros([SIZE]),
+        initCarry,
         xs,
       );
     });
@@ -42,6 +42,7 @@ describe("scan performance benchmarks", () => {
     const data = await c.data();
     expect(data[0]).toBeCloseTo(N, 1);
     _y.dispose();
+    c.dispose();
 
     const autoMs = await timeMs(() => {
       const [c, y] = scanAuto(xs) as [any, any];
@@ -49,19 +50,18 @@ describe("scan performance benchmarks", () => {
       y.dispose();
     });
     console.log(
-      `[${device}] cumsum          (N=${N}, size=${SIZE}): ${autoMs.toFixed(2)}ms`,
+      `cumsum          (N=${N}, size=${SIZE}): ${autoMs.toFixed(2)}ms`,
     );
 
     scanAuto.dispose();
-    xs.dispose();
   });
 
   it("cumsum large: N=500, SIZE=256", async () => {
     await init();
-    const device = defaultDevice();
     const N = 500;
     const SIZE = 256;
-    const xs = np.ones([N, SIZE]);
+    using xs = np.ones([N, SIZE]);
+    using initCarry = np.zeros([SIZE]);
 
     const scanAuto = jit((xs: any) => {
       return lax.scan(
@@ -69,7 +69,7 @@ describe("scan performance benchmarks", () => {
           const newCarry = carry.add(x);
           return [newCarry, newCarry];
         },
-        np.zeros([SIZE]),
+        initCarry,
         xs,
       );
     });
@@ -80,26 +80,26 @@ describe("scan performance benchmarks", () => {
       y.dispose();
     });
     console.log(
-      `[${device}] cumsum-large    (N=${N}, size=${SIZE}): ${autoMs.toFixed(2)}ms`,
+      `cumsum-large    (N=${N}, size=${SIZE}): ${autoMs.toFixed(2)}ms`,
     );
 
     scanAuto.dispose();
-    xs.dispose();
   });
 
   it("carry-only scan: N=200, SIZE=32", async () => {
     await init();
-    const device = defaultDevice();
     const N = 200;
     const SIZE = 32;
+    using onesConst = np.ones([SIZE]);
+    using initCarry = np.zeros([SIZE]);
 
     const scanAuto = jit(() => {
       return lax.scan(
         (carry: any, _x: any) => {
-          const newCarry = carry.add(np.ones([SIZE]));
+          const newCarry = carry.add(onesConst);
           return [newCarry, null];
         },
-        np.zeros([SIZE]),
+        initCarry,
         null,
         { length: N },
       );
@@ -110,7 +110,7 @@ describe("scan performance benchmarks", () => {
       c.dispose();
     });
     console.log(
-      `[${device}] carry-only      (N=${N}, size=${SIZE}): ${autoMs.toFixed(2)}ms`,
+      `carry-only      (N=${N}, size=${SIZE}): ${autoMs.toFixed(2)}ms`,
     );
 
     scanAuto.dispose();
@@ -118,23 +118,26 @@ describe("scan performance benchmarks", () => {
 
   it("multi-carry scan: N=100, SIZE=32", async () => {
     await init();
-    const device = defaultDevice();
     const N = 100;
     const SIZE = 32;
-    const xs = np.ones([N, SIZE]);
+    using xs = np.ones([N, SIZE]);
+    using decay = np.array([0.99]);
+    using scale = np.array([0.01]);
+    using initA = np.zeros([SIZE]);
+    using initB = np.zeros([SIZE]);
 
     const scanAuto = jit((xs: any) => {
       return lax.scan(
         (carry: any, x: any) => {
           const [a, b] = carry;
           const newA = a.add(x);
-          const newB = b.mul(np.array([0.99])).add(x.mul(np.array([0.01])));
+          const newB = b.mul(decay).add(x.mul(scale));
           return [
             [newA, newB],
             [newA, newB],
           ] as any;
         },
-        [np.zeros([SIZE]), np.zeros([SIZE])] as any,
+        [initA, initB] as any,
         xs,
       );
     });
@@ -147,19 +150,18 @@ describe("scan performance benchmarks", () => {
       (y as any)[1].dispose();
     });
     console.log(
-      `[${device}] multi-carry     (N=${N}, size=${SIZE}): ${autoMs.toFixed(2)}ms`,
+      `multi-carry     (N=${N}, size=${SIZE}): ${autoMs.toFixed(2)}ms`,
     );
 
     scanAuto.dispose();
-    xs.dispose();
   });
 
   it("scan with reduction: N=100, SIZE=64", async () => {
     await init();
-    const device = defaultDevice();
     const N = 100;
     const SIZE = 64;
-    const xs = np.ones([N, SIZE]);
+    using xs = np.ones([N, SIZE]);
+    using initCarry = np.zeros([]);
 
     const scanAuto = jit((xs: any) => {
       return lax.scan(
@@ -167,7 +169,7 @@ describe("scan performance benchmarks", () => {
           const s = carry.add(np.sum(x));
           return [s, s];
         },
-        np.zeros([]),
+        initCarry,
         xs,
       );
     });
@@ -178,19 +180,18 @@ describe("scan performance benchmarks", () => {
       y.dispose();
     });
     console.log(
-      `[${device}] reduction       (N=${N}, size=${SIZE}): ${autoMs.toFixed(2)}ms`,
+      `reduction       (N=${N}, size=${SIZE}): ${autoMs.toFixed(2)}ms`,
     );
 
     scanAuto.dispose();
-    xs.dispose();
   });
 
   it("reverse scan: N=200, SIZE=64", async () => {
     await init();
-    const device = defaultDevice();
     const N = 200;
     const SIZE = 64;
-    const xs = np.ones([N, SIZE]);
+    using xs = np.ones([N, SIZE]);
+    using initCarry = np.zeros([SIZE]);
 
     const scanAuto = jit((xs: any) => {
       return lax.scan(
@@ -198,7 +199,7 @@ describe("scan performance benchmarks", () => {
           const newCarry = carry.add(x);
           return [newCarry, newCarry];
         },
-        np.zeros([SIZE]),
+        initCarry,
         xs,
         { reverse: true },
       );
@@ -210,10 +211,9 @@ describe("scan performance benchmarks", () => {
       y.dispose();
     });
     console.log(
-      `[${device}] reverse         (N=${N}, size=${SIZE}): ${autoMs.toFixed(2)}ms`,
+      `reverse         (N=${N}, size=${SIZE}): ${autoMs.toFixed(2)}ms`,
     );
 
     scanAuto.dispose();
-    xs.dispose();
   });
 });

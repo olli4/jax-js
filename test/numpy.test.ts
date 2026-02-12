@@ -21,37 +21,40 @@ suite.each(devices)("device:%s", (device) => {
 
   suite("jax.numpy.sum()", () => {
     test("can take multiple axes", () => {
-      const x = np.arange(24).reshape([2, 3, 4]);
-      const y = x.sum([0, 2]);
+      using _x = np.arange(24);
+      using x = _x.reshape([2, 3, 4]);
+      using y = x.sum([0, 2]);
       expect(y.js()).toEqual([60, 92, 124]);
     });
 
     test("keepdims preserves dim of size 1", () => {
-      const x = np.arange(24).reshape([2, 3, 4]);
-      const y = x.sum([0, 2], { keepdims: true });
+      using _x = np.arange(24);
+      using x = _x.reshape([2, 3, 4]);
+      using y = x.sum([0, 2], { keepdims: true });
       expect(y.shape).toEqual([1, 3, 1]);
       expect(y.js()).toEqual([[[60], [92], [124]]]);
     });
 
     test("is identity on empty axes", () => {
-      const x = np.arange(24).reshape([2, 3, 4]);
-      const y = x.sum([]);
+      using _x = np.arange(24);
+      using x = _x.reshape([2, 3, 4]);
+      const y = x.sum([]); // may return same object — no using
       expect(x.js()).toEqual(y.js());
     });
   });
 
   suite("jax.numpy.cumsum()", () => {
     test("computes cumsum along axis", () => {
-      const x = np.array([
+      using x = np.array([
         [1, 2, 3],
         [4, 5, 6],
       ]);
-      const y = np.cumsum(x, 0);
+      using y = np.cumsum(x, 0);
       expect(y.js()).toEqual([
         [1, 2, 3],
         [5, 7, 9],
       ]);
-      const z = np.cumsum(x, 1);
+      using z = np.cumsum(x, 1);
       expect(z.js()).toEqual([
         [1, 3, 6],
         [4, 9, 15],
@@ -61,7 +64,7 @@ suite.each(devices)("device:%s", (device) => {
 
   suite("jax.numpy.eye()", () => {
     test("computes a square matrix", () => {
-      const x = np.eye(3);
+      using x = np.eye(3);
       expect(x).toBeAllclose([
         [1, 0, 0],
         [0, 1, 0],
@@ -70,7 +73,7 @@ suite.each(devices)("device:%s", (device) => {
     });
 
     test("computes a rectangular matrix", () => {
-      const x = np.eye(2, 3);
+      using x = np.eye(2, 3);
       expect(x).toBeAllclose([
         [1, 0, 0],
         [0, 1, 0],
@@ -78,8 +81,10 @@ suite.each(devices)("device:%s", (device) => {
     });
 
     test("can be multiplied", () => {
-      const x = np.eye(3, 5).mul(-42);
-      expect(x.sum()).toBeAllclose(-126);
+      using e = np.eye(3, 5);
+      using x = e.mul(-42);
+      using s = x.sum();
+      expect(s).toBeAllclose(-126);
       expect(x).toBeAllclose([
         [-42, 0, 0, 0, 0],
         [0, -42, 0, 0, 0],
@@ -90,8 +95,8 @@ suite.each(devices)("device:%s", (device) => {
 
   suite("jax.numpy.diag()", () => {
     test("constructs diagonal from 1D array", () => {
-      const x = np.array([1, 2, 3]);
-      const y = np.diag(x);
+      using x = np.array([1, 2, 3]);
+      using y = np.diag(x);
       expect(y.js()).toEqual([
         [1, 0, 0],
         [0, 2, 0],
@@ -100,85 +105,130 @@ suite.each(devices)("device:%s", (device) => {
     });
 
     test("fetches diagonal of 2D array", () => {
-      const x = np.array([
+      using x = np.array([
         [1, 2, 3],
         [4, 5, 6],
         [7, 8, 9],
       ]);
-      const y = np.diag(x);
+      using y = np.diag(x);
       expect(y.js()).toEqual([1, 5, 9]);
-      const z = np.diag(x, 1);
+      using z = np.diag(x, 1);
       expect(z.js()).toEqual([2, 6]);
     });
 
     test("can construct off-diagonal", () => {
-      expect(np.diag(np.array([1, 2]), 1).js()).toEqual([
-        [0, 1, 0],
-        [0, 0, 2],
-        [0, 0, 0],
-      ]);
-      expect(np.diag(np.array([1, 2]), -2).js()).toEqual([
-        [0, 0, 0, 0],
-        [0, 0, 0, 0],
-        [1, 0, 0, 0],
-        [0, 2, 0, 0],
-      ]);
+      {
+        using a = np.array([1, 2]);
+        using d1 = np.diag(a, 1);
+        expect(d1.js()).toEqual([
+          [0, 1, 0],
+          [0, 0, 2],
+          [0, 0, 0],
+        ]);
+      }
+      {
+        using a = np.array([1, 2]);
+        using d2 = np.diag(a, -2);
+        expect(d2.js()).toEqual([
+          [0, 0, 0, 0],
+          [0, 0, 0, 0],
+          [1, 0, 0, 0],
+          [0, 2, 0, 0],
+        ]);
+      }
     });
   });
 
   suite("jax.numpy.diagonal()", () => {
     test("diagonal defaults to first two axes", () => {
-      const a = np.arange(4).reshape([2, 2]);
-      expect(a.diagonal().js()).toEqual([0, 3]);
-      expect(a.diagonal(1).js()).toEqual([1]);
-      expect(a.diagonal(-1).js()).toEqual([2]);
+      using _a = np.arange(4);
+      using a = _a.reshape([2, 2]);
+      {
+        using d = a.diagonal();
+        expect(d.js()).toEqual([0, 3]);
+      }
+      {
+        using d = a.diagonal(1);
+        expect(d.js()).toEqual([1]);
+      }
+      {
+        using d = a.diagonal(-1);
+        expect(d.js()).toEqual([2]);
+      }
 
-      const b = np.arange(8).reshape([2, 2, 2]);
-      expect(b.diagonal().js()).toEqual([
-        [0, 6],
-        [1, 7],
-      ]);
+      using _b = np.arange(8);
+      using b = _b.reshape([2, 2, 2]);
+      {
+        using d = b.diagonal();
+        expect(d.js()).toEqual([
+          [0, 6],
+          [1, 7],
+        ]);
+      }
     });
 
     test("can take diagonal over other axes", () => {
-      const a = np.arange(12).reshape([3, 2, 2]);
-      expect(a.diagonal(0, 1, 2).js()).toEqual([
-        [0, 3],
-        [4, 7],
-        [8, 11],
-      ]);
+      using _a = np.arange(12);
+      using a = _a.reshape([3, 2, 2]);
+      {
+        using d = a.diagonal(0, 1, 2);
+        expect(d.js()).toEqual([
+          [0, 3],
+          [4, 7],
+          [8, 11],
+        ]);
+      }
 
       // a[:, :, 0] = [[0, 2], [4, 6], [8, 10]]
-      expect(np.diagonal(a, 0, 0, 1).js()).toEqual([
-        [0, 6],
-        [1, 7],
-      ]);
-      expect(np.diagonal(a, 1, 0, 1).js()).toEqual([[2], [3]]);
-      expect(np.diagonal(a, 1, 1, 0).js()).toEqual([
-        [4, 10],
-        [5, 11],
-      ]);
+      {
+        using d = np.diagonal(a, 0, 0, 1);
+        expect(d.js()).toEqual([
+          [0, 6],
+          [1, 7],
+        ]);
+      }
+      {
+        using d = np.diagonal(a, 1, 0, 1);
+        expect(d.js()).toEqual([[2], [3]]);
+      }
+      {
+        using d = np.diagonal(a, 1, 1, 0);
+        expect(d.js()).toEqual([
+          [4, 10],
+          [5, 11],
+        ]);
+      }
     });
 
     test("gradient over diagonal sum-of-squares", () => {
-      const a = np.arange(6).astype(np.float32).reshape([2, 3]);
+      using __a = np.arange(6);
+      using _a = __a.astype(np.float32);
+      using a = _a.reshape([2, 3]);
       const f = (a: np.Array) => a.mul(a).diagonal(1).sum();
-      expect(grad(f)(a).js()).toEqual([
+      using g = grad(f)(a);
+      expect(g.js()).toEqual([
         [0, 2, 0],
         [0, 0, 10],
       ]);
     });
 
     test("computes trace", () => {
-      const x = np.arange(9).reshape([3, 3]);
-      expect(np.trace(x).js()).toEqual(12);
-      expect(np.trace(x, 1).js()).toEqual(6);
+      using _x = np.arange(9);
+      using x = _x.reshape([3, 3]);
+      {
+        using t = np.trace(x);
+        expect(t.js()).toEqual(12);
+      }
+      {
+        using t = np.trace(x, 1);
+        expect(t.js()).toEqual(6);
+      }
     });
   });
 
   suite("jax.numpy.tri()", () => {
     test("computes lower-triangular matrix", () => {
-      const x = np.tri(3);
+      using x = np.tri(3);
       expect(x.js()).toEqual([
         [1, 0, 0],
         [1, 1, 0],
@@ -187,7 +237,7 @@ suite.each(devices)("device:%s", (device) => {
     });
 
     test("computes rectangular lower-triangular matrix", () => {
-      const x = np.tri(2, 4, 1);
+      using x = np.tri(2, 4, 1);
       expect(x.js()).toEqual([
         [1, 1, 0, 0],
         [1, 1, 1, 0],
@@ -195,8 +245,9 @@ suite.each(devices)("device:%s", (device) => {
     });
 
     test("triu works", () => {
-      const x = np.arange(24).reshape([2, 3, 4]);
-      const y = np.triu(x);
+      using _x = np.arange(24);
+      using x = _x.reshape([2, 3, 4]);
+      using y = np.triu(x);
       expect(y.js()).toEqual([
         [
           [0, 1, 2, 3],
@@ -212,8 +263,9 @@ suite.each(devices)("device:%s", (device) => {
     });
 
     test("tril works", () => {
-      const x = np.arange(24).reshape([2, 3, 4]);
-      const y = np.tril(x);
+      using _x = np.arange(24);
+      using x = _x.reshape([2, 3, 4]);
+      using y = np.tril(x);
       expect(y.js()).toEqual([
         [
           [0, 0, 0, 0],
@@ -234,30 +286,38 @@ suite.each(devices)("device:%s", (device) => {
       let x = np.arange(5);
       expect(x.js()).toEqual([0, 1, 2, 3, 4]);
 
+      x.dispose();
       x = np.arange(0);
       expect(x.js()).toEqual([]);
 
+      x.dispose();
       x = np.arange(-10);
       expect(x.js()).toEqual([]);
+      x.dispose();
     });
 
     test("can be called with 2 arguments", () => {
       let x = np.arange(50, 60);
       expect(x.js()).toEqual([50, 51, 52, 53, 54, 55, 56, 57, 58, 59]);
 
+      x.dispose();
       x = np.arange(-10, -5);
       expect(x.js()).toEqual([-10, -9, -8, -7, -6]);
+      x.dispose();
     });
 
     test("can be called with 3 arguments", () => {
       let x = np.arange(0, 10, 2);
       expect(x.js()).toEqual([0, 2, 4, 6, 8]);
 
+      x.dispose();
       x = np.arange(10, 0, -2);
       expect(x.js()).toEqual([10, 8, 6, 4, 2]);
 
+      x.dispose();
       x = np.arange(0, -10, -2);
       expect(x.js()).toEqual([0, -2, -4, -6, -8]);
+      x.dispose();
     });
 
     test("works with non-integer step", () => {
@@ -266,14 +326,16 @@ suite.each(devices)("device:%s", (device) => {
       expect(x.js()).toEqual([0, 0, 0, 0, 0]);
 
       // Explicitly set dtype to Float32.
+      x.dispose();
       x = np.arange(0, 1, 0.2, { dtype: np.float32 });
       expect(x).toBeAllclose([0, 0.2, 0.4, 0.6, 0.8]);
+      x.dispose();
     });
   });
 
   suite("jax.numpy.linspace()", () => {
     test("creates a linear space with 5 elements", () => {
-      const x = np.linspace(0, 1, 5);
+      using x = np.linspace(0, 1, 5);
       expect(x.js()).toEqual([0, 0.25, 0.5, 0.75, 1]);
     });
 
@@ -281,15 +343,18 @@ suite.each(devices)("device:%s", (device) => {
       let x = np.linspace(0, 1, 3);
       expect(x.js()).toEqual([0, 0.5, 1]);
 
+      x.dispose();
       x = np.linspace(0, 1, 2);
       expect(x.js()).toEqual([0, 1]);
 
+      x.dispose();
       x = np.linspace(0, 1, 1);
       expect(x.js()).toEqual([0]);
+      x.dispose();
     });
 
     test("defaults to 50 elements", () => {
-      const x = np.linspace(0, 1);
+      using x = np.linspace(0, 1);
       expect(x.shape).toEqual([50]);
       const ar = x.js() as number[];
       expect(ar[0]).toEqual(0);
@@ -301,19 +366,19 @@ suite.each(devices)("device:%s", (device) => {
   suite("jax.numpy.logspace()", () => {
     test("creates log-spaced values with base 10", () => {
       // logspace(0, 2, 3) should give 10^0, 10^1, 10^2 = [1, 10, 100]
-      const x = np.logspace(0, 2, 3);
+      using x = np.logspace(0, 2, 3);
       expect(x.js()).toBeAllclose([1, 10, 100]);
     });
 
     test("creates log-spaced values with base 2", () => {
       // logspace(0, 3, 4, base=2) should give 2^0, 2^1, 2^2, 2^3 = [1, 2, 4, 8]
-      const x = np.logspace(0, 3, 4, true, 2);
+      using x = np.logspace(0, 3, 4, true, 2);
       expect(x.js()).toBeAllclose([1, 2, 4, 8]);
     });
 
     test("handles endpoint=false", () => {
       // logspace(0, 2, 4, endpoint=false) should give [1, ~3.16, 10, ~31.6]
-      const x = np.logspace(0, 2, 4, false);
+      using x = np.logspace(0, 2, 4, false);
       const result = x.js() as number[];
       expect(result[0]).toBeCloseTo(1, 5);
       expect(result[1]).toBeCloseTo(Math.pow(10, 0.5), 5);
@@ -322,7 +387,7 @@ suite.each(devices)("device:%s", (device) => {
     });
 
     test("defaults to 50 elements with base 10", () => {
-      const x = np.logspace(0, 1);
+      using x = np.logspace(0, 1);
       expect(x.shape).toEqual([50]);
       const ar = x.js() as number[];
       expect(ar[0]).toBeCloseTo(1, 5); // 10^0
@@ -332,79 +397,98 @@ suite.each(devices)("device:%s", (device) => {
 
   suite("jax.numpy.where()", () => {
     test("computes where", () => {
-      const x = np.array([1, 2, 3]);
-      const y = np.array([4, 5, 6]);
-      const z = np.array([true, false, true]);
-      const result = np.where(z, x, y);
+      using x = np.array([1, 2, 3]);
+      using y = np.array([4, 5, 6]);
+      using z = np.array([true, false, true]);
+      using result = np.where(z, x, y);
       expect(result.js()).toEqual([1, 5, 3]);
     });
 
     test("works with jvp", () => {
-      const x = np.array([1, 2, 3]);
-      const y = np.array([4, 5, 6]);
-      const z = np.array([true, false, true]);
-      const result = jvp(
+      using x = np.array([1, 2, 3]);
+      using y = np.array([4, 5, 6]);
+      using z = np.array([true, false, true]);
+      using t1 = np.array([1, 1, 1]);
+      using t2 = np.zeros([3]);
+      const [primal, tangent] = jvp(
         (x: np.Array, y: np.Array) => np.where(z, x, y),
         [x, y],
-        [np.array([1, 1, 1]), np.zeros([3])],
+        [t1, t2],
       );
-      expect(result[0].js()).toEqual([1, 5, 3]);
-      expect(result[1].js()).toEqual([1, 0, 1]);
+      using _p = primal;
+      using _t = tangent;
+      expect(primal.js()).toEqual([1, 5, 3]);
+      expect(tangent.js()).toEqual([1, 0, 1]);
     });
 
     test("works with grad reverse-mode", () => {
-      const x = np.array([1, 2, 3]);
-      const y = np.array([4, 5, 6]);
-      const z = np.array([true, false, true]);
+      using x = np.array([1, 2, 3]);
+      using y = np.array([4, 5, 6]);
+      using z = np.array([true, false, true]);
       const f = ({ x, y }: { x: np.Array; y: np.Array }) =>
         np.where(z, x, y).sum();
       const grads = grad(f)({ x, y });
       expect(grads.x.js()).toEqual([1, 0, 1]);
       expect(grads.y.js()).toEqual([0, 1, 0]);
-      z.dispose();
+      grads.x.dispose();
+      grads.y.dispose();
     });
 
     test("where broadcasting", () => {
-      const z = np.array([true, false, true, true]);
-      expect(np.where(z, 1, 3).js()).toEqual([1, 3, 1, 1]);
-      expect(np.where(false, 1, 3).js()).toEqual(3);
-      expect(np.where(false, 1, np.array([10, 11])).js()).toEqual([10, 11]);
-      expect(np.where(true, 7, np.array([10, 11, 12])).js()).toEqual([7, 7, 7]);
+      using z = np.array([true, false, true, true]);
+      using r1 = np.where(z, 1, 3);
+      expect(r1.js()).toEqual([1, 3, 1, 1]);
+      using r2 = np.where(false, 1, 3);
+      expect(r2.js()).toEqual(3);
+      {
+        using a = np.array([10, 11]);
+        using r3 = np.where(false, 1, a);
+        expect(r3.js()).toEqual([10, 11]);
+      }
+      {
+        using a = np.array([10, 11, 12]);
+        using r4 = np.where(true, 7, a);
+        expect(r4.js()).toEqual([7, 7, 7]);
+      }
     });
   });
 
   suite("jax.numpy.equal()", () => {
     test("computes equal", () => {
-      const x = np.array([1, 2, 3, 4]);
-      const y = np.array([4, 5, 3, 4]);
-      expect(np.equal(x, y).js()).toEqual([false, false, true, true]);
-      expect(np.notEqual(x, y).js()).toEqual([true, true, false, false]);
+      using x = np.array([1, 2, 3, 4]);
+      using y = np.array([4, 5, 3, 4]);
+      using eq = np.equal(x, y);
+      expect(eq.js()).toEqual([false, false, true, true]);
+      using ne = np.notEqual(x, y);
+      expect(ne.js()).toEqual([true, true, false, false]);
     });
 
     test("does not propagate gradients", () => {
-      const x = np.array([1, 2, 3]);
-      const y = np.array([0, 5, 6]);
+      using x = np.array([1, 2, 3]);
+      using y = np.array([0, 5, 6]);
       const f = ({ x, y }: { x: np.Array; y: np.Array }) =>
         np.where(np.equal(x, y), 1, 0).sum();
       const grads = grad(f)({ x, y });
       expect(grads.x.js()).toEqual([0, 0, 0]);
       expect(grads.y.js()).toEqual([0, 0, 0]);
+      grads.x.dispose();
+      grads.y.dispose();
     });
   });
 
   suite("jax.numpy.transpose()", () => {
     test("transposes a 1D array (no-op)", () => {
-      const x = np.array([1, 2, 3]);
-      const y = np.transpose(x);
+      using x = np.array([1, 2, 3]);
+      using y = np.transpose(x);
       expect(y.js()).toEqual([1, 2, 3]);
     });
 
     test("transposes a 2D array", () => {
-      const x = np.array([
+      using x = np.array([
         [1, 2, 3],
         [4, 5, 6],
       ]);
-      const y = np.transpose(x);
+      using y = np.transpose(x);
       expect(y.js()).toEqual([
         [1, 4],
         [2, 5],
@@ -413,30 +497,43 @@ suite.each(devices)("device:%s", (device) => {
     });
 
     test("composes with jvp", () => {
-      const x = np.array([
+      using x = np.array([
         [1, 2, 3],
         [4, 5, 6],
       ]);
+      using t = np.ones([2, 3]);
       const [y, dy] = jvp(
         (x: np.Array) => x.transpose().mul(x.transpose()),
         [x],
-        [np.ones([2, 3])],
+        [t],
       );
-      expect(y).toBeAllclose(x.mul(x).transpose());
-      expect(dy).toBeAllclose(x.mul(2).transpose());
+      using _y = y;
+      using _dy = dy;
+      {
+        using xsq = x.mul(x);
+        using expected = xsq.transpose();
+        expect(y).toBeAllclose(expected);
+      }
+      {
+        using x2 = x.mul(2);
+        using expected = x2.transpose();
+        expect(dy).toBeAllclose(expected);
+      }
     });
 
     test("composes with grad", () => {
-      const x = np.ones([3, 4]);
-      const dx = grad((x: np.Array) => x.transpose().sum())(x);
+      using x = np.ones([3, 4]);
+      using dx = grad((x: np.Array) => x.transpose().sum())(x);
       expect(dx).toBeAllclose(x);
     });
   });
 
   suite("jax.numpy.swapaxes()", () => {
     test("swaps axis of an array", () => {
-      const x = np.arange(12).reshape([2, 2, 3]);
-      expect(np.swapaxes(x, 1, 2).js()).toEqual([
+      using _x = np.arange(12);
+      using x = _x.reshape([2, 2, 3]);
+      using s = np.swapaxes(x, 1, 2);
+      expect(s.js()).toEqual([
         [
           [0, 3],
           [1, 4],
@@ -453,8 +550,8 @@ suite.each(devices)("device:%s", (device) => {
 
   suite("jax.numpy.reshape()", () => {
     test("reshapes a 1D array", () => {
-      const x = np.array([1, 2, 3, 4]);
-      const y = np.reshape(x, [2, -1]);
+      using x = np.array([1, 2, 3, 4]);
+      using y = np.reshape(x, [2, -1]);
       expect(y.js()).toEqual([
         [1, 2],
         [3, 4],
@@ -462,7 +559,7 @@ suite.each(devices)("device:%s", (device) => {
     });
 
     test("raises Error on incompatible shapes", () => {
-      const x = np.array([1, 2, 3, 4]);
+      using x = np.array([1, 2, 3, 4]);
       expect(() => np.reshape(x, [3, 2])).toThrow(Error);
       expect(() => np.reshape(x, [2, 3])).toThrow(Error);
       expect(() => np.reshape(x, [2, 2, 2])).toThrow(Error);
@@ -471,12 +568,15 @@ suite.each(devices)("device:%s", (device) => {
     });
 
     test("composes with jvp", () => {
-      const x = np.array([1, 2, 3, 4]);
+      using x = np.array([1, 2, 3, 4]);
+      using t = np.ones([4]);
       const [y, dy] = jvp(
         (x: np.Array) => np.reshape(x, [2, 2]).sum(),
         [x],
-        [np.ones([4])],
+        [t],
       );
+      using _y = y;
+      using _dy = dy;
       expect(y).toBeAllclose(10);
       expect(dy).toBeAllclose(4);
     });
@@ -484,48 +584,58 @@ suite.each(devices)("device:%s", (device) => {
 
   suite("jax.numpy.flip()", () => {
     test("flips a 1D array", () => {
-      const x = np.array([1, 2, 3]);
-      expect(np.flip(x).js()).toEqual([3, 2, 1]);
+      using x = np.array([1, 2, 3]);
+      using f = np.flip(x);
+      expect(f.js()).toEqual([3, 2, 1]);
     });
 
     test("flips a 2D array", () => {
-      const x = np.array([
+      using x = np.array([
         [1, 2, 3],
         [4, 5, 6],
       ]);
-      expect(np.flip(x).js()).toEqual([
-        [6, 5, 4],
-        [3, 2, 1],
-      ]);
-      expect(np.flip(x, 0).js()).toEqual([
-        [4, 5, 6],
-        [1, 2, 3],
-      ]);
-      expect(np.flip(x, 1).js()).toEqual([
-        [3, 2, 1],
-        [6, 5, 4],
-      ]);
+      {
+        using f = np.flip(x);
+        expect(f.js()).toEqual([
+          [6, 5, 4],
+          [3, 2, 1],
+        ]);
+      }
+      {
+        using f = np.flip(x, 0);
+        expect(f.js()).toEqual([
+          [4, 5, 6],
+          [1, 2, 3],
+        ]);
+      }
+      {
+        using f = np.flip(x, 1);
+        expect(f.js()).toEqual([
+          [3, 2, 1],
+          [6, 5, 4],
+        ]);
+      }
     });
   });
 
   suite("jax.numpy.matmul()", () => {
     test("acts as vector dot product", () => {
-      const x = np.array([1, 2, 3, 4]);
-      const y = np.array([10, 100, 1000, 1]);
-      const z = np.matmul(x, y);
+      using x = np.array([1, 2, 3, 4]);
+      using y = np.array([10, 100, 1000, 1]);
+      using z = np.matmul(x, y);
       expect(z.js()).toEqual(3214);
     });
 
     test("computes 2x2 matmul", () => {
-      const x = np.array([
+      using x = np.array([
         [1, 2],
         [3, 4],
       ]);
-      const y = np.array([
+      using y = np.array([
         [5, 6],
         [7, 8],
       ]);
-      const z = np.matmul(x, y);
+      using z = np.matmul(x, y);
       expect(z.js()).toEqual([
         [19, 22],
         [43, 50],
@@ -533,16 +643,16 @@ suite.each(devices)("device:%s", (device) => {
     });
 
     test("computes 2x3 matmul", () => {
-      const x = np.array([
+      using x = np.array([
         [1, 2, 3],
         [4, 5, 6],
       ]);
-      const y = np.array([
+      using y = np.array([
         [7, 8],
         [9, 10],
         [11, 12],
       ]);
-      const z = np.matmul(x, y);
+      using z = np.matmul(x, y);
       expect(z.js()).toEqual([
         [58, 64],
         [139, 154],
@@ -550,7 +660,7 @@ suite.each(devices)("device:%s", (device) => {
     });
 
     test("computes stacked 3x3 matmul", () => {
-      const a = np.array([
+      using a = np.array([
         [
           [1, 2, 3],
           [4, 5, 6],
@@ -562,12 +672,12 @@ suite.each(devices)("device:%s", (device) => {
           [16, 17, 18],
         ],
       ]);
-      const b = np.array([
+      using b = np.array([
         [20, 21, 22],
         [23, 24, 25],
         [26, 27, 28],
       ]);
-      const c = np.matmul(a, b);
+      using c = np.matmul(a, b);
       expect(c.shape).toEqual([2, 3, 3]);
       expect(c.js()).toEqual([
         [
@@ -584,24 +694,24 @@ suite.each(devices)("device:%s", (device) => {
     });
 
     test("jit with fused bias and relu", () => {
-      const matmulWithBiasAndRelu = jit(
+      using matmulWithBiasAndRelu = jit(
         (x: np.Array, w: np.Array, b: np.Array) => {
-          const y = np.matmul(x, w).add(b);
+          using y = np.matmul(x, w).add(b);
           return np.maximum(y, 0);
         },
       );
 
-      const x = np.array([
+      using x = np.array([
         [1, -1],
         [-1, 1],
       ]);
-      const w = np.array([
+      using w = np.array([
         [2, 3],
         [4, 6],
       ]);
-      const b = np.array([10, -10]);
+      using b = np.array([10, -10]);
 
-      const y = matmulWithBiasAndRelu(x, w, b);
+      using y = matmulWithBiasAndRelu(x, w, b);
       expect(y.js()).toEqual([
         [8, 0],
         [12, 0],
@@ -611,27 +721,27 @@ suite.each(devices)("device:%s", (device) => {
 
   suite("jax.numpy.dot()", () => {
     test("acts as scalar multiplication", () => {
-      const z = np.dot(3, 4);
+      using z = np.dot(3, 4);
       expect(z.js()).toEqual(12);
     });
 
     test("computes 1D dot product", () => {
-      const x = np.array([1, 2, 3]);
-      const y = np.array([4, 5, 6]);
-      const z = np.dot(x, y);
+      using x = np.array([1, 2, 3]);
+      using y = np.array([4, 5, 6]);
+      using z = np.dot(x, y);
       expect(z.js()).toEqual(32);
     });
 
     test("computes 2D dot product", () => {
-      const x = np.array([
+      using x = np.array([
         [1, 2],
         [3, 4],
       ]);
-      const y = np.array([
+      using y = np.array([
         [5, 6],
         [7, 8],
       ]);
-      const z = np.dot(x, y);
+      using z = np.dot(x, y);
       expect(z.js()).toEqual([
         [19, 22],
         [43, 50],
@@ -639,22 +749,23 @@ suite.each(devices)("device:%s", (device) => {
     });
 
     test("produces correct shape", () => {
-      const x = np.zeros([2, 3, 4, 5]);
-      const y = np.zeros([1, 4, 5, 6]);
-      const z = np.dot(x, y);
+      using x = np.zeros([2, 3, 4, 5]);
+      using y = np.zeros([1, 4, 5, 6]);
+      using z = np.dot(x, y);
       expect(z.shape).toEqual([2, 3, 4, 1, 4, 6]);
     });
 
     if (device !== "cpu") {
       test("200-256-200 matrix product", async () => {
-        const x = np
-          .arange(200)
-          .astype(np.float32)
-          .reshape([200, 1])
-          .mul(np.ones([200, 256]));
-        const y = np.ones([256, 200]);
+        using _a = np.arange(200);
+        using _b = _a.astype(np.float32);
+        using _c = _b.reshape([200, 1]);
+        using _d = np.ones([200, 256]);
+        using x = _c.mul(_d);
+        using y = np.ones([256, 200]);
         await Promise.all([x.data(), y.data()]);
-        const buf = await np.dot(x, y).data();
+        using dotResult = np.dot(x, y);
+        const buf = await dotResult.data();
         expect(buf.length).toEqual(200 * 200);
         expect(buf[0]).toEqual(0);
         expect(buf[200]).toEqual(256);
@@ -665,10 +776,13 @@ suite.each(devices)("device:%s", (device) => {
     // This test observes a past tuning / shape tracking issue where indices
     // would be improperly calculated applying the Unroll optimization.
     test("1-784-10 matrix product", async () => {
-      const x = np.arange(784).astype(np.float32).reshape([1, 784]);
-      const y = np.ones([784, 10]);
+      using __x = np.arange(784);
+      using _x = __x.astype(np.float32);
+      using x = _x.reshape([1, 784]);
+      using y = np.ones([784, 10]);
       await Promise.all([x.data(), y.data()]);
-      const buf = await np.dot(x, y).data();
+      using dotResult = np.dot(x, y);
+      const buf = await dotResult.data();
       expect(buf.length).toEqual(10);
       expect(buf).toEqual(
         new Float32Array(Array.from({ length: 10 }, () => (784 * 783) / 2)),
@@ -678,14 +792,16 @@ suite.each(devices)("device:%s", (device) => {
 
   suite("jax.numpy.tensordot()", () => {
     test("2-3-4 with 3-4-5", async () => {
-      const x1 = np.arange(24).reshape([2, 3, 4]);
-      const x2 = np.ones([3, 4, 5]);
+      using _x1 = np.arange(24);
+      using x1 = _x1.reshape([2, 3, 4]);
+      using x2 = np.ones([3, 4, 5]);
       let z = np.tensordot(x1, x2);
       expect(await z.jsAsync()).toEqual([
         [66, 66, 66, 66, 66],
         [210, 210, 210, 210, 210],
       ]);
       // Equivalent to the above as explicit sequences.
+      z.dispose();
       z = np.tensordot(x1, x2, [
         [1, 2],
         [0, 1],
@@ -694,14 +810,16 @@ suite.each(devices)("device:%s", (device) => {
         [66, 66, 66, 66, 66],
         [210, 210, 210, 210, 210],
       ]);
+      z.dispose();
     });
   });
 
   suite("jax.numpy.einsum()", () => {
     test("basic einsum matmul", () => {
-      const a = np.arange(6).reshape([2, 3]);
-      const b = np.ones([3, 4]);
-      const c = np.einsum("ik,kj->ij", a, b);
+      using _a = np.arange(6);
+      using a = _a.reshape([2, 3]);
+      using b = np.ones([3, 4]);
+      using c = np.einsum("ik,kj->ij", a, b);
       expect(c.js()).toEqual([
         [3, 3, 3, 3],
         [12, 12, 12, 12],
@@ -709,29 +827,38 @@ suite.each(devices)("device:%s", (device) => {
     });
 
     test("einsum one-array sums", () => {
-      const a = np.arange(6).reshape([2, 3]);
+      using _a = np.arange(6);
+      using a = _a.reshape([2, 3]);
       let c = np.einsum("ij->", a);
       expect(c.js()).toEqual(15);
 
+      c.dispose();
       c = np.einsum(a, [0, 1], []);
       expect(c.js()).toEqual(15);
 
+      c.dispose();
       c = np.einsum(a, [0, 1], []);
       expect(c.js()).toEqual(15);
 
+      c.dispose();
       c = np.einsum("ij->j", a);
       expect(c.js()).toEqual([3, 5, 7]);
 
+      c.dispose();
       c = np.einsum("ji->j", a);
       expect(c.js()).toEqual([3, 12]);
 
-      c = np.einsum("ii->", a.slice([0, 2], [1, 3]));
+      c.dispose();
+      using _sliced = a.slice([0, 2], [1, 3]);
+      c = np.einsum("ii->", _sliced);
       expect(c.js()).toEqual(6);
+      c.dispose();
     });
 
     test("einsum transposition", () => {
-      const a = np.arange(6).reshape([2, 3]);
-      const b = np.einsum("ji", a);
+      using _a = np.arange(6);
+      using a = _a.reshape([2, 3]);
+      using b = np.einsum("ji", a);
       expect(b.js()).toEqual([
         [0, 3],
         [1, 4],
@@ -741,30 +868,29 @@ suite.each(devices)("device:%s", (device) => {
 
     test("examples from jax docs", () => {
       // https://docs.jax.dev/en/latest/_autosummary/jax.numpy.einsum.html
-      const M = np.arange(16).reshape([4, 4]);
-      const x = np.arange(4);
-      const y = np.array([5, 4, 3, 2]);
-      onTestFinished(() => {
-        M.dispose();
-        x.dispose();
-        y.dispose();
-      });
+      using _M = np.arange(16);
+      using M = _M.reshape([4, 4]);
+      using x = np.arange(4);
+      using y = np.array([5, 4, 3, 2]);
+
+      const results: np.Array[] = [];
+      const e = (...args: Parameters<typeof np.einsum>) => {
+        const r = np.einsum(...args);
+        results.push(r);
+        return r;
+      };
 
       // Vector product
-      expect(np.einsum("i,i", x, y).js()).toEqual(16);
-      expect(np.einsum("i,i->", x, y).js()).toEqual(16);
-      expect(np.einsum(x, [0], y, [0]).js()).toEqual(16);
-      expect(np.einsum(x, [0], y, [0], []).js()).toEqual(16);
+      expect(e("i,i", x, y).js()).toEqual(16);
+      expect(e("i,i->", x, y).js()).toEqual(16);
+      expect(e(x, [0], y, [0]).js()).toEqual(16);
+      expect(e(x, [0], y, [0], []).js()).toEqual(16);
 
       // Matrix product
-      expect(np.einsum("ij,j->i", M, x).js()).toEqual([14, 38, 62, 86]);
-      expect(np.einsum("ij,j", M, x).js()).toEqual([14, 38, 62, 86]);
-      expect(np.einsum(M, [0, 1], x, [1], [0]).js()).toEqual([
-        14, 38, 62, 86,
-      ]);
-      expect(np.einsum(M, [0, 1], x, [1]).js()).toEqual([
-        14, 38, 62, 86,
-      ]);
+      expect(e("ij,j->i", M, x).js()).toEqual([14, 38, 62, 86]);
+      expect(e("ij,j", M, x).js()).toEqual([14, 38, 62, 86]);
+      expect(e(M, [0, 1], x, [1], [0]).js()).toEqual([14, 38, 62, 86]);
+      expect(e(M, [0, 1], x, [1]).js()).toEqual([14, 38, 62, 86]);
 
       // Outer product
       const outerExpected = [
@@ -773,100 +899,84 @@ suite.each(devices)("device:%s", (device) => {
         [10, 8, 6, 4],
         [15, 12, 9, 6],
       ];
-      expect(np.einsum("i,j->ij", x, y).js()).toEqual(outerExpected);
-      expect(np.einsum("i,j", x, y).js()).toEqual(outerExpected);
-      expect(np.einsum(x, [0], y, [1], [0, 1]).js()).toEqual(
-        outerExpected,
-      );
-      expect(np.einsum(x, [0], y, [1]).js()).toEqual(outerExpected);
+      expect(e("i,j->ij", x, y).js()).toEqual(outerExpected);
+      expect(e("i,j", x, y).js()).toEqual(outerExpected);
+      expect(e(x, [0], y, [1], [0, 1]).js()).toEqual(outerExpected);
+      expect(e(x, [0], y, [1]).js()).toEqual(outerExpected);
 
       // 1D array sum
-      expect(np.einsum("i->", x).js()).toEqual(6);
-      expect(np.einsum(x, [0], []).js()).toEqual(6);
+      expect(e("i->", x).js()).toEqual(6);
+      expect(e(x, [0], []).js()).toEqual(6);
 
       // Sum along an axis
-      expect(np.einsum("...j->...", M).js()).toEqual([6, 22, 38, 54]);
+      expect(e("...j->...", M).js()).toEqual([6, 22, 38, 54]);
 
       // Matrix transpose
-      const y2 = np.array([
+      using y2 = np.array([
         [1, 2, 3],
         [4, 5, 6],
       ]);
-      onTestFinished(() => y2.dispose());
       const transposeExpected = [
         [1, 4],
         [2, 5],
         [3, 6],
       ];
-      expect(np.einsum("ij->ji", y2).js()).toEqual(transposeExpected);
-      expect(np.einsum("ji", y2).js()).toEqual(transposeExpected);
-      expect(np.einsum(y2, [1, 0]).js()).toEqual(transposeExpected);
-      expect(np.einsum(y2, [0, 1], [1, 0]).js()).toEqual(transposeExpected);
+      expect(e("ij->ji", y2).js()).toEqual(transposeExpected);
+      expect(e("ji", y2).js()).toEqual(transposeExpected);
+      expect(e(y2, [1, 0]).js()).toEqual(transposeExpected);
+      expect(e(y2, [0, 1], [1, 0]).js()).toEqual(transposeExpected);
 
       // Matrix diagonal
-      expect(np.einsum("ii->i", M).js()).toEqual([0, 5, 10, 15]);
+      expect(e("ii->i", M).js()).toEqual([0, 5, 10, 15]);
 
       // Matrix trace
-      expect(np.einsum("ii", M).js()).toEqual(30);
+      expect(e("ii", M).js()).toEqual(30);
 
       // Tensor products
-      const tx = np.arange(30).reshape([2, 3, 5]);
-      const ty = np.arange(60).reshape([3, 4, 5]);
-      onTestFinished(() => {
-        tx.dispose();
-        ty.dispose();
-      });
+      using _tx = np.arange(30);
+      using tx = _tx.reshape([2, 3, 5]);
+      using _ty = np.arange(60);
+      using ty = _ty.reshape([3, 4, 5]);
       const tensorExpected = [
         [3340, 3865, 4390, 4915],
         [8290, 9940, 11590, 13240],
       ];
-      expect(np.einsum("ijk,jlk->il", tx, ty).js()).toEqual(
+      expect(e("ijk,jlk->il", tx, ty).js()).toEqual(tensorExpected);
+      expect(e("ijk,jlk", tx, ty).js()).toEqual(tensorExpected);
+      expect(e(tx, [0, 1, 2], ty, [1, 3, 2], [0, 3]).js()).toEqual(
         tensorExpected,
       );
-      expect(np.einsum("ijk,jlk", tx, ty).js()).toEqual(tensorExpected);
-      expect(
-        np.einsum(tx, [0, 1, 2], ty, [1, 3, 2], [0, 3]).js(),
-      ).toEqual(tensorExpected);
-      expect(np.einsum(tx, [0, 1, 2], ty, [1, 3, 2]).js()).toEqual(
-        tensorExpected,
-      );
+      expect(e(tx, [0, 1, 2], ty, [1, 3, 2]).js()).toEqual(tensorExpected);
 
       // Chained dot products
-      const w = np.arange(5, 9).reshape([2, 2]);
-      const cx = np.arange(6).reshape([2, 3]);
-      const cy = np.arange(-2, 4).reshape([3, 2]);
-      const z = np.array([
+      using _w = np.arange(5, 9);
+      using w = _w.reshape([2, 2]);
+      using _cx = np.arange(6);
+      using cx = _cx.reshape([2, 3]);
+      using _cy = np.arange(-2, 4);
+      using cy = _cy.reshape([3, 2]);
+      using z = np.array([
         [2, 4, 6],
         [3, 5, 7],
       ]);
-      onTestFinished(() => {
-        w.dispose();
-        cx.dispose();
-        cy.dispose();
-        z.dispose();
-      });
       const chainedExpected = [
         [481, 831, 1181],
         [651, 1125, 1599],
       ];
-      expect(
-        np.einsum("ij,jk,kl,lm->im", w, cx, cy, z).js(),
-      ).toEqual(chainedExpected);
-      expect(
-        np
-          .einsum(w, [0, 1], cx, [1, 2], cy, [2, 3], z, [3, 4])
-          .js(),
-      ).toEqual(chainedExpected);
+      expect(e("ij,jk,kl,lm->im", w, cx, cy, z).js()).toEqual(chainedExpected);
+      expect(e(w, [0, 1], cx, [1, 2], cy, [2, 3], z, [3, 4]).js()).toEqual(
+        chainedExpected,
+      );
+
+      for (const r of results) r.dispose();
     });
 
     test("shape tests", () => {
-      const checkEinsumShapes = async (expr: string, ...shapes: number[][]) => {
-        const result = np.einsum(
-          expr,
-          ...shapes.slice(0, -1).map((shape) => np.zeros(shape)),
-        );
+      const checkEinsumShapes = (expr: string, ...shapes: number[][]) => {
+        const inputs = shapes.slice(0, -1).map((shape) => np.zeros(shape));
+        using result = np.einsum(expr, ...inputs);
         expect(result.shape).toEqual(shapes[shapes.length - 1]);
-        result.dispose();
+        for (const inp of inputs) inp.dispose();
       };
 
       // Tests without ellipsis
@@ -934,9 +1044,11 @@ suite.each(devices)("device:%s", (device) => {
 
   suite("jax.numpy.meshgrid()", () => {
     test("creates xy meshgrid", () => {
-      const x = np.array([1, 2, 3]);
-      const y = np.array([4, 5]);
+      using x = np.array([1, 2, 3]);
+      using y = np.array([4, 5]);
       const [X, Y] = np.meshgrid([x, y]);
+      using _X = X;
+      using _Y = Y;
       expect(X.js()).toEqual([
         [1, 2, 3],
         [1, 2, 3],
@@ -948,9 +1060,11 @@ suite.each(devices)("device:%s", (device) => {
     });
 
     test("works with ij indexing", () => {
-      const x = np.array([1, 2, 3]);
-      const y = np.array([4, 5]);
+      using x = np.array([1, 2, 3]);
+      using y = np.array([4, 5]);
       const [X, Y] = np.meshgrid([x, y], { indexing: "ij" });
+      using _X = X;
+      using _Y = Y;
       expect(X.js()).toEqual([
         [1, 1],
         [2, 2],
@@ -965,10 +1079,13 @@ suite.each(devices)("device:%s", (device) => {
 
     test("works with 3D arrays", () => {
       // Note: XYZ -> [Y, X, Z]
-      const x = np.array([1, 2]);
-      const y = np.array([3, 4, 5]);
-      const z = np.array([6, 7, 8, 9]);
+      using x = np.array([1, 2]);
+      using y = np.array([3, 4, 5]);
+      using z = np.array([6, 7, 8, 9]);
       const [X, Y, Z] = np.meshgrid([x, y, z]); // "xy" indexing
+      using _X = X;
+      using _Y = Y;
+      using _Z = Z;
       expect(X.shape).toEqual([3, 2, 4]);
       expect(Y.shape).toEqual([3, 2, 4]);
       expect(Z.shape).toEqual([3, 2, 4]);
@@ -977,48 +1094,56 @@ suite.each(devices)("device:%s", (device) => {
 
   suite("jax.numpy.minimum()", () => {
     test("computes element-wise minimum", () => {
-      const x = np.array([1, 2, 3]);
-      const y = np.array([4, 2, 0]);
-      const z = np.minimum(x, y);
+      using x = np.array([1, 2, 3]);
+      using y = np.array([4, 2, 0]);
+      using z = np.minimum(x, y);
       expect(z.js()).toEqual([1, 2, 0]);
     });
 
     test("works with jvp", () => {
-      const x = np.array([1, 3, 3]);
-      const y = np.array([4, 2, 0]);
+      using x = np.array([1, 3, 3]);
+      using y = np.array([4, 2, 0]);
+      using t1 = np.ones([3]);
+      using t2 = np.zeros([3]);
       const [z, dz] = jvp(
         (x: np.Array, y: np.Array) => np.minimum(x, y),
         [x, y],
-        [np.ones([3]), np.zeros([3])],
+        [t1, t2],
       );
+      using _z = z;
+      using _dz = dz;
       expect(z.js()).toEqual([1, 2, 0]);
       expect(dz.js()).toEqual([1, 0, 0]);
     });
 
     test("minimum of bools", () => {
-      const x = np.array([true, false, true]);
-      const y = np.array([false, false, true]);
-      const z = np.minimum(x, y);
+      using x = np.array([true, false, true]);
+      using y = np.array([false, false, true]);
+      using z = np.minimum(x, y);
       expect(z.js()).toEqual([false, false, true]);
     });
   });
 
   suite("jax.numpy.maximum()", () => {
     test("computes element-wise maximum", () => {
-      const x = np.array([1, 2, 3]);
-      const y = np.array([4, 2, 0]);
-      const z = np.maximum(x, y);
+      using x = np.array([1, 2, 3]);
+      using y = np.array([4, 2, 0]);
+      using z = np.maximum(x, y);
       expect(z.js()).toEqual([4, 2, 3]);
     });
 
     test("works with jvp", () => {
-      const x = np.array([1, 1, 3]);
-      const y = np.array([4, 2, 0]);
+      using x = np.array([1, 1, 3]);
+      using y = np.array([4, 2, 0]);
+      using t1 = np.ones([3]);
+      using t2 = np.zeros([3]);
       const [z, dz] = jvp(
         (x: np.Array, y: np.Array) => np.maximum(x, y),
         [x, y],
-        [np.ones([3]), np.zeros([3])],
+        [t1, t2],
       );
+      using _z = z;
+      using _dz = dz;
       expect(z.js()).toEqual([4, 2, 3]);
       expect(dz.js()).toEqual([0, 0, 1]);
     });
@@ -1026,19 +1151,19 @@ suite.each(devices)("device:%s", (device) => {
 
   suite("jax.numpy.absolute()", () => {
     test("computes absolute value", () => {
-      const x = np.array([-1, 2, -3]);
-      const y = np.absolute(x);
+      using x = np.array([-1, 2, -3]);
+      using y = np.absolute(x);
       expect(y.js()).toEqual([1, 2, 3]);
 
-      const z = np.abs(x); // Alias for absolute
+      using z = np.abs(x); // Alias for absolute
       expect(z.js()).toEqual([1, 2, 3]);
     });
   });
 
   suite("jax.numpy.sign()", () => {
     test("computes sign function", () => {
-      const x = np.array([-10, 0, 5]);
-      const y = np.sign(x);
+      using x = np.array([-10, 0, 5]);
+      using y = np.sign(x);
       expect(y.js()).toEqual([-1, 0, 1]);
     });
 
@@ -1050,73 +1175,78 @@ suite.each(devices)("device:%s", (device) => {
 
   suite("jax.numpy.reciprocal()", () => {
     test("computes element-wise reciprocal", () => {
-      const x = np.array([1, 2, 3]);
-      const y = np.reciprocal(x);
+      using x = np.array([1, 2, 3]);
+      using y = np.reciprocal(x);
       expect(y.js()).toBeAllclose([1, 0.5, 1 / 3]);
     });
 
     test("works with jvp", () => {
-      const x = np.array([1, 2, 3]);
-      const [y, dy] = jvp(
-        (x: np.Array) => np.reciprocal(x),
-        [x],
-        [np.ones([3])],
-      );
+      using x = np.array([1, 2, 3]);
+      using t = np.ones([3]);
+      const [y, dy] = jvp((x: np.Array) => np.reciprocal(x), [x], [t]);
+      using _y = y;
+      using _dy = dy;
       expect(y).toBeAllclose([1, 0.5, 1 / 3]);
       expect(dy).toBeAllclose([-1, -0.25, -1 / 9]);
     });
 
     test("can be used in grad", () => {
-      const x = np.array([1, 2, 3]);
-      const dx = grad((x: np.Array) => np.reciprocal(x).sum())(x);
+      using x = np.array([1, 2, 3]);
+      using dx = grad((x: np.Array) => np.reciprocal(x).sum())(x);
       expect(dx).toBeAllclose([-1, -0.25, -1 / 9]);
     });
 
     test("called via Array.div() and jax.numpy.divide()", () => {
-      const x = np.array([1, 2, 3]);
-      const y = np.array([4, 5, 6]);
-      const z = x.div(y);
+      using x = np.array([1, 2, 3]);
+      using y = np.array([4, 5, 6]);
+      using z = x.div(y);
       expect(z).toBeAllclose([0.25, 0.4, 0.5]);
 
-      const w = np.divide(x, y);
+      using w = np.divide(x, y);
       expect(w.js()).toBeAllclose([0.25, 0.4, 0.5]);
     });
 
     test("recip of 0 is infinity", () => {
-      const x = np.reciprocal(0);
+      using x = np.reciprocal(0);
       expect(x.js()).toEqual(Infinity);
 
-      const y = np.array(9.0).div(0);
+      using y = np.array(9.0).div(0);
       expect(y.js()).toEqual(Infinity);
     });
   });
 
   suite("jax.numpy.floorDivide()", () => {
     test("computes element-wise floor division", () => {
-      const x = np.array([7, 7, -7, -7]);
-      const y = np.array([3, -3, 3, -3]);
-      const z = np.floorDivide(x, y);
+      using x = np.array([7, 7, -7, -7]);
+      using y = np.array([3, -3, 3, -3]);
+      using z = np.floorDivide(x, y);
       // floor(7/3)=2, floor(7/-3)=-3, floor(-7/3)=-3, floor(-7/-3)=2
       expect(z.js()).toEqual([2, -3, -3, 2]);
     });
 
     test("handles integer division that rounds toward negative infinity", () => {
-      const x = np.array([5, -5, 10, -10]);
-      const y = np.array([2, 2, 3, 3]);
-      const z = np.floorDivide(x, y);
+      using x = np.array([5, -5, 10, -10]);
+      using y = np.array([2, 2, 3, 3]);
+      using z = np.floorDivide(x, y);
       // floor(5/2)=2, floor(-5/2)=-3, floor(10/3)=3, floor(-10/3)=-4
       expect(z.js()).toEqual([2, -3, 3, -4]);
     });
 
     test("works with scalars", () => {
-      expect(np.floorDivide(7, 3).js()).toBeCloseTo(2, 5);
-      expect(np.floorDivide(-7, 3).js()).toBeCloseTo(-3, 5);
+      {
+        using r = np.floorDivide(7, 3);
+        expect(r.js()).toBeCloseTo(2, 5);
+      }
+      {
+        using r = np.floorDivide(-7, 3);
+        expect(r.js()).toBeCloseTo(-3, 5);
+      }
     });
 
     test("works with int32 dtype", () => {
-      const x = np.array([7, 7, -7, -7], { dtype: np.int32 });
-      const y = np.array([3, -3, 3, -3], { dtype: np.int32 });
-      const z = np.floorDivide(x, y);
+      using x = np.array([7, 7, -7, -7], { dtype: np.int32 });
+      using y = np.array([3, -3, 3, -3], { dtype: np.int32 });
+      using z = np.floorDivide(x, y);
       // Should round toward -infinity, not toward zero
       // floor(7/3)=2, floor(7/-3)=-3, floor(-7/3)=-3, floor(-7/-3)=2
       expect(z.js()).toEqual([2, -3, -3, 2]);
@@ -1126,18 +1256,18 @@ suite.each(devices)("device:%s", (device) => {
 
   suite("jax.numpy.fmod()", () => {
     test("computes element-wise fmod", () => {
-      const x = np.array([5, 7, -9, -11]);
-      const y = np.array([3, -4, 2, -3]);
-      const z = np.fmod(x, y);
+      using x = np.array([5, 7, -9, -11]);
+      using y = np.array([3, -4, 2, -3]);
+      using z = np.fmod(x, y);
       expect(z.js()).toEqual([2, 3, -1, -2]);
     });
 
     test("gradient is correct", () => {
-      const x = np.array([5, 7, -9, -11]);
-      const y = np.array([3, -4, 2, -3]);
-      const { x: dx, y: dy } = vmap(
-        grad(({ x, y }: { x: np.Array; y: np.Array }) => np.fmod(x, y)),
-      )({ x, y });
+      using x = np.array([5, 7, -9, -11]);
+      using y = np.array([3, -4, 2, -3]);
+      const { x: dx, y: dy } = grad(({ x, y }: { x: np.Array; y: np.Array }) =>
+        np.fmod(x, y).sum(),
+      )({ x, y }) as unknown as { x: np.Array; y: np.Array };
       expect(dx.js()).toEqual([1, 1, 1, 1]);
       expect(dy.js()).toEqual([
         -Math.trunc(5 / 3),
@@ -1145,24 +1275,26 @@ suite.each(devices)("device:%s", (device) => {
         -Math.trunc(-9 / 2),
         -Math.trunc(-11 / -3),
       ]);
+      dx.dispose();
+      dy.dispose();
     });
   });
 
   suite("jax.numpy.remainder()", () => {
     test("computes element-wise remainder", () => {
-      const x = np.array([5, 5, -5, -5]);
-      const y = np.array([3, -3, 3, -3]);
-      const z = np.remainder(x, y);
+      using x = np.array([5, 5, -5, -5]);
+      using y = np.array([3, -3, 3, -3]);
+      using z = np.remainder(x, y);
       // Should follow the sign of the divisor, like Python (but unlike JS).
       expect(z.js()).toEqual([2, -1, 1, -2]);
     });
 
     test("remainder gradient is correct", () => {
-      const x = np.array([5, 5, -5, -5]);
-      const y = np.array([3, -3, 3, -3]);
-      const { x: dx, y: dy } = vmap(
-        grad(({ x, y }: { x: np.Array; y: np.Array }) => np.remainder(x, y)),
-      )({ x, y });
+      using x = np.array([5, 5, -5, -5]);
+      using y = np.array([3, -3, 3, -3]);
+      const { x: dx, y: dy } = grad(({ x, y }: { x: np.Array; y: np.Array }) =>
+        np.remainder(x, y).sum(),
+      )({ x, y }) as unknown as { x: np.Array; y: np.Array };
       expect(dx.js()).toEqual([1, 1, 1, 1]);
       expect(dy.js()).toEqual([
         -Math.floor(5 / 3),
@@ -1170,14 +1302,18 @@ suite.each(devices)("device:%s", (device) => {
         -Math.floor(-5 / 3),
         -Math.floor(-5 / -3),
       ]);
+      dx.dispose();
+      dy.dispose();
     });
   });
 
   suite("jax.numpy.divmod()", () => {
     test("returns floor division and remainder", () => {
-      const x = np.array([7, 7, -7, -7]);
-      const y = np.array([3, -3, 3, -3]);
+      using x = np.array([7, 7, -7, -7]);
+      using y = np.array([3, -3, 3, -3]);
       const [q, r] = np.divmod(x, y);
+      using _q = q;
+      using _r = r;
       // floor(7/3)=2, floor(7/-3)=-3, floor(-7/3)=-3, floor(-7/-3)=2
       expect(q.js()).toEqual([2, -3, -3, 2]);
       // remainder follows sign of divisor y
@@ -1185,24 +1321,31 @@ suite.each(devices)("device:%s", (device) => {
     });
 
     test("satisfies invariant x == q*y + r", () => {
-      const x = np.array([5, -5, 10, -10]);
-      const y = np.array([3, 3, 4, 4]);
+      using x = np.array([5, -5, 10, -10]);
+      using y = np.array([3, 3, 4, 4]);
       const [q, r] = np.divmod(x, y);
+      using _q = q;
+      using _r = r;
       // Verify: x == q * y + r
-      const reconstructed = np.add(np.multiply(q, y), r);
+      using _qy = np.multiply(q, y);
+      using reconstructed = np.add(_qy, r);
       expect(reconstructed.js()).toEqual([5, -5, 10, -10]);
     });
 
     test("works with scalars", () => {
       const [q, r] = np.divmod(7, 3);
+      using _q = q;
+      using _r = r;
       expect(q.js()).toBeCloseTo(2, 5);
       expect(r.js()).toBeCloseTo(1, 5);
     });
 
     test("works with int32 dtype", () => {
-      const x = np.array([7, -7], { dtype: np.int32 });
-      const y = np.array([3, 3], { dtype: np.int32 });
+      using x = np.array([7, -7], { dtype: np.int32 });
+      using y = np.array([3, 3], { dtype: np.int32 });
       const [q, r] = np.divmod(x, y);
+      using _q = q;
+      using _r = r;
       expect(q.js()).toEqual([2, -3]);
       expect(r.js()).toEqual([1, 2]);
       expect(q.dtype).toBe(np.int32);
@@ -1212,19 +1355,19 @@ suite.each(devices)("device:%s", (device) => {
 
   suite("jax.numpy.exp()", () => {
     test("computes element-wise exponential", () => {
-      const x = np.array([-Infinity, 0, 1, 2, 3]);
-      const y = np.exp(x);
+      using x = np.array([-Infinity, 0, 1, 2, 3]);
+      using y = np.exp(x);
       expect(y.js()).toBeAllclose([0, 1, Math.E, Math.E ** 2, Math.E ** 3]);
     });
 
     test("exp(-Infinity) = 0", () => {
-      const x = np.exp(-Infinity);
+      using x = np.exp(-Infinity);
       expect(x.js()).toEqual(0);
     });
 
     test("works with small and large numbers", () => {
-      const x = np.array([-1000, -100, -50, -10, 0, 10, 50, 100, 1000]);
-      const y = np.exp(x);
+      using x = np.array([-1000, -100, -50, -10, 0, 10, 50, 100, 1000]);
+      using y = np.exp(x);
       expect(y.js()).toBeAllclose([
         0,
         3.720075976020836e-44,
@@ -1239,58 +1382,64 @@ suite.each(devices)("device:%s", (device) => {
     });
 
     test("works with jvp", () => {
-      const x = np.array([1, 2, 3]);
-      const [y, dy] = jvp((x: np.Array) => np.exp(x), [x], [np.ones([3])]);
+      using x = np.array([1, 2, 3]);
+      using t = np.ones([3]);
+      const [y, dy] = jvp((x: np.Array) => np.exp(x), [x], [t]);
+      using _y = y;
+      using _dy = dy;
       expect(y.js()).toBeAllclose([Math.E, Math.E ** 2, Math.E ** 3]);
       expect(dy.js()).toBeAllclose([Math.E, Math.E ** 2, Math.E ** 3]);
     });
 
     test("can be used in grad", () => {
-      const x = np.array([1, 2, 3]);
-      const dx = grad((x: np.Array) => np.exp(x).sum())(x);
+      using x = np.array([1, 2, 3]);
+      using dx = grad((x: np.Array) => np.exp(x).sum())(x);
       expect(dx.js()).toBeAllclose([Math.E, Math.E ** 2, Math.E ** 3]);
     });
 
     test("exp2(10) = 1024", () => {
-      const x = np.exp2(10);
+      using x = np.exp2(10);
       expect(x.js()).toBeCloseTo(1024);
     });
 
     test("exp2(0) = 1", () => {
-      const x = np.exp2(0);
+      using x = np.exp2(0);
       expect(x.js()).toBeCloseTo(1);
     });
   });
 
   suite("jax.numpy.log()", () => {
     test("computes element-wise natural logarithm", () => {
-      const x = np.array([1, Math.E, Math.E ** 2]);
-      const y = np.log(x);
+      using x = np.array([1, Math.E, Math.E ** 2]);
+      using y = np.log(x);
       expect(y.js()).toBeAllclose([0, 1, 2]);
     });
 
     test("log(0) is -Infinity", () => {
-      const x = np.log(0);
+      using x = np.log(0);
       expect(x.js()).toEqual(-Infinity);
     });
 
     test("works with jvp", () => {
-      const x = np.array([1, Math.E, Math.E ** 2]);
-      const [y, dy] = jvp((x: np.Array) => np.log(x), [x], [np.ones([3])]);
+      using x = np.array([1, Math.E, Math.E ** 2]);
+      using t = np.ones([3]);
+      const [y, dy] = jvp((x: np.Array) => np.log(x), [x], [t]);
+      using _y = y;
+      using _dy = dy;
       expect(y.js()).toBeAllclose([0, 1, 2]);
       expect(dy.js()).toBeAllclose([1, 1 / Math.E, 1 / Math.E ** 2]);
     });
 
     test("can be used in grad", () => {
-      const x = np.array([1, Math.E, Math.E ** 2]);
-      const dx = grad((x: np.Array) => np.log(x).sum())(x);
+      using x = np.array([1, Math.E, Math.E ** 2]);
+      using dx = grad((x: np.Array) => np.log(x).sum())(x);
       expect(dx.js()).toBeAllclose([1, 1 / Math.E, 1 / Math.E ** 2]);
     });
 
     test("log2 and log10", () => {
-      const x = np.array([1, 2, 4, 8]);
-      const y2 = np.log2(x);
-      const y10 = np.log10(x);
+      using x = np.array([1, 2, 4, 8]);
+      using y2 = np.log2(x);
+      using y10 = np.log10(x);
       expect(y2.js()).toBeAllclose([0, 1, 2, 3]);
       expect(y10.js()).toBeAllclose([
         0,
@@ -1303,28 +1452,31 @@ suite.each(devices)("device:%s", (device) => {
 
   suite("jax.numpy.sqrt()", () => {
     test("computes element-wise square root", () => {
-      const x = np.array([1, 4, 9]);
-      const y = np.sqrt(x);
+      using x = np.array([1, 4, 9]);
+      using y = np.sqrt(x);
       expect(y.js()).toBeAllclose([1, 2, 3]);
     });
 
     test("returns NaN for negative inputs", () => {
-      const x = np.array([-1, -4, 9]);
-      const y = np.sqrt(x);
+      using x = np.array([-1, -4, 9]);
+      using y = np.sqrt(x);
       expect(y.js()).toEqual([NaN, NaN, 3.0]);
     });
   });
 
   suite("jax.numpy.cbrt()", () => {
     test("computes element-wise cube root", () => {
-      const x = np.array([-8, -1, 0, 1, 8]);
-      const y = np.cbrt(x);
+      using x = np.array([-8, -1, 0, 1, 8]);
+      using y = np.cbrt(x);
       expect(y).toBeAllclose([-2, -1, 0, 1, 2]);
     });
 
     test("works with jvp", () => {
-      const x = np.array([-8, -1, 0, 1, 8]);
-      const [y, dy] = jvp(np.cbrt, [x], [np.ones([5])]);
+      using x = np.array([-8, -1, 0, 1, 8]);
+      using t = np.ones([5]);
+      const [y, dy] = jvp(np.cbrt, [x], [t]);
+      using _y = y;
+      using _dy = dy;
       expect(y).toBeAllclose([-2, -1, 0, 1, 2]);
       expect(dy).toBeAllclose([1 / 12, 1 / 3, NaN, 1 / 3, 1 / 12]);
     });
@@ -1332,104 +1484,107 @@ suite.each(devices)("device:%s", (device) => {
 
   suite("jax.numpy.power()", () => {
     test("computes element-wise power", () => {
-      const x = np.array([-1, 2, 3, 4]);
-      const y = np.power(x, 3);
+      using x = np.array([-1, 2, 3, 4]);
+      using y = np.power(x, 3);
       expect(y).toBeAllclose([-1, 8, 27, 64]);
     });
 
     test("multiple different exponents", () => {
-      const y = np.power(3, np.array([-2, 0, 0.5, 1, 2]));
+      using _exp = np.array([-2, 0, 0.5, 1, 2]);
+      using y = np.power(3, _exp);
       expect(y).toBeAllclose([1 / 9, 1, Math.sqrt(3), 3, 9]);
     });
 
     test("works with negative numbers", () => {
       // const y = np.power(-3, np.array([-2, -1, 0, 1, 2, 3, 4, 5]));
       // expect(y).toBeAllclose([1 / 9, -1 / 3, 1, -3, 9, -27, 81, -243]);
-      const z = np.power(-3, np.array([0.5, 1.5, 2.5]));
+      using _neg_exp = np.array([0.5, 1.5, 2.5]);
+      using z = np.power(-3, _neg_exp);
       expect(z.js()).toEqual([NaN, NaN, NaN]);
     });
 
     test("power of zero", () => {
-      const y = np.power(0, np.array([-2, -1, 0, 0.5, 1, 2]));
+      using _exp = np.array([-2, -1, 0, 0.5, 1, 2]);
+      using y = np.power(0, _exp);
       expect(y.js()).toEqual([Infinity, Infinity, NaN, 0, 0, 0]);
     });
   });
 
   suite("jax.numpy.min()", () => {
     test("computes minimum of 1D array", () => {
-      const x = np.array([3, 1, 4, 2]);
-      const y = np.min(x);
+      using x = np.array([3, 1, 4, 2]);
+      using y = np.min(x);
       expect(y.js()).toEqual(1);
     });
 
     test("computes minimum of 2D array along axis", () => {
-      const x = np.array([
+      using x = np.array([
         [3, 1, 4],
         [2, 5, 0],
       ]);
-      const y = np.min(x, 0);
+      using y = np.min(x, 0);
       expect(y.js()).toEqual([2, 1, 0]);
     });
 
     test("computes minimum of 2D array without axis", () => {
-      const x = np.array([
+      using x = np.array([
         [3, 1, 4],
         [2, 5, 0],
       ]);
-      const y = np.min(x);
+      using y = np.min(x);
       expect(y.js()).toEqual(0);
     });
 
     test("can have grad of min", () => {
-      const x = np.array([3, 1, 4, 1]);
-      const dx = grad((x: np.Array) => np.min(x))(x);
+      using x = np.array([3, 1, 4, 1]);
+      using dx = grad((x: np.Array) => np.min(x))(x);
       expect(dx.js()).toEqual([0, 0.5, 0, 0.5]); // Gradient is 1 at the minimum
     });
   });
 
   suite("jax.numpy.max()", () => {
     test("computes maximum of 1D array", () => {
-      const x = np.array([3, 1, 4, 2]);
-      const y = np.max(x);
+      using x = np.array([3, 1, 4, 2]);
+      using y = np.max(x);
       expect(y.js()).toEqual(4);
     });
 
     test("computes maximum of 2D array along axis", () => {
-      const x = np.array([
+      using x = np.array([
         [3, 1, 4],
         [2, 5, 0],
       ]);
-      const y = np.max(x, 0);
+      using y = np.max(x, 0);
       expect(y.js()).toEqual([3, 5, 4]);
     });
 
     test("computes maximum of 2D array without axis", () => {
-      const x = np.array([
+      using x = np.array([
         [3, 1, 4],
         [2, 5, 0],
       ]);
-      const y = np.max(x);
+      using y = np.max(x);
       expect(y.js()).toEqual(5);
     });
 
     test("can have grad of max", () => {
-      const x = np.array([10, 3, 4, 10]);
-      const dx = grad((x: np.Array) => np.max(x))(x);
+      using x = np.array([10, 3, 4, 10]);
+      using dx = grad((x: np.Array) => np.max(x))(x);
       expect(dx.js()).toEqual([0.5, 0, 0, 0.5]); // Gradient is 1 at the maximum
     });
   });
 
   suite("jax.numpy.pad()", () => {
     test("pads an array equally", () => {
-      const a = np.array([1, 2, 3]);
-      const b = np.pad(a, 1);
+      using a = np.array([1, 2, 3]);
+      using b = np.pad(a, 1);
       expect(b.js()).toEqual([0, 1, 2, 3, 0]);
 
-      const c = np.array([
+      using c = np.array([
         [1, 2],
         [3, 4],
       ]);
-      const d = np.pad(c, 1);
+      using d = np.pad(c, 1);
       expect(d.js()).toEqual([
         [0, 0, 0, 0],
         [0, 1, 2, 0],
@@ -1439,8 +1594,8 @@ suite.each(devices)("device:%s", (device) => {
     });
 
     test("pads an array with uneven widths", () => {
-      const a = np.array([[1]]);
-      const b = np.pad(a, [
+      using a = np.array([[1]]);
+      using b = np.pad(a, [
         [1, 2],
         [3, 0],
       ]);
@@ -1453,7 +1608,7 @@ suite.each(devices)("device:%s", (device) => {
     });
 
     test("raises TypeError on axis mismatch", () => {
-      const a = np.zeros([1, 2, 3]);
+      using a = np.zeros([1, 2, 3]);
       expect(() => np.pad(a, [])).toThrow(Error);
       expect(() => np.pad(a, [[0, 1]])).not.toThrow(Error);
       expect(() =>
@@ -1465,43 +1620,47 @@ suite.each(devices)("device:%s", (device) => {
     });
 
     test("pad handles backprop", () => {
-      const a = np.array([1, 2, 3]);
-      expect(grad((x: np.Array) => np.pad(x, 1).sum())(a).js()).toEqual([
-        1, 1, 1,
-      ]);
+      using a = np.array([1, 2, 3]);
+      using da = grad((x: np.Array) => np.pad(x, 1).sum())(a);
+      expect(da.js()).toEqual([1, 1, 1]);
     });
 
     test("works with jit and a prior operation", () => {
       // See comment about `needsCleanShapePrimitives` in JIT.
-      const f = jit((x: np.Array) => {
-        const y = x.add(2);
+      using f = jit((x: np.Array) => {
+        using y = x.add(2);
         return np.pad(y, 1);
       });
-      const a = np.array([1, 2, 3]);
-      const b = f(a);
+      using a = np.array([1, 2, 3]);
+      using b = f(a);
       expect(b.js()).toEqual([0, 3, 4, 5, 0]);
     });
 
     test("pad with explicit indices", () => {
-      const x = np.zeros([2, 3, 4, 5]);
-      const y = np.pad(x, { 1: [0, 2], [-1]: [3, 0] });
+      using x = np.zeros([2, 3, 4, 5]);
+      using y = np.pad(x, { 1: [0, 2], [-1]: [3, 0] });
       expect(y.shape).toEqual([2, 5, 4, 8]);
-      y.dispose();
     });
   });
 
   suite("jax.numpy.split()", () => {
     test("splits into equal parts with integer", () => {
-      const x = np.arange(6);
+      using x = np.arange(6);
       const [a, b, c] = np.split(x, 3);
+      using _a = a;
+      using _b = b;
+      using _c = c;
       expect(a.js()).toEqual([0, 1]);
       expect(b.js()).toEqual([2, 3]);
       expect(c.js()).toEqual([4, 5]);
     });
 
     test("splits 2D array along axis 0", () => {
-      const x = np.arange(12).reshape([4, 3]);
+      using _x = np.arange(12);
+      using x = _x.reshape([4, 3]);
       const [a, b] = np.split(x, 2, 0);
+      using _a = a;
+      using _b = b;
       expect(a.js()).toEqual([
         [0, 1, 2],
         [3, 4, 5],
@@ -1513,8 +1672,11 @@ suite.each(devices)("device:%s", (device) => {
     });
 
     test("splits 2D array along axis 1", () => {
-      const x = np.arange(12).reshape([3, 4]);
+      using _x = np.arange(12);
+      using x = _x.reshape([3, 4]);
       const [a, b] = np.split(x, 2, 1);
+      using _a = a;
+      using _b = b;
       expect(a.js()).toEqual([
         [0, 1],
         [4, 5],
@@ -1528,16 +1690,23 @@ suite.each(devices)("device:%s", (device) => {
     });
 
     test("splits at indices", () => {
-      const x = np.arange(10);
+      using x = np.arange(10);
       const [a, b, c] = np.split(x, [3, 7]);
+      using _a = a;
+      using _b = b;
+      using _c = c;
       expect(a.js()).toEqual([0, 1, 2]);
       expect(b.js()).toEqual([3, 4, 5, 6]);
       expect(c.js()).toEqual([7, 8, 9]);
     });
 
     test("splits at indices with empty sections", () => {
-      const x = np.arange(5);
+      using x = np.arange(5);
       const [a, b, c, d] = np.split(x, [0, 0, 3]);
+      using _a = a;
+      using _b = b;
+      using _c = c;
+      using _d = d;
       expect(a.js()).toEqual([]);
       expect(b.js()).toEqual([]);
       expect(c.js()).toEqual([0, 1, 2]);
@@ -1545,14 +1714,17 @@ suite.each(devices)("device:%s", (device) => {
     });
 
     test("throws on uneven split", () => {
-      const x = np.arange(5);
+      using x = np.arange(5);
       expect(() => np.split(x, 2)).toThrow(Error);
       expect(() => np.split(x, 3)).toThrow(Error);
     });
 
     test("works with negative axis", () => {
-      const x = np.arange(12).reshape([3, 4]);
+      using _x = np.arange(12);
+      using x = _x.reshape([3, 4]);
       const [a, b] = np.split(x, 2, -1);
+      using _a = a;
+      using _b = b;
       expect(a.js()).toEqual([
         [0, 1],
         [4, 5],
@@ -1566,29 +1738,31 @@ suite.each(devices)("device:%s", (device) => {
     });
 
     test("works with grad", () => {
-      const x = np.arange(6).astype(np.float32);
+      using _x = np.arange(6);
+      using x = _x.astype(np.float32);
       const f = (x: np.Array) => {
         const [a, b] = np.split(x, 2);
         return a.sum().add(b.mul(2).sum());
       };
-      const dx = grad(f)(x);
+      using dx = grad(f)(x);
       expect(dx.js()).toEqual([1, 1, 1, 2, 2, 2]);
     });
 
     test("works inside jit", () => {
-      const f = jit((x: np.Array) => {
+      using f = jit((x: np.Array) => {
         const [a, b] = np.split(x, 2);
         return a.add(b);
       });
-      const x = np.arange(6);
-      const y = f(x);
+      using x = np.arange(6);
+      using y = f(x);
       expect(y.js()).toEqual([3, 5, 7]);
     });
 
     test("splits an array into 20 parts", () => {
-      const x = np.arange(20);
+      using x = np.arange(20);
       for (const [i, a] of np.split(x, 20).entries()) {
         expect(a.js()).toEqual([i]);
+        a.dispose();
       }
     });
   });
@@ -1597,79 +1771,109 @@ suite.each(devices)("device:%s", (device) => {
     // This suite also handles stack, hstack, vstack, dstack, etc.
 
     test("can concatenate 1D arrays", () => {
-      const a = np.array([1, 2, 3]);
-      const b = np.array([4, 5, 6]);
-      const c = np.concatenate([a, b]);
+      using a = np.array([1, 2, 3]);
+      using b = np.array([4, 5, 6]);
+      using c = np.concatenate([a, b]);
       expect(c.js()).toEqual([1, 2, 3, 4, 5, 6]);
     });
 
     test("concatenation size mismatch", () => {
-      const a = np.zeros([2, 3]);
-      let b = np.zeros([3, 2]);
-      expect(() => np.concatenate([a, b])).toThrow(Error);
-      expect(() => np.concatenate([a, b], 1)).toThrow(Error);
-      b = b.transpose();
+      using a = np.zeros([2, 3]);
+      using b0 = np.zeros([3, 2]);
+      expect(() => np.concatenate([a, b0])).toThrow(Error);
+      expect(() => np.concatenate([a, b0], 1)).toThrow(Error);
+      using b = b0.transpose();
       expect(() => np.concatenate([a, b]).dispose()).not.toThrow(Error);
     });
 
     test("stack() and variants work", () => {
-      expect(np.stack([2, 3]).js()).toEqual([2, 3]);
-      expect(np.stack([2, 3], -1).js()).toEqual([2, 3]);
+      {
+        using r = np.stack([2, 3]);
+        expect(r.js()).toEqual([2, 3]);
+      }
+      {
+        using r = np.stack([2, 3], -1);
+        expect(r.js()).toEqual([2, 3]);
+      }
       expect(() => np.stack([2, 3], 1)).toThrow(Error); // invalid axis
       expect(() => np.stack([2, 3], 2)).toThrow(Error); // invalid axis
 
-      expect(np.vstack([1, 2, 3]).js()).toEqual([[1], [2], [3]]);
-      expect(np.vstack([np.array([1, 2, 3]), np.ones([3])]).js()).toEqual([
-        [1, 2, 3],
-        [1, 1, 1],
-      ]);
+      {
+        using r = np.vstack([1, 2, 3]);
+        expect(r.js()).toEqual([[1], [2], [3]]);
+      }
+      {
+        using a = np.array([1, 2, 3]);
+        using b = np.ones([3]);
+        using r = np.vstack([a, b]);
+        expect(r.js()).toEqual([
+          [1, 2, 3],
+          [1, 1, 1],
+        ]);
+      }
 
-      expect(np.hstack([1, 2, 3]).js()).toEqual([1, 2, 3]);
-      expect(np.hstack([np.array([1, 2, 3]), np.ones([3])]).js()).toEqual([
-        1, 2, 3, 1, 1, 1,
-      ]);
+      {
+        using r = np.hstack([1, 2, 3]);
+        expect(r.js()).toEqual([1, 2, 3]);
+      }
+      {
+        using a = np.array([1, 2, 3]);
+        using b = np.ones([3]);
+        using r = np.hstack([a, b]);
+        expect(r.js()).toEqual([1, 2, 3, 1, 1, 1]);
+      }
 
-      expect(np.dstack([1, 2, 3]).js()).toEqual([[[1, 2, 3]]]);
-      expect(np.dstack([np.array([1, 2, 3]), np.ones([3])]).js()).toEqual([
-        [
-          [1, 1],
-          [2, 1],
-          [3, 1],
-        ],
-      ]);
+      {
+        using r = np.dstack([1, 2, 3]);
+        expect(r.js()).toEqual([[[1, 2, 3]]]);
+      }
+      {
+        using a = np.array([1, 2, 3]);
+        using b = np.ones([3]);
+        using r = np.dstack([a, b]);
+        expect(r.js()).toEqual([
+          [
+            [1, 1],
+            [2, 1],
+            [3, 1],
+          ],
+        ]);
+      }
     });
 
     test("concatenate works in jit", () => {
-      const f = jit(np.concatenate);
-      const c = f([np.flip(np.array([1, 2])), np.array([3, 4]), np.array([5])]);
+      using f = jit(np.concatenate);
+      using _a1 = np.array([1, 2]);
+      using _a1f = np.flip(_a1);
+      using _a2 = np.array([3, 4]);
+      using _a3 = np.array([5]);
+      using c = f([_a1f, _a2, _a3]);
       expect(c.js()).toEqual([2, 1, 3, 4, 5]);
     });
   });
 
   suite("jax.numpy.argmax()", () => {
     test("finds maximum of logits", () => {
-      const x = np.argmax(np.array([0.1, 0.2, 0.3, 0.2]));
+      using _a = np.array([0.1, 0.2, 0.3, 0.2]);
+      using x = np.argmax(_a);
       expect(x.js()).toEqual(2);
     });
 
     test("retrieves first index of maximum", () => {
-      const x = np.argmax(
-        np.array([
-          [0.1, -0.2, -0.3, 0.1],
-          [0, 0.1, 0.3, 0.3],
-        ]),
-        1,
-      );
+      using _a = np.array([
+        [0.1, -0.2, -0.3, 0.1],
+        [0, 0.1, 0.3, 0.3],
+      ]);
+      using x = np.argmax(_a, 1);
       expect(x.js()).toEqual([0, 2]);
     });
 
     test("runs on flattened array by default", () => {
-      const x = np.argmax(
-        np.array([
-          [0.1, -0.2],
-          [0.3, 0.1],
-        ]),
-      );
+      using _a = np.array([
+        [0.1, -0.2],
+        [0.3, 0.1],
+      ]);
+      using x = np.argmax(_a);
       expect(x.js()).toEqual(2); // Index of maximum in flattened array
     });
   });
@@ -1679,33 +1883,39 @@ suite.each(devices)("device:%s", (device) => {
 
     test("sinh values", () => {
       for (const x of vals) {
-        expect(np.sinh(x)).toBeAllclose(Math.sinh(x));
+        using r = np.sinh(x);
+        expect(r).toBeAllclose(Math.sinh(x));
       }
     });
 
     test("cosh values", () => {
       for (const x of vals) {
-        expect(np.cosh(x)).toBeAllclose(Math.cosh(x));
+        using r = np.cosh(x);
+        expect(r).toBeAllclose(Math.cosh(x));
       }
     });
 
     test("tanh values", () => {
       for (const x of vals) {
-        expect(np.tanh(x)).toBeAllclose(Math.tanh(x));
+        using r = np.tanh(x);
+        expect(r).toBeAllclose(Math.tanh(x));
       }
-      expect(np.tanh(Infinity).js()).toEqual(1);
+      using r = np.tanh(Infinity);
+      expect(r.js()).toEqual(1);
     });
   });
 
   suite("jax.numpy.sinc()", () => {
     test("sinc(0) = 1", () => {
-      expect(np.sinc(0).js()).toBeCloseTo(1, 5);
+      using r = np.sinc(0);
+      expect(r.js()).toBeCloseTo(1, 5);
     });
 
     test("sinc at integer values is 0", () => {
       // sinc(n) = sin(πn) / (πn) = 0 for non-zero integers
-      const x = np.array([1, 2, 3, -1, -2, -3]);
-      const result: number[] = np.sinc(x).js();
+      using x = np.array([1, 2, 3, -1, -2, -3]);
+      using _r = np.sinc(x);
+      const result: number[] = _r.js();
       for (const val of result) {
         expect(val).toBeCloseTo(0, 5);
       }
@@ -1713,26 +1923,32 @@ suite.each(devices)("device:%s", (device) => {
 
     test("sinc at 0.5", () => {
       // sinc(0.5) = sin(π/2) / (π/2) = 1 / (π/2) = 2/π
-      expect(np.sinc(0.5).js()).toBeCloseTo(2 / Math.PI, 5);
+      using r = np.sinc(0.5);
+      expect(r.js()).toBeCloseTo(2 / Math.PI, 5);
     });
 
     test("sinc is symmetric", () => {
-      const x = np.array([0.1, 0.5, 1.5, 2.5]);
-      const negX = np.array([-0.1, -0.5, -1.5, -2.5]);
-      expect(np.sinc(x).js()).toBeAllclose(np.sinc(negX).js());
+      using x = np.array([0.1, 0.5, 1.5, 2.5]);
+      using negX = np.array([-0.1, -0.5, -1.5, -2.5]);
+      using r1 = np.sinc(x);
+      using r2 = np.sinc(negX);
+      expect(r1.js()).toBeAllclose(r2.js());
     });
 
     test("sinc on array", () => {
-      const x = np.array([0, 0.5, 1]);
+      using x = np.array([0, 0.5, 1]);
       const expected = [1, 2 / Math.PI, 0];
-      expect(np.sinc(x).js()).toBeAllclose(expected);
+      using r = np.sinc(x);
+      expect(r.js()).toBeAllclose(expected);
     });
   });
 
   suite("jax.numpy.atan()", () => {
     test("arctan values", () => {
       const vals = [-1000, -100, -10, -1, 0, 1, 10, 100, 1000, Infinity];
-      const atanvals: number[] = np.atan(np.array(vals)).js();
+      using _a = np.array(vals);
+      using _r = np.atan(_a);
+      const atanvals: number[] = _r.js();
       for (let i = 0; i < vals.length; i++) {
         expect(atanvals[i]).toBeCloseTo(Math.atan(vals[i]), 5);
       }
@@ -1740,8 +1956,11 @@ suite.each(devices)("device:%s", (device) => {
 
     test("arcsin and arccos values", () => {
       const vals = [-1, -0.7, 0, 0.5, 1];
-      const asinvals: number[] = np.asin(np.array(vals)).js();
-      const acosvals: number[] = np.acos(np.array(vals)).js();
+      using _a = np.array(vals);
+      using _asin = np.asin(_a);
+      using _acos = np.acos(_a);
+      const asinvals: number[] = _asin.js();
+      const acosvals: number[] = _acos.js();
       for (let i = 0; i < vals.length; i++) {
         expect(asinvals[i]).toBeCloseTo(Math.asin(vals[i]), 5);
         expect(acosvals[i]).toBeCloseTo(Math.acos(vals[i]), 5);
@@ -1749,15 +1968,15 @@ suite.each(devices)("device:%s", (device) => {
     });
 
     test("grad of arctan", () => {
-      const x = np.array([1, Math.sqrt(3), 0]);
-      const dx = grad((x: np.Array) => np.atan(x).sum())(x);
+      using x = np.array([1, Math.sqrt(3), 0]);
+      using dx = grad((x: np.Array) => np.atan(x).sum())(x);
       const expected = [0.5, 0.25, 1];
       expect(dx.js()).toBeAllclose(expected);
     });
 
     test("grad of arcsin", () => {
-      const x = np.array([-0.5, 0, 0.5]);
-      const dx = grad((x: np.Array) => np.asin(x).sum())(x);
+      using x = np.array([-0.5, 0, 0.5]);
+      using dx = grad((x: np.Array) => np.asin(x).sum())(x);
       const expected = [2 / Math.sqrt(3), 1, 2 / Math.sqrt(3)];
       expect(dx.js()).toBeAllclose(expected);
     });
@@ -1768,7 +1987,10 @@ suite.each(devices)("device:%s", (device) => {
       // Test all four quadrants and special cases with various values
       const y = [3, 5, -7, -2, 4, -6, 0, 0, 1.5, -2.5];
       const x = [4, -2, -3, 8, 0, 0, 5, -9, 1.5, -2.5];
-      const result: number[] = np.atan2(np.array(y), np.array(x)).js();
+      using _ya = np.array(y);
+      using _xa = np.array(x);
+      using _r = np.atan2(_ya, _xa);
+      const result: number[] = _r.js();
       for (let i = 0; i < y.length; i++) {
         expect(result[i]).toBeCloseTo(Math.atan2(y[i], x[i]), 5);
       }
@@ -1777,17 +1999,17 @@ suite.each(devices)("device:%s", (device) => {
 
   suite("jax.numpy.repeat()", () => {
     test("repeats elements of 1D array", () => {
-      const x = np.array([1, 2, 3]);
-      const y = np.repeat(x, 2);
+      using x = np.array([1, 2, 3]);
+      using y = np.repeat(x, 2);
       expect(y.js()).toEqual([1, 1, 2, 2, 3, 3]);
     });
 
     test("repeats elements of 2D array along axis", () => {
-      const x = np.array([
+      using x = np.array([
         [1, 2],
         [3, 4],
       ]);
-      const y = np.repeat(x, 2, 0);
+      using y = np.repeat(x, 2, 0);
       expect(y.js()).toEqual([
         [1, 2],
         [1, 2],
@@ -1795,7 +2017,7 @@ suite.each(devices)("device:%s", (device) => {
         [3, 4],
       ]);
 
-      const z = np.repeat(x, 3, 1);
+      using z = np.repeat(x, 3, 1);
       expect(z.js()).toEqual([
         [1, 1, 1, 2, 2, 2],
         [3, 3, 3, 4, 4, 4],
@@ -1803,28 +2025,28 @@ suite.each(devices)("device:%s", (device) => {
     });
 
     test("flattens input when axis is null", () => {
-      const x = np.array([
+      using x = np.array([
         [1, 2],
         [3, 4],
       ]);
-      const y = np.repeat(x, 2);
+      using y = np.repeat(x, 2);
       expect(y.js()).toEqual([1, 1, 2, 2, 3, 3, 4, 4]);
     });
   });
 
   suite("jax.numpy.tile()", () => {
     test("tiles 1D array", () => {
-      const x = np.array([1, 2, 3]);
-      const y = np.tile(x, 2);
+      using x = np.array([1, 2, 3]);
+      using y = np.tile(x, 2);
       expect(y.js()).toEqual([1, 2, 3, 1, 2, 3]);
     });
 
     test("tiles 2D array along multiple axes", () => {
-      const x = np.array([
+      using x = np.array([
         [1, 2],
         [3, 4],
       ]);
-      const y = np.tile(x, [2, 1]);
+      using y = np.tile(x, [2, 1]);
       expect(y.js()).toEqual([
         [1, 2],
         [3, 4],
@@ -1832,7 +2054,7 @@ suite.each(devices)("device:%s", (device) => {
         [3, 4],
       ]);
 
-      const z = np.tile(x, 3);
+      using z = np.tile(x, 3);
       expect(z.js()).toEqual([
         [1, 2, 1, 2, 1, 2],
         [3, 4, 3, 4, 3, 4],
@@ -1840,8 +2062,8 @@ suite.each(devices)("device:%s", (device) => {
     });
 
     test("tiles with reps having more dimensions than array", () => {
-      const x = np.array([1, 2]);
-      const y = np.tile(x, [2, 2]);
+      using x = np.array([1, 2]);
+      using y = np.tile(x, [2, 2]);
       expect(y.js()).toEqual([
         [1, 2, 1, 2],
         [1, 2, 1, 2],
@@ -1851,25 +2073,25 @@ suite.each(devices)("device:%s", (device) => {
 
   suite("jax.numpy.var_()", () => {
     test("computes variance", () => {
-      const x = np.array([1, 2, 3, 4]);
-      const y = np.var_(x);
+      using x = np.array([1, 2, 3, 4]);
+      using y = np.var_(x);
       expect(y).toBeAllclose(1.25);
     });
 
     test("computes standard deviation", () => {
-      const x = np.array([1, 2, 3, 4]);
-      const y = np.std(x);
+      using x = np.array([1, 2, 3, 4]);
+      using y = np.std(x);
       expect(y).toBeAllclose(Math.sqrt(1.25));
     });
   });
 
   suite("jax.numpy.cov()", () => {
     test("computes covariance matrix", () => {
-      const x = np.array([
+      using x = np.array([
         [0, 1, 2],
         [0, 1, 2],
       ]);
-      const cov1 = np.cov(x);
+      using cov1 = np.cov(x);
       expect(cov1.js()).toBeAllclose([
         [1, 1],
         [1, 1],
@@ -1877,11 +2099,11 @@ suite.each(devices)("device:%s", (device) => {
     });
 
     test("computes covariance matrix for anti-correlated data", () => {
-      const x = np.array([
+      using x = np.array([
         [-1, 0, 1],
         [1, 0, -1],
       ]);
-      const cov2 = np.cov(x);
+      using cov2 = np.cov(x);
       expect(cov2.js()).toBeAllclose([
         [1, -1],
         [-1, 1],
@@ -1889,9 +2111,9 @@ suite.each(devices)("device:%s", (device) => {
     });
 
     test("computes covariance matrix from separate arrays", () => {
-      const x = np.array([-1, 0, 1]);
-      const y = np.array([1, 0, -1]);
-      const cov3 = np.cov(x, y);
+      using x = np.array([-1, 0, 1]);
+      using y = np.array([1, 0, -1]);
+      using cov3 = np.cov(x, y);
       expect(cov3.js()).toBeAllclose([
         [1, -1],
         [-1, 1],
@@ -1902,86 +2124,100 @@ suite.each(devices)("device:%s", (device) => {
   suite("jax.numpy.isnan()", () => {
     test("identify special values", () => {
       // Test isnan and related functions (isinf, isfinite, etc.)
-      const x = np.array([NaN, Infinity, -Infinity, 1]);
-      expect(np.isnan(x).js()).toEqual([true, false, false, false]);
-      expect(np.isinf(x).js()).toEqual([false, true, true, false]);
-      expect(np.isfinite(x).js()).toEqual([false, false, false, true]);
-      expect(np.isneginf(x).js()).toEqual([false, false, true, false]);
-      expect(np.isposinf(x).js()).toEqual([false, true, false, false]);
-      x.dispose();
+      using x = np.array([NaN, Infinity, -Infinity, 1]);
+      {
+        using r = np.isnan(x);
+        expect(r.js()).toEqual([true, false, false, false]);
+      }
+      {
+        using r = np.isinf(x);
+        expect(r.js()).toEqual([false, true, true, false]);
+      }
+      {
+        using r = np.isfinite(x);
+        expect(r.js()).toEqual([false, false, false, true]);
+      }
+      {
+        using r = np.isneginf(x);
+        expect(r.js()).toEqual([false, false, true, false]);
+      }
+      {
+        using r = np.isposinf(x);
+        expect(r.js()).toEqual([false, true, false, false]);
+      }
     });
   });
 
   suite("jax.numpy.nanToNum()", () => {
     test("replaces NaN with 0 by default", () => {
-      const x = np.array([1, NaN, 3]);
-      const y = np.nanToNum(x);
+      using x = np.array([1, NaN, 3]);
+      using y = np.nanToNum(x);
       expect(y.js()).toEqual([1, 0, 3]);
     });
 
     test("replaces NaN with custom value", () => {
-      const x = np.array([NaN, 2, NaN]);
-      const y = np.nanToNum(x, { nan: 99 });
+      using x = np.array([NaN, 2, NaN]);
+      using y = np.nanToNum(x, { nan: 99 });
       expect(y.js()).toEqual([99, 2, 99]);
     });
 
     test("replaces positive infinity when specified", () => {
-      const x = np.array([1, Infinity, 3]);
-      const y = np.nanToNum(x, { posinf: 999 });
+      using x = np.array([1, Infinity, 3]);
+      using y = np.nanToNum(x, { posinf: 999 });
       expect(y.js()).toEqual([1, 999, 3]);
     });
 
     test("replaces negative infinity when specified", () => {
-      const x = np.array([1, -Infinity, 3]);
-      const y = np.nanToNum(x, { neginf: -999 });
+      using x = np.array([1, -Infinity, 3]);
+      using y = np.nanToNum(x, { neginf: -999 });
       expect(y.js()).toEqual([1, -999, 3]);
     });
 
     test("sets infinity to limit values when not specified", () => {
-      const x = np.array([Infinity, -Infinity]);
-      const y = np.nanToNum(x);
+      using x = np.array([Infinity, -Infinity]);
+      using y = np.nanToNum(x);
       expect(y).toBeAllclose([3.40282347e38, -3.40282347e38]);
     });
 
     test("handles all special values together", () => {
-      const x = np.array([NaN, Infinity, -Infinity, 42]);
-      const y = np.nanToNum(x, { nan: 0, posinf: 100, neginf: -100 });
+      using x = np.array([NaN, Infinity, -Infinity, 42]);
+      using y = np.nanToNum(x, { nan: 0, posinf: 100, neginf: -100 });
       expect(y.js()).toEqual([0, 100, -100, 42]);
     });
   });
 
   suite("jax.numpy.convolve()", () => {
     test("computes 1D convolution", () => {
-      const x = np.array([1, 2, 3, 2, 1]);
-      const y = np.array([4, 1, 2]);
+      using x = np.array([1, 2, 3, 2, 1]);
+      using y = np.array([4, 1, 2]);
 
-      const full = np.convolve(x, y);
+      using full = np.convolve(x, y);
       expect(full.js()).toEqual([4, 9, 16, 15, 12, 5, 2]);
 
-      const same = np.convolve(x, y, "same");
+      using same = np.convolve(x, y, "same");
       expect(same.js()).toEqual([9, 16, 15, 12, 5]);
 
-      const valid = np.convolve(x, y, "valid");
+      using valid = np.convolve(x, y, "valid");
       expect(valid.js()).toEqual([16, 15, 12]);
     });
 
     test("computes 1D correlation", () => {
-      const x = np.array([1, 2, 3, 2, 1]);
-      const y = np.array([4, 5, 6]);
+      using x = np.array([1, 2, 3, 2, 1]);
+      using y = np.array([4, 5, 6]);
 
-      const valid = np.correlate(x, y);
+      using valid = np.correlate(x, y);
       expect(valid.js()).toEqual([32, 35, 28]);
 
-      const full = np.correlate(x, y, "full");
+      using full = np.correlate(x, y, "full");
       expect(full.js()).toEqual([6, 17, 32, 35, 28, 13, 4]);
 
-      const same = np.correlate(x, y, "same");
+      using same = np.correlate(x, y, "same");
       expect(same.js()).toEqual([17, 32, 35, 28, 13]);
 
-      const x1 = np.array([1, 2, 3, 2, 1]);
-      const y1 = np.array([4, 5, 4]);
-      const corr = np.correlate(x1, y1, "full");
-      const conv = np.convolve(x1, y1, "full");
+      using x1 = np.array([1, 2, 3, 2, 1]);
+      using y1 = np.array([4, 5, 4]);
+      using corr = np.correlate(x1, y1, "full");
+      using conv = np.convolve(x1, y1, "full");
       expect(corr.js()).toEqual([4, 13, 26, 31, 26, 13, 4]);
       expect(conv.js()).toEqual([4, 13, 26, 31, 26, 13, 4]);
     });
@@ -1989,38 +2225,52 @@ suite.each(devices)("device:%s", (device) => {
 
   suite("jax.numpy.all()", () => {
     test("returns true when all elements are true", () => {
-      const x = np.array([true, true, true]);
-      expect(np.all(x).js()).toEqual(true);
+      using x = np.array([true, true, true]);
+      using r = np.all(x);
+      expect(r.js()).toEqual(true);
     });
 
     test("returns false when any element is false", () => {
-      const x = np.array([true, false, true]);
-      expect(np.all(x).js()).toEqual(false);
+      using x = np.array([true, false, true]);
+      using r = np.all(x);
+      expect(r.js()).toEqual(false);
     });
 
     test("works along axis", () => {
-      const x = np.array([
+      using x = np.array([
         [true, false],
         [true, true],
       ]);
-      expect(np.all(x, 0).js()).toEqual([true, false]);
-      expect(np.all(x, 1).js()).toEqual([false, true]);
+      {
+        using r = np.all(x, 0);
+        expect(r.js()).toEqual([true, false]);
+      }
+      {
+        using r = np.all(x, 1);
+        expect(r.js()).toEqual([false, true]);
+      }
     });
 
     test("works with numeric arrays (truthy values)", () => {
-      const x = np.array([1, 2, 3]);
-      expect(np.all(x).js()).toEqual(true);
+      using x = np.array([1, 2, 3]);
+      {
+        using r = np.all(x);
+        expect(r.js()).toEqual(true);
+      }
 
-      const y = np.array([1, 0, 3]);
-      expect(np.all(y).js()).toEqual(false);
+      using y = np.array([1, 0, 3]);
+      {
+        using r = np.all(y);
+        expect(r.js()).toEqual(false);
+      }
     });
 
     test("supports keepdims", () => {
-      const x = np.array([
+      using x = np.array([
         [true, true],
         [true, false],
       ]);
-      const result = np.all(x, 1, { keepdims: true });
+      using result = np.all(x, 1, { keepdims: true });
       expect(result.shape).toEqual([2, 1]);
       expect(result.js()).toEqual([[true], [false]]);
     });
@@ -2028,38 +2278,52 @@ suite.each(devices)("device:%s", (device) => {
 
   suite("jax.numpy.any()", () => {
     test("returns true when any element is true", () => {
-      const x = np.array([false, true, false]);
-      expect(np.any(x).js()).toEqual(true);
+      using x = np.array([false, true, false]);
+      using r = np.any(x);
+      expect(r.js()).toEqual(true);
     });
 
     test("returns false when all elements are false", () => {
-      const x = np.array([false, false, false]);
-      expect(np.any(x).js()).toEqual(false);
+      using x = np.array([false, false, false]);
+      using r = np.any(x);
+      expect(r.js()).toEqual(false);
     });
 
     test("works along axis", () => {
-      const x = np.array([
+      using x = np.array([
         [false, false],
         [true, false],
       ]);
-      expect(np.any(x, 0).js()).toEqual([true, false]);
-      expect(np.any(x, 1).js()).toEqual([false, true]);
+      {
+        using r = np.any(x, 0);
+        expect(r.js()).toEqual([true, false]);
+      }
+      {
+        using r = np.any(x, 1);
+        expect(r.js()).toEqual([false, true]);
+      }
     });
 
     test("works with numeric arrays (truthy values)", () => {
-      const x = np.array([0, 0, 0]);
-      expect(np.any(x).js()).toEqual(false);
+      using x = np.array([0, 0, 0]);
+      {
+        using r = np.any(x);
+        expect(r.js()).toEqual(false);
+      }
 
-      const y = np.array([0, 1, 0]);
-      expect(np.any(y).js()).toEqual(true);
+      using y = np.array([0, 1, 0]);
+      {
+        using r = np.any(y);
+        expect(r.js()).toEqual(true);
+      }
     });
 
     test("supports keepdims", () => {
-      const x = np.array([
+      using x = np.array([
         [false, false],
         [true, false],
       ]);
-      const result = np.any(x, 1, { keepdims: true });
+      using result = np.any(x, 1, { keepdims: true });
       expect(result.shape).toEqual([2, 1]);
       expect(result.js()).toEqual([[false], [true]]);
     });
@@ -2067,70 +2331,69 @@ suite.each(devices)("device:%s", (device) => {
 
   suite("jax.numpy.expandDims()", () => {
     test("expands dims at position 0", () => {
-      const x = np.array([1, 2, 3]);
-      const y = np.expandDims(x, 0);
+      using x = np.array([1, 2, 3]);
+      using y = np.expandDims(x, 0);
       expect(y.shape).toEqual([1, 3]);
       expect(y.js()).toEqual([[1, 2, 3]]);
     });
 
     test("expands dims at position 1", () => {
-      const x = np.array([1, 2, 3]);
-      const y = np.expandDims(x, 1);
+      using x = np.array([1, 2, 3]);
+      using y = np.expandDims(x, 1);
       expect(y.shape).toEqual([3, 1]);
       expect(y.js()).toEqual([[1], [2], [3]]);
     });
 
     test("expands dims with negative axis", () => {
-      const x = np.array([1, 2, 3]);
-      const y = np.expandDims(x, -1);
+      using x = np.array([1, 2, 3]);
+      using y = np.expandDims(x, -1);
       expect(y.shape).toEqual([3, 1]);
       expect(y.js()).toEqual([[1], [2], [3]]);
     });
 
     test("expands multiple dims at once", () => {
-      const x = np.array([1, 2]);
-      const y = np.expandDims(x, [0, 2]);
+      using x = np.array([1, 2]);
+      using y = np.expandDims(x, [0, 2]);
       expect(y.shape).toEqual([1, 2, 1]);
       expect(y.js()).toEqual([[[1], [2]]]);
     });
 
     test("expands dims on 2D array", () => {
-      const x = np.array([
+      using x = np.array([
         [1, 2, 3],
         [4, 5, 6],
       ]);
-      const y = np.expandDims(x, 0);
+      using y = np.expandDims(x, 0);
       expect(y.shape).toEqual([1, 2, 3]);
 
-      const z = np.expandDims(x, 2);
+      using z = np.expandDims(x, 2);
       expect(z.shape).toEqual([2, 3, 1]);
     });
 
     test("throws on out of bounds axis", () => {
-      const x = np.array([1, 2, 3]);
+      using x = np.array([1, 2, 3]);
       expect(() => np.expandDims(x, 3)).toThrow(Error);
       expect(() => np.expandDims(x, -4)).toThrow(Error);
     });
 
     test("throws on repeated axis", () => {
-      const x = np.array([1, 2, 3]);
+      using x = np.array([1, 2, 3]);
       expect(() => np.expandDims(x, [0, 0])).toThrow(Error);
     });
 
     test("works with jvp", () => {
-      const x = np.array([1, 2, 3]);
-      const [y, dy] = jvp(
-        (x: np.Array) => np.expandDims(x, 0),
-        [x],
-        [np.ones([3])],
-      );
+      using x = np.array([1, 2, 3]);
+      using t = np.ones([3]);
+      const [y, dy] = jvp((x: np.Array) => np.expandDims(x, 0), [x], [t]);
+      using _y = y;
+      using _dy = dy;
       expect(y.shape).toEqual([1, 3]);
       expect(dy.shape).toEqual([1, 3]);
     });
 
     test("works with grad", () => {
-      const x = np.array([1, 2, 3]);
-      const dx = grad((x: np.Array) => np.expandDims(x, 0).sum())(x);
+      using x = np.array([1, 2, 3]);
+      using dx = grad((x: np.Array) => np.expandDims(x, 0).sum())(x);
       expect(dx.js()).toEqual([1, 1, 1]);
     });
   });
@@ -2138,22 +2401,22 @@ suite.each(devices)("device:%s", (device) => {
   if (device !== "webgl") {
     suite("jax.numpy.sort()", () => {
       test("sorts 1D array", () => {
-        const x = np.array([3, 1, 4, 1, 5, 9, 2, 6]);
-        const y = np.sort(x);
+        using x = np.array([3, 1, 4, 1, 5, 9, 2, 6]);
+        using y = np.sort(x);
         expect(y.js()).toEqual([1, 1, 2, 3, 4, 5, 6, 9]);
       });
 
       test("sorts 2D array along axis", () => {
-        const x = np.array([
+        using x = np.array([
           [3, 1, 2],
           [6, 4, 5],
         ]);
-        const y0 = np.sort(x, 0);
+        using y0 = np.sort(x, 0);
         expect(y0.js()).toEqual([
           [3, 1, 2],
           [6, 4, 5],
         ]);
-        const y1 = np.sort(x, 1);
+        using y1 = np.sort(x, 1);
         expect(y1.js()).toEqual([
           [1, 2, 3],
           [4, 5, 6],
@@ -2161,49 +2424,52 @@ suite.each(devices)("device:%s", (device) => {
       });
 
       test("sorts NaN to the end", () => {
-        const x = np.array([3, NaN, 1, NaN, 2]);
-        const y = np.sort(x);
+        using x = np.array([3, NaN, 1, NaN, 2]);
+        using y = np.sort(x);
         expect(y.js()).toEqual([1, 2, 3, NaN, NaN]);
       });
 
       test("works with jvp", () => {
-        const x = np.array([3, 1, 2]);
-        const [y, dy] = jvp(np.sort, [x], [np.array([10, 20, 30])]);
+        using x = np.array([3, 1, 2]);
+        using t = np.array([10, 20, 30]);
+        const [y, dy] = jvp(np.sort, [x], [t]);
+        using _y = y;
+        using _dy = dy;
         expect(y.js()).toEqual([1, 2, 3]);
         expect(dy.js()).toEqual([20, 30, 10]);
       });
 
       // Won't work until scatter is implemented.
       test.fails("works with grad", () => {
-        const x = np.array([3, 1, 4, 2]);
-        const f = (x: np.Array) => np.sort(x).slice([0, 2]).sum();
-        const dx = grad(f)(x);
+        using x = np.array([3, 1, 4, 2]);
+        using f = (x: np.Array) => np.sort(x).slice([0, 2]).sum();
+        using dx = grad(f)(x);
         expect(dx.js()).toEqual([0, 1, 0, 1]);
       });
 
       test("works inside a jit function", () => {
-        const x = np.array([5, 2, 8, 1]);
-        const f = jit((x: np.Array) => np.sort(x));
-        const y = f(x);
+        using x = np.array([5, 2, 8, 1]);
+        using f = jit((x: np.Array) => np.sort(x));
+        using y = f(x);
         expect(y.js()).toEqual([1, 2, 5, 8]);
       });
 
       test("works for int and bool dtypes", () => {
         for (const dtype of [np.int32, np.uint32]) {
-          const x = np.array([3, 1, 4, 1, 5], { dtype });
-          const y = np.sort(x);
+          using x = np.array([3, 1, 4, 1, 5], { dtype });
+          using y = np.sort(x);
           expect(y.js()).toEqual([1, 1, 3, 4, 5]);
           expect(y.dtype).toBe(dtype);
         }
-        const x = np.array([true, false, true, false, true]);
-        const y = np.sort(x);
+        using x = np.array([true, false, true, false, true]);
+        using y = np.sort(x);
         expect(y.js()).toEqual([false, false, true, true, true]);
         expect(y.dtype).toBe(np.bool);
       });
 
       test("handles zero-sized arrays", () => {
-        const x = np.array([[], [], []], { dtype: np.float32 });
-        const y = np.sort(x);
+        using x = np.array([[], [], []], { dtype: np.float32 });
+        using y = np.sort(x);
         expect(y.shape).toEqual([3, 0]);
         expect(y.dtype).toBe(np.float32);
       });
@@ -2212,26 +2478,27 @@ suite.each(devices)("device:%s", (device) => {
         // If the maximum workgroup size is 1024, then only 2048 elements can fit
         // into a single-workgroup sort. This test exercises multi-pass sorting in
         // global memory for GPUs.
-        const x = np.linspace(0, 1, 8192);
-        const y = np.sort(np.flip(x));
+        using x = np.linspace(0, 1, 8192);
+        using _fx = np.flip(x);
+        using y = np.sort(_fx);
         expect(y).toBeAllclose(x);
       });
     });
 
     suite("jax.numpy.argsort()", () => {
       test("argsorts 1D array", () => {
-        const x = np.array([3, 1, 4, 2, 5]);
-        const idx = np.argsort(x);
+        using x = np.array([3, 1, 4, 2, 5]);
+        using idx = np.argsort(x);
         expect(idx.js()).toEqual([1, 3, 0, 2, 4]);
         expect(idx.dtype).toBe("int32");
       });
 
       test("argsorts 2D array", () => {
-        const x = np.array([
+        using x = np.array([
           [3, 1, 2],
           [6, 4, 5],
         ]);
-        const idx = np.argsort(x, 1);
+        using idx = np.argsort(x, 1);
         expect(idx.js()).toEqual([
           [1, 2, 0],
           [1, 2, 0],
@@ -2239,7 +2506,7 @@ suite.each(devices)("device:%s", (device) => {
       });
 
       test("is a stable sorting algorithm", () => {
-        const x = np.array([
+        using x = np.array([
           3,
           1,
           1,
@@ -2252,21 +2519,22 @@ suite.each(devices)("device:%s", (device) => {
           -0,
           Infinity,
         ]);
-        const idx = np.argsort(x);
+        using idx = np.argsort(x);
         expect(idx.js()).toEqual([8, 9, 1, 2, 7, 5, 0, 4, 10, 3, 6]);
       });
 
       test("produces zero gradient", () => {
-        const x = np.array([3, 1, 2]);
+        using x = np.array([3, 1, 2]);
         const f = (x: np.Array) => np.argsort(x).astype(np.float32).sum();
-        const dx = grad(f)(x);
+        using dx = grad(f)(x);
         expect(dx.js()).toEqual([0, 0, 0]);
       });
 
       test("can argsort 8191 elements", async () => {
         // Testing 8191 as it's not exactly a power-of-two size.
-        const x = np.linspace(0, 1, 8191);
-        const y = np.argsort(np.flip(x));
+        using x = np.linspace(0, 1, 8191);
+        using _fx = np.flip(x);
+        using y = np.argsort(_fx);
         const ar = y.js() as number[];
         expect(ar).toEqual(Array.from({ length: 8191 }, (_, i) => 8190 - i));
       });
@@ -2275,25 +2543,25 @@ suite.each(devices)("device:%s", (device) => {
 
   suite("jax.numpy.take()", () => {
     test("takes elements from 1D array", () => {
-      const x = np.array([10, 20, 30, 40, 50]);
-      const indices = np.array([3, 0, 4, 1]);
-      const y = np.take(x, indices);
+      using x = np.array([10, 20, 30, 40, 50]);
+      using indices = np.array([3, 0, 4, 1]);
+      using y = np.take(x, indices);
       expect(y.js()).toEqual([40, 10, 50, 20]);
     });
 
     test("takes elements from 2D array along axis", () => {
-      const x = np.array([
+      using x = np.array([
         [10, 20, 30],
         [40, 50, 60],
         [70, 80, 90],
       ]);
-      const indices = np.array([2, 0]);
-      const y0 = np.take(x, indices, 0);
+      using indices = np.array([2, 0]);
+      using y0 = np.take(x, indices, 0);
       expect(y0.js()).toEqual([
         [70, 80, 90],
         [10, 20, 30],
       ]);
-      const y1 = np.take(x, indices, 1);
+      using y1 = np.take(x, indices, 1);
       expect(y1.js()).toEqual([
         [30, 10],
         [60, 40],

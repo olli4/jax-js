@@ -12,6 +12,7 @@ import {
   flip,
   fullRaise,
   gather,
+  insideTrace,
   ndim,
   newMain,
   pad,
@@ -34,6 +35,7 @@ import {
   flatten as treeFlatten,
   unflatten as treeUnflatten,
 } from "../tree";
+import { _registerJitCacheDisposer } from "./check-leaks";
 import { ClosedJaxpr, Jaxpr, jaxprAsFun, makeJaxpr } from "./jaxpr";
 import { jvp } from "./jvp";
 
@@ -200,18 +202,28 @@ function broadcastBatcher<P extends Primitive>(prim: P): VmapRule<P> {
 
     // Move the batch axes to the front. If needed, expand arrays so that all
     // inputs have the same number of dimensions.
+    const origArgs = args;
     args = args.map((x, i) => {
       if (dims[i] === null) return x;
-      x = moveBatchAxis(axisSize, dims[i], 0, x);
-      if (x.ndim < nd)
-        x = x.reshape([
-          x.shape[0],
-          ...rep(nd - x.ndim, 1),
-          ...x.shape.slice(1),
+      const moved = moveBatchAxis(axisSize, dims[i], 0, x);
+      if (moved.ndim < nd) {
+        const reshaped = moved.reshape([
+          moved.shape[0],
+          ...rep(nd - moved.ndim, 1),
+          ...moved.shape.slice(1),
         ]);
-      return x;
+        // Dispose moveBatchAxis intermediate replaced by reshape
+        if (moved !== x) moved[Symbol.dispose]();
+        return reshaped;
+      }
+      return moved;
     });
-    return [[bind1(prim, args, params)], [0]];
+    const result = bind1(prim, args, params);
+    // Dispose moveBatchAxis/reshape intermediates after they've been consumed
+    for (let i = 0; i < args.length; i++) {
+      if (args[i] !== origArgs[i]) args[i][Symbol.dispose]();
+    }
+    return [[result], [0]];
   };
 }
 
@@ -231,8 +243,11 @@ function lastDimsBatcher<P extends Primitive>(
     if (xBdim < x.ndim - inputDims) {
       return [bind(prim, [x], params), rep(numOutputs, xBdim)];
     }
+    const origX = x;
     x = moveBatchAxis(axisSize, xBdim, 0, x);
-    return [bind(prim, [x], params), rep(numOutputs, 0)];
+    const result = bind(prim, [x], params);
+    if (x !== origX) x[Symbol.dispose]();
+    return [result, rep(numOutputs, 0)];
   };
 }
 
@@ -267,16 +282,24 @@ const vmapRules: Partial<{ [P in Primitive]: VmapRule<P> }> = {
   },
   [Primitive.Dot](axisSize, [x, y], [xBdim, yBdim]) {
     // Move both the batch axes to the second-to-last position.
+    const origX = x,
+      origY = y;
     x = moveBatchAxis(axisSize, xBdim, x.ndim - (xBdim === null ? 1 : 2), x);
     y = moveBatchAxis(axisSize, yBdim, y.ndim - (yBdim === null ? 1 : 2), y);
     const z = dot(x, y);
+    if (x !== origX) x[Symbol.dispose]();
+    if (y !== origY) y[Symbol.dispose]();
     return [[z], [z.ndim - 1]]; // The batch axis is now at the end.
   },
   [Primitive.Conv](axisSize, [x, y], [xBdim, yBdim], params) {
     // Move batch axes to the front, then increment params.vmapDims.
+    const origX = x,
+      origY = y;
     x = moveBatchAxis(axisSize, xBdim, 0, x);
     y = moveBatchAxis(axisSize, yBdim, 0, y);
     const z = conv(x, y, { ...params, vmapDims: params.vmapDims + 1 });
+    if (x !== origX) x[Symbol.dispose]();
+    if (y !== origY) y[Symbol.dispose]();
     return [[z], [0]];
   },
   // TODO: pool, pool_transpose
@@ -284,9 +307,14 @@ const vmapRules: Partial<{ [P in Primitive]: VmapRule<P> }> = {
   [Primitive.Where]: broadcastBatcher(Primitive.Where),
   [Primitive.Concatenate](axisSize, xs, xBdims, { axis }) {
     const minBdim = Math.min(...xBdims.filter((d) => d !== null));
+    const origXs = xs;
     xs = xs.map((x, i) => moveBatchAxis(axisSize, xBdims[i], minBdim, x));
     const newAxis = axis + (minBdim <= axis ? 1 : 0);
-    return [[concatenate(xs, newAxis)], [minBdim]];
+    const result = concatenate(xs, newAxis);
+    for (let i = 0; i < xs.length; i++) {
+      if (xs[i] !== origXs[i]) xs[i][Symbol.dispose]();
+    }
+    return [[result], [minBdim]];
   },
   [Primitive.Split](axisSize, [x], [xBdim], { axis, sizes }) {
     assertNonNull(xBdim);
@@ -295,9 +323,14 @@ const vmapRules: Partial<{ [P in Primitive]: VmapRule<P> }> = {
     return [outs, rep(outs.length, xBdim)];
   },
   [Primitive.RandomBits](axisSize, [k0, k1], [bdim0, bdim1], { shape, mode }) {
+    const origK0 = k0,
+      origK1 = k1;
     k0 = moveBatchAxis(axisSize, bdim0, 0, k0);
     k1 = moveBatchAxis(axisSize, bdim1, 0, k1);
-    return [[randomBits(k0, k1, [axisSize, ...shape], mode)], [0]];
+    const result = randomBits(k0, k1, [axisSize, ...shape], mode);
+    if (k0 !== origK0) k0[Symbol.dispose]();
+    if (k1 !== origK1) k1[Symbol.dispose]();
+    return [[result], [0]];
   },
   [Primitive.Gather](
     axisSize,
@@ -320,28 +353,46 @@ const vmapRules: Partial<{ [P in Primitive]: VmapRule<P> }> = {
     const nd = Math.max(
       ...indices.map((m, i) => ndim(m) + (indicesBdim[i] === null ? 1 : 0)),
     );
+    const origIndices = [...indices];
     indices = indices.map((m, i) => {
       if (indicesBdim[i] === null) return m;
-      m = moveBatchAxis(axisSize, indicesBdim[i], 0, m);
-      if (m.ndim < nd)
-        m = m.reshape([
-          m.shape[0],
-          ...rep(nd - m.ndim, 1),
-          ...m.shape.slice(1),
+      const moved = moveBatchAxis(axisSize, indicesBdim[i], 0, m);
+      if (moved.ndim < nd) {
+        const reshaped = moved.reshape([
+          moved.shape[0],
+          ...rep(nd - moved.ndim, 1),
+          ...moved.shape.slice(1),
         ]);
-      return m;
+        if (moved !== m) moved[Symbol.dispose]();
+        return reshaped;
+      }
+      return moved;
     });
     // Now there are two cases. If x is not mapped, dispatch directly.
     if (xBdim === null) {
-      return [[gather(x, indices, axis, outDim)], [outDim]];
+      const result = gather(x, indices, axis, outDim);
+      for (let i = 0; i < indices.length; i++) {
+        if (indices[i] !== origIndices[i]) indices[i][Symbol.dispose]();
+      }
+      return [[result], [outDim]];
     } else {
       // Otherwise, we need a new `arange(axisSize)` index.
       // For simplicity, let's also move x's batch axis to the front.
+      const origX = x;
       x = moveBatchAxis(axisSize, xBdim, 0, x);
       const newAxis = [0, ...axis.map((ax) => ax + 1)];
-      const extraBatchIndex = arange(axisSize).reshape([-1, ...rep(nd - 1, 1)]);
+      const arangeArr = arange(axisSize);
+      const extraBatchIndex = arangeArr.reshape([-1, ...rep(nd - 1, 1)]);
+      arangeArr[Symbol.dispose]();
       indices.splice(0, 0, extraBatchIndex);
-      return [[gather(x, indices, newAxis, outDim)], [outDim]];
+      const result = gather(x, indices, newAxis, outDim);
+      if (x !== origX) x[Symbol.dispose]();
+      extraBatchIndex[Symbol.dispose]();
+      for (let i = 1; i < indices.length; i++) {
+        // skip extraBatchIndex at 0
+        if (indices[i] !== origIndices[i - 1]) indices[i][Symbol.dispose]();
+      }
+      return [[result], [outDim]];
     }
   },
   [Primitive.Transpose](axisSize, [x], [xBdim], { perm }) {
@@ -358,8 +409,11 @@ const vmapRules: Partial<{ [P in Primitive]: VmapRule<P> }> = {
   },
   [Primitive.Reshape](axisSize, [x], [xBdim], { shape }) {
     // Move xBdim to the front, so reshape can have contiguous axes.
+    const origX = x;
     x = moveBatchAxis(axisSize, xBdim, 0, x);
-    return [[reshape(x, [axisSize, ...shape])], [0]];
+    const result = reshape(x, [axisSize, ...shape]);
+    if (x !== origX) x[Symbol.dispose]();
+    return [[result], [0]];
   },
   [Primitive.Flip](axisSize, [x], [xBdim], { axis }) {
     assertNonNull(xBdim);
@@ -386,31 +440,38 @@ const vmapRules: Partial<{ [P in Primitive]: VmapRule<P> }> = {
   ) {
     if (aBdim === null) {
       // If only vmapping over b, we can just call TriangularSolve directly.
+      const origB = b;
       b = moveBatchAxis(axisSize, bBdim, -3, b);
+      const bMoved = b;
       const [s, m, n] = b.shape.slice(-3);
       b = b.reshape([...b.shape.slice(0, -3), s * m, n]);
+      if (bMoved !== origB) bMoved[Symbol.dispose]();
       let x = bind1(Primitive.TriangularSolve, [a, b], { unitDiagonal });
-      x = x.reshape([...b.shape.slice(0, -2), s, m, n]);
+      const xOrig = x;
+      const savedShape = [...b.shape.slice(0, -2)];
+      x = x.reshape([...savedShape, s, m, n]);
+      if (b !== origB) b[Symbol.dispose]();
+      xOrig[Symbol.dispose]();
       return [[x], [x.ndim - 3]];
     }
+    const origA = a,
+      origB = b;
     a = moveBatchAxis(axisSize, aBdim, 0, a);
     b = moveBatchAxis(axisSize, bBdim, 0, b);
     const x = bind1(Primitive.TriangularSolve, [a, b], { unitDiagonal });
+    if (a !== origA) a[Symbol.dispose]();
+    if (b !== origB) b[Symbol.dispose]();
     return [[x], [0]];
   },
   [Primitive.Cholesky]: lastDimsBatcher(Primitive.Cholesky, 2),
   [Primitive.LU]: lastDimsBatcher(Primitive.LU, 2, 3),
   [Primitive.Jit](axisSize, args, dims, { name, jaxpr }) {
     const newJaxpr = vmapJaxpr(jaxpr, axisSize, dims);
-    const outs = bind(
-      Primitive.Jit,
-      [...newJaxpr.consts, ...args],
-      {
-        name: `${name}_vmap`,
-        jaxpr: newJaxpr.jaxpr,
-        numConsts: newJaxpr.consts.length,
-      },
-    );
+    const outs = bind(Primitive.Jit, [...newJaxpr.consts, ...args], {
+      name: `${name}_vmap`,
+      jaxpr: newJaxpr.jaxpr,
+      numConsts: newJaxpr.consts.length,
+    });
     return [outs, rep(outs.length, 0)];
   },
   [Primitive.DynamicUpdateSlice]() {
@@ -494,18 +555,42 @@ const vmapRules: Partial<{ [P in Primitive]: VmapRule<P> }> = {
       reverse,
     });
 
+    // Dispose moveBatchAxis/moveaxis/broadcast intermediates
+    for (let i = 0; i < movedConsts.length; i++) {
+      if (movedConsts[i] !== consts[i]) movedConsts[i][Symbol.dispose]();
+    }
+    for (let i = 0; i < movedCarry.length; i++) {
+      if (movedCarry[i] !== initCarry[i]) movedCarry[i][Symbol.dispose]();
+    }
+    for (let i = 0; i < movedXs.length; i++) {
+      if (movedXs[i] !== xs[i]) movedXs[i][Symbol.dispose]();
+    }
+
     // Results: carry has batch at axis 0, ys has batch at axis 1
     // Move ys batch from axis 1 to axis 0
     const carryOut = results.slice(0, numCarry);
     const ysOut = results.slice(numCarry);
 
-    const movedYs = ysOut.map((y) => moveaxis(y, 1, 0));
+    const movedYs = ysOut.map((y) => {
+      const moved = moveaxis(y, 1, 0);
+      if (moved !== y) y[Symbol.dispose]();
+      return moved;
+    });
 
     return [[...carryOut, ...movedYs], rep(numCarry + numY, 0)];
   },
 };
 
 const vmapJaxprCache = new Map<Jaxpr, Map<string, ClosedJaxpr>>();
+
+_registerJitCacheDisposer(() => {
+  console.log("[vmap] clearing vmapJaxprCache, size:", vmapJaxprCache.size);
+  for (const inner of vmapJaxprCache.values()) {
+    for (const jaxpr of inner.values()) jaxpr.dispose();
+    inner.clear();
+  }
+  vmapJaxprCache.clear();
+});
 
 function vmapJaxpr(
   jaxpr: Jaxpr,
@@ -528,8 +613,8 @@ function vmapJaxpr(
     shape.splice(dims[i], 0, axisSize); // Insert the mapped axis into the shape.
     return new ShapedArray(shape, v.aval.dtype, v.aval.weakType);
   });
-  const { jaxpr: newJaxpr } = makeJaxpr(
-    (args: Tracer[]) => vmapFlat(jaxprAsFun(jaxpr), dims, args),
+  const { jaxpr: newJaxpr } = makeJaxpr((args: Tracer[]) =>
+    vmapFlat(jaxprAsFun(jaxpr), dims, args),
   )(inAvals);
 
   if (!vmapJaxprCache.has(jaxpr)) vmapJaxprCache.set(jaxpr, new Map());
@@ -576,9 +661,11 @@ function vmapFlat(
     const tracersOut = outs.map((out) => fullRaise(trace, out) as BatchTracer);
     [valsOut, bdimsOut] = unzip2(tracersOut.map((t) => [t.val, t.batchDim]));
   }
-  return zip(valsOut, bdimsOut).map(([valOut, bdim]) =>
-    moveBatchAxis(axisSize, bdim, 0, valOut),
-  ); // outs_transposed
+  return zip(valsOut, bdimsOut).map(([valOut, bdim]) => {
+    const result = moveBatchAxis(axisSize, bdim, 0, valOut);
+    if (result !== valOut) valOut[Symbol.dispose]();
+    return result;
+  }); // outs_transposed
 }
 
 export function vmap(
@@ -631,7 +718,14 @@ export function jacfwd(f: any) {
       throw new TypeError("jacfwd only supports 1D inputs");
     }
     const [size] = x.shape;
-    const pushfwd = (v: Tracer) => jvp(f, [x], [v])[1];
-    return vmap(pushfwd, [0])(eye(size, undefined, { dtype: x.dtype }));
+    const pushfwd = (v: Tracer) => {
+      const [primals, tangents] = jvp(f, [x], [v]);
+      for (const p of primals) p[Symbol.dispose]();
+      return tangents;
+    };
+    const eyeMatrix = eye(size, undefined, { dtype: x.dtype });
+    const result = vmap(pushfwd, [0])(eyeMatrix);
+    eyeMatrix.dispose();
+    return result;
   };
 }

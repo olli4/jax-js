@@ -2,60 +2,303 @@ import { __export } from "./chunk-Cl8Af3a2.js";
 import { AluExp, AluGroup, AluOp, AluVar, DEBUG, DType, FpHash, Kernel, PPrint, Reduction, Routine, Routines, ShapeTracker, accessorAluExp, accessorGlobal, assertNonNull, byteWidth, checkAxis, checkInts, deepEqual, defaultDevice, devices, dtypedArray, dtypedJsArray, generalBroadcast, getBackend, getScanRoutineInfo, init, invertPermutation, isFloatDtype, isNumberPair, isPermutation, normalizeAxis, partitionList, prod, promoteTypes, range, recursiveFlatten, rep, runWithCache, setDebug, toposort, unravelAlu, unzip2, zip, zipn } from "./backend-C_OH9-qi.js";
 
 //#region src/frontend/check-leaks.ts
-/** Whether leak tracking is currently enabled. Checked in Array constructor/dispose. */
-let _leakTrackingEnabled = false;
-/** Map from live tracked Array → creation stack trace string. */
-const _leakTrackingMap = /* @__PURE__ */ new Map();
-/** Snapshot of slot counts per backend device at start. */
-const _startSlotCounts = /* @__PURE__ */ new Map();
-/** Devices to check, captured at start time. */
-const _devices = [];
-/** Get slot count from a backend (all 3 implement slotCount()). */
-function slotCount(device) {
-	return getBackend(device).slotCount();
+const _jitCacheDisposers = [];
+/** Register a callback that clears a JIT-related cache. Called by jit.ts. */
+function _registerJitCacheDisposer(fn) {
+	_jitCacheDisposers.push(fn);
 }
-/** Parse a stack trace to find the first user-code frame (skip jax-js internals). */
-function parseUserFrame(stack$1) {
-	const lines = stack$1.split("\n");
-	for (const line of lines) {
-		const trimmed = line.trim();
-		if (trimmed.startsWith("Error")) continue;
-		if (trimmed.includes("/src/frontend/") || trimmed.includes("/src/backend/") || trimmed.includes("/src/library/") || trimmed.includes("/src/alu") || trimmed.includes("/src/routine") || trimmed.includes("/src/shape") || trimmed.includes("/src/tree") || trimmed.includes("/src/utils") || trimmed.includes("/src/index") || trimmed.includes("/dist/") || trimmed.includes("node_modules")) continue;
-		return trimmed;
+/**
+* Per-function jit() cache disposers. Each jit() call registers a callback
+* that disposes its ClosedJaxpr consts and clears its cache. This allows
+* `_disposeAllJitCaches()` to clean up module-level jit functions whose consts
+* were created during a test session.
+*/
+const _jitFunctionDisposers = /* @__PURE__ */ new Set();
+function _disposeAllJitCaches() {
+	for (const fn of _jitCacheDisposers) fn();
+	for (const fn of _jitFunctionDisposers) fn();
+}
+/** True only between start() and stop(). Checked in Array ctor/dispose. */
+let _leakTrackingEnabled = false;
+/**
+* Live tracked Arrays → Error captured at construction time.
+* `new Error()` records V8 frame pointers cheaply; the `.stack` string
+* is only formatted on first access (cold path, inside stop()).
+*/
+const _leakTrackingMap = /* @__PURE__ */ new Map();
+/**
+* When `trackRefs` is enabled, records the last `.ref` call site per array.
+* Only populated when `start({ trackRefs: true })` — checked in array.ts.
+*/
+let _trackRefsEnabled = false;
+const _lastRefMap = /* @__PURE__ */ new Map();
+/** Set of OwnedFunction objects (linearize/vjp results) created during tracking. */
+const _leakTrackingOwnedFns = /* @__PURE__ */ new Set();
+const _startSlots = /* @__PURE__ */ new Map();
+let _active = false;
+/**
+* Library source URL prefix, derived from this module's own URL.
+* Any stack frame whose URL starts with this is library-internal.
+* Computed once at load time (not on the hot path).
+*/
+const _libSrcPrefix = (() => {
+	try {
+		const url = import.meta.url;
+		const i = url.lastIndexOf("/src/frontend/check-leaks.");
+		if (i >= 0) return url.slice(0, i + 1) + "src/";
+	} catch {}
+	return null;
+})();
+/**
+* Detect which package a raw frame URL belongs to.
+* Returns the package name (e.g. "@jax-js/jax", "some-lib") or null for user code.
+*/
+function detectPackage(rawUrl) {
+	const nm = rawUrl.match(/node_modules\/((?:@[^/]+\/)?[^/]+)/);
+	if (nm) return nm[1];
+	if (_libSrcPrefix !== null && rawUrl.startsWith(_libSrcPrefix)) return "@jax-js/jax";
+	return null;
+}
+/** Convert a Vite/V8 stack location to a workspace-relative path. */
+function toRelativePath(raw) {
+	let loc = raw.replace(/\?[^:]*(?=:\d+:\d+)/, "");
+	loc = loc.replace(/^https?:\/\/[^/]+\//, "");
+	if (loc.startsWith("@fs/")) {
+		loc = loc.slice(4);
+		if (!loc.startsWith("/")) loc = "/" + loc;
 	}
-	return lines.find((l) => l.trim().startsWith("at"))?.trim() ?? "(unknown)";
+	loc = loc.replace(/^file:\/\//, "");
+	for (const m of [
+		"/src/",
+		"/test/",
+		"/packages/",
+		"/bench/"
+	]) {
+		const i = loc.indexOf(m);
+		if (i >= 0) return loc.slice(i + 1);
+	}
+	return loc;
+}
+/** Boilerplate frames to skip (Array constructor internals). */
+const SKIP_FUNCS = [
+	"new Array",
+	"new PendingExecute",
+	"Array2",
+	"new Array2"
+];
+/** Dep functions that appear in every creation stack — filtered from via chain. */
+const VIA_SKIP = new Set([
+	"bind",
+	"bind1",
+	"pureArray",
+	"fullLower",
+	"fullRaise"
+]);
+/**
+* Walk the Error's stack to find the creation site.
+* Accessing err.stack here triggers V8's lazy string formatting.
+*/
+function findCreationSite(err) {
+	const stack$1 = err.stack;
+	if (!stack$1) return {
+		location: "(unknown)",
+		via: null,
+		pkg: "(unknown)"
+	};
+	let lastDepLoc = null;
+	let lastDepPkg = null;
+	/** Dep function names (innermost-first) for building via chain. */
+	const depChain = [];
+	let prevClean = null;
+	for (const line of stack$1.split("\n")) {
+		const trimmed = line.trim();
+		if (!trimmed.startsWith("at ")) continue;
+		let rawLoc;
+		let funcName;
+		const m = trimmed.match(/^at\s+(.+?)\s+\((.+)\)$/);
+		if (m) {
+			funcName = m[1];
+			rawLoc = m[2];
+		} else rawLoc = trimmed.slice(3);
+		const location = toRelativePath(rawLoc);
+		const pathOnly = location.replace(/:\d+:\d+$/, "");
+		if (pathOnly === "<anonymous>" || pathOnly === "native" || pathOnly.startsWith("eval ")) continue;
+		if (funcName && SKIP_FUNCS.some((p) => funcName.startsWith(p))) continue;
+		const pkg = detectPackage(rawLoc);
+		if (pkg && !/\.test\.[jt]sx?$/.test(pathOnly)) {
+			lastDepLoc = location;
+			lastDepPkg = pkg;
+			const clean = funcName?.replace(/^(Module|Object)\./, "") ?? null;
+			if (clean && clean !== prevClean && !VIA_SKIP.has(clean)) {
+				depChain.push(clean);
+				prevClean = clean;
+			}
+			continue;
+		}
+		const chain = depChain.reverse().slice(0, 2);
+		const via = chain.length > 0 ? chain.join(" → ") : null;
+		return {
+			location,
+			via,
+			pkg: null
+		};
+	}
+	return {
+		location: lastDepLoc ?? "(unknown)",
+		via: null,
+		pkg: lastDepPkg ?? "(unknown)"
+	};
+}
+function safeDesc(arr) {
+	try {
+		return arr.toString();
+	} catch {
+		return "(unknown)";
+	}
+}
+function safeRefCountNum(arr) {
+	try {
+		const rc = arr.refCount;
+		return typeof rc === "number" ? rc : 0;
+	} catch {
+		return 0;
+	}
+}
+function safeRefCount(arr) {
+	const rc = safeRefCountNum(arr);
+	return rc > 0 ? ` rc=${rc}` : "";
 }
 const checkLeaks = {
-	start() {
+	start(opts) {
 		_leakTrackingMap.clear();
-		_startSlotCounts.clear();
-		_devices.length = 0;
-		try {
-			const device = getBackend().type;
-			const count = slotCount(device);
-			_startSlotCounts.set(device, count);
-			_devices.push(device);
+		_lastRefMap.clear();
+		_trackRefsEnabled = opts?.trackRefs ?? false;
+		_startSlots.clear();
+		for (const d of devices) try {
+			_startSlots.set(d, getBackend(d).slotCount());
 		} catch {}
 		_leakTrackingEnabled = true;
+		_active = true;
 	},
-	stop() {
+	snapshot() {
+		const entries = [];
+		for (const [arr, err] of _leakTrackingMap) {
+			const site = findCreationSite(err);
+			const refErr = _lastRefMap.get(arr);
+			let lastRef = null;
+			if (refErr) {
+				const refSite = findCreationSite(refErr);
+				lastRef = refSite.location;
+			}
+			entries.push({
+				desc: safeDesc(arr),
+				rc: safeRefCountNum(arr),
+				location: site.location,
+				pkg: site.pkg,
+				lastRef
+			});
+		}
+		return entries;
+	},
+	stop(options) {
+		if (!_active) return {
+			leaked: 0,
+			details: [],
+			summary: "No leaks detected."
+		};
 		_leakTrackingEnabled = false;
+		_trackRefsEnabled = false;
+		_active = false;
+		_disposeAllJitCaches();
+		if (options?.autoDispose) {
+			for (const fn of _leakTrackingOwnedFns) try {
+				fn.dispose();
+			} catch {}
+			_leakTrackingOwnedFns.clear();
+			for (let pass = 0; pass < 3; pass++) {
+				let anyDisposed = false;
+				for (const [arr] of _leakTrackingMap) {
+					const rc = safeRefCountNum(arr);
+					if (rc > 0) try {
+						arr.dispose();
+						anyDisposed = true;
+					} catch {}
+				}
+				if (!anyDisposed) break;
+			}
+		}
 		let leaked = 0;
-		for (const device of _devices) {
-			const before = _startSlotCounts.get(device) ?? 0;
-			const after = slotCount(device);
-			leaked += after - before;
+		for (const [d, baseline] of _startSlots) try {
+			leaked += getBackend(d).slotCount() - baseline;
+		} catch {}
+		_startSlots.clear();
+		if (leaked === 0) {
+			_leakTrackingMap.clear();
+			_lastRefMap.clear();
+			_leakTrackingOwnedFns.clear();
+			return {
+				leaked: 0,
+				details: [],
+				summary: "No leaks detected."
+			};
 		}
 		const details = [];
-		for (const [arr, stack$1] of _leakTrackingMap) {
-			const desc = typeof arr.toString === "function" ? arr.toString() : "(unknown array)";
-			const frame = parseUserFrame(stack$1);
-			details.push(`${desc} created at ${frame}`);
+		const groups = /* @__PURE__ */ new Map();
+		/** Leak counts by package (null key = user code). */
+		const pkgCounts = /* @__PURE__ */ new Map();
+		for (const [arr, err] of _leakTrackingMap) {
+			const site = findCreationSite(err);
+			const desc = safeDesc(arr) + safeRefCount(arr);
+			details.push(`${desc} created at ${site.location}`);
+			let g = groups.get(site.location);
+			if (!g) {
+				g = {
+					count: 0,
+					descs: [],
+					via: site.via,
+					pkg: site.pkg,
+					maxRc: 0,
+					lastRefLocs: []
+				};
+				groups.set(site.location, g);
+			}
+			g.count++;
+			g.maxRc = Math.max(g.maxRc, safeRefCountNum(arr));
+			if (g.descs.length < 4) g.descs.push(desc);
+			const refErr = _lastRefMap.get(arr);
+			if (refErr && safeRefCountNum(arr) >= 2) {
+				const refSite = findCreationSite(refErr);
+				if (g.lastRefLocs.length < 2 && !g.lastRefLocs.includes(refSite.location)) g.lastRefLocs.push(refSite.location);
+			}
+			pkgCounts.set(site.pkg, (pkgCounts.get(site.pkg) ?? 0) + 1);
 		}
 		_leakTrackingMap.clear();
-		_startSlotCounts.clear();
-		_devices.length = 0;
-		const summary = leaked === 0 ? "No leaks detected." : `${leaked} slot(s) leaked:\n${details.length > 0 ? details.map((d) => `  - ${d}`).join("\n") : "  (no tracked arrays — leak may be from internal allocations)"}\n\nWrap computation in jit() or call .dispose().`;
+		_lastRefMap.clear();
+		_leakTrackingOwnedFns.clear();
+		const sorted = [...groups.entries()].sort((a, b) => Number(a[1].pkg !== null) - Number(b[1].pkg !== null) || b[1].count - a[1].count);
+		const total = [...pkgCounts.values()].reduce((a, b) => a + b, 0);
+		const lines = [`${leaked} slot(s) leaked (${total} tracked array(s)):\n`];
+		for (const [loc, g] of sorted) {
+			const descs = g.descs.join(", ") + (g.count > g.descs.length ? ", …" : "");
+			const tagParts = [];
+			if (g.pkg) tagParts.push(g.pkg);
+			if (g.via) tagParts.push(`via ${g.via}`);
+			const tag = tagParts.length > 0 ? `  (${tagParts.join(", ")})` : "";
+			lines.push(`  ${loc} — ${g.count}× ${descs}${tag}`);
+			for (const refLoc of g.lastRefLocs) lines.push(`    ↳ last .ref at ${refLoc}`);
+		}
+		const summaryParts = [];
+		for (const [pkg, count] of pkgCounts) summaryParts.push(pkg ? `${count} in ${pkg}` : `${count} from user code`);
+		if (summaryParts.length > 0) lines.push("", summaryParts.join(", ") + ".");
+		const tips = [];
+		if (leaked > total) tips.push(`${leaked - total} slot(s) not in tracked list (created before start() or by internal buffers).`);
+		if (total > leaked) tips.push(`Some tracked arrays share backend storage (${total} tracked, ${leaked} slots).`);
+		if (sorted.some(([, g]) => !g.pkg && g.maxRc === 1)) tips.push("rc=1 → never disposed. Call .dispose() when done.");
+		if (sorted.some(([, g]) => g.maxRc >= 2)) tips.push("rc≥2 → extra .ref without matching .dispose().");
+		if (pkgCounts.size > (pkgCounts.has(null) ? 1 : 0)) tips.push("Package-tagged leaks are library bugs, not user error.");
+		if (tips.length === 0) tips.push("Call .dispose() on unused results.");
+		lines.push("", ...tips);
+		const summary = lines.join("\n");
 		return {
 			leaked,
 			details,
@@ -63,7 +306,7 @@ const checkLeaks = {
 		};
 	},
 	get active() {
-		return _leakTrackingEnabled;
+		return _active;
 	}
 };
 
@@ -387,6 +630,63 @@ function dispose(tree) {
 }
 
 //#endregion
+//#region node_modules/.pnpm/@oxc-project+runtime@0.78.0/node_modules/@oxc-project/runtime/src/helpers/esm/usingCtx.js
+function _usingCtx() {
+	var r = "function" == typeof SuppressedError ? SuppressedError : function(r$1, e$2) {
+		var n$1 = Error();
+		return n$1.name = "SuppressedError", n$1.error = r$1, n$1.suppressed = e$2, n$1;
+	}, e$1 = {}, n = [];
+	function using(r$1, e$2) {
+		if (null != e$2) {
+			if (Object(e$2) !== e$2) throw new TypeError("using declarations can only be used with objects, functions, null, or undefined.");
+			if (r$1) var o = e$2[Symbol.asyncDispose || Symbol["for"]("Symbol.asyncDispose")];
+			if (void 0 === o && (o = e$2[Symbol.dispose || Symbol["for"]("Symbol.dispose")], r$1)) var t = o;
+			if ("function" != typeof o) throw new TypeError("Object is not disposable.");
+			t && (o = function o$1() {
+				try {
+					t.call(e$2);
+				} catch (r$2) {
+					return Promise.reject(r$2);
+				}
+			}), n.push({
+				v: e$2,
+				d: o,
+				a: r$1
+			});
+		} else r$1 && n.push({
+			d: e$2,
+			a: r$1
+		});
+		return e$2;
+	}
+	return {
+		e: e$1,
+		u: using.bind(null, !1),
+		a: using.bind(null, !0),
+		d: function d() {
+			var o, t = this.e, s = 0;
+			function next() {
+				for (; o = n.pop();) try {
+					if (!o.a && 1 === s) return s = 0, n.push(o), Promise.resolve().then(next);
+					if (o.d) {
+						var r$1 = o.d.call(o.v);
+						if (o.a) return s |= 2, Promise.resolve(r$1).then(next, err);
+					} else s |= 1;
+				} catch (r$2) {
+					return err(r$2);
+				}
+				if (1 === s) return t !== e$1 ? Promise.reject(t) : Promise.resolve();
+				if (t !== e$1) throw t;
+			}
+			function err(n$1) {
+				return t = t !== e$1 ? new r(n$1, t) : n$1, next();
+			}
+			return next();
+		}
+	};
+}
+
+//#endregion
 //#region src/frontend/core.ts
 /**
 * Frontend primitive operations, which are lowered into Kernel objects before
@@ -537,7 +837,11 @@ function reduce(x, op, axis = null, opts) {
 		op,
 		axis
 	});
-	if (opts?.keepdims) result = result.reshape(originalShape.map((dim, i) => axis.includes(i) ? 1 : dim));
+	if (opts?.keepdims) {
+		const preReshape = result;
+		result = result.reshape(originalShape.map((dim, i) => axis.includes(i) ? 1 : dim));
+		if (preReshape !== result) preReshape.dispose();
+	}
 	return result;
 }
 function dot$2(x, y) {
@@ -675,18 +979,23 @@ function pad$1(x, width) {
 	return bind1(Primitive.Pad, [x], { width: w });
 }
 function triangularSolve$1(a, b, { lower = false, unitDiagonal = false } = {}) {
-	const as = getShape(a);
-	const bs = getShape(b);
-	if (as.length < 2 || bs.length < 2) throw new Error(`triangular_solve: must be >=2D, got a=${as}, b=${bs}`);
-	const n = as[as.length - 2];
-	if (n !== as[as.length - 1] || n !== bs[bs.length - 1]) throw new Error(`triangular_solve: incompatible shapes a=${as}, b=${bs}`);
-	if (lower) {
-		a = flip$1(a, [-2, -1]);
-		b = flip$1(b, [-1]);
+	try {
+		var _usingCtx$1 = _usingCtx();
+		const as = getShape(a);
+		const bs = getShape(b);
+		if (as.length < 2 || bs.length < 2) throw new Error(`triangular_solve: must be >=2D, got a=${as}, b=${bs}`);
+		const n = as[as.length - 2];
+		if (n !== as[as.length - 1] || n !== bs[bs.length - 1]) throw new Error(`triangular_solve: incompatible shapes a=${as}, b=${bs}`);
+		if (!lower) return bind1(Primitive.TriangularSolve, [a, b], { unitDiagonal });
+		const aFlipped = _usingCtx$1.u(flip$1(a, [-2, -1]));
+		const bFlipped = _usingCtx$1.u(flip$1(b, [-1]));
+		const x = _usingCtx$1.u(bind1(Primitive.TriangularSolve, [aFlipped, bFlipped], { unitDiagonal }));
+		return flip$1(x, [-1]);
+	} catch (_) {
+		_usingCtx$1.e = _;
+	} finally {
+		_usingCtx$1.d();
 	}
-	let x = bind1(Primitive.TriangularSolve, [a, b], { unitDiagonal });
-	if (lower) x = flip$1(x, [-1]);
-	return x;
 }
 function cholesky$2(x) {
 	const aval = ShapedArray.fromAval(getAval(x));
@@ -745,6 +1054,18 @@ function newDynamic(main) {
 function currentTraceLevel() {
 	return traceStack[traceStack.length - 1].level;
 }
+/**
+* Returns true if code is currently executing inside a trace context (e.g.
+* makeJaxpr, jit, vmap). Disposal of ClosedJaxpr constants is unsafe inside
+* traces because the consts may be JaxprTracers or BatchTracers from an outer
+* trace that must remain alive.
+*
+* Note: traceStack always has at least 1 entry (the base EvalTrace at level 0),
+* so we check for length > 1 to detect non-eval traces.
+*/
+function insideTrace() {
+	return traceStack.length > 1;
+}
 var Trace = class {
 	constructor(main) {
 		this.main = main;
@@ -770,6 +1091,19 @@ var Tracer = class Tracer {
 	_trace;
 	constructor(trace$1) {
 		this._trace = trace$1;
+	}
+	/**
+	* Enables `using` declarations for automatic disposal at block exit.
+	*
+	* Default is a no-op on the abstract Tracer base. Only concrete `Array`
+	* overrides this to call `dispose()`. Calling `dispose()` here would be
+	* unsafe for JVPTracer / BatchTracer / PartialEvalTracer because it would
+	* cascade prematurely during `grad()` / `jvp()` / `vmap()` tracing.
+	*/
+	[Symbol.dispose]() {}
+	/** Current reference count (only meaningful on concrete Arrays). */
+	get refCount() {
+		return 0;
 	}
 	/** The shape of the array. */
 	get shape() {
@@ -845,8 +1179,16 @@ var Tracer = class Tracer {
 		if (n === 0) throw new Error("mean: cannot compute mean over zero-length axis");
 		const originalDtype = this.dtype;
 		const castDtype = promoteTypes(originalDtype, DType.Float32);
-		const result = reduce(this.astype(castDtype), AluOp.Add, axis, opts);
-		return result.mul(1 / n).astype(originalDtype);
+		const d = [];
+		const casted = this.astype(castDtype);
+		if (casted !== this) d.push(casted);
+		const result = reduce(casted, AluOp.Add, axis, opts);
+		d.push(result);
+		const scaled = result.mul(1 / n);
+		d.push(scaled);
+		const final_ = scaled.astype(originalDtype);
+		for (const v of d) if (v !== final_) v[Symbol.dispose]();
+		return final_;
 	}
 	/** Minimum of the elements of the array along a given axis. */
 	min(axis = null, opts) {
@@ -858,11 +1200,21 @@ var Tracer = class Tracer {
 	}
 	/** Test whether all array elements along a given axis evaluate to true. */
 	all(axis = null, opts) {
-		return this.astype(DType.Bool).min(axis, opts);
+		const boolArr = this.astype(DType.Bool);
+		try {
+			return boolArr.min(axis, opts);
+		} finally {
+			if (boolArr !== this) boolArr[Symbol.dispose]();
+		}
 	}
 	/** Test whether any array element along a given axis evaluates to true. */
 	any(axis = null, opts) {
-		return this.astype(DType.Bool).max(axis, opts);
+		const boolArr = this.astype(DType.Bool);
+		try {
+			return boolArr.max(axis, opts);
+		} finally {
+			if (boolArr !== this) boolArr[Symbol.dispose]();
+		}
 	}
 	/** Permute the dimensions of an array. Defaults to reversing the axis order. */
 	transpose(perm) {
@@ -884,11 +1236,27 @@ var Tracer = class Tracer {
 	}
 	/** Subtract an array from this one. */
 	sub(other) {
-		return this.add(neg(other));
+		try {
+			var _usingCtx3 = _usingCtx();
+			const n = _usingCtx3.u(neg(other));
+			return this.add(n);
+		} catch (_) {
+			_usingCtx3.e = _;
+		} finally {
+			_usingCtx3.d();
+		}
 	}
 	/** Divide an array by this one. */
 	div(other) {
-		if (isFloatDtype(this.dtype)) return this.mul(reciprocal$1(other));
+		if (isFloatDtype(this.dtype)) try {
+			var _usingCtx4 = _usingCtx();
+			const r = _usingCtx4.u(reciprocal$1(other));
+			return this.mul(r);
+		} catch (_) {
+			_usingCtx4.e = _;
+		} finally {
+			_usingCtx4.d();
+		}
 		return idiv(this, other);
 	}
 	/** Return specified diagonals. See `jax.numpy.diagonal` for full docs. */
@@ -899,24 +1267,36 @@ var Tracer = class Tracer {
 		axis2 = checkAxis(axis2, this.ndim);
 		if (axis1 === axis2) throw new Error("axis1 and axis2 must not be equal");
 		if (offset >= this.shape[axis2]) throw new Error("offset exceeds axis size");
+		const toDispose = [];
 		let ar = this;
 		if (axis1 !== ar.ndim - 2 || axis2 !== ar.ndim - 1) {
 			const perm = range(ar.ndim).filter((i) => i !== axis1 && i !== axis2).concat(axis1, axis2);
 			ar = ar.transpose(perm);
+			toDispose.push(ar);
 		}
 		const [n, m] = ar.shape.slice(-2);
 		const diagSize = Math.min(n, m - offset);
 		ar = ar.reshape([...ar.shape.slice(0, -2), n * m]);
+		toDispose.push(ar);
 		const npad = diagSize * (m + 1) - n * m;
-		if (npad > 0) ar = pad$1(ar, [...rep(ar.ndim - 1, [0, 0]), [0, npad]]);
-		else if (npad < 0) ar = shrink(ar, [...ar.shape.slice(0, -1), n * m + npad].map((x) => [0, x]));
+		if (npad > 0) {
+			ar = pad$1(ar, [...rep(ar.ndim - 1, [0, 0]), [0, npad]]);
+			toDispose.push(ar);
+		} else if (npad < 0) {
+			ar = shrink(ar, [...ar.shape.slice(0, -1), n * m + npad].map((x) => [0, x]));
+			toDispose.push(ar);
+		}
 		ar = ar.reshape([
 			...ar.shape.slice(0, -1),
 			diagSize,
 			m + 1
 		]);
-		ar = shrink(ar, [...ar.shape.slice(0, -1).map((x) => [0, x]), [offset, offset + 1]]).reshape(ar.shape.slice(0, -1));
-		return ar;
+		toDispose.push(ar);
+		const sliced = shrink(ar, [...ar.shape.slice(0, -1).map((x) => [0, x]), [offset, offset + 1]]);
+		toDispose.push(sliced);
+		const result = sliced.reshape(ar.shape.slice(0, -1));
+		for (const v of toDispose) if (v !== result) v[Symbol.dispose]();
+		return result;
 	}
 	/** Flatten the array without changing its data. */
 	flatten() {
@@ -941,13 +1321,21 @@ var Tracer = class Tracer {
 	*[Symbol.iterator]() {
 		if (this.ndim === 0) throw new Error("Cannot iterate over a scalar array");
 		let residual = this;
+		const n = this.shape[0];
 		const subarrayShape = this.shape.slice(1);
-		for (let i = 0; i < this.shape[0]; i++) {
+		for (let i = 0; i < n; i++) if (i < n - 1) {
 			const lr = split$2(residual, 0, [1, residual.shape[0] - 1]);
-			yield lr[0].reshape(subarrayShape);
+			if (residual !== this) residual[Symbol.dispose]?.();
+			const first = lr[0];
+			const reshaped = first.reshape(subarrayShape);
+			if (first !== reshaped) first[Symbol.dispose]?.();
+			yield reshaped;
 			residual = lr[1];
+		} else {
+			const reshaped = residual.reshape(subarrayShape);
+			if (residual !== reshaped && residual !== this) residual[Symbol.dispose]?.();
+			yield reshaped;
 		}
-		residual.dispose();
 	}
 	/**
 	* Return a sorted copy of an array in ascending order.
@@ -956,12 +1344,17 @@ var Tracer = class Tracer {
 	*/
 	sort(axis = -1) {
 		axis = checkAxis(axis, this.ndim);
-		if (this.shape[axis] <= 1) return this;
+		if (this.shape[axis] <= 1) return this.reshape(this.shape);
 		if (axis === this.ndim - 1) return sort$1(this);
 		const perm = range(this.ndim);
 		perm.splice(axis, 1);
 		perm.push(axis);
-		return sort$1(this.transpose(perm)).transpose(invertPermutation(perm));
+		const transposed = this.transpose(perm);
+		const sorted = sort$1(transposed);
+		const result = sorted.transpose(invertPermutation(perm));
+		if (transposed !== this) transposed[Symbol.dispose]();
+		if (sorted !== result) sorted[Symbol.dispose]();
+		return result;
 	}
 	/**
 	* Return the indices that would sort an array. Unlike `sort`, this is
@@ -980,9 +1373,13 @@ var Tracer = class Tracer {
 		const perm = range(this.ndim);
 		perm.splice(axis, 1);
 		perm.push(axis);
-		const [y, yi] = argsort$1(this.transpose(perm));
+		const transposed = this.transpose(perm);
+		const [y, yi] = argsort$1(transposed);
 		y.dispose();
-		return yi.transpose(invertPermutation(perm));
+		if (transposed !== this) transposed[Symbol.dispose]();
+		const result = yi.transpose(invertPermutation(perm));
+		if (yi !== result) yi[Symbol.dispose]();
+		return result;
 	}
 	/**
 	* Slice an array along one or more axes.
@@ -1077,8 +1474,16 @@ var Tracer = class Tracer {
 			basicShape.push(this.shape[axis++]);
 		}
 		let result = shrink(this, slice);
-		result = needsReshape ? reshape$1(result, basicShape) : result;
-		if (hasAdvancedIdx) result = gather(result, index.filter((a) => a instanceof Tracer), axesForGather, outDim);
+		if (needsReshape) {
+			const prev = result;
+			result = reshape$1(result, basicShape);
+			if (prev !== result) prev[Symbol.dispose]?.();
+		}
+		if (hasAdvancedIdx) {
+			const prev = result;
+			result = gather(result, index.filter((a) => a instanceof Tracer), axesForGather, outDim);
+			if (prev !== result) prev[Symbol.dispose]?.();
+		}
 		return result;
 	}
 };
@@ -1119,12 +1524,24 @@ function getAval(x) {
 	else if (typeof x === "boolean" || typeof x === "number") return new ShapedArray([], typeof x === "boolean" ? DType.Bool : DType.Float32, typeof x === "boolean" ? false : true);
 	else throw new TypeError(`Unknown value: ${x}`);
 }
+/**
+* When non-null, bind() pushes EvalTrace-level results (level 0) into this
+* array. Used by partialEvalFlat to track intermediate concrete Arrays created
+* during PE scope — these bypass PE tracking and would otherwise leak.
+* Activated in the Array constructor when set (not null).
+*/
+let _peArrayCreationTracker = null;
+function _setPACT(v) {
+	_peArrayCreationTracker = v;
+}
 function bind(prim, args, params = {}) {
 	const topTrace = findTopTrace(args);
 	const tracers = args.map((arg) => fullRaise(topTrace, arg));
 	const outs = topTrace.processPrimitive(prim, tracers, params);
 	if (DEBUG >= 5) console.info(`processing rule for ${prim} on ${tracers.map((x) => x.toString())} and got ${outs.map((x) => x.toString())}`);
-	return outs.map((out) => out.fullLower());
+	const lowered = outs.map((out) => out.fullLower());
+	for (let i = 0; i < args.length; i++) if (!(args[i] instanceof Tracer)) tracers[i][Symbol.dispose]();
+	return lowered;
 }
 function findTopTrace(xs) {
 	let topMain = traceStack[0];
@@ -1182,63 +1599,6 @@ var UseAfterFreeError = class extends ReferenceError {
 		super(`Referenced tracer ${tracer.toString()} has been disposed`);
 	}
 };
-
-//#endregion
-//#region node_modules/.pnpm/@oxc-project+runtime@0.78.0/node_modules/@oxc-project/runtime/src/helpers/esm/usingCtx.js
-function _usingCtx() {
-	var r = "function" == typeof SuppressedError ? SuppressedError : function(r$1, e$2) {
-		var n$1 = Error();
-		return n$1.name = "SuppressedError", n$1.error = r$1, n$1.suppressed = e$2, n$1;
-	}, e$1 = {}, n = [];
-	function using(r$1, e$2) {
-		if (null != e$2) {
-			if (Object(e$2) !== e$2) throw new TypeError("using declarations can only be used with objects, functions, null, or undefined.");
-			if (r$1) var o = e$2[Symbol.asyncDispose || Symbol["for"]("Symbol.asyncDispose")];
-			if (void 0 === o && (o = e$2[Symbol.dispose || Symbol["for"]("Symbol.dispose")], r$1)) var t = o;
-			if ("function" != typeof o) throw new TypeError("Object is not disposable.");
-			t && (o = function o$1() {
-				try {
-					t.call(e$2);
-				} catch (r$2) {
-					return Promise.reject(r$2);
-				}
-			}), n.push({
-				v: e$2,
-				d: o,
-				a: r$1
-			});
-		} else r$1 && n.push({
-			d: e$2,
-			a: r$1
-		});
-		return e$2;
-	}
-	return {
-		e: e$1,
-		u: using.bind(null, !1),
-		a: using.bind(null, !0),
-		d: function d() {
-			var o, t = this.e, s = 0;
-			function next() {
-				for (; o = n.pop();) try {
-					if (!o.a && 1 === s) return s = 0, n.push(o), Promise.resolve().then(next);
-					if (o.d) {
-						var r$1 = o.d.call(o.v);
-						if (o.a) return s |= 2, Promise.resolve(r$1).then(next, err);
-					} else s |= 1;
-				} catch (r$2) {
-					return err(r$2);
-				}
-				if (1 === s) return t !== e$1 ? Promise.reject(t) : Promise.resolve();
-				if (t !== e$1) throw t;
-			}
-			function err(n$1) {
-				return t = t !== e$1 ? new r(n$1, t) : n$1, next();
-			}
-			return next();
-		}
-	};
-}
 
 //#endregion
 //#region src/frontend/jaxpr.ts
@@ -1574,9 +1934,6 @@ var JaxprTracer = class extends Tracer {
 	dispose() {
 		this.#rc--;
 	}
-	[Symbol.dispose]() {
-		this.dispose();
-	}
 	/** Number of live references the user holds (1 + .ref count − .dispose count). */
 	get refCount() {
 		return this.#rc;
@@ -1596,11 +1953,18 @@ var JaxprTrace = class extends Trace {
 	}
 	/** Register a constant / literal in this Jaxpr. */
 	getOrMakeConstTracer(val) {
-		if (!(val instanceof Tracer)) val = pureArray(val);
+		let ownedByBuilder = false;
+		if (!(val instanceof Tracer)) {
+			val = pureArray(val);
+			ownedByBuilder = true;
+		} else if (val instanceof Array$1 && anonymousConstArrays.has(val)) {
+			ownedByBuilder = true;
+			anonymousConstArrays.delete(val);
+		}
 		let tracer = this.builder.constTracers.get(val);
 		if (tracer === void 0) {
 			tracer = this.builder.newTracer(this, ShapedArray.fromAval(getAval(val)));
-			val.ref;
+			if (!ownedByBuilder) val.ref;
 			this.builder.addConst(tracer, val);
 		} else tracer.trackLiftedConstant();
 		return tracer;
@@ -1669,6 +2033,7 @@ function _inlineLiterals({ jaxpr, consts }) {
 	for (let i = 0; i < consts.length; i++) if (ndim$1(consts[i]) === 0 && consts[i] instanceof Array$1) {
 		const ar = consts[i];
 		literals.set(jaxpr.inBinders[i], new Lit(ar.aval, ar.dataSync()[0]));
+		ar.dispose();
 	} else {
 		constBinders.push(jaxpr.inBinders[i]);
 		newConsts.push(consts[i]);
@@ -1901,7 +2266,14 @@ function makeJaxpr$1(f, opts) {
 			_usingCtx$1.u(newDynamic(main));
 			const trace$1 = new JaxprTrace(main);
 			const tracersIn = avalsIn.map((aval) => trace$1.newArg(typeof aval === "object" ? aval : pureArray(aval)));
-			const outs = fFlat(...tracersIn);
+			const prevTracker = _peArrayCreationTracker;
+			_setPACT(null);
+			let outs;
+			try {
+				outs = fFlat(...tracersIn);
+			} finally {
+				_setPACT(prevTracker);
+			}
 			const tracersOut = outs.map((out) => fullRaise(trace$1, out));
 			const jaxpr = builder.build(tracersIn, tracersOut);
 			if (outTree.value === void 0) throw new Error("outTree was not set in makeJaxpr");
@@ -1937,7 +2309,10 @@ function jit$1(f, opts) {
 	});
 	result.dispose = () => {
 		for (const { jaxpr } of cache.values()) jaxpr.dispose();
+		cache.clear();
 	};
+	result[Symbol.dispose] = result.dispose;
+	_jitFunctionDisposers.add(result.dispose);
 	return result;
 }
 
@@ -2812,6 +3187,15 @@ var JitProgramBuilder = class {
 	}
 };
 const jitCompileCache = /* @__PURE__ */ new Map();
+/**
+* Clear the internal JIT compilation cache. Called by `_disposeAllJitCaches()`
+* in jaxpr.ts during leak checking.
+* @internal
+*/
+function _clearJitCompileCache() {
+	jitCompileCache.clear();
+}
+_registerJitCacheDisposer(_clearJitCompileCache);
 function jitCompile(backend, jaxpr) {
 	const cacheKey = backend.type + "," + FpHash.hash(jaxpr);
 	const cached = jitCompileCache.get(cacheKey);
@@ -3430,7 +3814,8 @@ var Array$1 = class Array$1 extends Tracer {
 		this.#pendingSet = new Set(args.pending);
 		if (this.#pendingSet.size === 0) this.#pendingSet = null;
 		else if (this.#source instanceof AluExp) throw new Error("internal: AluExp source cannot have pending executes");
-		if (_leakTrackingEnabled) _leakTrackingMap.set(this, (/* @__PURE__ */ new Error()).stack ?? "(no stack)");
+		if (_leakTrackingEnabled) _leakTrackingMap.set(this, /* @__PURE__ */ new Error());
+		if (_peArrayCreationTracker) _peArrayCreationTracker.push(this);
 	}
 	/** @ignore */
 	get aval() {
@@ -3461,6 +3846,7 @@ var Array$1 = class Array$1 extends Tracer {
 	get ref() {
 		this.#check();
 		this.#rc++;
+		if (_trackRefsEnabled) _lastRefMap.set(this, /* @__PURE__ */ new Error());
 		return this;
 	}
 	/** Get the current reference count (for debugging memory management). */
@@ -3470,13 +3856,26 @@ var Array$1 = class Array$1 extends Tracer {
 	dispose() {
 		this.#check();
 		if (--this.#rc === 0) {
-			if (_leakTrackingEnabled) _leakTrackingMap.delete(this);
+			if (_leakTrackingMap.size > 0) _leakTrackingMap.delete(this);
 			for (const exe of this.#pending) exe.updateRc(-1);
 			if (typeof this.#source === "number") this.#backend.decRef(this.#source);
 		}
 	}
+	/**
+	* Override Tracer's no-op to actually dispose concrete Arrays.
+	*
+	* During PE tracing, concrete Arrays are created by PE's all-known evaluation
+	* path and tracked in knownIntermediates. Their lifecycle is managed by
+	* disposePeIntermediates after PE completes. If `using` declarations in JVP
+	* helpers also dispose these arrays, the double-dispose causes
+	* UseAfterFreeError when the ClosedJaxpr later accesses its consts.
+	*
+	* We detect PE scope via _peArrayCreationTracker (non-null when inside PE).
+	* JVP-only traces (no PE) still dispose normally — those intermediates have
+	* real Slots that need cleanup.
+	*/
 	[Symbol.dispose]() {
-		this.dispose();
+		if (!_peArrayCreationTracker && this.#rc > 0) this.dispose();
 	}
 	/** Get the pending executes as a list, trimming if already submitted. */
 	get #pending() {
@@ -3573,7 +3972,10 @@ var Array$1 = class Array$1 extends Tracer {
 			newShape.push(this.#st.shape[i]);
 		}
 		newShape.push(-1);
-		return this.#transpose(keptAxes.concat(shiftedAxes)).reshape(newShape);
+		const transposed = this.#transpose(keptAxes.concat(shiftedAxes));
+		const result = transposed.reshape(newShape);
+		transposed.dispose();
+		return result;
 	}
 	#transpose(perm) {
 		this.#check();
@@ -3625,7 +4027,9 @@ var Array$1 = class Array$1 extends Tracer {
 		} else ({dtype: castDtype, weakType: castWeakType} = promoteAvals(new ShapedArray([], castDtype, castWeakType), arrays[i].aval.scalar()));
 		const weakType = castWeakType && !strongTypeOutput;
 		const { backend, committed } = Array$1.#computeBackend(name, arrays);
+		const originalArrays = [...arrays];
 		arrays = arrays.map((ar) => ar._putSync(backend));
+		const preBroadcast = [...arrays];
 		arrays = Array$1.#broadcastArrays(arrays);
 		const newShape = [...arrays[0].shape];
 		if (arrays.every((ar) => ar.#source instanceof AluExp) && !reduceAxis) {
@@ -3635,6 +4039,8 @@ var Array$1 = class Array$1 extends Tracer {
 			});
 			if (arrays.every((ar) => deepEqual(ar.#st, arrays[0].#st))) {
 				const exp$4 = custom(sources);
+				for (let i = 0; i < arrays.length; i++) if (arrays[i] !== preBroadcast[i]) arrays[i].dispose();
+				for (let i = 0; i < originalArrays.length; i++) if (preBroadcast[i] !== originalArrays[i]) preBroadcast[i].dispose();
 				return new Array$1({
 					source: exp$4.simplify(),
 					st: arrays[0].#st,
@@ -3650,6 +4056,8 @@ var Array$1 = class Array$1 extends Tracer {
 				return accessorAluExp(src$1, ar.#st, unravelAlu(newShape, AluVar.idx));
 			}));
 			const st = ShapeTracker.fromShape(newShape);
+			for (let i = 0; i < arrays.length; i++) if (arrays[i] !== preBroadcast[i]) arrays[i].dispose();
+			for (let i = 0; i < originalArrays.length; i++) if (preBroadcast[i] !== originalArrays[i]) preBroadcast[i].dispose();
 			return new Array$1({
 				source: exp$3.simplify(),
 				st,
@@ -3692,6 +4100,8 @@ var Array$1 = class Array$1 extends Tracer {
 		const pending = new Set([...arrays.flatMap((ar) => ar.#pending)]);
 		for (const exe of pending) exe.updateRc(1);
 		pending.add(new PendingExecute(backend, kernel, inputs, [output]));
+		for (let i = 0; i < arrays.length; i++) if (arrays[i] !== preBroadcast[i]) arrays[i].dispose();
+		for (let i = 0; i < originalArrays.length; i++) if (preBroadcast[i] !== originalArrays[i]) preBroadcast[i].dispose();
 		return new Array$1({
 			source: output,
 			st: ShapeTracker.fromShape(newShape),
@@ -3790,10 +4200,17 @@ var Array$1 = class Array$1 extends Tracer {
 		}
 	}
 	#dataInline() {
-		this.#check();
-		if (!(this.#source instanceof AluExp)) throw new Error("internal: #dataInline called on non-AluExp source");
-		const ar = this.#newArrayFrom({ backend: getBackend("cpu") });
-		return ar.dataSync();
+		try {
+			var _usingCtx$1 = _usingCtx();
+			this.#check();
+			if (!(this.#source instanceof AluExp)) throw new Error("internal: #dataInline called on non-AluExp source");
+			const ar = _usingCtx$1.u(this.#newArrayFrom({ backend: getBackend("cpu") }));
+			return ar.dataSync();
+		} catch (_) {
+			_usingCtx$1.e = _;
+		} finally {
+			_usingCtx$1.d();
+		}
 	}
 	static #broadcastArrays(arrays) {
 		if (arrays.length === 0) throw new Error("Need at least one array to broadcast");
@@ -3983,7 +4400,10 @@ var Array$1 = class Array$1 extends Tracer {
 			},
 			[Primitive.Reduce]([x], { op, axis }) {
 				if (axis.length === 0) return [x];
-				return [x.#moveAxesDown(axis).#reduce(op)];
+				const moved = x.#moveAxesDown(axis);
+				const result = moved.#reduce(op);
+				moved.dispose();
+				return [result];
 			},
 			[Primitive.Pool]([x], { window, strides }) {
 				const st = pool(x.#st, window, strides);
@@ -3993,7 +4413,10 @@ var Array$1 = class Array$1 extends Tracer {
 				const n = inShape.length;
 				let st = poolTranspose(x.#st, inShape, window, strides);
 				st = st.reshape([...st.shape.slice(0, n), prod(st.shape.slice(n))]);
-				return [x.#reshape(st).#reduce(AluOp.Add)];
+				const reshaped = x.#reshape(st);
+				const result = reshaped.#reduce(AluOp.Add);
+				reshaped.dispose();
+				return [result];
 			},
 			[Primitive.Dot]([x, y]) {
 				return [Array$1.#naryCustom("dot", ([x$1, y$1]) => AluExp.mul(x$1, y$1), [x, y], { reduceAxis: true })];
@@ -4001,7 +4424,12 @@ var Array$1 = class Array$1 extends Tracer {
 			[Primitive.Conv]([x, y], params) {
 				checkConvShape(x.shape, y.shape, params);
 				const [stX, stY] = prepareConv(x.#st, y.#st, params);
-				return [Array$1.#naryCustom("conv", ([x$1, y$1]) => AluExp.mul(x$1, y$1), [x.#reshape(stX), y.#reshape(stY)], { reduceAxis: true })];
+				const xView = x.#reshape(stX);
+				const yView = y.#reshape(stY);
+				const result = Array$1.#naryCustom("conv", ([x$1, y$1]) => AluExp.mul(x$1, y$1), [xView, yView], { reduceAxis: true });
+				xView.dispose();
+				yView.dispose();
+				return [result];
 			},
 			[Primitive.Compare]([x, y], { op }) {
 				const custom = ([x$1, y$1]) => aluCompare(x$1, y$1, op);
@@ -4028,7 +4456,9 @@ var Array$1 = class Array$1 extends Tracer {
 					cum += sizes[i];
 				}
 				const custom = (exps) => exps.reduce(AluExp.add);
-				return [Array$1.#naryCustom("concatenate", custom, xsPadded)];
+				const result = Array$1.#naryCustom("concatenate", custom, xsPadded);
+				for (const p of xsPadded) p.dispose();
+				return [result];
 			},
 			[Primitive.Split]([x], { axis, sizes }) {
 				const outputs = [];
@@ -4050,15 +4480,18 @@ var Array$1 = class Array$1 extends Tracer {
 					dtype: DType.Uint32,
 					device: k0.device
 				}).reshape(genShape);
-				k0 = k0.#reshape(k0.#st.reshape(keyShape.concat(rep(genShape.length, 1))));
-				k1 = k1.#reshape(k1.#st.reshape(keyShape.concat(rep(genShape.length, 1))));
+				const k0View = k0.#reshape(k0.#st.reshape(keyShape.concat(rep(genShape.length, 1))));
+				const k1View = k1.#reshape(k1.#st.reshape(keyShape.concat(rep(genShape.length, 1))));
 				const custom = ([k0$1, k1$1, c0$1, c1$1]) => AluExp.threefry2x32(k0$1, k1$1, c0$1, c1$1, mode);
-				return [Array$1.#naryCustom("random_bits", custom, [
-					k0,
-					k1,
+				const result = Array$1.#naryCustom("random_bits", custom, [
+					k0View,
+					k1View,
 					c0,
 					c1
-				])];
+				]);
+				k0View.dispose();
+				k1View.dispose();
+				return [result];
 			},
 			[Primitive.Gather]([x, ...indices], { axis, outDim }) {
 				return [x.#gather(indices, axis, outDim)];
@@ -4422,9 +4855,21 @@ function dataToJs(dtype, data, shape$1) {
 	return ret;
 }
 /** If x is a value, lift it into an array, otherwise leave it be. */
+/**
+* WeakSet tracking arrays created by pureArray from raw (non-Tracer) values.
+* These arrays are "anonymous" — created transiently by fudgeArray/pureArray
+* inside library functions, with no user code holding a reference.
+* getOrMakeConstTracer checks this to avoid calling .ref on anonymous consts,
+* which would leak when the ClosedJaxpr is disposed.
+*/
+const anonymousConstArrays = /* @__PURE__ */ new WeakSet();
 function pureArray(x) {
 	if (x instanceof Tracer) return x;
-	else return array(x);
+	else {
+		const arr = array(x);
+		anonymousConstArrays.add(arr);
+		return arr;
+	}
 }
 var EvalTrace = class extends Trace {
 	pure = (x) => pureArray(x);
@@ -4559,34 +5004,63 @@ function arange(start, stop, step = 1, { dtype, device } = {}) {
 * `k>0` is above it.
 */
 function tri(n, m, k = 0, { dtype, device } = {}) {
-	m ??= n;
-	dtype ??= DType.Float32;
-	if (!Number.isInteger(n) || n < 0) throw new Error(`tri: n must be a non-negative integer, got ${n}`);
-	if (!Number.isInteger(m) || m < 0) throw new Error(`tri: m must be a non-negative integer, got ${m}`);
-	if (!Number.isInteger(k)) throw new Error(`tri: k must be an integer, got ${k}`);
-	const rows = arange(k, n + k, 1, {
-		dtype: DType.Int32,
-		device
-	});
-	const cols = arange(0, m, 1, {
-		dtype: DType.Int32,
-		device
-	});
-	return rows.reshape([n, 1]).greaterEqual(cols).astype(dtype);
+	try {
+		var _usingCtx3 = _usingCtx();
+		m ??= n;
+		dtype ??= DType.Float32;
+		if (!Number.isInteger(n) || n < 0) throw new Error(`tri: n must be a non-negative integer, got ${n}`);
+		if (!Number.isInteger(m) || m < 0) throw new Error(`tri: m must be a non-negative integer, got ${m}`);
+		if (!Number.isInteger(k)) throw new Error(`tri: k must be an integer, got ${k}`);
+		const rows = _usingCtx3.u(arange(k, n + k, 1, {
+			dtype: DType.Int32,
+			device
+		}));
+		const cols = _usingCtx3.u(arange(0, m, 1, {
+			dtype: DType.Int32,
+			device
+		}));
+		const rowsReshaped = _usingCtx3.u(rows.reshape([n, 1]));
+		const ge = rowsReshaped.greaterEqual(cols);
+		if (ge.dtype === dtype) return ge;
+		_usingCtx3.u(ge);
+		return ge.astype(dtype);
+	} catch (_) {
+		_usingCtx3.e = _;
+	} finally {
+		_usingCtx3.d();
+	}
 }
 /** Return the lower triangle of an array. Must be of dimension >= 2. */
 function tril(a, k = 0) {
-	if (ndim$1(a) < 2) throw new Error(`tril: input array must be at least 2D, got ${ndim$1(a)}D`);
-	a = fudgeArray(a);
-	const [n, m] = a.shape.slice(-2);
-	return where$1(tri(n, m, k, { dtype: DType.Bool }), a, zerosLike$1(a));
+	try {
+		var _usingCtx4 = _usingCtx();
+		if (ndim$1(a) < 2) throw new Error(`tril: input array must be at least 2D, got ${ndim$1(a)}D`);
+		a = fudgeArray(a);
+		const [n, m] = a.shape.slice(-2);
+		const mask = _usingCtx4.u(tri(n, m, k, { dtype: DType.Bool }));
+		const zeros$1 = _usingCtx4.u(zerosLike$1(a));
+		return where$1(mask, a, zeros$1);
+	} catch (_) {
+		_usingCtx4.e = _;
+	} finally {
+		_usingCtx4.d();
+	}
 }
 /** Return the upper triangle of an array. Must be of dimension >= 2. */
 function triu(a, k = 0) {
-	if (ndim$1(a) < 2) throw new Error(`tril: input array must be at least 2D, got ${ndim$1(a)}D`);
-	a = fudgeArray(a);
-	const [n, m] = a.shape.slice(-2);
-	return where$1(tri(n, m, k - 1, { dtype: DType.Bool }), zerosLike$1(a), a);
+	try {
+		var _usingCtx5 = _usingCtx();
+		if (ndim$1(a) < 2) throw new Error(`tril: input array must be at least 2D, got ${ndim$1(a)}D`);
+		a = fudgeArray(a);
+		const [n, m] = a.shape.slice(-2);
+		const mask = _usingCtx5.u(tri(n, m, k - 1, { dtype: DType.Bool }));
+		const zeros$1 = _usingCtx5.u(zerosLike$1(a));
+		return where$1(mask, zeros$1, a);
+	} catch (_) {
+		_usingCtx5.e = _;
+	} finally {
+		_usingCtx5.d();
+	}
 }
 /**
 * Return evenly spaced numbers over a specified interval.
@@ -4741,17 +5215,24 @@ function broadcastBatcher(prim) {
 		const firstIdx = dims.findIndex((d) => d !== null);
 		const firstBdim = dims[firstIdx] - args[firstIdx].ndim;
 		if (zip(args, dims).every(([x, d]) => d === null && ndim$1(x) < -firstBdim || d !== null && d - x.ndim === firstBdim)) return [[bind1(prim, args, params)], [nd + firstBdim]];
+		const origArgs = args;
 		args = args.map((x, i) => {
 			if (dims[i] === null) return x;
-			x = moveBatchAxis(axisSize, dims[i], 0, x);
-			if (x.ndim < nd) x = x.reshape([
-				x.shape[0],
-				...rep(nd - x.ndim, 1),
-				...x.shape.slice(1)
-			]);
-			return x;
+			const moved = moveBatchAxis(axisSize, dims[i], 0, x);
+			if (moved.ndim < nd) {
+				const reshaped = moved.reshape([
+					moved.shape[0],
+					...rep(nd - moved.ndim, 1),
+					...moved.shape.slice(1)
+				]);
+				if (moved !== x) moved[Symbol.dispose]();
+				return reshaped;
+			}
+			return moved;
 		});
-		return [[bind1(prim, args, params)], [0]];
+		const result = bind1(prim, args, params);
+		for (let i = 0; i < args.length; i++) if (args[i] !== origArgs[i]) args[i][Symbol.dispose]();
+		return [[result], [0]];
 	};
 }
 function unopBatcher(prim) {
@@ -4763,8 +5244,11 @@ function lastDimsBatcher(prim, inputDims, numOutputs = 1) {
 	return (axisSize, [x], [xBdim], params) => {
 		assertNonNull(xBdim);
 		if (xBdim < x.ndim - inputDims) return [bind(prim, [x], params), rep(numOutputs, xBdim)];
+		const origX = x;
 		x = moveBatchAxis(axisSize, xBdim, 0, x);
-		return [bind(prim, [x], params), rep(numOutputs, 0)];
+		const result = bind(prim, [x], params);
+		if (x !== origX) x[Symbol.dispose]();
+		return [result, rep(numOutputs, 0)];
 	};
 }
 const vmapRules = {
@@ -4797,27 +5281,36 @@ const vmapRules = {
 		return [[reduce(x, op, newAxis)], [outBdim]];
 	},
 	[Primitive.Dot](axisSize, [x, y], [xBdim, yBdim]) {
+		const origX = x, origY = y;
 		x = moveBatchAxis(axisSize, xBdim, x.ndim - (xBdim === null ? 1 : 2), x);
 		y = moveBatchAxis(axisSize, yBdim, y.ndim - (yBdim === null ? 1 : 2), y);
 		const z = dot$2(x, y);
+		if (x !== origX) x[Symbol.dispose]();
+		if (y !== origY) y[Symbol.dispose]();
 		return [[z], [z.ndim - 1]];
 	},
 	[Primitive.Conv](axisSize, [x, y], [xBdim, yBdim], params) {
+		const origX = x, origY = y;
 		x = moveBatchAxis(axisSize, xBdim, 0, x);
 		y = moveBatchAxis(axisSize, yBdim, 0, y);
 		const z = conv$1(x, y, {
 			...params,
 			vmapDims: params.vmapDims + 1
 		});
+		if (x !== origX) x[Symbol.dispose]();
+		if (y !== origY) y[Symbol.dispose]();
 		return [[z], [0]];
 	},
 	[Primitive.Compare]: broadcastBatcher(Primitive.Compare),
 	[Primitive.Where]: broadcastBatcher(Primitive.Where),
 	[Primitive.Concatenate](axisSize, xs, xBdims, { axis }) {
 		const minBdim = Math.min(...xBdims.filter((d) => d !== null));
+		const origXs = xs;
 		xs = xs.map((x, i) => moveBatchAxis(axisSize, xBdims[i], minBdim, x));
 		const newAxis = axis + (minBdim <= axis ? 1 : 0);
-		return [[concatenate$1(xs, newAxis)], [minBdim]];
+		const result = concatenate$1(xs, newAxis);
+		for (let i = 0; i < xs.length; i++) if (xs[i] !== origXs[i]) xs[i][Symbol.dispose]();
+		return [[result], [minBdim]];
 	},
 	[Primitive.Split](axisSize, [x], [xBdim], { axis, sizes }) {
 		assertNonNull(xBdim);
@@ -4826,9 +5319,13 @@ const vmapRules = {
 		return [outs, rep(outs.length, xBdim)];
 	},
 	[Primitive.RandomBits](axisSize, [k0, k1], [bdim0, bdim1], { shape: shape$1, mode }) {
+		const origK0 = k0, origK1 = k1;
 		k0 = moveBatchAxis(axisSize, bdim0, 0, k0);
 		k1 = moveBatchAxis(axisSize, bdim1, 0, k1);
-		return [[randomBits(k0, k1, [axisSize, ...shape$1], mode)], [0]];
+		const result = randomBits(k0, k1, [axisSize, ...shape$1], mode);
+		if (k0 !== origK0) k0[Symbol.dispose]();
+		if (k1 !== origK1) k1[Symbol.dispose]();
+		return [[result], [0]];
 	},
 	[Primitive.Gather](axisSize, [x, ...indices], [xBdim, ...indicesBdim], { axis, outDim }) {
 		if (indicesBdim.every((d) => d === null)) {
@@ -4841,23 +5338,38 @@ const vmapRules = {
 			return [[gather(x, indices, newAxis, newOutDim)], [newBdim]];
 		}
 		const nd = Math.max(...indices.map((m, i) => ndim$1(m) + (indicesBdim[i] === null ? 1 : 0)));
+		const origIndices = [...indices];
 		indices = indices.map((m, i) => {
 			if (indicesBdim[i] === null) return m;
-			m = moveBatchAxis(axisSize, indicesBdim[i], 0, m);
-			if (m.ndim < nd) m = m.reshape([
-				m.shape[0],
-				...rep(nd - m.ndim, 1),
-				...m.shape.slice(1)
-			]);
-			return m;
+			const moved = moveBatchAxis(axisSize, indicesBdim[i], 0, m);
+			if (moved.ndim < nd) {
+				const reshaped = moved.reshape([
+					moved.shape[0],
+					...rep(nd - moved.ndim, 1),
+					...moved.shape.slice(1)
+				]);
+				if (moved !== m) moved[Symbol.dispose]();
+				return reshaped;
+			}
+			return moved;
 		});
-		if (xBdim === null) return [[gather(x, indices, axis, outDim)], [outDim]];
-		else {
+		if (xBdim === null) {
+			const result = gather(x, indices, axis, outDim);
+			for (let i = 0; i < indices.length; i++) if (indices[i] !== origIndices[i]) indices[i][Symbol.dispose]();
+			return [[result], [outDim]];
+		} else {
+			const origX = x;
 			x = moveBatchAxis(axisSize, xBdim, 0, x);
 			const newAxis = [0, ...axis.map((ax) => ax + 1)];
-			const extraBatchIndex = arange(axisSize).reshape([-1, ...rep(nd - 1, 1)]);
+			const arangeArr = arange(axisSize);
+			const extraBatchIndex = arangeArr.reshape([-1, ...rep(nd - 1, 1)]);
+			arangeArr[Symbol.dispose]();
 			indices.splice(0, 0, extraBatchIndex);
-			return [[gather(x, indices, newAxis, outDim)], [outDim]];
+			const result = gather(x, indices, newAxis, outDim);
+			if (x !== origX) x[Symbol.dispose]();
+			extraBatchIndex[Symbol.dispose]();
+			for (let i = 1; i < indices.length; i++) if (indices[i] !== origIndices[i - 1]) indices[i][Symbol.dispose]();
+			return [[result], [outDim]];
 		}
 	},
 	[Primitive.Transpose](axisSize, [x], [xBdim], { perm }) {
@@ -4873,8 +5385,11 @@ const vmapRules = {
 		return [[broadcast(x, newShape, newAxis)], [xBdim]];
 	},
 	[Primitive.Reshape](axisSize, [x], [xBdim], { shape: shape$1 }) {
+		const origX = x;
 		x = moveBatchAxis(axisSize, xBdim, 0, x);
-		return [[reshape$1(x, [axisSize, ...shape$1])], [0]];
+		const result = reshape$1(x, [axisSize, ...shape$1]);
+		if (x !== origX) x[Symbol.dispose]();
+		return [[result], [0]];
 	},
 	[Primitive.Flip](axisSize, [x], [xBdim], { axis }) {
 		assertNonNull(xBdim);
@@ -4895,25 +5410,35 @@ const vmapRules = {
 	[Primitive.Argsort]: lastDimsBatcher(Primitive.Argsort, 1, 2),
 	[Primitive.TriangularSolve](axisSize, [a, b], [aBdim, bBdim], { unitDiagonal }) {
 		if (aBdim === null) {
+			const origB$1 = b;
 			b = moveBatchAxis(axisSize, bBdim, -3, b);
+			const bMoved = b;
 			const [s, m, n] = b.shape.slice(-3);
 			b = b.reshape([
 				...b.shape.slice(0, -3),
 				s * m,
 				n
 			]);
+			if (bMoved !== origB$1) bMoved[Symbol.dispose]();
 			let x$1 = bind1(Primitive.TriangularSolve, [a, b], { unitDiagonal });
+			const xOrig = x$1;
+			const savedShape = [...b.shape.slice(0, -2)];
 			x$1 = x$1.reshape([
-				...b.shape.slice(0, -2),
+				...savedShape,
 				s,
 				m,
 				n
 			]);
+			if (b !== origB$1) b[Symbol.dispose]();
+			xOrig[Symbol.dispose]();
 			return [[x$1], [x$1.ndim - 3]];
 		}
+		const origA = a, origB = b;
 		a = moveBatchAxis(axisSize, aBdim, 0, a);
 		b = moveBatchAxis(axisSize, bBdim, 0, b);
 		const x = bind1(Primitive.TriangularSolve, [a, b], { unitDiagonal });
+		if (a !== origA) a[Symbol.dispose]();
+		if (b !== origB) b[Symbol.dispose]();
 		return [[x], [0]];
 	},
 	[Primitive.Cholesky]: lastDimsBatcher(Primitive.Cholesky, 2),
@@ -4971,13 +5496,28 @@ const vmapRules = {
 			length,
 			reverse
 		});
+		for (let i = 0; i < movedConsts.length; i++) if (movedConsts[i] !== consts[i]) movedConsts[i][Symbol.dispose]();
+		for (let i = 0; i < movedCarry.length; i++) if (movedCarry[i] !== initCarry[i]) movedCarry[i][Symbol.dispose]();
+		for (let i = 0; i < movedXs.length; i++) if (movedXs[i] !== xs[i]) movedXs[i][Symbol.dispose]();
 		const carryOut = results.slice(0, numCarry);
 		const ysOut = results.slice(numCarry);
-		const movedYs = ysOut.map((y) => moveaxis(y, 1, 0));
+		const movedYs = ysOut.map((y) => {
+			const moved = moveaxis(y, 1, 0);
+			if (moved !== y) y[Symbol.dispose]();
+			return moved;
+		});
 		return [[...carryOut, ...movedYs], rep(numCarry + numY, 0)];
 	}
 };
 const vmapJaxprCache = /* @__PURE__ */ new Map();
+_registerJitCacheDisposer(() => {
+	console.log("[vmap] clearing vmapJaxprCache, size:", vmapJaxprCache.size);
+	for (const inner$1 of vmapJaxprCache.values()) {
+		for (const jaxpr of inner$1.values()) jaxpr.dispose();
+		inner$1.clear();
+	}
+	vmapJaxprCache.clear();
+});
 function vmapJaxpr(jaxpr, axisSize, dims) {
 	const cacheKey = JSON.stringify([axisSize, dims]);
 	const prevResult = vmapJaxprCache.get(jaxpr)?.get(cacheKey);
@@ -5017,7 +5557,11 @@ function vmapFlat(f, inAxes, args) {
 	} finally {
 		_usingCtx$1.d();
 	}
-	return zip(valsOut, bdimsOut).map(([valOut, bdim]) => moveBatchAxis(axisSize, bdim, 0, valOut));
+	return zip(valsOut, bdimsOut).map(([valOut, bdim]) => {
+		const result = moveBatchAxis(axisSize, bdim, 0, valOut);
+		if (result !== valOut) valOut[Symbol.dispose]();
+		return result;
+	});
 }
 function vmap$1(f, inAxes = 0) {
 	return (...args) => {
@@ -5041,8 +5585,15 @@ function jacfwd$1(f) {
 	return function jacobianForward(x) {
 		if (x.shape.length !== 1) throw new TypeError("jacfwd only supports 1D inputs");
 		const [size$1] = x.shape;
-		const pushfwd = (v) => jvp$1(f, [x], [v])[1];
-		return vmap$1(pushfwd, [0])(eye(size$1, void 0, { dtype: x.dtype }));
+		const pushfwd = (v) => {
+			const [primals, tangents] = jvp$1(f, [x], [v]);
+			for (const p of primals) p[Symbol.dispose]();
+			return tangents;
+		};
+		const eyeMatrix = eye(size$1, void 0, { dtype: x.dtype });
+		const result = vmap$1(pushfwd, [0])(eyeMatrix);
+		eyeMatrix.dispose();
+		return result;
 	};
 }
 
@@ -5071,20 +5622,35 @@ var JVPTracer = class extends Tracer {
 			this.tangent.dispose();
 		}
 	}
+	/**
+	* Override Tracer's no-op to cascade disposal to primal and tangent.
+	*
+	* During PE tracing, JVPTracers may wrap concrete Arrays tracked in
+	* PE's knownIntermediates. Disposing via `using` would conflict with
+	* PE's lifecycle management, so we skip when inside PE scope.
+	*/
+	[Symbol.dispose]() {
+		if (!_peArrayCreationTracker) this.dispose();
+	}
 };
 var JVPTrace = class extends Trace {
 	pure(val) {
 		return this.lift(pureArray(val));
 	}
 	lift(val) {
-		return new JVPTracer(this, val, zerosLike$1(val));
+		const zero = zerosLike$1(val);
+		if (zero instanceof Array$1) anonymousConstArrays.add(zero);
+		return new JVPTracer(this, val, zero);
 	}
 	processPrimitive(primitive, tracers, params) {
 		const [primalsIn, tangentsIn] = unzip2(tracers.map((x) => [x.primal, x.tangent]));
 		const jvpRule = jvpRules[primitive];
 		if (jvpRule === void 0) throw new Error(`No JVP rule for: ${primitive}`);
 		const [primalsOut, tangentsOut] = jvpRule(primalsIn, tangentsIn, params);
-		return zip(primalsOut, tangentsOut).map(([x, t]) => new JVPTracer(this, x, t));
+		const result = zip(primalsOut, tangentsOut).map(([x, t]) => new JVPTracer(this, x, t));
+		const intermediates = this.main.globalData;
+		if (intermediates) intermediates.push(...result);
+		return result;
 	}
 };
 /** Rule that applies the same operation to primals and tangents. */
@@ -5098,9 +5664,18 @@ function linearTangentsJvp(primitive) {
 /** Rule for product of gradients in bilinear operations. */
 function bilinearTangentsJvp(primitive) {
 	return ([x, y], [dx, dy], params) => {
-		const primal = bind1(primitive, [x, y], params);
-		const tangent = bind1(primitive, [x, dy], params).add(bind1(primitive, [dx, y], params));
-		return [[primal], [tangent]];
+		try {
+			var _usingCtx$1 = _usingCtx();
+			const primal = bind1(primitive, [x, y], params);
+			const xdy = _usingCtx$1.u(bind1(primitive, [x, dy], params));
+			const dxy = _usingCtx$1.u(bind1(primitive, [dx, y], params));
+			const tangent = xdy.add(dxy);
+			return [[primal], [tangent]];
+		} catch (_) {
+			_usingCtx$1.e = _;
+		} finally {
+			_usingCtx$1.d();
+		}
 	};
 }
 /** Rule that zeros out any tangents. */
@@ -5112,19 +5687,28 @@ function zeroTangentsJvp(primitive) {
 }
 /** Compute `a @ b.T`, batched to last two axes. */
 function batchMatmulT(a, b) {
-	return dot$2(a.reshape(a.shape.toSpliced(-1, 0, 1)), b.reshape(b.shape.toSpliced(-2, 0, 1)));
+	try {
+		var _usingCtx3 = _usingCtx();
+		const aReshaped = _usingCtx3.u(a.reshape(a.shape.toSpliced(-1, 0, 1)));
+		const bReshaped = _usingCtx3.u(b.reshape(b.shape.toSpliced(-2, 0, 1)));
+		return dot$2(aReshaped, bReshaped);
+	} catch (_) {
+		_usingCtx3.e = _;
+	} finally {
+		_usingCtx3.d();
+	}
 }
 /** Batch matrix transpose. */
 function mT(a) {
 	return moveaxis(a, -2, -1);
 }
 function sliceAxis(a, axis, p) {
-	const slices = Array(a.shape.length).fill([]);
+	const slices = globalThis.Array(a.shape.length).fill([]);
 	slices[checkAxis(axis, a.ndim)] = p;
 	return a.slice(...slices);
 }
 function padAxis(a, axis, p) {
-	const pads = Array(a.shape.length).fill([0, 0]);
+	const pads = globalThis.Array(a.shape.length).fill([0, 0]);
 	pads[checkAxis(axis, a.ndim)] = p;
 	return pad$1(a, pads);
 }
@@ -5133,23 +5717,57 @@ const jvpRules = {
 	[Primitive.Mul]: bilinearTangentsJvp(Primitive.Mul),
 	[Primitive.Idiv]: zeroTangentsJvp(Primitive.Idiv),
 	[Primitive.Mod]([x, y], [dx, dy]) {
-		if (!isFloatDtype(x.dtype) && !isFloatDtype(y.dtype)) {
-			const result = mod(x, y);
-			return [[result], [zerosLike$1(result)]];
+		try {
+			var _usingCtx4 = _usingCtx();
+			if (!isFloatDtype(x.dtype) && !isFloatDtype(y.dtype)) {
+				const result = mod(x, y);
+				return [[result], [zerosLike$1(result)]];
+			}
+			const q = _usingCtx4.u(idiv(x, y));
+			const dyq = _usingCtx4.u(dy.mul(q));
+			const tangent = dx.sub(dyq);
+			return [[mod(x, y)], [tangent]];
+		} catch (_) {
+			_usingCtx4.e = _;
+		} finally {
+			_usingCtx4.d();
 		}
-		const q = idiv(x, y);
-		return [[mod(x, y)], [dx.sub(dy.mul(q))]];
 	},
 	[Primitive.Min]([x, y], [dx, dy]) {
-		return [[min$1(x, y)], [where$1(less$1(y, x), dy, dx)]];
+		try {
+			var _usingCtx5 = _usingCtx();
+			const cond = _usingCtx5.u(less$1(y, x));
+			return [[min$1(x, y)], [where$1(cond, dy, dx)]];
+		} catch (_) {
+			_usingCtx5.e = _;
+		} finally {
+			_usingCtx5.d();
+		}
 	},
 	[Primitive.Max]([x, y], [dx, dy]) {
-		return [[max$1(x, y)], [where$1(less$1(x, y), dy, dx)]];
+		try {
+			var _usingCtx6 = _usingCtx();
+			const cond = _usingCtx6.u(less$1(x, y));
+			return [[max$1(x, y)], [where$1(cond, dy, dx)]];
+		} catch (_) {
+			_usingCtx6.e = _;
+		} finally {
+			_usingCtx6.d();
+		}
 	},
 	[Primitive.Neg]: linearTangentsJvp(Primitive.Neg),
 	[Primitive.Reciprocal]([x], [dx]) {
-		const xRecip = reciprocal$1(x);
-		return [[xRecip], [neg(xRecip.mul(xRecip)).mul(dx)]];
+		try {
+			var _usingCtx7 = _usingCtx();
+			const xRecip = reciprocal$1(x);
+			const xRecipSq = _usingCtx7.u(xRecip.mul(xRecip));
+			const negXRecipSq = _usingCtx7.u(neg(xRecipSq));
+			return [[xRecip], [negXRecipSq.mul(dx)]];
+		} catch (_) {
+			_usingCtx7.e = _;
+		} finally {
+			_usingCtx7.d();
+		}
 	},
 	[Primitive.Floor]: zeroTangentsJvp(Primitive.Floor),
 	[Primitive.Ceil]: zeroTangentsJvp(Primitive.Ceil),
@@ -5164,53 +5782,147 @@ const jvpRules = {
 		return [[bitcast(x, dtype)], [zerosLike$1(x)]];
 	},
 	[Primitive.Sin]([x], [dx]) {
-		return [[sin$1(x)], [cos$1(x).mul(dx)]];
+		try {
+			var _usingCtx8 = _usingCtx();
+			const cosX = _usingCtx8.u(cos$1(x));
+			return [[sin$1(x)], [cosX.mul(dx)]];
+		} catch (_) {
+			_usingCtx8.e = _;
+		} finally {
+			_usingCtx8.d();
+		}
 	},
 	[Primitive.Cos]([x], [dx]) {
-		return [[cos$1(x)], [neg(sin$1(x)).mul(dx)]];
+		try {
+			var _usingCtx9 = _usingCtx();
+			const sinX = _usingCtx9.u(sin$1(x));
+			const negSinX = _usingCtx9.u(neg(sinX));
+			return [[cos$1(x)], [negSinX.mul(dx)]];
+		} catch (_) {
+			_usingCtx9.e = _;
+		} finally {
+			_usingCtx9.d();
+		}
 	},
 	[Primitive.Asin]([x], [dx]) {
-		const denom = sqrt$1(reciprocal$1(cast(1, x.dtype).sub(x.mul(x))));
-		return [[asin$1(x)], [denom.mul(dx)]];
+		try {
+			var _usingCtx10 = _usingCtx();
+			const one = _usingCtx10.u(cast(1, x.dtype));
+			const xSq = _usingCtx10.u(x.mul(x));
+			const oneMinusXSq = _usingCtx10.u(one.sub(xSq));
+			const recip = _usingCtx10.u(reciprocal$1(oneMinusXSq));
+			const denom = _usingCtx10.u(sqrt$1(recip));
+			return [[asin$1(x)], [denom.mul(dx)]];
+		} catch (_) {
+			_usingCtx10.e = _;
+		} finally {
+			_usingCtx10.d();
+		}
 	},
 	[Primitive.Atan]([x], [dx]) {
-		const denom = cast(1, x.dtype).add(x.mul(x));
-		return [[atan$1(x)], [dx.div(denom)]];
+		try {
+			var _usingCtx11 = _usingCtx();
+			const one = _usingCtx11.u(cast(1, x.dtype));
+			const xSq = _usingCtx11.u(x.mul(x));
+			const denom = _usingCtx11.u(one.add(xSq));
+			return [[atan$1(x)], [dx.div(denom)]];
+		} catch (_) {
+			_usingCtx11.e = _;
+		} finally {
+			_usingCtx11.d();
+		}
 	},
 	[Primitive.Exp]([x], [dx]) {
 		const z = exp$1(x);
 		return [[z], [z.mul(dx)]];
 	},
 	[Primitive.Log]([x], [dx]) {
-		return [[log$1(x)], [reciprocal$1(x).mul(dx)]];
+		try {
+			var _usingCtx12 = _usingCtx();
+			const recipX = _usingCtx12.u(reciprocal$1(x));
+			return [[log$1(x)], [recipX.mul(dx)]];
+		} catch (_) {
+			_usingCtx12.e = _;
+		} finally {
+			_usingCtx12.d();
+		}
 	},
 	[Primitive.Erf]([x], [dx]) {
-		const coeff = 2 / Math.sqrt(Math.PI);
-		const expTerm = exp$1(neg(x.mul(x)));
-		return [[erf$1(x)], [expTerm.mul(coeff).mul(dx)]];
+		try {
+			var _usingCtx13 = _usingCtx();
+			const coeff = 2 / Math.sqrt(Math.PI);
+			const xSq = _usingCtx13.u(x.mul(x));
+			const negXSq = _usingCtx13.u(neg(xSq));
+			const expTerm = _usingCtx13.u(exp$1(negXSq));
+			const scaled = _usingCtx13.u(expTerm.mul(coeff));
+			return [[erf$1(x)], [scaled.mul(dx)]];
+		} catch (_) {
+			_usingCtx13.e = _;
+		} finally {
+			_usingCtx13.d();
+		}
 	},
 	[Primitive.Erfc]([x], [dx]) {
-		const coeff = -2 / Math.sqrt(Math.PI);
-		const expTerm = exp$1(neg(x.mul(x)));
-		return [[erfc$1(x)], [expTerm.mul(coeff).mul(dx)]];
+		try {
+			var _usingCtx14 = _usingCtx();
+			const coeff = -2 / Math.sqrt(Math.PI);
+			const xSq = _usingCtx14.u(x.mul(x));
+			const negXSq = _usingCtx14.u(neg(xSq));
+			const expTerm = _usingCtx14.u(exp$1(negXSq));
+			const scaled = _usingCtx14.u(expTerm.mul(coeff));
+			return [[erfc$1(x)], [scaled.mul(dx)]];
+		} catch (_) {
+			_usingCtx14.e = _;
+		} finally {
+			_usingCtx14.d();
+		}
 	},
 	[Primitive.Sqrt]([x], [dx]) {
-		const z = sqrt$1(x);
-		return [[z], [reciprocal$1(z.mul(2)).mul(dx)]];
+		try {
+			var _usingCtx15 = _usingCtx();
+			const z = sqrt$1(x);
+			const z2 = _usingCtx15.u(z.mul(2));
+			const recipZ2 = _usingCtx15.u(reciprocal$1(z2));
+			return [[z], [recipZ2.mul(dx)]];
+		} catch (_) {
+			_usingCtx15.e = _;
+		} finally {
+			_usingCtx15.d();
+		}
 	},
 	[Primitive.Reduce]([x], [dx], { op, axis }) {
 		if (op === AluOp.Add) return [[reduce(x, op, axis)], [reduce(dx, op, axis)]];
-		else if (op === AluOp.Mul) {
+		else if (op === AluOp.Mul) try {
+			var _usingCtx16 = _usingCtx();
 			const primal = reduce(x, op, axis);
-			const tangent = broadcast(primal, x.shape, axis).mul(reciprocal$1(x)).mul(dx).sum(axis);
+			const bcast = _usingCtx16.u(broadcast(primal, x.shape, axis));
+			const recip = _usingCtx16.u(reciprocal$1(x));
+			const bcastTimesRecip = _usingCtx16.u(bcast.mul(recip));
+			const bcastTimesRecipTimesDx = _usingCtx16.u(bcastTimesRecip.mul(dx));
+			const tangent = bcastTimesRecipTimesDx.sum(axis);
 			return [[primal], [tangent]];
-		} else if (op === AluOp.Min || op === AluOp.Max) {
+		} catch (_) {
+			_usingCtx16.e = _;
+		} finally {
+			_usingCtx16.d();
+		}
+		else if (op === AluOp.Min || op === AluOp.Max) try {
+			var _usingCtx17 = _usingCtx();
 			const primal = reduce(x, op, axis);
-			const notMin = notEqual$1(x, broadcast(primal, x.shape, axis));
-			const minCount = where$1(notMin, 0, 1).sum(axis);
-			const tangent = where$1(notMin, 0, dx).sum(axis).div(minCount);
+			const bcastPrimal = _usingCtx17.u(broadcast(primal, x.shape, axis));
+			const notMin = _usingCtx17.u(notEqual$1(x, bcastPrimal));
+			const whereNotMin0 = _usingCtx17.u(where$1(notMin, 0, 1));
+			const minCount = _usingCtx17.u(whereNotMin0.sum(axis));
+			const whereNotMin0Dx = _usingCtx17.u(where$1(notMin, 0, dx));
+			const sumDx = _usingCtx17.u(whereNotMin0Dx.sum(axis));
+			const tangent = sumDx.div(minCount);
 			return [[primal], [tangent]];
-		} else throw new Error(`JVP rule not implemented for reduce op: ${op}`);
+		} catch (_) {
+			_usingCtx17.e = _;
+		} finally {
+			_usingCtx17.d();
+		}
+		else throw new Error(`JVP rule not implemented for reduce op: ${op}`);
 	},
 	[Primitive.Pool]: linearTangentsJvp(Primitive.Pool),
 	[Primitive.PoolTranspose]: linearTangentsJvp(Primitive.PoolTranspose),
@@ -5235,58 +5947,117 @@ const jvpRules = {
 	[Primitive.Pad]: linearTangentsJvp(Primitive.Pad),
 	[Primitive.Sort]([x], [dx]) {
 		const [y, idx] = argsort$1(x);
-		return [[y], [gather(dx, [idx], [-1], -1)]];
+		const gatherResult = gather(dx, [idx], [-1], -1);
+		idx.dispose();
+		return [[y], [gatherResult]];
 	},
 	[Primitive.Argsort]([x], [dx]) {
 		const [y, idx] = argsort$1(x);
-		return [[y, idx.ref], [gather(dx, [idx], [-1], -1), zerosLike$1(idx)]];
+		const gatherResult = gather(dx, [idx], [-1], -1);
+		const zerosIdx = zerosLike$1(idx);
+		return [[y, idx], [gatherResult, zerosIdx]];
 	},
 	[Primitive.TriangularSolve]([a, b], [da, db], { unitDiagonal }) {
-		const x = triangularSolve$1(a, b, { unitDiagonal });
-		const dax = batchMatmulT(da, x);
-		const rhsT = db.sub(mT(dax));
-		const dx = triangularSolve$1(a, rhsT, { unitDiagonal });
-		return [[x], [dx]];
+		try {
+			var _usingCtx18 = _usingCtx();
+			const x = triangularSolve$1(a, b, { unitDiagonal });
+			const dax = _usingCtx18.u(batchMatmulT(da, x));
+			const mTdax = _usingCtx18.u(mT(dax));
+			const rhsT = _usingCtx18.u(db.sub(mTdax));
+			const dx = triangularSolve$1(a, rhsT, { unitDiagonal });
+			return [[x], [dx]];
+		} catch (_) {
+			_usingCtx18.e = _;
+		} finally {
+			_usingCtx18.d();
+		}
 	},
 	[Primitive.Cholesky]([a], [da]) {
-		const L = cholesky$2(a);
-		da = da.add(mT(da)).mul(.5);
-		const W = triangularSolve$1(L, da, { lower: true });
-		const ST = triangularSolve$1(L, mT(W), { lower: true });
-		const dL = batchMatmulT(L, triu(ST, 1).add(triu(ST)).mul(.5));
-		return [[L], [dL]];
+		try {
+			var _usingCtx19 = _usingCtx();
+			const L = cholesky$2(a);
+			const mTda = _usingCtx19.u(mT(da));
+			const daSymm = _usingCtx19.u(da.add(mTda));
+			const da2 = _usingCtx19.u(daSymm.mul(.5));
+			const W = _usingCtx19.u(triangularSolve$1(L, da2, { lower: true }));
+			const mTW = _usingCtx19.u(mT(W));
+			const ST = _usingCtx19.u(triangularSolve$1(L, mTW, { lower: true }));
+			const triuST1 = _usingCtx19.u(triu(ST, 1));
+			const triuST0 = _usingCtx19.u(triu(ST));
+			const triuSum = _usingCtx19.u(triuST1.add(triuST0));
+			const triuHalf = _usingCtx19.u(triuSum.mul(.5));
+			const dL = batchMatmulT(L, triuHalf);
+			return [[L], [dL]];
+		} catch (_) {
+			_usingCtx19.e = _;
+		} finally {
+			_usingCtx19.d();
+		}
 	},
 	[Primitive.LU]([a], [da]) {
-		const [luMatrix, pivots, permutation] = lu$1(a);
-		const [m, n] = a.shape.slice(-2);
-		const k = Math.min(m, n);
-		const luSliceL = sliceAxis(luMatrix, -1, [0, k]);
-		const lLower = tril(luSliceL, -1);
-		const lPadded = m > k ? padAxis(lLower, -1, [0, m - k]) : lLower;
-		const L = lPadded.add(eye(m));
-		const luSliceU = sliceAxis(luMatrix, -2, [0, k]);
-		const uUpper = triu(luSliceU);
-		const uPadded = n > k ? padAxis(uUpper, -2, [0, n - k]) : uUpper;
-		const uEye = n > k ? padAxis(padAxis(eye(n - k), -1, [k, 0]), -2, [k, 0]) : zerosLike$1(uPadded);
-		const U = uPadded.add(uEye);
-		const P = permutation.reshape([...permutation.shape, 1]).equal(arange(m)).astype(da.dtype);
-		const pda = batchMatmulT(P, mT(da));
-		const la = mT(triangularSolve$1(L, mT(pda), {
-			lower: true,
-			unitDiagonal: true
-		}));
-		const lau = triangularSolve$1(mT(U), la, { lower: true });
-		const lDot = batchMatmulT(L, mT(tril(lau, -1)));
-		const uDot = batchMatmulT(triu(lau), mT(U));
-		return [[
-			luMatrix,
-			pivots,
-			permutation
-		], [
-			lDot.add(uDot),
-			zerosLike$1(pivots),
-			zerosLike$1(permutation)
-		]];
+		try {
+			var _usingCtx20 = _usingCtx();
+			const [luMatrix, pivots, permutation] = lu$1(a);
+			const [m, n] = a.shape.slice(-2);
+			const k = Math.min(m, n);
+			const luSliceL = _usingCtx20.u(sliceAxis(luMatrix, -1, [0, k]));
+			const lLower = _usingCtx20.u(tril(luSliceL, -1));
+			const lPadded = _usingCtx20.u(m > k ? padAxis(lLower, -1, [0, m - k]) : lLower.ref);
+			const eyeM = _usingCtx20.u(eye(m));
+			const L = _usingCtx20.u(lPadded.add(eyeM));
+			const luSliceU = _usingCtx20.u(sliceAxis(luMatrix, -2, [0, k]));
+			const uUpper = _usingCtx20.u(triu(luSliceU));
+			const uPadded = _usingCtx20.u(n > k ? padAxis(uUpper, -2, [0, n - k]) : uUpper.ref);
+			const uEye = _usingCtx20.u(n > k ? (() => {
+				try {
+					var _usingCtx21 = _usingCtx();
+					const innerEye = _usingCtx21.u(eye(n - k));
+					const padded1 = _usingCtx21.u(padAxis(innerEye, -1, [k, 0]));
+					return padAxis(padded1, -2, [k, 0]);
+				} catch (_) {
+					_usingCtx21.e = _;
+				} finally {
+					_usingCtx21.d();
+				}
+			})() : zerosLike$1(uPadded));
+			const U = _usingCtx20.u(uPadded.add(uEye));
+			const permReshaped = _usingCtx20.u(permutation.reshape([...permutation.shape, 1]));
+			const arangeM = _usingCtx20.u(arange(m));
+			const permEq = _usingCtx20.u(permReshaped.equal(arangeM));
+			const P = _usingCtx20.u(permEq.astype(da.dtype));
+			const mTda = _usingCtx20.u(mT(da));
+			const pda = _usingCtx20.u(batchMatmulT(P, mTda));
+			const mTpda = _usingCtx20.u(mT(pda));
+			const solvedPda = _usingCtx20.u(triangularSolve$1(L, mTpda, {
+				lower: true,
+				unitDiagonal: true
+			}));
+			const la = _usingCtx20.u(mT(solvedPda));
+			const mTU = _usingCtx20.u(mT(U));
+			const lau = _usingCtx20.u(triangularSolve$1(mTU, la, { lower: true }));
+			const trilLau = _usingCtx20.u(tril(lau, -1));
+			const mTtrilLau = _usingCtx20.u(mT(trilLau));
+			const lDot = _usingCtx20.u(batchMatmulT(L, mTtrilLau));
+			const triuLau = _usingCtx20.u(triu(lau));
+			const mTU2 = _usingCtx20.u(mT(U));
+			const uDot = _usingCtx20.u(batchMatmulT(triuLau, mTU2));
+			const luDot = lDot.add(uDot);
+			const zerosPivots = zerosLike$1(pivots);
+			const zerosPerm = zerosLike$1(permutation);
+			return [[
+				luMatrix,
+				pivots,
+				permutation
+			], [
+				luDot,
+				zerosPivots,
+				zerosPerm
+			]];
+		} catch (_) {
+			_usingCtx20.e = _;
+		} finally {
+			_usingCtx20.d();
+		}
 	},
 	[Primitive.Jit](primals, tangents, { name, jaxpr }) {
 		const newJaxpr = jvpJaxpr(jaxpr);
@@ -5393,6 +6164,10 @@ const jvpRules = {
 	}
 };
 const jvpJaxprCache = /* @__PURE__ */ new Map();
+_registerJitCacheDisposer(() => {
+	for (const cj of jvpJaxprCache.values()) cj.dispose();
+	jvpJaxprCache.clear();
+});
 function jvpJaxpr(jaxpr) {
 	if (jvpJaxprCache.has(jaxpr)) return jvpJaxprCache.get(jaxpr);
 	const inAvals = jaxpr.inBinders.map((v) => v.aval);
@@ -5402,17 +6177,35 @@ function jvpJaxpr(jaxpr) {
 }
 function jvpFlat(f, primals, tangents) {
 	try {
-		var _usingCtx$1 = _usingCtx();
-		const main = _usingCtx$1.u(newMain(JVPTrace));
+		var _usingCtx22 = _usingCtx();
+		const intermediateTracers = [];
+		const main = _usingCtx22.u(newMain(JVPTrace, intermediateTracers));
 		const trace$1 = new JVPTrace(main);
-		const tracersIn = zip(primals, tangents).map(([x, t]) => new JVPTracer(trace$1, pureArray(x), pureArray(t)));
+		const newlyCreatedInputs = [];
+		const tracersIn = zip(primals, tangents).map(([x, t]) => {
+			const px = pureArray(x);
+			const pt = pureArray(t);
+			if (px !== x) newlyCreatedInputs.push(px);
+			if (pt !== t) newlyCreatedInputs.push(pt);
+			return new JVPTracer(trace$1, px, pt);
+		});
 		const outs = f(...tracersIn);
 		const tracersOut = outs.map((out) => fullRaise(trace$1, out));
-		return unzip2(tracersOut.map((t) => [t.primal, t.tangent]));
+		const result = unzip2(tracersOut.map((t) => [t.primal, t.tangent]));
+		if (main.level <= 1) {
+			const outputSet = new Set(tracersOut);
+			for (const t of intermediateTracers) if (!outputSet.has(t)) {
+				if (t.primal.refCount > 0) t.primal[Symbol.dispose]();
+				if (t.tangent.refCount > 0) t.tangent[Symbol.dispose]();
+			}
+			const outputArrays = new Set([...result[0], ...result[1]]);
+			for (const a of newlyCreatedInputs) if (!outputArrays.has(a) && a.refCount > 0) a[Symbol.dispose]?.();
+		}
+		return result;
 	} catch (_) {
-		_usingCtx$1.e = _;
+		_usingCtx22.e = _;
 	} finally {
-		_usingCtx$1.d();
+		_usingCtx22.d();
 	}
 }
 function jvp$1(f, primals, tangents, { hasAux = false } = {}) {
@@ -5469,20 +6262,79 @@ var PartialVal = class PartialVal {
 	}
 };
 function partialEvalFlat(f, pvalsIn) {
-	const main = newMain(PartialEvalTrace);
-	main.isTransform = true;
-	const trace$1 = new PartialEvalTrace(main);
-	const tracersIn = pvalsIn.map((pval) => trace$1.newArg(pval));
-	const unknownTracersIn = tracersIn.filter((t) => !t.pval.isKnown).map((t) => t.ref);
-	const outs = f(...tracersIn);
-	const tracersOut = outs.map((out) => fullRaise(trace$1, out));
-	const pvalsOut = tracersOut.map((t) => t.pval);
-	const unknownTracersOut = tracersOut.filter((t) => !t.pval.isKnown);
-	const jaxpr = partialEvalGraphToJaxpr(unknownTracersIn, unknownTracersOut);
+	let jaxpr;
+	let pvalsOut;
+	let knownIntermediates;
+	try {
+		var _usingCtx$1 = _usingCtx();
+		const main = _usingCtx$1.u(newMain(PartialEvalTrace));
+		main.isTransform = true;
+		const trace$1 = new PartialEvalTrace(main);
+		const tracersIn = pvalsIn.map((pval) => trace$1.newArg(pval));
+		const unknownTracersIn = tracersIn.filter((t) => !t.pval.isKnown).map((t) => t.ref);
+		const previousTracker = _peArrayCreationTracker;
+		const peCreatedArrays = [];
+		_setPACT(peCreatedArrays);
+		let outs;
+		try {
+			outs = f(...tracersIn);
+		} catch (e$1) {
+			_setPACT(previousTracker);
+			for (const t of peCreatedArrays) try {
+				t.dispose();
+			} catch {}
+			throw e$1;
+		}
+		_setPACT(previousTracker);
+		const tracersOut = outs.map((out) => fullRaise(trace$1, out));
+		pvalsOut = tracersOut.map((t) => t.pval);
+		const unknownTracersOut = tracersOut.filter((t) => !t.pval.isKnown);
+		jaxpr = partialEvalGraphToJaxpr(unknownTracersIn, unknownTracersOut);
+		for (const ct of trace$1.allConstPETracers) if (ct.isAlive) ct.dispose();
+		knownIntermediates = trace$1.knownIntermediates;
+		knownIntermediates.push(...peCreatedArrays);
+	} catch (_) {
+		_usingCtx$1.e = _;
+	} finally {
+		_usingCtx$1.d();
+	}
 	return {
 		jaxpr,
-		pvalsOut
+		pvalsOut,
+		peIntermediates: knownIntermediates
 	};
+}
+/**
+* Dispose PE intermediates that aren't outputs or externally captured.
+* During PE, all-known evaluations create concrete arrays. Output values
+* (in protectedVals) are returned to the caller. ClosedJaxpr consts have
+* independent ownership via .ref in partialEvalGraphToJaxpr. Everything
+* else (pure intermediates AND computed consts) needs one dispose here
+* to balance the rc=1 from creation.
+*/
+function disposePeIntermediates(peIntermediates, protectedVals) {
+	if (insideTrace()) return;
+	const disposed = /* @__PURE__ */ new Set();
+	for (const t of peIntermediates) if (!protectedVals.has(t) && !disposed.has(t)) {
+		disposed.add(t);
+		try {
+			t.dispose();
+		} catch {}
+	}
+}
+/**
+* Extract concrete Arrays from a value tree that may contain JVPTracers,
+* PartialEvalTracers, or other wrappers. Uses lowerAux to walk through
+* the tracer chain (JVPTracer→PETracer→concrete Array).
+*/
+function collectConcreteArrays(value) {
+	const result = [];
+	const lowered = lowerAux(value);
+	map((x) => {
+		if (x instanceof Tracer) result.push(x);
+		return x;
+	}, lowered);
+	return result;
 }
 /**
 * Helper function with shared Jaxpr logic between linearize and vjp.
@@ -5498,17 +6350,21 @@ function linearizeFlatUtil(f, primalsIn) {
 		const [primalsOut$1, tangentsOut] = jvp$1(f, x.slice(0, k), x.slice(k, 2 * k));
 		return [...primalsOut$1, ...tangentsOut];
 	};
-	const { jaxpr, pvalsOut } = partialEvalFlat(fJvp, pvalsIn);
+	const { jaxpr, pvalsOut, peIntermediates } = partialEvalFlat(fJvp, pvalsIn);
 	const primalPvals = pvalsOut.slice(0, pvalsOut.length / 2);
 	if (!primalPvals.every((pval) => pval.isKnown)) throw new Error("Not all primal values are known after partial evaluation");
 	const primalsOut = primalPvals.map((pval) => pval.val);
 	return {
 		primalsOut,
-		jaxpr
+		jaxpr,
+		peIntermediates
 	};
 }
-function linearizeFlat(f, primalsIn) {
-	const { primalsOut, jaxpr } = linearizeFlatUtil(f, primalsIn);
+function linearizeFlat(f, primalsIn, auxStore) {
+	const { primalsOut, jaxpr, peIntermediates } = linearizeFlatUtil(f, primalsIn);
+	const protectedVals = new Set(primalsOut);
+	if (auxStore?.value != null) for (const arr of collectConcreteArrays(auxStore.value)) protectedVals.add(arr);
+	disposePeIntermediates(peIntermediates, protectedVals);
 	const fLin = (...tangents) => evalJaxpr(jaxpr.jaxpr, [...jaxpr.consts.map((c) => c.ref), ...tangents]);
 	const dispose$1 = () => jaxpr.dispose();
 	return [
@@ -5522,7 +6378,12 @@ function linearize$1(f, primalsIn, { hasAux = false } = {}) {
 	let fFlat, outTree, aux;
 	if (hasAux) [fFlat, outTree, aux] = flattenFunWithAux(f, inTree);
 	else [fFlat, outTree] = flattenFun(f, inTree);
-	const [primalsOutFlat, fLinFlat, dispose$1] = linearizeFlat(fFlat, primalsInFlat.map(pureArray));
+	const wrappedPrimals = primalsInFlat.map(pureArray);
+	const [primalsOutFlat, fLinFlat, dispose$1] = linearizeFlat(fFlat, wrappedPrimals, hasAux ? aux : void 0);
+	if (!insideTrace()) {
+		const primalsOutSet = new Set(primalsOutFlat);
+		for (let i = 0; i < wrappedPrimals.length; i++) if (wrappedPrimals[i] !== primalsInFlat[i] && !primalsOutSet.has(wrappedPrimals[i])) wrappedPrimals[i].dispose();
+	}
 	if (outTree.value === void 0) throw new Error("outTree was not set in linearize");
 	const primalsOut = unflatten(outTree.value, primalsOutFlat);
 	const fLin = ((...tangentsIn) => {
@@ -5532,6 +6393,8 @@ function linearize$1(f, primalsIn, { hasAux = false } = {}) {
 		return unflatten(outTree.value, tangentsOutFlat);
 	});
 	fLin.dispose = dispose$1;
+	fLin[Symbol.dispose] = dispose$1;
+	if (_leakTrackingEnabled) _leakTrackingOwnedFns.add(fLin);
 	if (hasAux) return [
 		primalsOut,
 		fLin,
@@ -5559,6 +6422,10 @@ var PartialEvalTracer = class extends Tracer {
 		this.#rc++;
 		return this;
 	}
+	/** Whether this PETracer hasn't been fully disposed yet. */
+	get isAlive() {
+		return this.#rc > 0;
+	}
 	dispose() {
 		if (this.#rc <= 0) throw new UseAfterFreeError(this);
 		if (--this.#rc === 0) {
@@ -5577,22 +6444,48 @@ var PartialEvalTrace = class extends Trace {
 		return new PartialEvalTracer(this, pval, { type: "LambdaBinding" });
 	}
 	pure(val) {
-		return new PartialEvalTracer(this, PartialVal.known(pureArray(val)), null);
+		const arr = pureArray(val);
+		if (!(val instanceof Tracer)) this.knownIntermediates.push(arr);
+		return new PartialEvalTracer(this, PartialVal.known(arr), null);
 	}
 	lift = this.pure;
+	get knownIntermediates() {
+		let arr = this.main.globalData?._knownIntermediates;
+		if (!arr) {
+			arr = [];
+			if (!this.main.globalData) this.main.globalData = {};
+			this.main.globalData._knownIntermediates = arr;
+		}
+		return arr;
+	}
+	get allConstPETracers() {
+		let arr = this.main.globalData?._allConstPETracers;
+		if (!arr) {
+			arr = [];
+			if (!this.main.globalData) this.main.globalData = {};
+			this.main.globalData._allConstPETracers = arr;
+		}
+		return arr;
+	}
 	instantiateConst(tracer) {
 		if (!tracer.pval.isKnown) return tracer;
 		else {
 			const pval = PartialVal.unknown(ShapedArray.fromAval(tracer.aval));
 			const val = tracer.pval.val.ref;
-			return new PartialEvalTracer(this, pval, {
+			const constTracer = new PartialEvalTracer(this, pval, {
 				type: "Const",
 				val
 			});
+			this.allConstPETracers.push(constTracer);
+			return constTracer;
 		}
 	}
 	processPrimitive(primitive, tracers, params) {
-		if (tracers.every((t) => t.pval.isKnown)) return bind(primitive, tracers.map((t) => t.fullLower()), params);
+		if (tracers.every((t) => t.pval.isKnown)) {
+			const results = bind(primitive, tracers.map((t) => t.fullLower()), params);
+			for (const r of results) this.knownIntermediates.push(r);
+			return results;
+		}
 		if (primitive === Primitive.Jit) {
 			const { name, jaxpr, numConsts } = params;
 			return this.#partialEvalJaxpr(name, jaxpr, numConsts, tracers);
@@ -5776,6 +6669,7 @@ function partialEvalGraphToJaxpr(tracersIn, tracersOut) {
 	const tracerToVar = /* @__PURE__ */ new Map();
 	const constToVar = /* @__PURE__ */ new Map();
 	const processedEqns = /* @__PURE__ */ new Set();
+	const constPETracers = [];
 	const eqns = [];
 	for (const t of tracersIn) tracerToVar.set(t, new Var(ShapedArray.fromAval(t.aval)));
 	for (const t of toposort(tracersOut, (t$1) => t$1.recipe?.type === "JaxprEqn" ? t$1.recipe.tracersIn : [])) {
@@ -5790,6 +6684,7 @@ function partialEvalGraphToJaxpr(tracersIn, tracersOut) {
 				constToVar.set(val, binder);
 			}
 			tracerToVar.set(t, binder);
+			constPETracers.push(t);
 		} else if (t.recipe.type === "JaxprEqn") {
 			if (!processedEqns.has(t.recipe)) {
 				processedEqns.add(t.recipe);
@@ -5809,9 +6704,10 @@ function partialEvalGraphToJaxpr(tracersIn, tracersOut) {
 	const outVars = tracersOut.map((t) => tracerToVar.get(t));
 	let jaxpr = new Jaxpr(inBinders, eqns, outVars);
 	typecheckJaxpr(jaxpr);
-	for (const t of consts) t.ref;
-	for (const t of tracersIn) t.dispose();
-	for (const t of tracersOut) t.dispose();
+	for (const c of consts) c.ref;
+	for (const t of constPETracers) t.dispose();
+	for (const t of tracersIn) if (!t.pval.isKnown) t.dispose();
+	for (const t of tracersOut) if (!t.pval.isKnown) t.dispose();
 	jaxpr = jaxpr.simplify();
 	if (DEBUG >= 5) console.info("jaxpr from partial evaluation:\n" + jaxpr.toString());
 	return new ClosedJaxpr(jaxpr, consts);
@@ -5828,16 +6724,22 @@ var UndefPrimal = class {
 * For intermediate variables that are known (computed from only known inputs),
 * we need to evaluate the equations that produce them.
 */
-function getOrComputePrimal(jaxpr, knownVars, knownPrimals, v) {
-	if (knownPrimals.has(v)) return knownPrimals.get(v).ref;
+function getOrComputePrimal(jaxpr, knownVars, knownPrimals, v, internalArrays) {
+	if (knownPrimals.has(v)) {
+		const r$1 = knownPrimals.get(v).ref;
+		if (internalArrays) internalArrays.add(r$1);
+		return r$1;
+	}
 	const eqn = jaxpr.eqns.find((eq) => eq.outBinders.some((out) => out === v));
 	if (!eqn) throw new Error(`Internal error: could not find equation producing variable`);
-	const inputVals = eqn.inputs.map((inp) => inp instanceof Lit ? array(inp.value, { dtype: inp.dtype }) : getOrComputePrimal(jaxpr, knownVars, knownPrimals, inp));
+	const inputVals = eqn.inputs.map((inp) => inp instanceof Lit ? array(inp.value, { dtype: inp.dtype }) : getOrComputePrimal(jaxpr, knownVars, knownPrimals, inp, internalArrays));
 	const results = bind(eqn.primitive, inputVals, eqn.params);
 	for (let i = 0; i < eqn.outBinders.length; i++) knownPrimals.set(eqn.outBinders[i], results[i]);
 	const result = knownPrimals.get(v);
 	if (!result) throw new Error(`Internal error: variable not produced by equation`);
-	return result.ref;
+	const r = result.ref;
+	if (internalArrays) internalArrays.add(r);
+	return r;
 }
 /**
 * Evaluate the backward pass over a linearized Jaxpr (pullback of cotangents).
@@ -5854,23 +6756,36 @@ function evalJaxprTransposed(jaxpr, args, cotangents) {
 	}
 	const knownPrimals = /* @__PURE__ */ new Map();
 	const argPrimals = /* @__PURE__ */ new Set();
+	const argPrimalInitRc = /* @__PURE__ */ new Map();
 	for (let i = 0; i < jaxpr.inBinders.length; i++) if (!(args[i] instanceof UndefPrimal)) {
 		knownPrimals.set(jaxpr.inBinders[i], args[i]);
 		argPrimals.add(jaxpr.inBinders[i]);
+		argPrimalInitRc.set(jaxpr.inBinders[i], args[i].refCount);
 	}
 	const ctStore = /* @__PURE__ */ new Map();
+	const internalArrays = /* @__PURE__ */ new Set();
+	const externalCts = /* @__PURE__ */ new Set();
+	for (const ct of cotangents) if (ct instanceof Tracer) externalCts.add(ct);
 	const readCotangent = (v) => {
 		const ct = ctStore.get(v);
 		if (ct) {
 			ctStore.delete(v);
 			return ct;
-		} else return zeros(v.aval.shape, { dtype: v.aval.dtype });
+		} else {
+			const z = zeros(v.aval.shape, { dtype: v.aval.dtype });
+			internalArrays.add(z);
+			return z;
+		}
 	};
 	const writeCotangent = (v, ct) => {
 		if (ct !== null) {
+			if (!externalCts.has(ct)) internalArrays.add(ct);
 			const oldCt = ctStore.get(v);
-			if (oldCt) ctStore.set(v, add$1(oldCt, ct));
-			else ctStore.set(v, ct);
+			if (oldCt) {
+				const sum$1 = add$1(oldCt, ct);
+				internalArrays.add(sum$1);
+				ctStore.set(v, sum$1);
+			} else ctStore.set(v, ct);
 		}
 	};
 	for (let i = 0; i < jaxpr.outs.length; i++) {
@@ -5881,7 +6796,14 @@ function evalJaxprTransposed(jaxpr, args, cotangents) {
 		const eqn = jaxpr.eqns[i];
 		const allInputsKnown = eqn.inputs.every((v) => v instanceof Lit || knownVars.has(v));
 		if (allInputsKnown) continue;
-		const primalsIn = eqn.inputs.map((v) => v instanceof Lit ? array(v.value, { dtype: v.dtype }) : knownVars.has(v) ? getOrComputePrimal(jaxpr, knownVars, knownPrimals, v) : new UndefPrimal(v.aval));
+		const primalsIn = eqn.inputs.map((v) => {
+			if (v instanceof Lit) {
+				const lit = array(v.value, { dtype: v.dtype });
+				internalArrays.add(lit);
+				return lit;
+			}
+			return knownVars.has(v) ? getOrComputePrimal(jaxpr, knownVars, knownPrimals, v, internalArrays) : new UndefPrimal(v.aval);
+		});
 		const cotangentsOut = eqn.outBinders.map(readCotangent);
 		const rule = transposeRules[eqn.primitive];
 		if (!rule) throw new TypeError(`Backward pass not implemented for ${eqn.primitive}`);
@@ -5892,9 +6814,36 @@ function evalJaxprTransposed(jaxpr, args, cotangents) {
 			else if (cotangentsIn[j] !== null) throw new Error("internal: cotangent should be null");
 		}
 	}
-	for (const [v, t] of knownPrimals.entries()) if (!argPrimals.has(v)) t.dispose();
 	const results = [];
 	for (let i = 0; i < jaxpr.inBinders.length; i++) if (args[i] instanceof UndefPrimal) results.push(readCotangent(jaxpr.inBinders[i]));
+	if (!insideTrace()) {
+		const returnedSet = new Set(results);
+		for (const v of argPrimals) {
+			const val = knownPrimals.get(v);
+			const initialRc = argPrimalInitRc.get(v);
+			if (val && initialRc !== void 0) {
+				const excess = val.refCount - initialRc;
+				for (let i = 0; i < excess; i++) try {
+					val.dispose();
+				} catch {
+					break;
+				}
+			}
+		}
+		for (const [v, t] of knownPrimals.entries()) if (!argPrimals.has(v) && !returnedSet.has(t)) try {
+			while (t.refCount > 0) t.dispose();
+		} catch {}
+		for (const arr of internalArrays) if (!returnedSet.has(arr) && !externalCts.has(arr)) {
+			let isArgPrimal = false;
+			for (const v of argPrimals) if (knownPrimals.get(v) === arr) {
+				isArgPrimal = true;
+				break;
+			}
+			if (!isArgPrimal) try {
+				arr.dispose();
+			} catch {}
+		}
+	}
 	return results;
 }
 /**
@@ -5922,7 +6871,11 @@ function unbroadcast(x, target) {
 	const reductionDims = [...extraDims, ...keptReduceDims];
 	if (reductionDims.length === 0) return x;
 	let result = x.sum(reductionDims);
-	if (!deepEqual(result.shape, shape$1)) result = broadcast(result, shape$1, unsqueeze);
+	if (!deepEqual(result.shape, shape$1)) {
+		const sumResult = result;
+		result = broadcast(sumResult, shape$1, unsqueeze);
+		sumResult.dispose();
+	}
 	return result;
 }
 var NonlinearError = class extends TypeError {
@@ -5933,7 +6886,17 @@ var NonlinearError = class extends TypeError {
 const transposeRules = {
 	[Primitive.Mul]([ct], [x, y]) {
 		if (x instanceof UndefPrimal === y instanceof UndefPrimal) throw new NonlinearError(Primitive.Mul);
-		return [x instanceof UndefPrimal ? unbroadcast(mul(ct, y), x) : null, y instanceof UndefPrimal ? unbroadcast(mul(x, ct), y) : null];
+		if (x instanceof UndefPrimal) {
+			const prod$2 = mul(ct, y);
+			const result = unbroadcast(prod$2, x);
+			if (result !== prod$2) prod$2.dispose();
+			return [result, null];
+		} else {
+			const prod$2 = mul(x, ct);
+			const result = unbroadcast(prod$2, y);
+			if (result !== prod$2) prod$2.dispose();
+			return [null, result];
+		}
 	},
 	[Primitive.Neg]([ct], [x]) {
 		if (!(x instanceof UndefPrimal)) throw new NonlinearError(Primitive.Neg);
@@ -5941,7 +6904,7 @@ const transposeRules = {
 	},
 	[Primitive.Add]([ct], [x, y]) {
 		if (!(x instanceof UndefPrimal || y instanceof UndefPrimal)) throw new NonlinearError(Primitive.Add);
-		if (x instanceof UndefPrimal && y instanceof UndefPrimal) return [unbroadcast(ct.ref, x), unbroadcast(ct, y)];
+		if (x instanceof UndefPrimal && y instanceof UndefPrimal) return [unbroadcast(ct, x), unbroadcast(ct, y)];
 		return x instanceof UndefPrimal ? (y.dispose(), [unbroadcast(ct, x), null]) : (x.dispose(), [null, unbroadcast(ct, y)]);
 	},
 	[Primitive.Reduce]([ct], [x], { op, axis }) {
@@ -5967,8 +6930,20 @@ const transposeRules = {
 	[Primitive.Dot]([ct], [x, y]) {
 		if (x instanceof UndefPrimal === y instanceof UndefPrimal) throw new NonlinearError(Primitive.Dot);
 		const axisSize = generalBroadcast(x.aval.shape, y.aval.shape).slice(-1)[0];
-		ct = broadcast(ct, ct.shape.concat(axisSize), [-1]);
-		return [x instanceof UndefPrimal ? unbroadcast(mul(ct, y), x) : null, y instanceof UndefPrimal ? unbroadcast(mul(x, ct), y) : null];
+		const ctBroad = broadcast(ct, ct.shape.concat(axisSize), [-1]);
+		if (x instanceof UndefPrimal) {
+			const prod$2 = mul(ctBroad, y);
+			const result = unbroadcast(prod$2, x);
+			if (result !== prod$2) prod$2.dispose();
+			ctBroad.dispose();
+			return [result, null];
+		} else {
+			const prod$2 = mul(x, ctBroad);
+			const result = unbroadcast(prod$2, y);
+			if (result !== prod$2) prod$2.dispose();
+			ctBroad.dispose();
+			return [null, result];
+		}
 	},
 	[Primitive.Conv]([ct], [lhs, rhs], params) {
 		if (lhs instanceof UndefPrimal === rhs instanceof UndefPrimal) throw new NonlinearError(Primitive.Conv);
@@ -5979,10 +6954,10 @@ const transposeRules = {
 			v,
 			...range(v + 2, ct.ndim)
 		];
-		if (lhs instanceof UndefPrimal) {
-			let kernel = rhs;
-			kernel = transpose$1(kernel, rev01);
-			kernel = flip$1(kernel, range(v + 2, kernel.ndim));
+		if (lhs instanceof UndefPrimal) try {
+			var _usingCtx3 = _usingCtx();
+			const kernelTransposed = _usingCtx3.u(transpose$1(rhs, rev01));
+			const kernel = _usingCtx3.u(flip$1(kernelTransposed, range(v + 2, kernelTransposed.ndim)));
 			const result = conv$1(ct, kernel, {
 				vmapDims: v,
 				strides: params.lhsDilation,
@@ -5998,10 +6973,16 @@ const transposeRules = {
 				rhsDilation: params.rhsDilation
 			});
 			return [result, null];
-		} else {
-			const newLhs = transpose$1(lhs, rev01);
-			const newRhs = transpose$1(ct, rev01);
-			let result = conv$1(newLhs, newRhs, {
+		} catch (_) {
+			_usingCtx3.e = _;
+		} finally {
+			_usingCtx3.d();
+		}
+		else try {
+			var _usingCtx4 = _usingCtx();
+			const newLhs = _usingCtx4.u(transpose$1(lhs, rev01));
+			const newRhs = _usingCtx4.u(transpose$1(ct, rev01));
+			const convResult = _usingCtx4.u(conv$1(newLhs, newRhs, {
 				vmapDims: v,
 				strides: params.rhsDilation,
 				padding: params.padding.map(([pl, _pr], i) => {
@@ -6014,9 +6995,13 @@ const transposeRules = {
 				}),
 				lhsDilation: params.lhsDilation,
 				rhsDilation: params.strides
-			});
-			result = transpose$1(result, rev01);
+			}));
+			const result = transpose$1(convResult, rev01);
 			return [null, result];
+		} catch (_) {
+			_usingCtx4.e = _;
+		} finally {
+			_usingCtx4.d();
 		}
 	},
 	[Primitive.Where]([ct], [cond, x, y]) {
@@ -6026,12 +7011,16 @@ const transposeRules = {
 			null
 		];
 		if (cond instanceof UndefPrimal) throw new NonlinearError(Primitive.Where);
-		if (x instanceof UndefPrimal) cts[1] = unbroadcast(where$1(cond.ref, ct.ref, 0), x);
-		else x.dispose();
-		if (y instanceof UndefPrimal) cts[2] = unbroadcast(where$1(cond.ref, 0, ct.ref), y);
-		else y.dispose();
-		ct.dispose();
-		cond.dispose();
+		if (x instanceof UndefPrimal) {
+			const masked = where$1(cond, ct, 0);
+			cts[1] = unbroadcast(masked, x);
+			if (cts[1] !== masked) masked.dispose();
+		} else x.dispose();
+		if (y instanceof UndefPrimal) {
+			const masked = where$1(cond, 0, ct);
+			cts[2] = unbroadcast(masked, y);
+			if (cts[2] !== masked) masked.dispose();
+		} else y.dispose();
 		return cts;
 	},
 	[Primitive.Concatenate]([ct], inputs, { axis }) {
@@ -6075,12 +7064,20 @@ const transposeRules = {
 		return [shrink(ct, slice)];
 	},
 	[Primitive.TriangularSolve]([ct], [a, b], { unitDiagonal }) {
-		if (a instanceof UndefPrimal || !(b instanceof UndefPrimal)) throw new NonlinearError(Primitive.TriangularSolve);
-		const ctB = triangularSolve$1(moveaxis(a, -2, -1), ct, {
-			lower: true,
-			unitDiagonal
-		});
-		return [null, ctB];
+		try {
+			var _usingCtx5 = _usingCtx();
+			if (a instanceof UndefPrimal || !(b instanceof UndefPrimal)) throw new NonlinearError(Primitive.TriangularSolve);
+			const aT = _usingCtx5.u(moveaxis(a, -2, -1));
+			const ctB = triangularSolve$1(aT, ct, {
+				lower: true,
+				unitDiagonal
+			});
+			return [null, ctB];
+		} catch (_) {
+			_usingCtx5.e = _;
+		} finally {
+			_usingCtx5.d();
+		}
 	},
 	[Primitive.Jit](cts, args, { name, jaxpr }) {
 		const undefPrimals = args.map((x) => x instanceof UndefPrimal);
@@ -6317,6 +7314,10 @@ const transposeRules = {
 	}
 };
 const transposeJaxprCache = /* @__PURE__ */ new Map();
+_registerJitCacheDisposer(() => {
+	for (const inner$1 of transposeJaxprCache.values()) for (const cj of inner$1.values()) cj.dispose();
+	transposeJaxprCache.clear();
+});
 function transposeJaxpr(jaxpr, undefPrimals) {
 	const cacheKey = JSON.stringify(undefPrimals);
 	const prevResult = transposeJaxprCache.get(jaxpr)?.get(cacheKey);
@@ -6335,10 +7336,13 @@ function transposeJaxpr(jaxpr, undefPrimals) {
 	transposeJaxprCache.get(jaxpr).set(cacheKey, newJaxpr);
 	return newJaxpr;
 }
-function vjpFlat(f, primalsIn) {
-	const { primalsOut, jaxpr } = linearizeFlatUtil(f, primalsIn);
+function vjpFlat(f, primalsIn, auxStore) {
+	const { primalsOut, jaxpr, peIntermediates } = linearizeFlatUtil(f, primalsIn);
+	const protectedVals = new Set(primalsOut);
+	if (auxStore?.value != null) for (const arr of collectConcreteArrays(auxStore.value)) protectedVals.add(arr);
+	disposePeIntermediates(peIntermediates, protectedVals);
 	const fVjp = (...cotangents) => {
-		const transposeInputs = [...jaxpr.consts.map((c) => c.ref), ...primalsIn.map((t) => new UndefPrimal(t.aval))];
+		const transposeInputs = [...jaxpr.consts, ...primalsIn.map((t) => new UndefPrimal(t.aval))];
 		return evalJaxprTransposed(jaxpr.jaxpr, transposeInputs, cotangents);
 	};
 	const dispose$1 = () => jaxpr.dispose();
@@ -6353,16 +7357,27 @@ function vjp$1(f, primalsIn, { hasAux = false } = {}) {
 	let fFlat, outTree, aux;
 	if (hasAux) [fFlat, outTree, aux] = flattenFunWithAux(f, inTree);
 	else [fFlat, outTree] = flattenFun(f, inTree);
-	const [primalsOutFlat, fVjpFlat, dispose$1] = vjpFlat(fFlat, primalsInFlat.map(pureArray));
+	const wrappedPrimals = primalsInFlat.map(pureArray);
+	const [primalsOutFlat, fVjpFlat, innerDispose] = vjpFlat(fFlat, wrappedPrimals, hasAux ? aux : void 0);
+	if (!insideTrace()) {
+		const primalsOutSet = new Set(primalsOutFlat);
+		for (let i = 0; i < wrappedPrimals.length; i++) if (wrappedPrimals[i] !== primalsInFlat[i] && !primalsOutSet.has(wrappedPrimals[i])) wrappedPrimals[i].dispose();
+	}
 	if (outTree.value === void 0) throw new Error("outTree was not set in vjp");
 	const primalsOut = unflatten(outTree.value, primalsOutFlat);
 	const fVjp = ((cotangentsOut) => {
 		const [cotangentsOutFlat, outTree2] = flatten(cotangentsOut);
 		if (!outTree.value.equals(outTree2)) throw new TreeMismatchError("vjp", outTree.value, outTree2);
-		const cotangentsInFlat = fVjpFlat(...cotangentsOutFlat.map(pureArray));
+		const wrappedCots = cotangentsOutFlat.map(pureArray);
+		const cotangentsInFlat = fVjpFlat(...wrappedCots);
+		if (!insideTrace()) {
+			for (let i = 0; i < wrappedCots.length; i++) if (wrappedCots[i] !== cotangentsOutFlat[i]) wrappedCots[i].dispose();
+		}
 		return unflatten(inTree, cotangentsInFlat);
 	});
-	fVjp.dispose = dispose$1;
+	fVjp.dispose = innerDispose;
+	fVjp[Symbol.dispose] = innerDispose;
+	if (_leakTrackingEnabled) _leakTrackingOwnedFns.add(fVjp);
 	if (hasAux) return [
 		primalsOut,
 		fVjp,
@@ -6375,11 +7390,11 @@ function grad$1(f, opts) {
 	return (...x) => {
 		if (opts?.hasAux) {
 			const [[y, aux], dx] = valueAndGradFn(...x);
-			y.dispose();
+			if (!insideTrace()) y.dispose();
 			return [dx, aux];
 		} else {
 			const [y, dx] = valueAndGradFn(...x);
-			y.dispose();
+			if (!insideTrace()) y.dispose();
 			return dx;
 		}
 	};
@@ -6391,12 +7406,42 @@ function valueAndGrad$1(f, opts) {
 	const argnumsSet = new Set(typeof argnums === "number" ? [argnums] : argnums);
 	return (...x) => {
 		if (x.length === 0) throw new Error("grad requires at least one argument to differentiate");
-		for (let i = 0; i < x.length; i++) if (!argnumsSet.has(i)) x[i] = map(stopGradient, x[i]);
+		const sgArrays = [];
+		const sgOriginals = /* @__PURE__ */ new Set();
+		for (let i = 0; i < x.length; i++) if (!argnumsSet.has(i)) x[i] = map((leaf) => {
+			const sg = stopGradient(leaf);
+			if (sg instanceof Tracer) {
+				if (leaf instanceof Tracer) sgOriginals.add(leaf);
+				sgArrays.push(sg);
+			}
+			return sg;
+		}, x[i]);
 		const [y, fVjp, aux] = vjp$1(f, x, { hasAux });
-		if (!(y instanceof Tracer) || ndim$1(y) !== 0) throw new TypeError("grad requires a scalar output");
-		if (!isFloatDtype(y.dtype)) throw new TypeError("grad only supports floating-point dtypes");
-		const cts = fVjp(onesLike$1(y.ref));
-		fVjp.dispose();
+		if (!(y instanceof Tracer) || ndim$1(y) !== 0) {
+			if (!insideTrace()) {
+				fVjp.dispose();
+				dispose(y);
+				if (hasAux) dispose(aux);
+				for (const a of sgArrays) if (!sgOriginals.has(a)) a.dispose();
+			}
+			throw new TypeError("grad requires a scalar output");
+		}
+		if (!isFloatDtype(y.dtype)) {
+			if (!insideTrace()) {
+				fVjp.dispose();
+				dispose(y);
+				if (hasAux) dispose(aux);
+				for (const a of sgArrays) if (!sgOriginals.has(a)) a.dispose();
+			}
+			throw new TypeError("grad only supports floating-point dtypes");
+		}
+		const seed = onesLike$1(y);
+		const cts = fVjp(seed);
+		if (!insideTrace()) {
+			seed.dispose();
+			fVjp.dispose();
+			for (const a of sgArrays) if (!sgOriginals.has(a)) a.dispose();
+		}
 		for (let i = 0; i < cts.length; i++) if (!argnumsSet.has(i)) dispose(cts[i]);
 		const grads = typeof argnums === "number" ? cts[argnums] : argnums.map((i) => cts[i]);
 		return hasAux ? [[y, aux], grads] : [y, grads];
@@ -6413,7 +7458,10 @@ function jacrev$1(f) {
 			fVjp.dispose();
 			return ret;
 		};
-		return vmap$1(pullback, [1])(eye(size$1, void 0, { dtype: x.dtype }));
+		const eyeMatrix = eye(size$1, void 0, { dtype: x.dtype });
+		const result = vmap$1(pullback, [1])(eyeMatrix);
+		eyeMatrix.dispose();
+		return result;
 	};
 }
 function hessian$1(f) {
@@ -6662,31 +7710,55 @@ function fft(a, axis = -1) {
 	const n = real.shape[axis];
 	checkPowerOfTwo("fft", n);
 	const logN = Math.log2(n);
-	let perm = null;
-	if (axis !== real.ndim - 1) {
-		perm = range(real.ndim);
-		perm.splice(axis, 1);
-		perm.push(axis);
-		real = real.transpose(perm);
-		imag = imag.transpose(perm);
+	const d = [];
+	try {
+		let perm = null;
+		if (axis !== real.ndim - 1) {
+			perm = range(real.ndim);
+			perm.splice(axis, 1);
+			perm.push(axis);
+			real = real.transpose(perm);
+			d.push(real);
+			imag = imag.transpose(perm);
+			d.push(imag);
+		}
+		const originalShape = real.shape;
+		const realR = real.reshape([-1, ...rep(logN, 2)]);
+		d.push(realR);
+		const realT = realR.transpose([0, ...range(1, logN + 1).reverse()]);
+		d.push(realT);
+		real = realT.flatten();
+		d.push(real);
+		const imagR = imag.reshape([-1, ...rep(logN, 2)]);
+		d.push(imagR);
+		const imagT = imagR.transpose([0, ...range(1, logN + 1).reverse()]);
+		d.push(imagT);
+		imag = imagT.flatten();
+		d.push(imag);
+		for (let i = 0; i < logN; i++) {
+			({real, imag} = fftUpdate(i, {
+				real,
+				imag
+			}));
+			d.push(real, imag);
+		}
+		real = real.reshape(originalShape);
+		d.push(real);
+		imag = imag.reshape(originalShape);
+		d.push(imag);
+		if (perm !== null) {
+			real = real.transpose(invertPermutation(perm));
+			d.push(real);
+			imag = imag.transpose(invertPermutation(perm));
+			d.push(imag);
+		}
+		return {
+			real,
+			imag
+		};
+	} finally {
+		for (const v of d) if (v !== real && v !== imag) v[Symbol.dispose]();
 	}
-	const originalShape = real.shape;
-	real = real.reshape([-1, ...rep(logN, 2)]).transpose([0, ...range(1, logN + 1).reverse()]).flatten();
-	imag = imag.reshape([-1, ...rep(logN, 2)]).transpose([0, ...range(1, logN + 1).reverse()]).flatten();
-	for (let i = 0; i < logN; i++) ({real, imag} = fftUpdate(i, {
-		real,
-		imag
-	}));
-	real = real.reshape(originalShape);
-	imag = imag.reshape(originalShape);
-	if (perm !== null) {
-		real = real.transpose(invertPermutation(perm));
-		imag = imag.transpose(invertPermutation(perm));
-	}
-	return {
-		real,
-		imag
-	};
 }
 /**
 * Compute a one-dimensional inverse discrete Fourier transform.
@@ -6694,20 +7766,30 @@ function fft(a, axis = -1) {
 * Currently, the size of the axis must be a power of two.
 */
 function ifft(a, axis = -1) {
-	checkPairInput("ifft", a);
-	let { real, imag } = a;
-	axis = checkAxis(axis, real.ndim);
-	const n = real.shape[axis];
-	checkPowerOfTwo("ifft", n);
-	imag = imag.mul(-1);
-	const result = fft({
-		real,
-		imag
-	}, axis);
-	return {
-		real: result.real.div(n),
-		imag: result.imag.mul(-1).div(n)
-	};
+	try {
+		var _usingCtx$1 = _usingCtx();
+		checkPairInput("ifft", a);
+		const { real, imag } = a;
+		axis = checkAxis(axis, real.ndim);
+		const n = real.shape[axis];
+		checkPowerOfTwo("ifft", n);
+		const negImag = _usingCtx$1.u(imag.mul(-1));
+		const result = fft({
+			real,
+			imag: negImag
+		}, axis);
+		const fftReal = _usingCtx$1.u(result.real);
+		const fftImag = _usingCtx$1.u(result.imag);
+		const negFftImag = _usingCtx$1.u(fftImag.mul(-1));
+		return {
+			real: fftReal.div(n),
+			imag: negFftImag.div(n)
+		};
+	} catch (_) {
+		_usingCtx$1.e = _;
+	} finally {
+		_usingCtx$1.d();
+	}
 }
 
 //#endregion
@@ -6742,24 +7824,58 @@ function checkSquare(name, a) {
 function cholesky(a, { upper = false, symmetrizeInput = true } = {}) {
 	a = fudgeArray(a);
 	checkSquare("cholesky", a);
-	if (symmetrizeInput) a = a.add(matrixTranspose(a)).mul(.5);
+	if (symmetrizeInput) try {
+		var _usingCtx$1 = _usingCtx();
+		const at = _usingCtx$1.u(matrixTranspose(a));
+		const sum$1 = _usingCtx$1.u(a.add(at));
+		const sym = _usingCtx$1.u(sum$1.mul(.5));
+		return cholesky$1(sym, { upper });
+	} catch (_) {
+		_usingCtx$1.e = _;
+	} finally {
+		_usingCtx$1.d();
+	}
 	return cholesky$1(a, { upper });
 }
 /** Compute the determinant of a square matrix (batched). */
 function det(a) {
-	a = fudgeArray(a);
-	const n = checkSquare("det", a);
-	const [lu$2, pivots, permutation] = lu(a);
-	const parity = pivots.notEqual(arange(n)).astype(int32).sum(-1).mod(2);
-	const sign$1 = parity.mul(-2).add(1);
-	const diag$1 = lu$2.diagonal(0, -1, -2);
-	return prod$1(diag$1, -1).mul(sign$1);
+	try {
+		var _usingCtx3 = _usingCtx();
+		a = fudgeArray(a);
+		const n = checkSquare("det", a);
+		const luResult = lu(a);
+		const lu$2 = _usingCtx3.u(luResult[0]);
+		const pivots = _usingCtx3.u(luResult[1]);
+		_usingCtx3.u(luResult[2]);
+		const indices = _usingCtx3.u(arange(n));
+		const neq = _usingCtx3.u(pivots.notEqual(indices));
+		const neqInt = _usingCtx3.u(neq.astype(int32));
+		const sumAxis = _usingCtx3.u(neqInt.sum(-1));
+		const parity = _usingCtx3.u(sumAxis.mod(2));
+		const neg2 = _usingCtx3.u(parity.mul(-2));
+		const sign$1 = _usingCtx3.u(neg2.add(1));
+		const diag$1 = _usingCtx3.u(lu$2.diagonal(0, -1, -2));
+		const prod$2 = _usingCtx3.u(prod$1(diag$1, -1));
+		return prod$2.mul(sign$1);
+	} catch (_) {
+		_usingCtx3.e = _;
+	} finally {
+		_usingCtx3.d();
+	}
 }
 /** Compute the inverse of a square matrix (batched). */
 function inv(a) {
-	a = fudgeArray(a);
-	const n = checkSquare("inv", a);
-	return solve(a, eye(n));
+	try {
+		var _usingCtx4 = _usingCtx();
+		a = fudgeArray(a);
+		const n = checkSquare("inv", a);
+		const eye$1 = _usingCtx4.u(eye(n));
+		return solve(a, eye$1);
+	} catch (_) {
+		_usingCtx4.e = _;
+	} finally {
+		_usingCtx4.d();
+	}
 }
 /**
 * Return the least-squares solution to a linear equation.
@@ -6775,39 +7891,56 @@ function inv(a) {
 * @return least-squares solution of shape `(N,)` or `(N, K)`
 */
 function lstsq(a, b) {
-	a = fudgeArray(a);
-	b = fudgeArray(b);
-	if (a.ndim !== 2) throw new Error(`lstsq: 'a' must be a 2D array, got ${a.aval}`);
-	const [m, n] = a.shape;
-	if (b.shape[0] !== m) throw new Error(`lstsq: leading dimension of 'b' must match number of rows of 'a', got ${b.aval}`);
-	const at = matrixTranspose(a);
-	if (m <= n) {
-		const aat = matmul(a, at);
-		const l = cholesky(aat, { symmetrizeInput: false });
-		const lb = triangularSolve(l, b, {
-			leftSide: true,
-			lower: true
-		});
-		const llb = triangularSolve(l, lb, {
-			leftSide: true,
-			lower: true,
-			transposeA: true
-		});
-		return matmul(at, llb);
-	} else {
-		const ata = matmul(at, a);
-		const l = cholesky(ata, { symmetrizeInput: false });
-		const atb = matmul(at, b);
-		const lb = triangularSolve(l, atb, {
-			leftSide: true,
-			lower: true
-		});
-		const llb = triangularSolve(l, lb, {
-			leftSide: true,
-			lower: true,
-			transposeA: true
-		});
-		return llb;
+	try {
+		var _usingCtx5 = _usingCtx();
+		a = fudgeArray(a);
+		b = fudgeArray(b);
+		if (a.ndim !== 2) throw new Error(`lstsq: 'a' must be a 2D array, got ${a.aval}`);
+		const [m, n] = a.shape;
+		if (b.shape[0] !== m) throw new Error(`lstsq: leading dimension of 'b' must match number of rows of 'a', got ${b.aval}`);
+		const at = _usingCtx5.u(matrixTranspose(a));
+		if (m <= n) try {
+			var _usingCtx6 = _usingCtx();
+			const aat = _usingCtx6.u(matmul(a, at));
+			const l = _usingCtx6.u(cholesky(aat, { symmetrizeInput: false }));
+			const lb = _usingCtx6.u(triangularSolve(l, b, {
+				leftSide: true,
+				lower: true
+			}));
+			const llb = _usingCtx6.u(triangularSolve(l, lb, {
+				leftSide: true,
+				lower: true,
+				transposeA: true
+			}));
+			return matmul(at, llb);
+		} catch (_) {
+			_usingCtx6.e = _;
+		} finally {
+			_usingCtx6.d();
+		}
+		else try {
+			var _usingCtx7 = _usingCtx();
+			const ata = _usingCtx7.u(matmul(at, a));
+			const l = _usingCtx7.u(cholesky(ata, { symmetrizeInput: false }));
+			const atb = _usingCtx7.u(matmul(at, b));
+			const lb = _usingCtx7.u(triangularSolve(l, atb, {
+				leftSide: true,
+				lower: true
+			}));
+			return triangularSolve(l, lb, {
+				leftSide: true,
+				lower: true,
+				transposeA: true
+			});
+		} catch (_) {
+			_usingCtx7.e = _;
+		} finally {
+			_usingCtx7.d();
+		}
+	} catch (_) {
+		_usingCtx5.e = _;
+	} finally {
+		_usingCtx5.d();
 	}
 }
 /** Raise a square matrix to an integer power, via repeated squarings. */
@@ -6815,7 +7948,16 @@ function matrixPower(a, n) {
 	if (!Number.isInteger(n)) throw new Error(`matrixPower: exponent must be an integer, got ${n}`);
 	a = fudgeArray(a);
 	const m = checkSquare("matrixPower", a);
-	if (n === 0) return broadcastTo(eye(m), a.shape);
+	if (n === 0) try {
+		var _usingCtx8 = _usingCtx();
+		const eye$1 = _usingCtx8.u(eye(m));
+		return broadcastTo(eye$1, a.shape);
+	} catch (_) {
+		_usingCtx8.e = _;
+	} finally {
+		_usingCtx8.d();
+	}
+	const isInputOwned = n < 0;
 	if (n < 0) {
 		a = inv(a);
 		n = -n;
@@ -6823,23 +7965,52 @@ function matrixPower(a, n) {
 	let result = null;
 	let a2k = a;
 	for (let k = 0; n; k++) {
-		if (k > 0) a2k = matmul(a2k, a2k);
-		if (n % 2 === 1) result = result === null ? a2k : matmul(result, a2k);
+		if (k > 0) {
+			const prev = a2k;
+			a2k = matmul(a2k, a2k);
+			if (prev !== a || isInputOwned) prev[Symbol.dispose]();
+		}
+		if (n % 2 === 1) {
+			const prev = result;
+			result = result === null ? a2k : matmul(result, a2k);
+			if (prev !== null && prev !== a2k) prev[Symbol.dispose]();
+		}
 		n = Math.floor(n / 2);
 	}
+	if (a2k !== result && (a2k !== a || isInputOwned)) a2k[Symbol.dispose]();
 	return result;
 }
 /** Return sign and natural logarithm of the determinant of `a`. */
 function slogdet(a) {
-	a = fudgeArray(a);
-	const n = checkSquare("slogdet", a);
-	const [lu$2, pivots, permutation] = lu(a);
-	let parity = pivots.notEqual(arange(n)).astype(int32).sum(-1);
-	const diag$1 = lu$2.diagonal(0, -1, -2);
-	parity = parity.add(diag$1.less(0).astype(int32).sum(-1)).mod(2);
-	const logabsdet = log(absolute(diag$1)).sum(-1);
-	const sign$1 = parity.mul(-2).add(1);
-	return [sign$1, logabsdet];
+	try {
+		var _usingCtx9 = _usingCtx();
+		a = fudgeArray(a);
+		const n = checkSquare("slogdet", a);
+		const luResult = lu(a);
+		const lu$2 = _usingCtx9.u(luResult[0]);
+		const pivots = _usingCtx9.u(luResult[1]);
+		_usingCtx9.u(luResult[2]);
+		const indices = _usingCtx9.u(arange(n));
+		const neq = _usingCtx9.u(pivots.notEqual(indices));
+		const neqInt = _usingCtx9.u(neq.astype(int32));
+		const parityBase = _usingCtx9.u(neqInt.sum(-1));
+		const diag$1 = _usingCtx9.u(lu$2.diagonal(0, -1, -2));
+		const diagNeg = _usingCtx9.u(diag$1.less(0));
+		const diagNegInt = _usingCtx9.u(diagNeg.astype(int32));
+		const diagNegSum = _usingCtx9.u(diagNegInt.sum(-1));
+		const parityTotal = _usingCtx9.u(parityBase.add(diagNegSum));
+		const parity = _usingCtx9.u(parityTotal.mod(2));
+		const neg2 = _usingCtx9.u(parity.mul(-2));
+		const sign$1 = neg2.add(1);
+		const absDiag = _usingCtx9.u(absolute(diag$1));
+		const logDiag = _usingCtx9.u(log(absDiag));
+		const logabsdet = logDiag.sum(-1);
+		return [sign$1, logabsdet];
+	} catch (_) {
+		_usingCtx9.e = _;
+	} finally {
+		_usingCtx9.d();
+	}
 }
 /**
 * Solve a linear system of equations.
@@ -6857,33 +8028,57 @@ function solve(a, b) {
 	const n = checkSquare("solve", a);
 	if (b.ndim === 0) throw new Error(`solve: b cannot be scalar`);
 	const bIs1d = b.ndim === 1;
-	if (bIs1d) b = b.reshape([...b.shape, 1]);
-	if (b.shape[b.ndim - 2] !== n) throw new Error(`solve: leading dimension of b must match size of a, got a=${a.aval}, b=${b.aval}`);
-	const m = b.shape[b.ndim - 1];
-	const batchDims = generalBroadcast(a.shape.slice(0, -2), b.shape.slice(0, -2));
-	a = broadcastTo(a, [
-		...batchDims,
-		n,
-		n
-	]);
-	b = broadcastTo(b, [
-		...batchDims,
-		n,
-		m
-	]);
-	const [lu$2, pivots, permutation] = lu(a);
-	const P = arange(n).equal(permutation.reshape([...permutation.shape, 1])).astype(b.dtype);
-	const LPb = triangularSolve(lu$2, matmul(P, b), {
-		leftSide: true,
-		lower: true,
-		unitDiagonal: true
-	});
-	let x = triangularSolve(lu$2, LPb, {
-		leftSide: true,
-		lower: false
-	});
-	if (bIs1d) x = squeeze(x, -1);
-	return x;
+	const d = [];
+	try {
+		if (bIs1d) {
+			b = b.reshape([...b.shape, 1]);
+			d.push(b);
+		}
+		if (b.shape[b.ndim - 2] !== n) throw new Error(`solve: leading dimension of b must match size of a, got a=${a.aval}, b=${b.aval}`);
+		const m = b.shape[b.ndim - 1];
+		const batchDims = generalBroadcast(a.shape.slice(0, -2), b.shape.slice(0, -2));
+		a = broadcastTo(a, [
+			...batchDims,
+			n,
+			n
+		]);
+		d.push(a);
+		b = broadcastTo(b, [
+			...batchDims,
+			n,
+			m
+		]);
+		d.push(b);
+		const [lu$2, pivots, permutation] = lu(a);
+		d.push(lu$2, pivots, permutation);
+		const arangeN = arange(n);
+		d.push(arangeN);
+		const permR = permutation.reshape([...permutation.shape, 1]);
+		d.push(permR);
+		const eq = arangeN.equal(permR);
+		d.push(eq);
+		const P = eq.astype(b.dtype);
+		d.push(P);
+		const Pb = matmul(P, b);
+		d.push(Pb);
+		const LPb = triangularSolve(lu$2, Pb, {
+			leftSide: true,
+			lower: true,
+			unitDiagonal: true
+		});
+		d.push(LPb);
+		let x = triangularSolve(lu$2, LPb, {
+			leftSide: true,
+			lower: false
+		});
+		if (bIs1d) {
+			d.push(x);
+			x = squeeze(x, -1);
+		}
+		return x;
+	} finally {
+		for (const v of d) v[Symbol.dispose]();
+	}
 }
 
 //#endregion
@@ -7303,8 +8498,17 @@ function all(a, axis = null, opts) {
 }
 /** Return the peak-to-peak range along a given axis (`max - min`). */
 function ptp(a, axis = null, opts) {
-	a = fudgeArray(a);
-	return max(a, axis, opts).sub(min(a, axis, opts));
+	try {
+		var _usingCtx$1 = _usingCtx();
+		a = fudgeArray(a);
+		const maxVal = _usingCtx$1.u(max(a, axis, opts));
+		const minVal = _usingCtx$1.u(min(a, axis, opts));
+		return maxVal.sub(minVal);
+	} catch (_) {
+		_usingCtx$1.e = _;
+	} finally {
+		_usingCtx$1.d();
+	}
 }
 /** Compute the average of the array elements along the specified axis. */
 function mean(a, axis = null, opts) {
@@ -7318,21 +8522,39 @@ function mean(a, axis = null, opts) {
 */
 function argmin(a, axis, opts) {
 	a = fudgeArray(a);
+	let ravelled;
 	if (axis === void 0) {
-		a = a.ravel();
+		ravelled = a.ravel();
+		a = ravelled;
 		axis = 0;
 	} else axis = checkAxis(axis, a.ndim);
-	const shape$1 = a.shape;
-	const isMax = equal(a, min(a, axis, { keepdims: true }));
-	const length = array(shape$1[axis], {
-		dtype: int32,
-		device: a.device
-	});
-	const idx = isMax.astype(DType.Int32).mul(arange(shape$1[axis], 0, -1, {
-		dtype: int32,
-		device: a.device
-	}).reshape([shape$1[axis], ...rep(shape$1.length - axis - 1, 1)]));
-	return length.sub(max(idx, axis, opts));
+	try {
+		try {
+			var _usingCtx3 = _usingCtx();
+			const shape$1 = a.shape;
+			const minVal = _usingCtx3.u(min(a, axis, { keepdims: true }));
+			const isMax = _usingCtx3.u(equal(a, minVal));
+			const length = _usingCtx3.u(array(shape$1[axis], {
+				dtype: int32,
+				device: a.device
+			}));
+			const range$1 = _usingCtx3.u(arange(shape$1[axis], 0, -1, {
+				dtype: int32,
+				device: a.device
+			}));
+			const reshaped = _usingCtx3.u(range$1.reshape([shape$1[axis], ...rep(shape$1.length - axis - 1, 1)]));
+			const isMaxInt = _usingCtx3.u(isMax.astype(DType.Int32));
+			const idx = _usingCtx3.u(isMaxInt.mul(reshaped));
+			const maxIdx = _usingCtx3.u(max(idx, axis, opts));
+			return length.sub(maxIdx);
+		} catch (_) {
+			_usingCtx3.e = _;
+		} finally {
+			_usingCtx3.d();
+		}
+	} finally {
+		ravelled?.dispose();
+	}
 }
 /**
 * Returns the indices of the maximum values along an axis.
@@ -7342,21 +8564,39 @@ function argmin(a, axis, opts) {
 */
 function argmax(a, axis, opts) {
 	a = fudgeArray(a);
+	let ravelled;
 	if (axis === void 0) {
-		a = a.ravel();
+		ravelled = a.ravel();
+		a = ravelled;
 		axis = 0;
 	} else axis = checkAxis(axis, a.ndim);
-	const shape$1 = a.shape;
-	const isMax = equal(a, max(a, axis, { keepdims: true }));
-	const length = array(shape$1[axis], {
-		dtype: int32,
-		device: a.device
-	});
-	const idx = isMax.astype(DType.Int32).mul(arange(shape$1[axis], 0, -1, {
-		dtype: int32,
-		device: a.device
-	}).reshape([shape$1[axis], ...rep(shape$1.length - axis - 1, 1)]));
-	return length.sub(max(idx, axis, opts));
+	try {
+		try {
+			var _usingCtx4 = _usingCtx();
+			const shape$1 = a.shape;
+			const maxVal = _usingCtx4.u(max(a, axis, { keepdims: true }));
+			const isMax = _usingCtx4.u(equal(a, maxVal));
+			const length = _usingCtx4.u(array(shape$1[axis], {
+				dtype: int32,
+				device: a.device
+			}));
+			const range$1 = _usingCtx4.u(arange(shape$1[axis], 0, -1, {
+				dtype: int32,
+				device: a.device
+			}));
+			const reshaped = _usingCtx4.u(range$1.reshape([shape$1[axis], ...rep(shape$1.length - axis - 1, 1)]));
+			const isMaxInt = _usingCtx4.u(isMax.astype(DType.Int32));
+			const idx = _usingCtx4.u(isMaxInt.mul(reshaped));
+			const maxIdx = _usingCtx4.u(max(idx, axis, opts));
+			return length.sub(maxIdx);
+		} catch (_) {
+			_usingCtx4.e = _;
+		} finally {
+			_usingCtx4.d();
+		}
+	} finally {
+		ravelled?.dispose();
+	}
 }
 /**
 * Cumulative sum of elements along an axis.
@@ -7366,14 +8606,31 @@ function argmax(a, axis, opts) {
 */
 function cumsum(a, axis) {
 	a = fudgeArray(a);
+	const inputA = a;
 	if (axis === void 0) {
 		a = a.ravel();
 		axis = 0;
 	} else axis = checkAxis(axis, a.ndim);
 	const n = a.shape[axis];
-	a = moveaxis$1(a, axis, -1);
-	a = broadcast(a, a.shape.concat(n), [-2]);
-	return moveaxis$1(tril(a).sum(-1), -1, axis);
+	const a1 = moveaxis$1(a, axis, -1);
+	try {
+		try {
+			var _usingCtx5 = _usingCtx();
+			const a2 = _usingCtx5.u(broadcast(a1, a1.shape.concat(n), [-2]));
+			const trilA = _usingCtx5.u(tril(a2));
+			const summed = trilA.sum(-1);
+			const result = moveaxis$1(summed, -1, axis);
+			if (result !== summed) summed.dispose();
+			return result;
+		} catch (_) {
+			_usingCtx5.e = _;
+		} finally {
+			_usingCtx5.d();
+		}
+	} finally {
+		if (a1 !== a) a1.dispose();
+		if (a !== inputA) a.dispose();
+	}
 }
 /** Reverse the elements in an array along the given axes. */
 function flip(x, axis = null) {
@@ -7436,7 +8693,9 @@ function concatenate(xs, axis = 0) {
 	let result = xs[0];
 	for (let i = 1; i < xs.length; i += 7) {
 		const group = xs.slice(i, i + 7);
+		const prev = result;
 		result = concatenate$1([result, ...group], axis);
+		if (prev !== xs[0]) prev.dispose();
 	}
 	return result;
 }
@@ -7456,7 +8715,11 @@ function stack(xs, axis = 0) {
 	axis = checkAxis(axis, shapes[0].length + 1);
 	const newShape = shapes[0].toSpliced(axis, 0, 1);
 	const newArrays = xs.map((x) => fudgeArray(x).reshape(newShape));
-	return concatenate(newArrays, axis);
+	try {
+		return concatenate(newArrays, axis);
+	} finally {
+		for (const a of newArrays) a[Symbol.dispose]();
+	}
 }
 /**
 * Horizontally stack arrays. Inputs are promoted to rank at least 1, then
@@ -7478,7 +8741,15 @@ function vstack(xs) {
 	if (xs.length === 0) throw new Error("Need at least one array to vstack");
 	const nds = xs.map(ndim);
 	if (nds.some((n) => n !== nds[0])) throw new Error(`Cannot stack different ranks: ${JSON.stringify(nds)}`);
-	if (nds[0] === 0) return stack(xs).reshape([-1, 1]);
+	if (nds[0] === 0) try {
+		var _usingCtx6 = _usingCtx();
+		const stacked = _usingCtx6.u(stack(xs));
+		return stacked.reshape([-1, 1]);
+	} catch (_) {
+		_usingCtx6.e = _;
+	} finally {
+		_usingCtx6.d();
+	}
 	else if (nds[0] === 1) return stack(xs);
 	else return concatenate(xs);
 }
@@ -7490,15 +8761,29 @@ function dstack(xs) {
 	if (xs.length === 0) throw new Error("Need at least one array to dstack");
 	const nds = xs.map(ndim);
 	if (nds.some((n) => n !== nds[0])) throw new Error(`Cannot stack different ranks: ${JSON.stringify(nds)}`);
-	if (nds[0] === 0) return stack(xs).reshape([
-		1,
-		1,
-		-1
-	]);
-	else if (nds[0] === 1) {
-		const ret = stack(xs, -1);
+	if (nds[0] === 0) try {
+		var _usingCtx7 = _usingCtx();
+		const stacked = _usingCtx7.u(stack(xs));
+		return stacked.reshape([
+			1,
+			1,
+			-1
+		]);
+	} catch (_) {
+		_usingCtx7.e = _;
+	} finally {
+		_usingCtx7.d();
+	}
+	else if (nds[0] === 1) try {
+		var _usingCtx8 = _usingCtx();
+		const ret = _usingCtx8.u(stack(xs, -1));
 		return ret.reshape([1, ...ret.shape]);
-	} else if (nds[0] === 2) return stack(xs, -1);
+	} catch (_) {
+		_usingCtx8.e = _;
+	} finally {
+		_usingCtx8.d();
+	}
+	else if (nds[0] === 2) return stack(xs, -1);
 	else return concatenate(xs, 2);
 }
 /**
@@ -7509,7 +8794,15 @@ function columnStack(xs) {
 	if (xs.length === 0) throw new Error("Need at least one array to columnStack");
 	const nds = xs.map(ndim);
 	if (nds.some((n) => n !== nds[0])) throw new Error(`Cannot stack different ranks: ${JSON.stringify(nds)}`);
-	if (nds[0] === 0) return stack(xs).reshape([1, -1]);
+	if (nds[0] === 0) try {
+		var _usingCtx9 = _usingCtx();
+		const stacked = _usingCtx9.u(stack(xs));
+		return stacked.reshape([1, -1]);
+	} catch (_) {
+		_usingCtx9.e = _;
+	} finally {
+		_usingCtx9.d();
+	}
 	else if (nds[0] === 1) return stack(xs, -1);
 	else return concatenate(xs, 1);
 }
@@ -7584,17 +8877,32 @@ function expandDims(a, axis) {
 * output array.
 */
 function repeat(a, repeats, axis) {
-	if (!Number.isInteger(repeats) || repeats < 0) throw new Error(`repeat: repeats must be a non-negative integer, got ${repeats}`);
-	a = fudgeArray(a);
-	if (axis === void 0) {
-		a = ravel(a);
-		axis = 0;
+	try {
+		var _usingCtx10 = _usingCtx();
+		if (!Number.isInteger(repeats) || repeats < 0) throw new Error(`repeat: repeats must be a non-negative integer, got ${repeats}`);
+		a = fudgeArray(a);
+		let ravelled;
+		if (axis === void 0) {
+			ravelled = ravel(a);
+			a = ravelled;
+			axis = 0;
+		}
+		axis = checkAxis(axis, a.ndim);
+		if (repeats === 1) {
+			ravelled?.dispose();
+			return a.reshape(a.shape);
+		}
+		const broadcastedShape = a.shape.toSpliced(axis + 1, 0, repeats);
+		const finalShape = a.shape.toSpliced(axis, 1, a.shape[axis] * repeats);
+		const broadcasted = _usingCtx10.u(broadcast(a, broadcastedShape, [axis + 1]));
+		const result = broadcasted.reshape(finalShape);
+		ravelled?.dispose();
+		return result;
+	} catch (_) {
+		_usingCtx10.e = _;
+	} finally {
+		_usingCtx10.d();
 	}
-	axis = checkAxis(axis, a.ndim);
-	if (repeats === 1) return a;
-	const broadcastedShape = a.shape.toSpliced(axis + 1, 0, repeats);
-	const finalShape = a.shape.toSpliced(axis, 1, a.shape[axis] * repeats);
-	return broadcast(a, broadcastedShape, [axis + 1]).reshape(finalShape);
 }
 /**
 * Construct an array by repeating A the number of times given by reps.
@@ -7604,23 +8912,37 @@ function repeat(a, repeats, axis) {
 * reps[1] * d2, ..., reps[n] * dn)`, with `A` tiled along each dimension.
 */
 function tile(a, reps) {
-	a = fudgeArray(a);
-	if (typeof reps === "number") reps = [reps];
-	if (!reps.every((r) => Number.isInteger(r) && r >= 0)) throw new Error(`tile: reps must be non-negative integers, got ${JSON.stringify(reps)}`);
-	const ndiff = reps.length - a.ndim;
-	if (ndiff > 0) a = a.reshape([...rep(ndiff, 1), ...a.shape]);
-	if (ndiff < 0) reps = [...rep(-ndiff, 1), ...reps];
-	const broadcastedShape = [];
-	const broadcastAxes = [];
-	for (let i = 0; i < a.ndim; i++) {
-		if (reps[i] > 1) {
-			broadcastedShape.push(reps[i]);
-			broadcastAxes.push(broadcastedShape.length - 1);
+	try {
+		var _usingCtx11 = _usingCtx();
+		a = fudgeArray(a);
+		if (typeof reps === "number") reps = [reps];
+		if (!reps.every((r) => Number.isInteger(r) && r >= 0)) throw new Error(`tile: reps must be non-negative integers, got ${JSON.stringify(reps)}`);
+		const ndiff = reps.length - a.ndim;
+		let reshaped;
+		if (ndiff > 0) {
+			reshaped = a.reshape([...rep(ndiff, 1), ...a.shape]);
+			a = reshaped;
 		}
-		broadcastedShape.push(a.shape[i]);
+		if (ndiff < 0) reps = [...rep(-ndiff, 1), ...reps];
+		const broadcastedShape = [];
+		const broadcastAxes = [];
+		for (let i = 0; i < a.ndim; i++) {
+			if (reps[i] > 1) {
+				broadcastedShape.push(reps[i]);
+				broadcastAxes.push(broadcastedShape.length - 1);
+			}
+			broadcastedShape.push(a.shape[i]);
+		}
+		const finalShape = a.shape.map((d, i) => reps[i] * d);
+		const broadcasted = _usingCtx11.u(broadcast(a, broadcastedShape, broadcastAxes));
+		const result = broadcasted.reshape(finalShape);
+		reshaped?.dispose();
+		return result;
+	} catch (_) {
+		_usingCtx11.e = _;
+	} finally {
+		_usingCtx11.d();
 	}
-	const finalShape = a.shape.map((d, i) => reps[i] * d);
-	return broadcast(a, broadcastedShape, broadcastAxes).reshape(finalShape);
 }
 /**
 * Broadcast an array to a shape, with NumPy-style broadcasing rules.
@@ -7666,18 +8988,35 @@ function diagonal(a, offset, axis1, axis2) {
 function diag(v, k = 0) {
 	const a = fudgeArray(v);
 	if (!Number.isInteger(k)) throw new Error(`k must be an integer, got ${k}`);
-	if (a.ndim === 1) {
+	if (a.ndim === 1) try {
+		var _usingCtx12 = _usingCtx();
 		const n = a.shape[0];
-		const ret = where(eye(n).equal(1), a, zerosLike(a));
+		const eyeN = _usingCtx12.u(eye(n));
+		const mask = _usingCtx12.u(eyeN.equal(1));
+		const zeros$1 = _usingCtx12.u(zerosLike(a));
+		if (k === 0) return where(mask, a, zeros$1);
+		const ret = _usingCtx12.u(where(mask, a, zeros$1));
 		if (k > 0) return pad(ret, [[0, k], [k, 0]]);
-		else if (k < 0) return pad(ret, [[-k, 0], [0, -k]]);
-		else return ret;
-	} else if (a.ndim === 2) return diagonal(a, k);
+		else return pad(ret, [[-k, 0], [0, -k]]);
+	} catch (_) {
+		_usingCtx12.e = _;
+	} finally {
+		_usingCtx12.d();
+	}
+	else if (a.ndim === 2) return diagonal(a, k);
 	else throw new Error("numpy.diag only supports 1D and 2D arrays");
 }
 /** Calculate the sum of the diagonal of an array along the given axes. */
 function trace(a, offset = 0, axis1 = 0, axis2 = 1) {
-	return diagonal(a, offset, axis1, axis2).sum(-1);
+	try {
+		var _usingCtx13 = _usingCtx();
+		const diag$1 = _usingCtx13.u(diagonal(a, offset, axis1, axis2));
+		return diag$1.sum(-1);
+	} catch (_) {
+		_usingCtx13.e = _;
+	} finally {
+		_usingCtx13.d();
+	}
 }
 /**
 * Return a sorted copy of an array.
@@ -7707,26 +9046,37 @@ function argsort(a, axis = -1) {
 * numbered axis. By default, the flattened array is used.
 */
 function take(a, indices, axis = null) {
+	let ravelled;
 	if (axis === null) {
-		a = ravel(a);
+		ravelled = ravel(a);
+		a = ravelled;
 		axis = 0;
 	}
 	axis = checkAxis(axis, ndim(a));
-	return gather(a, [indices], [axis], axis);
+	const result = gather(a, [indices], [axis], axis);
+	ravelled?.dispose();
+	return result;
 }
 /** Return if two arrays are element-wise equal within a tolerance. */
 function allclose(actual, expected, options) {
 	const { rtol = 1e-5, atol = 1e-7 } = options ?? {};
 	const x = array(actual);
 	const y = array(expected);
-	if (!deepEqual(x.shape, y.shape)) return false;
-	const xData = x.dataSync();
-	const yData = y.dataSync();
-	for (let i = 0; i < xData.length; i++) {
-		if (isNaN(xData[i]) !== isNaN(yData[i])) return false;
-		if (Math.abs(xData[i] - yData[i]) > atol + rtol * Math.abs(yData[i])) return false;
+	const xOwned = x !== actual;
+	const yOwned = y !== expected;
+	try {
+		if (!deepEqual(x.shape, y.shape)) return false;
+		const xData = x.dataSync();
+		const yData = y.dataSync();
+		for (let i = 0; i < xData.length; i++) {
+			if (isNaN(xData[i]) !== isNaN(yData[i])) return false;
+			if (Math.abs(xData[i] - yData[i]) > atol + rtol * Math.abs(yData[i])) return false;
+		}
+		return true;
+	} finally {
+		if (xOwned) x.dispose();
+		if (yOwned) y.dispose();
 	}
-	return true;
 }
 /** Matrix product of two arrays. */
 function matmul(x, y) {
@@ -7819,6 +9169,8 @@ function einsum(...args) {
 	const indexUsageCounts = [];
 	for (const idx of [...input.lhsIndices.flat(), ...input.rhsIndex]) indexUsageCounts[idx] = (indexUsageCounts[idx] ?? 0) + 1;
 	const indices = [...input.lhsIndices];
+	const numUserOperands = operands.length;
+	const intermediates = [];
 	const processSingleTensor = (ar$1, index$1, doNotReduce = []) => {
 		index$1 = index$1.slice();
 		diag: while (true) {
@@ -7827,6 +9179,7 @@ function einsum(...args) {
 				const j = index$1.indexOf(idx, i + 1);
 				if (j !== -1) {
 					ar$1 = diagonal(ar$1, 0, i, j);
+					intermediates.push(ar$1);
 					index$1.splice(j, 1);
 					index$1.splice(i, 1);
 					index$1.push(idx);
@@ -7839,6 +9192,7 @@ function einsum(...args) {
 			const idx = index$1[i];
 			if (indexUsageCounts[idx] === 0 && !doNotReduce.includes(idx)) {
 				ar$1 = sum(ar$1, i);
+				intermediates.push(ar$1);
 				index$1.splice(i, 1);
 			}
 		}
@@ -7861,6 +9215,7 @@ function einsum(...args) {
 			lhsBatchDims: indexBatch.map((idx) => aidx.indexOf(idx)),
 			rhsBatchDims: indexBatch.map((idx) => bidx.indexOf(idx))
 		});
+		intermediates.push(result);
 		operands.push(result);
 		indices.push([
 			...indexBatch,
@@ -7872,7 +9227,11 @@ function einsum(...args) {
 	for (const idx of indices[operands.length - 1]) --indexUsageCounts[idx];
 	const [ar, index] = processSingleTensor(operands[operands.length - 1], indices[operands.length - 1]);
 	const finalPerm = input.rhsIndex.map((idx) => index.indexOf(idx));
-	return ar.transpose(finalPerm);
+	const finalResult = ar.transpose(finalPerm);
+	const keep = new Set(operands.slice(0, numUserOperands));
+	keep.add(finalResult);
+	for (const a of intermediates) if (!keep.has(a)) a.dispose();
+	return finalResult;
 }
 /**
 * Compute the inner product of two arrays.
@@ -7895,18 +9254,33 @@ function inner(x, y) {
 * be of shape `[x.size, y.size]`.
 */
 function outer(x, y) {
-	x = ravel(x);
-	y = ravel(y);
-	return multiply(x.reshape([x.shape[0], 1]), y);
+	try {
+		var _usingCtx14 = _usingCtx();
+		const rx = _usingCtx14.u(ravel(x));
+		const ry = _usingCtx14.u(ravel(y));
+		const rxR = _usingCtx14.u(rx.reshape([rx.shape[0], 1]));
+		return multiply(rxR, ry);
+	} catch (_) {
+		_usingCtx14.e = _;
+	} finally {
+		_usingCtx14.d();
+	}
 }
 /** Vector dot product of two arrays along a given axis. */
 function vecdot(x, y, { axis } = {}) {
-	const xaxis = checkAxis(axis ?? -1, ndim(x));
-	const yaxis = checkAxis(axis ?? -1, ndim(y));
-	if (shape(x)[xaxis] !== shape(y)[yaxis]) throw new Error(`vecdot: shapes ${JSON.stringify(shape(x))} and ${JSON.stringify(shape(y))} not aligned along axis ${axis}: ${shape(x)[xaxis]} != ${shape(y)[yaxis]}`);
-	x = moveaxis$1(x, xaxis, -1);
-	y = moveaxis$1(y, yaxis, -1);
-	return dot$2(x, y);
+	try {
+		var _usingCtx15 = _usingCtx();
+		const xaxis = checkAxis(axis ?? -1, ndim(x));
+		const yaxis = checkAxis(axis ?? -1, ndim(y));
+		if (shape(x)[xaxis] !== shape(y)[yaxis]) throw new Error(`vecdot: shapes ${JSON.stringify(shape(x))} and ${JSON.stringify(shape(y))} not aligned along axis ${axis}: ${shape(x)[xaxis]} != ${shape(y)[yaxis]}`);
+		const xm = _usingCtx15.u(moveaxis$1(x, xaxis, -1));
+		const ym = _usingCtx15.u(moveaxis$1(y, yaxis, -1));
+		return dot$2(xm, ym);
+	} catch (_) {
+		_usingCtx15.e = _;
+	} finally {
+		_usingCtx15.d();
+	}
 }
 /**
 * Return the dot product of two vectors.
@@ -7914,7 +9288,16 @@ function vecdot(x, y, { axis } = {}) {
 * Like vecdot() but flattens the arguments first into vectors.
 */
 function vdot(x, y) {
-	return dot$2(ravel(x), ravel(y));
+	try {
+		var _usingCtx16 = _usingCtx();
+		const rx = _usingCtx16.u(ravel(x));
+		const ry = _usingCtx16.u(ravel(y));
+		return dot$2(rx, ry);
+	} catch (_) {
+		_usingCtx16.e = _;
+	} finally {
+		_usingCtx16.d();
+	}
 }
 function _convImpl(name, x, y, mode) {
 	if (x.ndim !== 1 || y.ndim !== 1) throw new Error(`${name}: both inputs must be 1D arrays, got ${x.ndim}D and ${y.ndim}D`);
@@ -7923,14 +9306,32 @@ function _convImpl(name, x, y, mode) {
 		[x, y] = [y, x];
 		if (name === "correlate") flipOutput = true;
 	}
-	if (name === "convolve") y = flip(y);
-	let padding;
-	if (mode === "valid") padding = "VALID";
-	else if (mode === "same") padding = "SAME_LOWER";
-	else if (mode === "full") padding = [[y.shape[0] - 1, y.shape[0] - 1]];
-	else throw new Error(`${name}: invalid mode ${mode}, expected "full", "same", or "valid"`);
-	const z = conv(x.slice(null, null), y.slice(null, null), [1], padding).slice(0, 0);
-	return flipOutput ? flip(z) : z;
+	const d = [];
+	try {
+		if (name === "convolve") {
+			y = flip(y);
+			d.push(y);
+		}
+		let padding;
+		if (mode === "valid") padding = "VALID";
+		else if (mode === "same") padding = "SAME_LOWER";
+		else if (mode === "full") padding = [[y.shape[0] - 1, y.shape[0] - 1]];
+		else throw new Error(`${name}: invalid mode ${mode}, expected "full", "same", or "valid"`);
+		const xs = x.slice(null, null);
+		d.push(xs);
+		const ys = y.slice(null, null);
+		d.push(ys);
+		const convResult = conv(xs, ys, [1], padding);
+		d.push(convResult);
+		const z = convResult.slice(0, 0);
+		if (flipOutput) {
+			d.push(z);
+			return flip(z);
+		}
+		return z;
+	} finally {
+		for (const v of d) v[Symbol.dispose]();
+	}
 }
 /** Convolution of two one-dimensional arrays. */
 function convolve(x, y, mode = "full") {
@@ -7977,8 +9378,17 @@ function meshgrid(xs, { indexing } = {}) {
 */
 function clip(a, min$2, max$2) {
 	a = fudgeArray(a);
-	if (max$2 !== void 0) a = minimum(a, max$2);
-	if (min$2 !== void 0) a = maximum(a, min$2);
+	if (max$2 !== void 0 && min$2 !== void 0) try {
+		var _usingCtx17 = _usingCtx();
+		const clipped = _usingCtx17.u(minimum(a, max$2));
+		return maximum(clipped, min$2);
+	} catch (_) {
+		_usingCtx17.e = _;
+	} finally {
+		_usingCtx17.d();
+	}
+	if (max$2 !== void 0) return minimum(a, max$2);
+	if (min$2 !== void 0) return maximum(a, min$2);
 	return a;
 }
 /**
@@ -7987,13 +9397,32 @@ function clip(a, min$2, max$2) {
 * This is the same function as `jax.numpy.abs()`.
 */
 function absolute(x) {
-	x = fudgeArray(x);
-	return where(less(x, 0), x.mul(-1), x);
+	try {
+		var _usingCtx18 = _usingCtx();
+		x = fudgeArray(x);
+		const cond = _usingCtx18.u(less(x, 0));
+		const negX = _usingCtx18.u(x.mul(-1));
+		return where(cond, negX, x);
+	} catch (_) {
+		_usingCtx18.e = _;
+	} finally {
+		_usingCtx18.d();
+	}
 }
 /** Return an element-wise indication of sign of the input. */
 function sign(x) {
-	x = fudgeArray(x);
-	return where(notEqual(x, 0), where(less(x, 0), -1, 1), 0);
+	try {
+		var _usingCtx19 = _usingCtx();
+		x = fudgeArray(x);
+		const neq = _usingCtx19.u(notEqual(x, 0));
+		const lt = _usingCtx19.u(less(x, 0));
+		const inner$1 = _usingCtx19.u(where(lt, -1, 1));
+		return where(neq, inner$1, 0);
+	} catch (_) {
+		_usingCtx19.e = _;
+	} finally {
+		_usingCtx19.d();
+	}
 }
 /** @function Return element-wise positive values of the input (no-op). */
 const positive = fudgeArray;
@@ -8003,7 +9432,17 @@ const positive = fudgeArray;
 * `w(n) = 0.54 - 0.46 * cos(2πn/(M-1))` for `0 <= n <= M-1`.
 */
 function hamming(M) {
-	return cos(linspace(0, 2 * Math.PI, M)).mul(-.46).add(.54);
+	try {
+		var _usingCtx20 = _usingCtx();
+		const ls = _usingCtx20.u(linspace(0, 2 * Math.PI, M));
+		const c = _usingCtx20.u(cos(ls));
+		const scaled = _usingCtx20.u(c.mul(-.46));
+		return scaled.add(.54);
+	} catch (_) {
+		_usingCtx20.e = _;
+	} finally {
+		_usingCtx20.d();
+	}
 }
 /**
 * Return the Hann window of size M, a taper with a weighted cosine bell.
@@ -8011,7 +9450,17 @@ function hamming(M) {
 * `w(n) = 0.5 - 0.5 * cos(2πn/(M-1))` for `0 <= n <= M-1`.
 */
 function hann(M) {
-	return cos(linspace(0, 2 * Math.PI, M)).mul(-.5).add(.5);
+	try {
+		var _usingCtx21 = _usingCtx();
+		const ls = _usingCtx21.u(linspace(0, 2 * Math.PI, M));
+		const c = _usingCtx21.u(cos(ls));
+		const scaled = _usingCtx21.u(c.mul(-.5));
+		return scaled.add(.5);
+	} catch (_) {
+		_usingCtx21.e = _;
+	} finally {
+		_usingCtx21.d();
+	}
 }
 /**
 * @function
@@ -8030,8 +9479,17 @@ function square(x) {
 }
 /** Element-wise tangent function (takes radians). */
 function tan(x) {
-	x = fudgeArray(x);
-	return sin(x).div(cos(x));
+	try {
+		var _usingCtx22 = _usingCtx();
+		x = fudgeArray(x);
+		const sinX = _usingCtx22.u(sin(x));
+		const cosX = _usingCtx22.u(cos(x));
+		return sinX.div(cosX);
+	} catch (_) {
+		_usingCtx22.e = _;
+	} finally {
+		_usingCtx22.d();
+	}
 }
 /**
 * @function
@@ -8049,7 +9507,15 @@ const sinc = jit$1(function sinc$1(x) {
 });
 /** Element-wise inverse cosine function (inverse of cos). */
 function acos(x) {
-	return subtract(pi / 2, asin(x));
+	try {
+		var _usingCtx23 = _usingCtx();
+		const asinX = _usingCtx23.u(asin(x));
+		return subtract(pi / 2, asinX);
+	} catch (_) {
+		_usingCtx23.e = _;
+	} finally {
+		_usingCtx23.d();
+	}
 }
 /**
 * @function
@@ -8092,9 +9558,15 @@ function subtract(x, y) {
 function trueDivide(x, y) {
 	x = fudgeArray(x);
 	y = fudgeArray(y);
-	if (!isFloatDtype(x.dtype) && !isFloatDtype(y.dtype)) {
-		x = x.astype(DType.Float32);
-		y = y.astype(DType.Float32);
+	if (!isFloatDtype(x.dtype) && !isFloatDtype(y.dtype)) try {
+		var _usingCtx24 = _usingCtx();
+		const xf = _usingCtx24.u(x.astype(DType.Float32));
+		const yf = _usingCtx24.u(y.astype(DType.Float32));
+		return xf.div(yf);
+	} catch (_) {
+		_usingCtx24.e = _;
+	} finally {
+		_usingCtx24.d();
 	}
 	return x.div(y);
 }
@@ -8112,10 +9584,32 @@ function trueDivide(x, y) {
 * @returns Element-wise floor division of x by y.
 */
 function floorDivide(x, y) {
-	x = fudgeArray(x);
-	y = fudgeArray(y);
-	if (isFloatDtype(x.dtype) || isFloatDtype(y.dtype)) return floor(trueDivide(x, y));
-	return subtract(x, remainder(x, y)).div(y);
+	const xArr = fudgeArray(x);
+	const yArr = fudgeArray(y);
+	try {
+		try {
+			var _usingCtx25 = _usingCtx();
+			if (isFloatDtype(xArr.dtype) || isFloatDtype(yArr.dtype)) try {
+				var _usingCtx26 = _usingCtx();
+				const div = _usingCtx26.u(trueDivide(xArr, yArr));
+				return floor(div);
+			} catch (_) {
+				_usingCtx26.e = _;
+			} finally {
+				_usingCtx26.d();
+			}
+			const rem = _usingCtx25.u(remainder(xArr, yArr));
+			const diff = _usingCtx25.u(subtract(xArr, rem));
+			return diff.div(yArr);
+		} catch (_) {
+			_usingCtx25.e = _;
+		} finally {
+			_usingCtx25.d();
+		}
+	} finally {
+		if (xArr !== x) xArr.dispose();
+		if (yArr !== y) yArr.dispose();
+	}
 }
 /**
 * @function
@@ -8143,7 +9637,10 @@ const remainder = jit$1(function remainder$1(x, y) {
 function divmod(x, y) {
 	const xArr = fudgeArray(x);
 	const yArr = fudgeArray(y);
-	return [floorDivide(xArr, yArr), remainder(xArr, yArr)];
+	const result = [floorDivide(xArr, yArr), remainder(xArr, yArr)];
+	if (xArr !== x) xArr.dispose();
+	if (yArr !== y) yArr.dispose();
+	return result;
 }
 /** Round input to the nearest integer towards zero. */
 function trunc(x) {
@@ -8155,7 +9652,15 @@ function trunc(x) {
 * This is the inverse of `frexp()`.
 */
 function ldexp(x1, x2) {
-	return multiply(x1, exp2(x2));
+	try {
+		var _usingCtx27 = _usingCtx();
+		const e$1 = _usingCtx27.u(exp2(x2));
+		return multiply(x1, e$1);
+	} catch (_) {
+		_usingCtx27.e = _;
+	} finally {
+		_usingCtx27.d();
+	}
 }
 /**
 * Decompose floating-point values into mantissa and two's exponent.
@@ -8173,23 +9678,63 @@ function frexp(x) {
 }
 /** Calculate `2**p` for all p in the input array. */
 function exp2(p) {
-	return exp(multiply(p, Math.LN2));
+	try {
+		var _usingCtx28 = _usingCtx();
+		const prod$2 = _usingCtx28.u(multiply(p, Math.LN2));
+		return exp(prod$2);
+	} catch (_) {
+		_usingCtx28.e = _;
+	} finally {
+		_usingCtx28.d();
+	}
 }
 /** Return the base-2 logarithm of x, element-wise. */
 function log2(x) {
-	return log(x).mul(Math.LOG2E);
+	try {
+		var _usingCtx29 = _usingCtx();
+		const logX = _usingCtx29.u(log(x));
+		return logX.mul(Math.LOG2E);
+	} catch (_) {
+		_usingCtx29.e = _;
+	} finally {
+		_usingCtx29.d();
+	}
 }
 /** Return the base-10 logarithm of x, element-wise. */
 function log10(x) {
-	return log(x).mul(Math.LOG10E);
+	try {
+		var _usingCtx30 = _usingCtx();
+		const logX = _usingCtx30.u(log(x));
+		return logX.mul(Math.LOG10E);
+	} catch (_) {
+		_usingCtx30.e = _;
+	} finally {
+		_usingCtx30.d();
+	}
 }
 /** Calculate `exp(x) - 1` element-wise. */
 function expm1(x) {
-	return exp(x).sub(1);
+	try {
+		var _usingCtx31 = _usingCtx();
+		const expX = _usingCtx31.u(exp(x));
+		return expX.sub(1);
+	} catch (_) {
+		_usingCtx31.e = _;
+	} finally {
+		_usingCtx31.d();
+	}
 }
 /** Calculate the natural logarithm of `1 + x` element-wise. */
 function log1p(x) {
-	return log(add(1, x));
+	try {
+		var _usingCtx32 = _usingCtx();
+		const sum$1 = _usingCtx32.u(add(1, x));
+		return log(sum$1);
+	} catch (_) {
+		_usingCtx32.e = _;
+	} finally {
+		_usingCtx32.d();
+	}
 }
 /** Convert angles from degrees to radians. */
 function deg2rad(x) {
@@ -8292,8 +9837,23 @@ function var_(x, axis = null, opts) {
 	axis = normalizeAxis(axis, x.ndim);
 	const n = axis.reduce((acc, a) => acc * x.shape[a], 1);
 	if (n === 0) throw new Error("var: cannot compute variance over zero-length axis");
-	const mu = opts?.mean !== void 0 ? opts.mean : mean(x, axis, { keepdims: true });
-	return square(x.sub(mu)).sum(axis, { keepdims: opts?.keepdims }).mul(1 / (n - (opts?.correction ?? 0)));
+	const d = [];
+	try {
+		const mu = opts?.mean !== void 0 ? opts.mean : (() => {
+			const m = mean(x, axis, { keepdims: true });
+			d.push(m);
+			return m;
+		})();
+		const centered = x.sub(mu);
+		d.push(centered);
+		const sq = square(centered);
+		d.push(sq);
+		const summed = sq.sum(axis, { keepdims: opts?.keepdims });
+		d.push(summed);
+		return summed.mul(1 / (n - (opts?.correction ?? 0)));
+	} finally {
+		for (const v of d) v[Symbol.dispose]();
+	}
 }
 /**
 * Compute the standard deviation of an array.
@@ -8305,33 +9865,82 @@ function var_(x, axis = null, opts) {
 * where `N` represents the number of elements (e.g., for Bessel's correction).
 */
 function std(x, axis = null, opts) {
-	return sqrt(var_(x, axis, opts));
+	try {
+		var _usingCtx33 = _usingCtx();
+		const v = _usingCtx33.u(var_(x, axis, opts));
+		return sqrt(v);
+	} catch (_) {
+		_usingCtx33.e = _;
+	} finally {
+		_usingCtx33.d();
+	}
 }
 /** Estimate the sample covariance of a set of variables. */
 function cov(x, y = null, { rowvar = true } = {}) {
-	x = fudgeArray(x);
-	if (x.ndim === 1) x = x.reshape([1, x.shape[0]]);
-	if (y !== null) {
-		y = fudgeArray(y);
-		if (y.ndim === 1) y = y.reshape([1, y.shape[0]]);
-		x = vstack([x, y]);
+	try {
+		var _usingCtx34 = _usingCtx();
+		const disposables = [];
+		let a = fudgeArray(x);
+		if (a.ndim === 1) {
+			a = a.reshape([1, a.shape[0]]);
+			disposables.push(a);
+		}
+		if (y !== null) {
+			let b = fudgeArray(y);
+			if (b.ndim === 1) {
+				b = b.reshape([1, b.shape[0]]);
+				disposables.push(b);
+			}
+			a = vstack([a, b]);
+			disposables.push(a);
+		}
+		if (!rowvar) {
+			a = a.transpose();
+			disposables.push(a);
+		}
+		const [_M, N] = a.shape;
+		const mean$1 = _usingCtx34.u(a.mean(1, { keepdims: true }));
+		const centered = a.sub(mean$1);
+		disposables.push(centered);
+		const xt = _usingCtx34.u(centered.transpose());
+		const dotResult = _usingCtx34.u(dot$1(centered, xt));
+		const result = dotResult.div(N - 1);
+		for (const d of disposables) d.dispose();
+		return result;
+	} catch (_) {
+		_usingCtx34.e = _;
+	} finally {
+		_usingCtx34.d();
 	}
-	if (!rowvar) x = x.transpose();
-	const [_M, N] = x.shape;
-	x = x.sub(x.mean(1, { keepdims: true }));
-	return dot$1(x, x.transpose()).div(N - 1);
 }
 /** Compute the Pearson correlation coefficients (in range `[-1, 1]`). */
 function corrcoef(x, y) {
-	const c = cov(x, y);
-	const variances = diag(c);
-	const norm = sqrt(outer(variances, variances));
-	return c.div(norm);
+	try {
+		var _usingCtx35 = _usingCtx();
+		const c = _usingCtx35.u(cov(x, y));
+		const variances = _usingCtx35.u(diag(c));
+		const norm = _usingCtx35.u(sqrt(outer(variances, variances)));
+		return c.div(norm);
+	} catch (_) {
+		_usingCtx35.e = _;
+	} finally {
+		_usingCtx35.d();
+	}
 }
 /** Test element-wise for positive or negative infinity, return bool array. */
 function isinf(x) {
-	x = fudgeArray(x);
-	return isFloatDtype(x.dtype) ? x.equal(Infinity).add(x.equal(-Infinity)) : fullLike$1(x, false);
+	try {
+		var _usingCtx36 = _usingCtx();
+		x = fudgeArray(x);
+		if (!isFloatDtype(x.dtype)) return fullLike$1(x, false);
+		const posInf = _usingCtx36.u(x.equal(Infinity));
+		const negInf = _usingCtx36.u(x.equal(-Infinity));
+		return posInf.add(negInf);
+	} catch (_) {
+		_usingCtx36.e = _;
+	} finally {
+		_usingCtx36.d();
+	}
 }
 /** Test element-wise for NaN (Not a Number). */
 function isnan(x) {
@@ -8355,13 +9964,22 @@ function isposinf(x) {
 * with the corresponding maximum or minimum finite values.
 */
 function nanToNum(x, { nan: nan$1 = 0, posinf = null, neginf = null } = {}) {
-	x = fudgeArray(x);
-	x = where(isnan(x), nan$1, x);
-	posinf ??= isFloatDtype(x.dtype) ? finfo(x.dtype).max : iinfo(x.dtype).max;
-	neginf ??= isFloatDtype(x.dtype) ? finfo(x.dtype).min : iinfo(x.dtype).min;
-	x = where(isposinf(x), posinf, x);
-	x = where(isneginf(x), neginf, x);
-	return x;
+	try {
+		var _usingCtx37 = _usingCtx();
+		x = fudgeArray(x);
+		const nanMask = _usingCtx37.u(isnan(x));
+		const afterNan = _usingCtx37.u(where(nanMask, nan$1, x));
+		posinf ??= isFloatDtype(afterNan.dtype) ? finfo(afterNan.dtype).max : iinfo(afterNan.dtype).max;
+		neginf ??= isFloatDtype(afterNan.dtype) ? finfo(afterNan.dtype).min : iinfo(afterNan.dtype).min;
+		const posInfMask = _usingCtx37.u(isposinf(afterNan));
+		const afterPosInf = _usingCtx37.u(where(posInfMask, posinf, afterNan));
+		const negInfMask = _usingCtx37.u(isneginf(afterPosInf));
+		return where(negInfMask, neginf, afterPosInf);
+	} catch (_) {
+		_usingCtx37.e = _;
+	} finally {
+		_usingCtx37.d();
+	}
 }
 /**
 * @function
@@ -8407,8 +10025,16 @@ __export(lax_linalg_exports, {
 * ```
 */
 function cholesky$1(a, { upper = false } = {}) {
-	const L = cholesky$2(a);
-	return upper ? moveaxis$1(L, -2, -1) : L;
+	if (upper) try {
+		var _usingCtx$1 = _usingCtx();
+		const L = _usingCtx$1.u(cholesky$2(a));
+		return moveaxis$1(L, -2, -1);
+	} catch (_) {
+		_usingCtx$1.e = _;
+	} finally {
+		_usingCtx$1.d();
+	}
+	return cholesky$2(a);
 }
 /**
 * LU decomposition with partial pivoting.
@@ -8459,18 +10085,30 @@ function lu(x) {
 function triangularSolve(a, b, { leftSide = false, lower = false, transposeA = false, unitDiagonal = false } = {}) {
 	a = fudgeArray(a);
 	b = fudgeArray(b);
-	if (!leftSide) transposeA = !transposeA;
-	else b = moveaxis$1(b, -2, -1);
-	if (transposeA) {
-		a = moveaxis$1(a, -2, -1);
-		lower = !lower;
+	const d = [];
+	try {
+		if (!leftSide) transposeA = !transposeA;
+		else {
+			b = moveaxis$1(b, -2, -1);
+			d.push(b);
+		}
+		if (transposeA) {
+			a = moveaxis$1(a, -2, -1);
+			d.push(a);
+			lower = !lower;
+		}
+		let x = triangularSolve$1(a, b, {
+			lower,
+			unitDiagonal
+		});
+		if (leftSide) {
+			d.push(x);
+			x = moveaxis$1(x, -2, -1);
+		}
+		return x;
+	} finally {
+		for (const v of d) v[Symbol.dispose]();
 	}
-	let x = triangularSolve$1(a, b, {
-		lower,
-		unitDiagonal
-	});
-	if (leftSide) x = moveaxis$1(x, -2, -1);
-	return x;
 }
 
 //#endregion
@@ -8809,49 +10447,67 @@ const JsArray = globalThis.Array;
 * `jax.numpy.tensordot(), and `jax.numpy.einsum()` where possible.
 */
 function dot(lhs, rhs, { lhsContractingDims: lc = [], rhsContractingDims: rc = [], lhsBatchDims: lb = [], rhsBatchDims: rb = [] } = {}) {
-	if (lc.length !== rc.length) throw new Error(`dot: contracting dims lengths mismatch, got ${JSON.stringify(lc)} and ${JSON.stringify(rc)}`);
-	else if (lb.length !== rb.length) throw new Error(`dot: batch dims lengths mismatch, got ${JSON.stringify(lb)} and ${JSON.stringify(rb)}`);
-	lc = lc.map((a) => checkAxis(a, lhs.ndim));
-	rc = rc.map((a) => checkAxis(a, rhs.ndim));
-	lb = lb.map((a) => checkAxis(a, lhs.ndim));
-	rb = rb.map((a) => checkAxis(a, rhs.ndim));
-	if (lc.some((a) => lb.includes(a))) throw new Error(`dot: lhs contracting dims ${JSON.stringify(lc)} overlap with batch dims ${JSON.stringify(lb)}`);
-	else if (rc.some((a) => rb.includes(a))) throw new Error(`dot: rhs contracting dims ${JSON.stringify(rc)} overlap with batch dims ${JSON.stringify(rb)}`);
-	const lf = range(lhs.ndim).filter((a) => !lc.includes(a) && !lb.includes(a));
-	const rf = range(rhs.ndim).filter((a) => !rc.includes(a) && !rb.includes(a));
-	const lhs2 = lhs.transpose([
-		...lb,
-		...lf,
-		...lc
-	]);
-	const rhs2 = rhs.transpose([
-		...rb,
-		...rf,
-		...rc
-	]);
-	if (lc.length === 0) return mul(lhs2.reshape([
-		...lb.map((a) => lhs.shape[a]),
-		...lf.map((a) => lhs.shape[a]),
-		...rep(rf.length, 1)
-	]), rhs2.reshape([
-		...rb.map((a) => rhs.shape[a]),
-		...rep(lf.length, 1),
-		...rf.map((a) => rhs.shape[a])
-	]));
-	const dotShapeX = lc.map((a) => lhs.shape[a]);
-	const dotShapeY = rc.map((a) => rhs.shape[a]);
-	if (!deepEqual(dotShapeX, dotShapeY)) throw new Error(`dot: shapes not aligned along contracting dims: ${JSON.stringify(dotShapeX)} != ${JSON.stringify(dotShapeY)}`);
-	return dot$2(lhs2.reshape([
-		...lb.map((a) => lhs.shape[a]),
-		...lf.map((a) => lhs.shape[a]),
-		...rep(rf.length, 1),
-		prod(dotShapeX)
-	]), rhs2.reshape([
-		...rb.map((a) => rhs.shape[a]),
-		...rep(lf.length, 1),
-		...rf.map((a) => rhs.shape[a]),
-		prod(dotShapeY)
-	]));
+	try {
+		var _usingCtx$1 = _usingCtx();
+		if (lc.length !== rc.length) throw new Error(`dot: contracting dims lengths mismatch, got ${JSON.stringify(lc)} and ${JSON.stringify(rc)}`);
+		else if (lb.length !== rb.length) throw new Error(`dot: batch dims lengths mismatch, got ${JSON.stringify(lb)} and ${JSON.stringify(rb)}`);
+		lc = lc.map((a) => checkAxis(a, lhs.ndim));
+		rc = rc.map((a) => checkAxis(a, rhs.ndim));
+		lb = lb.map((a) => checkAxis(a, lhs.ndim));
+		rb = rb.map((a) => checkAxis(a, rhs.ndim));
+		if (lc.some((a) => lb.includes(a))) throw new Error(`dot: lhs contracting dims ${JSON.stringify(lc)} overlap with batch dims ${JSON.stringify(lb)}`);
+		else if (rc.some((a) => rb.includes(a))) throw new Error(`dot: rhs contracting dims ${JSON.stringify(rc)} overlap with batch dims ${JSON.stringify(rb)}`);
+		const lf = range(lhs.ndim).filter((a) => !lc.includes(a) && !lb.includes(a));
+		const rf = range(rhs.ndim).filter((a) => !rc.includes(a) && !rb.includes(a));
+		const lhs2 = _usingCtx$1.u(lhs.transpose([
+			...lb,
+			...lf,
+			...lc
+		]));
+		const rhs2 = _usingCtx$1.u(rhs.transpose([
+			...rb,
+			...rf,
+			...rc
+		]));
+		if (lc.length === 0) try {
+			var _usingCtx3 = _usingCtx();
+			const lhsR$1 = _usingCtx3.u(lhs2.reshape([
+				...lb.map((a) => lhs.shape[a]),
+				...lf.map((a) => lhs.shape[a]),
+				...rep(rf.length, 1)
+			]));
+			const rhsR$1 = _usingCtx3.u(rhs2.reshape([
+				...rb.map((a) => rhs.shape[a]),
+				...rep(lf.length, 1),
+				...rf.map((a) => rhs.shape[a])
+			]));
+			return mul(lhsR$1, rhsR$1);
+		} catch (_) {
+			_usingCtx3.e = _;
+		} finally {
+			_usingCtx3.d();
+		}
+		const dotShapeX = lc.map((a) => lhs.shape[a]);
+		const dotShapeY = rc.map((a) => rhs.shape[a]);
+		if (!deepEqual(dotShapeX, dotShapeY)) throw new Error(`dot: shapes not aligned along contracting dims: ${JSON.stringify(dotShapeX)} != ${JSON.stringify(dotShapeY)}`);
+		const lhsR = _usingCtx$1.u(lhs2.reshape([
+			...lb.map((a) => lhs.shape[a]),
+			...lf.map((a) => lhs.shape[a]),
+			...rep(rf.length, 1),
+			prod(dotShapeX)
+		]));
+		const rhsR = _usingCtx$1.u(rhs2.reshape([
+			...rb.map((a) => rhs.shape[a]),
+			...rep(lf.length, 1),
+			...rf.map((a) => rhs.shape[a]),
+			prod(dotShapeY)
+		]));
+		return dot$2(lhsR, rhsR);
+	} catch (_) {
+		_usingCtx$1.e = _;
+	} finally {
+		_usingCtx$1.d();
+	}
 }
 function padtypeToPads(inShape, filterShape, strides, dilation, padding) {
 	const padType = padding.toUpperCase();
@@ -8886,38 +10542,45 @@ function convGeneralDilated(lhs, rhs, windowStrides, padding, { lhsDilation, rhs
 		if (lhsDilation?.some((d) => d !== 1)) throw new Error("String padding is not supported for transposed convolutions");
 		padding = padtypeToPads(lhs.shape.slice(2), rhs.shape.slice(2), windowStrides, rhsDilation ?? rep(rhs.ndim - 2, 1), padding);
 	}
-	if (featureGroupCount !== 1) {
+	if (featureGroupCount !== 1) try {
+		var _usingCtx4 = _usingCtx();
 		const G = featureGroupCount;
 		const [N, C_in, ...xs] = lhs.shape;
 		const [C_out, C_in_per_group, ...ks] = rhs.shape;
 		if (C_in % G !== 0) throw new Error(`featureGroupCount=${G} must divide input channels=${C_in}`);
 		if (C_out % G !== 0) throw new Error(`featureGroupCount=${G} must divide output channels=${C_out}`);
 		if (C_in / G !== C_in_per_group) throw new Error(`rhs input channels=${C_in_per_group} must equal lhs input channels / groups=${C_in / G}`);
-		const lhsGrouped = moveaxis(lhs.reshape([
+		const lhsReshaped = _usingCtx4.u(lhs.reshape([
 			N,
 			G,
 			C_in / G,
 			...xs
-		]), 1, 0);
-		const rhsGrouped = rhs.reshape([
+		]));
+		const lhsGrouped = _usingCtx4.u(moveaxis(lhsReshaped, 1, 0));
+		const rhsGrouped = _usingCtx4.u(rhs.reshape([
 			G,
 			C_out / G,
 			C_in_per_group,
 			...ks
-		]);
-		const result = conv$1(lhsGrouped, rhsGrouped, {
+		]));
+		const result = _usingCtx4.u(conv$1(lhsGrouped, rhsGrouped, {
 			vmapDims: 1,
 			strides: windowStrides,
 			padding,
 			lhsDilation,
 			rhsDilation
-		});
+		}));
 		const ys = result.shape.slice(3);
-		return moveaxis(result, 0, 1).reshape([
+		const moved = _usingCtx4.u(moveaxis(result, 0, 1));
+		return moved.reshape([
 			N,
 			C_out,
 			...ys
 		]);
+	} catch (_) {
+		_usingCtx4.e = _;
+	} finally {
+		_usingCtx4.d();
 	}
 	return conv$1(lhs, rhs, {
 		strides: windowStrides,
@@ -8966,9 +10629,14 @@ function convTranspose(lhs, rhs, strides, padding, { rhsDilation, transposeKerne
 	rhsDilation = rhsDilation ?? rep(kernelShape.length, 1);
 	const effectiveKernel = kernelShape.map((k, i) => Math.max(0, (k - 1) * rhsDilation[i] + 1));
 	const pads = effectiveKernel.map((k, i) => convTransposePadding(k, strides[i], typeof padding === "string" ? padding : padding[i]));
-	if (transposeKernel) {
-		rhs = flip$1(rhs, range(2, rhs.ndim));
-		rhs = moveaxis(rhs, 0, 1);
+	if (transposeKernel) try {
+		var _usingCtx5 = _usingCtx();
+		const flipped = _usingCtx5.u(flip$1(rhs, range(2, rhs.ndim)));
+		rhs = moveaxis(flipped, 0, 1);
+	} catch (_) {
+		_usingCtx5.e = _;
+	} finally {
+		_usingCtx5.d();
 	}
 	return convGeneralDilated(lhs, rhs, rep(lhs.ndim - 2, 1), pads, {
 		lhsDilation: strides,
@@ -8996,10 +10664,13 @@ function reduceWindow(operand, computation, windowDimensions, windowStrides) {
 	if (operand.ndim < windowDimensions.length) throw new Error(`Operand dimensions ${operand.ndim} < window ${windowDimensions.length}`);
 	if (!windowStrides) windowStrides = rep(windowDimensions.length, 1);
 	for (let i = 0; i < operand.ndim; i++) computation = vmap$1(computation, 0);
-	return computation(bind1(Primitive.Pool, [operand], {
+	const pooled = bind1(Primitive.Pool, [operand], {
 		window: windowDimensions,
 		strides: windowStrides
-	}));
+	});
+	const result = computation(pooled);
+	if (pooled !== result) pooled[Symbol.dispose]?.();
+	return result;
 }
 /** The error function: `erf(x) = 2/sqrt(pi) * int[0..x] exp(-t^2) dt`. */
 function erf(x) {
@@ -9040,21 +10711,36 @@ function topK(x, k, axis = -1) {
 	if (k === 0) {
 		const outShape = x.shape.slice();
 		outShape[axis] = 0;
-		const y$1 = zerosLike$1(x.ref, { shape: outShape });
+		const y$1 = zerosLike$1(x, { shape: outShape });
 		const yi$1 = zerosLike$1(x, {
 			dtype: DType.Int32,
 			shape: outShape
 		});
 		return [y$1, yi$1];
 	}
-	x = flip$1(x, [axis]);
-	x = moveaxis(x, axis, -1);
-	const [y, yi] = argsort$1(x);
+	const flipped = flip$1(x, [axis]);
+	const moved = moveaxis(flipped, axis, -1);
+	const argsortResult = argsort$1(moved);
+	const y = argsortResult[0];
+	const yi = argsortResult[1];
 	const extract = (a) => {
-		a = a.slice(...rep(a.ndim - 1, []), [-k]);
-		return flip$1(moveaxis(a, -1, axis), [axis]);
+		const sliced = a.slice(...rep(a.ndim - 1, []), [-k]);
+		const movedBack = moveaxis(sliced, -1, axis);
+		const result$1 = flip$1(movedBack, [axis]);
+		if (movedBack !== sliced) movedBack.dispose();
+		sliced.dispose();
+		return result$1;
 	};
-	return [extract(y), extract(yi.neg().add(size$1 - 1))];
+	const neg$1 = yi.neg();
+	const adjusted = neg$1.add(size$1 - 1);
+	const result = [extract(y), extract(adjusted)];
+	adjusted.dispose();
+	neg$1.dispose();
+	yi.dispose();
+	y.dispose();
+	if (moved !== flipped) moved.dispose();
+	flipped.dispose();
+	return result;
 }
 
 //#endregion
@@ -9113,7 +10799,17 @@ function relu6(x) {
 * Reference: https://en.wikipedia.org/wiki/Sigmoid_function
 */
 function sigmoid(x) {
-	return reciprocal(exp(negative(x)).add(1));
+	try {
+		var _usingCtx$1 = _usingCtx();
+		const neg$1 = _usingCtx$1.u(negative(x));
+		const e$1 = _usingCtx$1.u(exp(neg$1));
+		const sum$1 = _usingCtx$1.u(e$1.add(1));
+		return reciprocal(sum$1);
+	} catch (_) {
+		_usingCtx$1.e = _;
+	} finally {
+		_usingCtx$1.d();
+	}
 }
 /**
 * Softplus activation function:
@@ -9122,7 +10818,16 @@ function sigmoid(x) {
 * Reference: https://en.wikipedia.org/wiki/Softplus
 */
 function softplus(x) {
-	return log(exp(x).add(1));
+	try {
+		var _usingCtx3 = _usingCtx();
+		const e$1 = _usingCtx3.u(exp(x));
+		const sum$1 = _usingCtx3.u(e$1.add(1));
+		return log(sum$1);
+	} catch (_) {
+		_usingCtx3.e = _;
+	} finally {
+		_usingCtx3.d();
+	}
 }
 /**
 * @function
@@ -9151,8 +10856,17 @@ const sparseSigmoid = jit$1((x) => {
 * `softsign(x) = x / (|x| + 1)`.
 */
 function softSign(x) {
-	x = fudgeArray(x);
-	return x.div(absolute(x).add(1));
+	try {
+		var _usingCtx4 = _usingCtx();
+		x = fudgeArray(x);
+		const absX = _usingCtx4.u(absolute(x));
+		const denom = _usingCtx4.u(absX.add(1));
+		return x.div(denom);
+	} catch (_) {
+		_usingCtx4.e = _;
+	} finally {
+		_usingCtx4.d();
+	}
 }
 /**
 * @function
@@ -9172,7 +10886,16 @@ const silu = jit$1(function silu$1(x) {
 * `log_sigmoid(x) = log(sigmoid(x)) = -log(1 + exp(-x))`.
 */
 function logSigmoid(x) {
-	return negative(softplus(negative(x)));
+	try {
+		var _usingCtx5 = _usingCtx();
+		const neg$1 = _usingCtx5.u(negative(x));
+		const sp = _usingCtx5.u(softplus(neg$1));
+		return negative(sp);
+	} catch (_) {
+		_usingCtx5.e = _;
+	} finally {
+		_usingCtx5.d();
+	}
 }
 /**
 * @function
@@ -9181,17 +10904,43 @@ function logSigmoid(x) {
 const identity = fudgeArray;
 /** Leaky rectified linear (ReLU) activation function */
 function leakyRelu(x, negativeSlope = .01) {
-	x = fudgeArray(x);
-	return where(less(x, 0), x.mul(negativeSlope), x);
+	try {
+		var _usingCtx6 = _usingCtx();
+		x = fudgeArray(x);
+		const cond = _usingCtx6.u(less(x, 0));
+		const scaled = _usingCtx6.u(x.mul(negativeSlope));
+		return where(cond, scaled, x);
+	} catch (_) {
+		_usingCtx6.e = _;
+	} finally {
+		_usingCtx6.d();
+	}
 }
 /** Hard sigmoid activation function: `relu6(x+3)/6`. */
 function hardSigmoid(x) {
-	return relu6(add(x, 3)).mul(1 / 6);
+	try {
+		var _usingCtx7 = _usingCtx();
+		const sum$1 = _usingCtx7.u(add(x, 3));
+		const r = _usingCtx7.u(relu6(sum$1));
+		return r.mul(1 / 6);
+	} catch (_) {
+		_usingCtx7.e = _;
+	} finally {
+		_usingCtx7.d();
+	}
 }
 /** Hard SiLU (swish) activation function: `x * hardSigmoid(x)`. */
 function hardSilu(x) {
-	x = fudgeArray(x);
-	return x.mul(hardSigmoid(x));
+	try {
+		var _usingCtx8 = _usingCtx();
+		x = fudgeArray(x);
+		const hs = _usingCtx8.u(hardSigmoid(x));
+		return x.mul(hs);
+	} catch (_) {
+		_usingCtx8.e = _;
+	} finally {
+		_usingCtx8.d();
+	}
 }
 /** Hard tanh activation function: `clip(x, -1, 1)`. */
 function hardTanh(x) {
@@ -9204,8 +10953,19 @@ function hardTanh(x) {
 * `elu(x) = x > 0 ? x : alpha * (exp(x) - 1)`
 */
 function elu(x, alpha = 1) {
-	x = fudgeArray(x);
-	return where(less(x, 0), exp(x).sub(1).mul(alpha), x);
+	try {
+		var _usingCtx9 = _usingCtx();
+		x = fudgeArray(x);
+		const cond = _usingCtx9.u(less(x, 0));
+		const e$1 = _usingCtx9.u(exp(x));
+		const em1 = _usingCtx9.u(e$1.sub(1));
+		const scaled = _usingCtx9.u(em1.mul(alpha));
+		return where(cond, scaled, x);
+	} catch (_) {
+		_usingCtx9.e = _;
+	} finally {
+		_usingCtx9.d();
+	}
 }
 /**
 * Continuously-differentiable exponential linear unit activation function.
@@ -9214,8 +10974,20 @@ function elu(x, alpha = 1) {
 * `celu(x) = x > 0 ? x : alpha * (exp(x/alpha) - 1)`
 */
 function celu(x, alpha = 1) {
-	x = fudgeArray(x);
-	return where(less(x, 0), exp(x.div(alpha)).sub(1).mul(alpha), x);
+	try {
+		var _usingCtx10 = _usingCtx();
+		x = fudgeArray(x);
+		const cond = _usingCtx10.u(less(x, 0));
+		const ratio = _usingCtx10.u(x.div(alpha));
+		const e$1 = _usingCtx10.u(exp(ratio));
+		const em1 = _usingCtx10.u(e$1.sub(1));
+		const scaled = _usingCtx10.u(em1.mul(alpha));
+		return where(cond, scaled, x);
+	} catch (_) {
+		_usingCtx10.e = _;
+	} finally {
+		_usingCtx10.d();
+	}
 }
 /**
 * @function
@@ -9256,14 +11028,22 @@ const gelu = jit$1(function gelu$1(x, opts) {
 * computes `a * sigmoid(b)`.
 */
 function glu(x, axis = -1) {
-	x = fudgeArray(x);
-	axis = checkAxis(axis, x.ndim);
-	const size$1 = x.shape[axis];
-	if (size$1 % 2 !== 0) throw new Error(`glu: axis ${axis} of shape (${x.shape}) does not have even length`);
-	const slice = x.shape.map((a$1) => [0, a$1]);
-	const a = shrink(x, slice.toSpliced(axis, 1, [0, size$1 / 2]));
-	const b = shrink(x, slice.toSpliced(axis, 1, [size$1 / 2, size$1]));
-	return a.mul(sigmoid(b));
+	try {
+		var _usingCtx11 = _usingCtx();
+		x = fudgeArray(x);
+		axis = checkAxis(axis, x.ndim);
+		const size$1 = x.shape[axis];
+		if (size$1 % 2 !== 0) throw new Error(`glu: axis ${axis} of shape (${x.shape}) does not have even length`);
+		const slice = x.shape.map((a$1) => [0, a$1]);
+		const a = _usingCtx11.u(shrink(x, slice.toSpliced(axis, 1, [0, size$1 / 2])));
+		const b = _usingCtx11.u(shrink(x, slice.toSpliced(axis, 1, [size$1 / 2, size$1])));
+		const sig = _usingCtx11.u(sigmoid(b));
+		return a.mul(sig);
+	} catch (_) {
+		_usingCtx11.e = _;
+	} finally {
+		_usingCtx11.d();
+	}
 }
 /**
 * Squareplus activation function.
@@ -9272,8 +11052,19 @@ function glu(x, axis = -1) {
 * `squareplus(x) = 0.5 * (x + sqrt(x^2 + b))`
 */
 function squareplus(x, b = 4) {
-	x = fudgeArray(x);
-	return x.add(sqrt(square(x).add(b))).mul(.5);
+	try {
+		var _usingCtx12 = _usingCtx();
+		x = fudgeArray(x);
+		const sq = _usingCtx12.u(square(x));
+		const sumSq = _usingCtx12.u(sq.add(b));
+		const sr = _usingCtx12.u(sqrt(sumSq));
+		const sum$1 = _usingCtx12.u(x.add(sr));
+		return sum$1.mul(.5);
+	} catch (_) {
+		_usingCtx12.e = _;
+	} finally {
+		_usingCtx12.d();
+	}
 }
 /**
 * Mish activation function.
@@ -9282,8 +11073,17 @@ function squareplus(x, b = 4) {
 * `mish(x) = x * tanh(softplus(x))`
 */
 function mish(x) {
-	x = fudgeArray(x);
-	return x.mul(tanh(softplus(x)));
+	try {
+		var _usingCtx13 = _usingCtx();
+		x = fudgeArray(x);
+		const sp = _usingCtx13.u(softplus(x));
+		const t = _usingCtx13.u(tanh(sp));
+		return x.mul(t);
+	} catch (_) {
+		_usingCtx13.e = _;
+	} finally {
+		_usingCtx13.d();
+	}
 }
 /**
 * Softmax function. Computes the function which rescales elements to the range
@@ -9294,12 +11094,22 @@ function mish(x) {
 * Reference: https://en.wikipedia.org/wiki/Softmax_function
 */
 function softmax(x, axis = -1) {
-	x = fudgeArray(x);
-	axis = normalizeAxis(axis, x.ndim);
-	if (axis.length === 0) return onesLike(x);
-	const xMax = max(x, axis, { keepdims: true });
-	const unnormalized = exp(x.sub(stopGradient(xMax)));
-	return unnormalized.div(unnormalized.sum(axis, { keepdims: true }));
+	try {
+		var _usingCtx14 = _usingCtx();
+		x = fudgeArray(x);
+		axis = normalizeAxis(axis, x.ndim);
+		if (axis.length === 0) return onesLike(x);
+		const xMax = _usingCtx14.u(max(x, axis, { keepdims: true }));
+		const sg = stopGradient(xMax);
+		const shifted = _usingCtx14.u(x.sub(sg));
+		const unnormalized = _usingCtx14.u(exp(shifted));
+		const denom = _usingCtx14.u(unnormalized.sum(axis, { keepdims: true }));
+		return unnormalized.div(denom);
+	} catch (_) {
+		_usingCtx14.e = _;
+	} finally {
+		_usingCtx14.d();
+	}
 }
 /**
 * Log-Softmax function.
@@ -9310,13 +11120,23 @@ function softmax(x, axis = -1) {
 * If `axis` is not specified, it defaults to the last axis.
 */
 function logSoftmax(x, axis = -1) {
-	x = fudgeArray(x);
-	axis = normalizeAxis(axis, x.ndim);
-	if (axis.length === 0) return zerosLike(x);
-	const xMax = max(x, axis, { keepdims: true });
-	const shifted = x.sub(stopGradient(xMax));
-	const shiftedLogsumexp = log(exp(shifted).sum(axis, { keepdims: true }));
-	return shifted.sub(shiftedLogsumexp);
+	try {
+		var _usingCtx15 = _usingCtx();
+		x = fudgeArray(x);
+		axis = normalizeAxis(axis, x.ndim);
+		if (axis.length === 0) return zerosLike(x);
+		const xMax = _usingCtx15.u(max(x, axis, { keepdims: true }));
+		const sg = stopGradient(xMax);
+		const shifted = _usingCtx15.u(x.sub(sg));
+		const expShifted = _usingCtx15.u(exp(shifted));
+		const sumExp = _usingCtx15.u(expShifted.sum(axis, { keepdims: true }));
+		const shiftedLogsumexp = _usingCtx15.u(log(sumExp));
+		return shifted.sub(shiftedLogsumexp);
+	} catch (_) {
+		_usingCtx15.e = _;
+	} finally {
+		_usingCtx15.d();
+	}
 }
 /**
 * Log-sum-exp reduction. Also a multivariate version of `softplus`.
@@ -9327,21 +11147,42 @@ function logSoftmax(x, axis = -1) {
 * Reference: https://en.wikipedia.org/wiki/LogSumExp
 */
 function logsumexp(x, axis = null, opts) {
-	x = fudgeArray(x);
-	axis = normalizeAxis(axis, x.ndim);
-	if (axis.length === 0) return x;
-	const xMax = stopGradient(max(x, axis, { keepdims: true }));
-	const shifted = x.sub(xMax);
-	const result = xMax.add(log(exp(shifted).sum(axis, { keepdims: true })));
-	return opts?.keepdims ? result : squeeze(result, axis);
+	try {
+		var _usingCtx16 = _usingCtx();
+		x = fudgeArray(x);
+		axis = normalizeAxis(axis, x.ndim);
+		if (axis.length === 0) return x;
+		const rawMax = _usingCtx16.u(max(x, axis, { keepdims: true }));
+		const xMax = stopGradient(rawMax);
+		const shifted = _usingCtx16.u(x.sub(xMax));
+		const expShifted = _usingCtx16.u(exp(shifted));
+		const sumExp = _usingCtx16.u(expShifted.sum(axis, { keepdims: true }));
+		const logSum = _usingCtx16.u(log(sumExp));
+		const result = xMax.add(logSum);
+		if (opts?.keepdims) return result;
+		const resultToSqueeze = _usingCtx16.u(result);
+		return squeeze(resultToSqueeze, axis);
+	} catch (_) {
+		_usingCtx16.e = _;
+	} finally {
+		_usingCtx16.d();
+	}
 }
 /** Log-mean-exp reduction, like `jax.nn.logsumexp()` but subtracts `log(n)`. */
 function logmeanexp(x, axis = null, opts) {
-	x = fudgeArray(x);
-	axis = normalizeAxis(axis, x.ndim);
-	if (axis.length === 0) return x;
-	const n = axis.reduce((acc, a) => acc * x.shape[a], 1);
-	return logsumexp(x, axis, opts).sub(Math.log(n));
+	try {
+		var _usingCtx17 = _usingCtx();
+		x = fudgeArray(x);
+		axis = normalizeAxis(axis, x.ndim);
+		if (axis.length === 0) return x;
+		const n = axis.reduce((acc, a) => acc * x.shape[a], 1);
+		const lse = _usingCtx17.u(logsumexp(x, axis, opts));
+		return lse.sub(Math.log(n));
+	} catch (_) {
+		_usingCtx17.e = _;
+	} finally {
+		_usingCtx17.d();
+	}
 }
 /**
 * Standardizes input to zero mean and unit variance.
@@ -9355,9 +11196,35 @@ function standardize(x, axis = -1, opts = {}) {
 	x = fudgeArray(x);
 	axis = normalizeAxis(axis, x.ndim);
 	if (axis.length === 0) return x;
-	const mu = opts.mean !== void 0 ? fudgeArray(opts.mean) : x.mean(axis, { keepdims: true });
-	const sigma2 = opts.variance !== void 0 ? fudgeArray(opts.variance) : square(x).mean(axis, { keepdims: true }).sub(square(mu));
-	return x.sub(mu).div(sqrt(sigma2.add(opts.epsilon ?? 1e-5)));
+	const d = [];
+	try {
+		const mu = opts.mean !== void 0 ? fudgeArray(opts.mean) : (() => {
+			const m = x.mean(axis, { keepdims: true });
+			d.push(m);
+			return m;
+		})();
+		let sigma2;
+		if (opts.variance !== void 0) sigma2 = fudgeArray(opts.variance);
+		else {
+			const sq = square(x);
+			d.push(sq);
+			const sqMean = sq.mean(axis, { keepdims: true });
+			d.push(sqMean);
+			const muSq = square(mu);
+			d.push(muSq);
+			sigma2 = sqMean.sub(muSq);
+			d.push(sigma2);
+		}
+		const centered = x.sub(mu);
+		d.push(centered);
+		const denom = sigma2.add(opts.epsilon ?? 1e-5);
+		d.push(denom);
+		const sqrtDenom = sqrt(denom);
+		d.push(sqrtDenom);
+		return centered.div(sqrtDenom);
+	} finally {
+		for (const v of d) v[Symbol.dispose]();
+	}
 }
 /**
 * One-hot encodes the given indices.
@@ -9427,76 +11294,126 @@ function dotProductAttention(query, key$1, value, opts = {}) {
 	if (query.ndim !== 3 && query.ndim !== 4 || query.ndim !== key$1.ndim || query.ndim !== value.ndim) throw new Error(`dotProductAttention: expected all tensors to have rank 3 or 4, got Q=${query.aval}, K=${key$1.aval}, V=${value.aval}`);
 	if (!deepEqual(key$1.shape, value.shape)) throw new Error(`dotProductAttention: key and value shapes must match, got K=${key$1.shape}, V=${value.shape}`);
 	const isRank3 = query.ndim === 3;
-	if (isRank3) {
-		query = expandDims(query, 0);
-		key$1 = expandDims(key$1, 0);
-		value = expandDims(value, 0);
-	}
-	const [B, L, N, H] = query.shape;
-	if (key$1.shape[0] !== B || key$1.shape[3] !== H) throw new Error(`dotProductAttention: query and key shapes mismatch, got Q=${query.aval}, K=${key$1.aval}`);
-	const S = key$1.shape[1];
-	const K = key$1.shape[2];
-	if (N < K || N != K && N % K !== 0) throw new Error(`dotProductAttention: number of query heads N=${N} must be divisible by number of key/value heads K=${K} for GQA`);
-	const G = N / K;
-	key$1 = tile(key$1, [
-		1,
-		1,
-		G,
-		1
-	]);
-	value = tile(value, [
-		1,
-		1,
-		G,
-		1
-	]);
-	const scale = opts.scale ?? 1 / Math.sqrt(H);
-	let scores = einsum("BLNH,BSNH->BNLS", query, key$1).mul(scale);
-	if (opts.bias !== void 0) scores = scores.add(opts.bias);
-	if (opts.mask !== void 0) scores = where(opts.mask, scores, -Infinity);
-	if (opts.isCausal) {
-		const causalMask = tri(L, S, 0, { dtype: DType.Bool });
-		scores = where(causalMask, scores, -Infinity);
-	}
-	if (opts.localWindowSize !== void 0) {
-		const [before, after] = typeof opts.localWindowSize === "number" ? [opts.localWindowSize, opts.localWindowSize] : opts.localWindowSize;
-		if (before < 0 || after < 0 || !Number.isInteger(before) || !Number.isInteger(after)) throw new Error(`dotProductAttention: localWindowSize values must be non-negative, got ${opts.localWindowSize}`);
-		const localMask = tri(L, S, after, { dtype: DType.Bool }).mul(tri(L, S, -before - 1, { dtype: DType.Bool }).notEqual(true));
-		scores = where(localMask, scores, -Infinity);
-	}
-	if (opts.querySeqLengths !== void 0) {
-		const sl = expandDims(opts.querySeqLengths, [
-			-1,
-			-2,
-			-3
-		]);
-		scores = where(arange(L).reshape([
+	const d = [];
+	try {
+		if (isRank3) {
+			query = expandDims(query, 0);
+			d.push(query);
+			key$1 = expandDims(key$1, 0);
+			d.push(key$1);
+			value = expandDims(value, 0);
+			d.push(value);
+		}
+		const [B, L, N, H] = query.shape;
+		if (key$1.shape[0] !== B || key$1.shape[3] !== H) throw new Error(`dotProductAttention: query and key shapes mismatch, got Q=${query.aval}, K=${key$1.aval}`);
+		const S = key$1.shape[1];
+		const K = key$1.shape[2];
+		if (N < K || N != K && N % K !== 0) throw new Error(`dotProductAttention: number of query heads N=${N} must be divisible by number of key/value heads K=${K} for GQA`);
+		const G = N / K;
+		key$1 = tile(key$1, [
 			1,
 			1,
-			L,
+			G,
 			1
-		]).less(sl), scores, -Infinity);
-	}
-	if (opts.keyValueSeqLengths !== void 0) {
-		const sl = expandDims(opts.keyValueSeqLengths, [
-			-1,
-			-2,
-			-3
 		]);
-		scores = where(arange(S).reshape([
+		d.push(key$1);
+		value = tile(value, [
 			1,
 			1,
-			1,
-			S
-		]).less(sl), scores, -Infinity);
+			G,
+			1
+		]);
+		d.push(value);
+		const scale = opts.scale ?? 1 / Math.sqrt(H);
+		const rawScores = einsum("BLNH,BSNH->BNLS", query, key$1);
+		d.push(rawScores);
+		let scores = rawScores.mul(scale);
+		if (opts.bias !== void 0) {
+			d.push(scores);
+			scores = scores.add(opts.bias);
+		}
+		if (opts.mask !== void 0) {
+			d.push(scores);
+			scores = where(opts.mask, scores, -Infinity);
+		}
+		if (opts.isCausal) {
+			const causalMask = tri(L, S, 0, { dtype: DType.Bool });
+			d.push(causalMask);
+			d.push(scores);
+			scores = where(causalMask, scores, -Infinity);
+		}
+		if (opts.localWindowSize !== void 0) {
+			const [before, after] = typeof opts.localWindowSize === "number" ? [opts.localWindowSize, opts.localWindowSize] : opts.localWindowSize;
+			if (before < 0 || after < 0 || !Number.isInteger(before) || !Number.isInteger(after)) throw new Error(`dotProductAttention: localWindowSize values must be non-negative, got ${opts.localWindowSize}`);
+			const triAfter = tri(L, S, after, { dtype: DType.Bool });
+			d.push(triAfter);
+			const triBefore = tri(L, S, -before - 1, { dtype: DType.Bool });
+			d.push(triBefore);
+			const triBeforeNot = triBefore.notEqual(true);
+			d.push(triBeforeNot);
+			const localMask = triAfter.mul(triBeforeNot);
+			d.push(localMask);
+			d.push(scores);
+			scores = where(localMask, scores, -Infinity);
+		}
+		if (opts.querySeqLengths !== void 0) {
+			const sl = expandDims(opts.querySeqLengths, [
+				-1,
+				-2,
+				-3
+			]);
+			d.push(sl);
+			const ar = arange(L);
+			d.push(ar);
+			const arR = ar.reshape([
+				1,
+				1,
+				L,
+				1
+			]);
+			d.push(arR);
+			const cond = arR.less(sl);
+			d.push(cond);
+			d.push(scores);
+			scores = where(cond, scores, -Infinity);
+		}
+		if (opts.keyValueSeqLengths !== void 0) {
+			const sl = expandDims(opts.keyValueSeqLengths, [
+				-1,
+				-2,
+				-3
+			]);
+			d.push(sl);
+			const ar = arange(S);
+			d.push(ar);
+			const arR = ar.reshape([
+				1,
+				1,
+				1,
+				S
+			]);
+			d.push(arR);
+			const cond = arR.less(sl);
+			d.push(cond);
+			d.push(scores);
+			scores = where(cond, scores, -Infinity);
+		}
+		d.push(scores);
+		const attn = softmax(scores, -1);
+		d.push(attn);
+		const out = einsum("BNLS,BSNH->BLNH", attn, value);
+		if (isRank3) {
+			d.push(out);
+			return out.reshape([
+				L,
+				N,
+				H
+			]);
+		}
+		return out;
+	} finally {
+		for (const v of d) v[Symbol.dispose]();
 	}
-	const attn = softmax(scores, -1);
-	const out = einsum("BNLS,BSNH->BLNH", attn, value);
-	return isRank3 ? out.reshape([
-		L,
-		N,
-		H
-	]) : out;
 }
 
 //#endregion
@@ -9524,48 +11441,85 @@ function validateKeyShape(key$1, scalar = false) {
 }
 function getK01(key$1) {
 	const keyShape = validateKeyShape(key$1, true);
-	let [k0, k1] = split$2(key$1, -1, [1, 1]);
-	k0 = k0.reshape(keyShape);
-	k1 = k1.reshape(keyShape);
+	const splits = split$2(key$1, -1, [1, 1]);
+	const k0 = splits[0].reshape(keyShape);
+	const k1 = splits[1].reshape(keyShape);
+	splits[0].dispose();
+	splits[1].dispose();
 	return [k0, k1];
 }
 /** Create a pseudo-random number generator (PRNG) key from 32-bit integer seed. */
 function key(seed) {
-	seed = array(seed, { dtype: DType.Uint32 });
-	if (seed.ndim !== 0) throw new Error(`key: seed must be a scalar integer, but got shape ${seed.shape} - use jax.vmap for batching.`);
-	const key$1 = stack([0, seed]);
-	if (key$1 instanceof Array$1) key$1._realizeSource();
-	return key$1;
+	try {
+		var _usingCtx$1 = _usingCtx();
+		const seedArr = _usingCtx$1.u(array(seed, { dtype: DType.Uint32 }));
+		if (seedArr.ndim !== 0) throw new Error(`key: seed must be a scalar integer, but got shape ${seedArr.shape} - use jax.vmap for batching.`);
+		const key$1 = stack([0, seedArr]);
+		if (key$1 instanceof Array$1) key$1._realizeSource();
+		return key$1;
+	} catch (_) {
+		_usingCtx$1.e = _;
+	} finally {
+		_usingCtx$1.d();
+	}
 }
 /** Splits a PRNG key into `num` new keys by adding a leading axis. */
 function split(key$1, num = 2) {
 	const shape$1 = typeof num === "number" ? [num] : num;
 	for (const len of shape$1) if (len <= 0 || !Number.isInteger(len)) throw new Error(`Invalid split length: ${len}. Must be a positive integer.`);
 	const [k0, k1] = getK01(key$1);
-	return stack([randomBits(k0, k1, shape$1, 0), randomBits(k0, k1, shape$1, 1)], -1);
+	try {
+		try {
+			var _usingCtx3 = _usingCtx();
+			const r0 = _usingCtx3.u(randomBits(k0, k1, shape$1, 0));
+			const r1 = _usingCtx3.u(randomBits(k0, k1, shape$1, 1));
+			return stack([r0, r1], -1);
+		} catch (_) {
+			_usingCtx3.e = _;
+		} finally {
+			_usingCtx3.d();
+		}
+	} finally {
+		k0.dispose();
+		k1.dispose();
+	}
 }
 /** Sample uniform bits in the form of unsigned integers. */
 function bits(key$1, shape$1 = []) {
 	const [k0, k1] = getK01(key$1);
-	return randomBits(k0, k1, shape$1);
+	try {
+		return randomBits(k0, k1, shape$1);
+	} finally {
+		k0.dispose();
+		k1.dispose();
+	}
 }
 /**
 * @function
 * Sample uniform random values in [minval, maxval) with given shape.
 */
 const uniform = jit$1(function uniform$1(key$1, shape$1 = [], { minval = 0, maxval = 1 } = {}) {
-	if (minval >= maxval) throw new Error(`Invalid range: [${minval}, ${maxval}).`);
-	const mantissa = bits(key$1, shape$1).div(array(512, {
-		dtype: DType.Uint32,
-		device: key$1.device
-	}));
-	const float12 = mantissa.add(array(1065353216, {
-		dtype: DType.Uint32,
-		device: key$1.device
-	}));
-	const rand = bitcast(float12, DType.Float32).sub(1);
-	if (minval === 0 && maxval === 1) return rand;
-	else return rand.mul(maxval - minval).add(minval);
+	try {
+		var _usingCtx4 = _usingCtx();
+		if (minval >= maxval) throw new Error(`Invalid range: [${minval}, ${maxval}).`);
+		const divisor = _usingCtx4.u(array(512, {
+			dtype: DType.Uint32,
+			device: key$1.device
+		}));
+		const bias = _usingCtx4.u(array(1065353216, {
+			dtype: DType.Uint32,
+			device: key$1.device
+		}));
+		const mantissa = bits(key$1, shape$1).div(divisor);
+		const float12 = mantissa.add(bias);
+		const rand = bitcast(float12, DType.Float32).sub(1);
+		if (minval === 0 && maxval === 1) return rand;
+		else return rand.mul(maxval - minval).add(minval);
+	} catch (_) {
+		_usingCtx4.e = _;
+	} finally {
+		_usingCtx4.d();
+	}
 }, { staticArgnums: [1, 2] });
 /**
 * Sample Bernoulli random variables with given mean (0,1 categorical).
@@ -9574,8 +11528,16 @@ const uniform = jit$1(function uniform$1(key$1, shape$1 = [], { minval = 0, maxv
 * and must be broadcastable to `shape`.
 */
 function bernoulli(key$1, p = .5, shape$1 = []) {
-	p = fudgeArray(p);
-	return uniform(key$1, shape$1).less(p);
+	try {
+		var _usingCtx5 = _usingCtx();
+		p = fudgeArray(p);
+		const u = _usingCtx5.u(uniform(key$1, shape$1));
+		return u.less(p);
+	} catch (_) {
+		_usingCtx5.e = _;
+	} finally {
+		_usingCtx5.d();
+	}
 }
 /**
 * @function

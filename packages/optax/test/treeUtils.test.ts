@@ -4,66 +4,83 @@ import { expect, test } from "vitest";
 import { treeMax, treeNorm, treeSum } from "../src/treeUtils";
 
 test("treeSum: sums all elements across arrays", () => {
-  const tr = [np.array([1, 2, 3]), np.array([4, 5])];
-  const result = treeSum(tr);
+  using a = np.array([1, 2, 3]);
+  using b = np.array([4, 5]);
+  const tr = [a, b];
+  using result = treeSum(tr);
   expect(result).toBeAllclose(15);
 });
 
 test("treeSum: handles empty tree", () => {
   const tr: np.Array[] = [];
-  const result = treeSum(tr);
+  using result = treeSum(tr);
   expect(result).toBeAllclose(0);
 });
 
 test("treeSum: handles nested tree structure", () => {
-  const tr = { a: np.array([1, 2]), b: { c: np.array([3, 4, 5]) } };
-  const result = treeSum(tr);
+  using a = np.array([1, 2]);
+  using c = np.array([3, 4, 5]);
+  const tr = { a, b: { c } };
+  using result = treeSum(tr);
   expect(result).toBeAllclose(15);
 });
 
 test("treeMax: finds max across arrays", () => {
-  const tr = [np.array([1, 2, 3]), np.array([4, 5])];
-  const result = treeMax(tr);
+  using a = np.array([1, 2, 3]);
+  using b = np.array([4, 5]);
+  const tr = [a, b];
+  using result = treeMax(tr);
   expect(result).toBeAllclose(5);
 });
 
 test("treeMax: handles negative numbers", () => {
-  const tr = [np.array([-5, -2, -10]), np.array([-1])];
-  const result = treeMax(tr);
+  using a = np.array([-5, -2, -10]);
+  using b = np.array([-1]);
+  const tr = [a, b];
+  using result = treeMax(tr);
   expect(result).toBeAllclose(-1);
 });
 
 test("treeMax: handles empty tree", () => {
   const tr: np.Array[] = [];
-  const result = treeMax(tr);
+  using result = treeMax(tr);
   expect(result).toBeAllclose(-Infinity);
 });
 
 test("treeNorm: L2 norm (default)", () => {
-  const tr = [np.array([3]), np.array([4])];
-  const result = treeNorm(tr);
+  using a = np.array([3]);
+  using b = np.array([4]);
+  const tr = [a, b];
+  using result = treeNorm(tr);
   expect(result).toBeAllclose(5);
 });
 
 test("treeNorm: L2 norm squared", () => {
-  const tr = [np.array([3]), np.array([4])];
-  const result = treeNorm(tr, 2, true);
+  using a = np.array([3]);
+  using b = np.array([4]);
+  const tr = [a, b];
+  using result = treeNorm(tr, 2, true);
   expect(result).toBeAllclose(25);
 });
 
 test("treeNorm: L1 norm", () => {
-  const tr = [np.array([-3, 4]), np.array([-5])];
-  const result = treeNorm(tr, 1);
+  using a = np.array([-3, 4]);
+  using b = np.array([-5]);
+  const tr = [a, b];
+  using result = treeNorm(tr, 1);
   expect(result).toBeAllclose(12);
 });
 
 test("treeNorm: inf norm", () => {
-  const tr = [np.array([-3, 4]), np.array([-10])];
-  const result = treeNorm(tr, "inf");
+  using a = np.array([-3, 4]);
+  using b = np.array([-10]);
+  const tr = [a, b];
+  using result = treeNorm(tr, "inf");
   expect(result).toBeAllclose(10);
 });
 
 test("treeNorm: throws on unsupported ord", () => {
-  const tr = [np.array([1, 2, 3])];
+  using a = np.array([1, 2, 3]);
+  const tr = [a];
   expect(() => treeNorm(tr, 3)).toThrow("Unsupported ord: 3");
 });

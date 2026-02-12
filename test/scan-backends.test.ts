@@ -55,10 +55,8 @@ describe("lax.scan backend coverage", () => {
           try {
             backend.copyBufferToBuffer(slot1, 0, slot2, 0, 16);
           } finally {
-            if (backend.free) {
-              backend.free(slot1);
-              backend.free(slot2);
-            }
+            backend.decRef(slot1);
+            backend.decRef(slot2);
           }
         } else {
           if (device !== "webgl") {
@@ -82,6 +80,7 @@ describe("lax.scan backend coverage", () => {
         const [final, _] = await run(initVal, xs);
 
         expect((await final.data())[0]).toBe(5);
+        run.dispose();
       }
 
       // 4. Grad scan

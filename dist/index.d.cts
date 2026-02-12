@@ -637,6 +637,7 @@ interface ConvParams {
  */
 type OwnedFunction<F extends Function> = F & {
   dispose: () => void;
+  [Symbol.dispose]: () => void;
 };
 /** Variable in a Jaxpr expression. */
 declare class Var {
@@ -976,6 +977,17 @@ declare abstract class Tracer {
    * ```
    */
   abstract dispose(): void;
+  /**
+   * Enables `using` declarations for automatic disposal at block exit.
+   *
+   * Default is a no-op on the abstract Tracer base. Only concrete `Array`
+   * overrides this to call `dispose()`. Calling `dispose()` here would be
+   * unsafe for JVPTracer / BatchTracer / PartialEvalTracer because it would
+   * cascade prematurely during `grad()` / `jvp()` / `vmap()` tracing.
+   */
+  [Symbol.dispose](): void;
+  /** Current reference count (only meaningful on concrete Arrays). */
+  get refCount(): number;
   /** The shape of the array. */
   get shape(): number[];
   /** The total number of elements in the array. */
@@ -1185,6 +1197,19 @@ declare class Array extends Tracer {
   /** Get the current reference count (for debugging memory management). */
   get refCount(): number;
   dispose(): void;
+  /**
+   * Override Tracer's no-op to actually dispose concrete Arrays.
+   *
+   * During PE tracing, concrete Arrays are created by PE's all-known evaluation
+   * path and tracked in knownIntermediates. Their lifecycle is managed by
+   * disposePeIntermediates after PE completes. If `using` declarations in JVP
+   * helpers also dispose these arrays, the double-dispose causes
+   * UseAfterFreeError when the ClosedJaxpr later accesses its consts.
+   *
+   * We detect PE scope via _peArrayCreationTracker (non-null when inside PE).
+   * JVP-only traces (no PE) still dispose normally — those intermediates have
+   * real Slots that need cleanup.
+   */
   [Symbol.dispose](): void;
   /**
    * Convert this array into a primitive value.
@@ -1254,6 +1279,13 @@ declare function array(values: Array | DataArray | RecursiveArray<number> | Recu
   shape?: number[];
 } & DTypeAndDevice): Array;
 /** If x is a value, lift it into an array, otherwise leave it be. */
+/**
+ * WeakSet tracking arrays created by pureArray from raw (non-Tracer) values.
+ * These arrays are "anonymous" — created transiently by fudgeArray/pureArray
+ * inside library functions, with no user code holding a reference.
+ * getOrMakeConstTracer checks this to avoid calling .ref on anonymous consts,
+ * which would leak when the ClosedJaxpr is disposed.
+ */
 
 type ImplRule<P extends Primitive> = (tracers: Array[], params: PrimitiveParams<P>) => Array[];
 declare const implRules: { [P in Primitive]: ImplRule<P> };
@@ -1346,26 +1378,64 @@ declare function logspace(start: number, stop: number, num?: number, endpoint?: 
 }?: DTypeAndDevice): Array;
 //#endregion
 //#region src/frontend/check-leaks.d.ts
+/** Result returned by {@link checkLeaks.stop}. */
 interface LeakReport {
-  /** Number of leaked backend slots (delta from start). */
+  /** Number of unreleased backend slots (0 = no leaks). */
   leaked: number;
   /** Array descriptions with creation locations (best-effort from tracking map). */
   details: string[];
-  /** Human-readable summary string. */
+  /** Human-readable summary with source-mapped file:line:col locations. */
   summary: string;
+}
+/** A single entry from {@link checkLeaks.snapshot}. */
+interface SnapshotEntry {
+  /** Array description (dtype, shape). */
+  desc: string;
+  /** Current reference count. */
+  rc: number;
+  /** Creation location (workspace-relative path). */
+  location: string;
+  /** Package name, or null for user code. */
+  pkg: string | null;
+  /** Last .ref call site (only when trackRefs enabled). */
+  lastRef: string | null;
 }
 declare const checkLeaks: {
   /**
-   * Start tracking array allocations. Takes a snapshot of backend slot counts
-   * and enables the creation tracking map for diagnostic details.
+   * Begin tracking array allocations.
+   *
+   * Records the current backend slot count as a baseline and enables
+   * per-allocation tracking. Call this before the code you want to check,
+   * then call {@link stop} afterwards to get a leak report.
+   *
+   * @param opts.trackRefs - When `true`, also records each `.ref` call site
+   *   so the leak report can show `↳ last .ref at <location>` for rc≥2 leaks.
+   *   Adds one `Map.set` per `.ref` call. Off by default.
    */
-  start(): void;
+  start(opts?: {
+    trackRefs?: boolean;
+  }): void;
+  /**
+   * Return a snapshot of all currently-tracked arrays without stopping.
+   *
+   * Useful for mid-session debugging — you can inspect which arrays are
+   * still alive at any point between `start()` and `stop()`.
+   */
+  snapshot(): SnapshotEntry[];
   /**
    * Stop tracking and return a report of leaked backend slots.
-   * The `leaked` count is the total slot count delta across all backends.
-   * The `details` array provides descriptions of tracked arrays still alive.
+   *
+   * Flushes all JIT caches (freeing their cached constants), optionally
+   * auto-disposes tracked arrays, computes the backend slot delta since
+   * `start()`, and — when leaks are found — builds a human-readable
+   * summary with creation sites, reference counts, and diagnostic tips.
+   *
+   * @param options.autoDispose If true, auto-dispose all tracked arrays and
+   *   OwnedFunctions before checking the slot count delta.
    */
-  stop(): LeakReport;
+  stop(options?: {
+    autoDispose?: boolean;
+  }): LeakReport;
   /** Whether leak tracking is currently active. */
   readonly active: boolean;
 };
@@ -3212,4 +3282,4 @@ declare function blockUntilReady<T extends JsTree<any>>(x: T): Promise<T>;
  */
 declare function devicePut<T extends JsTree<any>>(x: T, device?: Device): Promise<MapJsTree<T, number | boolean, Array>>;
 //#endregion
-export { Array, ClosedJaxpr, DType, type Device, Jaxpr, type JsTree, type JsTreeDef, type LeakReport, type OwnedFunction, type ScanPath, blockUntilReady, checkLeaks, defaultDevice, devicePut, devices, getBackend, grad, hessian, init, jacfwd, jacrev as jacobian, jacrev, jit, jvp, lax_d_exports as lax, linearize, makeJaxpr, nn_d_exports as nn, numpy_d_exports as numpy, random_d_exports as random, scipy_special_d_exports as scipySpecial, setDebug, tree_d_exports as tree, valueAndGrad, vjp, vmap };
+export { Array, ClosedJaxpr, DType, type Device, Jaxpr, type JsTree, type JsTreeDef, type LeakReport, type OwnedFunction, type ScanPath, type SnapshotEntry, blockUntilReady, checkLeaks, defaultDevice, devicePut, devices, getBackend, grad, hessian, init, jacfwd, jacrev as jacobian, jacrev, jit, jvp, lax_d_exports as lax, linearize, makeJaxpr, nn_d_exports as nn, numpy_d_exports as numpy, random_d_exports as random, scipy_special_d_exports as scipySpecial, setDebug, tree_d_exports as tree, valueAndGrad, vjp, vmap };

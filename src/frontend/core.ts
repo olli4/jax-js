@@ -275,9 +275,11 @@ export function reduce(
   const originalShape = getShape(x);
   let result = bind1(Primitive.Reduce, [x], { op, axis });
   if (opts?.keepdims) {
+    const preReshape = result;
     result = result.reshape(
       originalShape.map((dim, i) => (axis.includes(i) ? 1 : dim)),
     );
+    if (preReshape !== result) preReshape.dispose();
   }
   return result;
 }
@@ -533,15 +535,17 @@ export function triangularSolve(
   const n = as[as.length - 2];
   if (n !== as[as.length - 1] || n !== bs[bs.length - 1])
     throw new Error(`triangular_solve: incompatible shapes a=${as}, b=${bs}`);
-  if (lower) {
-    // Convert lower-triangular solve into upper-triangular solve by
-    // flipping the matrices.
-    a = flip(a, [-2, -1]);
-    b = flip(b, [-1]);
+  if (!lower) {
+    return bind1(Primitive.TriangularSolve, [a, b], { unitDiagonal });
   }
-  let x = bind1(Primitive.TriangularSolve, [a, b], { unitDiagonal });
-  if (lower) x = flip(x, [-1]);
-  return x;
+  // Lower-triangular: convert to upper by flipping, solve, flip back.
+  // Dispose intermediates (no-op during tracing, frees buffers in eager).
+  using aFlipped = flip(a, [-2, -1]) as Tracer;
+  using bFlipped = flip(b, [-1]) as Tracer;
+  using x = bind1(Primitive.TriangularSolve, [aFlipped, bFlipped], {
+    unitDiagonal,
+  }) as Tracer;
+  return flip(x, [-1]);
 }
 
 export function cholesky(x: TracerValue) {
@@ -624,6 +628,19 @@ export function newDynamic(main: MainTrace): Disposable {
 
 export function currentTraceLevel(): number {
   return traceStack[traceStack.length - 1].level;
+}
+
+/**
+ * Returns true if code is currently executing inside a trace context (e.g.
+ * makeJaxpr, jit, vmap). Disposal of ClosedJaxpr constants is unsafe inside
+ * traces because the consts may be JaxprTracers or BatchTracers from an outer
+ * trace that must remain alive.
+ *
+ * Note: traceStack always has at least 1 entry (the base EvalTrace at level 0),
+ * so we check for length > 1 to detect non-eval traces.
+ */
+export function insideTrace(): boolean {
+  return traceStack.length > 1;
 }
 
 export type TracerValue = Tracer | number | boolean;
@@ -738,6 +755,21 @@ export abstract class Tracer {
    */
   abstract dispose(): void;
 
+  /**
+   * Enables `using` declarations for automatic disposal at block exit.
+   *
+   * Default is a no-op on the abstract Tracer base. Only concrete `Array`
+   * overrides this to call `dispose()`. Calling `dispose()` here would be
+   * unsafe for JVPTracer / BatchTracer / PartialEvalTracer because it would
+   * cascade prematurely during `grad()` / `jvp()` / `vmap()` tracing.
+   */
+  [Symbol.dispose]() {}
+
+  /** Current reference count (only meaningful on concrete Arrays). */
+  get refCount(): number {
+    return 0;
+  }
+
   /** The shape of the array. */
   get shape(): number[] {
     return this.aval.shape;
@@ -826,8 +858,16 @@ export abstract class Tracer {
     }
     const originalDtype = this.dtype;
     const castDtype = promoteTypes(originalDtype, DType.Float32);
-    const result = reduce(this.astype(castDtype), AluOp.Add, axis, opts);
-    return result.mul(1 / n).astype(originalDtype) as this;
+    const d: Tracer[] = [];
+    const casted = this.astype(castDtype);
+    if (casted !== (this as Tracer)) d.push(casted);
+    const result = reduce(casted, AluOp.Add, axis, opts);
+    d.push(result);
+    const scaled = result.mul(1 / n);
+    d.push(scaled);
+    const final_ = scaled.astype(originalDtype);
+    for (const v of d) if (v !== final_) v[Symbol.dispose]();
+    return final_ as this;
   }
 
   /** Minimum of the elements of the array along a given axis. */
@@ -842,12 +882,22 @@ export abstract class Tracer {
 
   /** Test whether all array elements along a given axis evaluate to true. */
   all(axis: Axis = null, opts?: ReduceOpts) {
-    return this.astype(DType.Bool).min(axis, opts);
+    const boolArr = this.astype(DType.Bool);
+    try {
+      return boolArr.min(axis, opts);
+    } finally {
+      if (boolArr !== (this as Tracer)) boolArr[Symbol.dispose]();
+    }
   }
 
   /** Test whether any array element along a given axis evaluates to true. */
   any(axis: Axis = null, opts?: ReduceOpts) {
-    return this.astype(DType.Bool).max(axis, opts);
+    const boolArr = this.astype(DType.Bool);
+    try {
+      return boolArr.max(axis, opts);
+    } finally {
+      if (boolArr !== (this as Tracer)) boolArr[Symbol.dispose]();
+    }
   }
 
   /** Permute the dimensions of an array. Defaults to reversing the axis order. */
@@ -875,13 +925,15 @@ export abstract class Tracer {
 
   /** Subtract an array from this one. */
   sub(other: this | TracerValue): this {
-    return this.add(neg(other));
+    using n = neg(other);
+    return this.add(n);
   }
 
   /** Divide an array by this one. */
   div(other: this | TracerValue): this {
     if (isFloatDtype(this.dtype)) {
-      return this.mul(reciprocal(other));
+      using r = reciprocal(other);
+      return this.mul(r);
     }
     return idiv(this, other) as this;
   }
@@ -901,12 +953,14 @@ export abstract class Tracer {
     //
     // We can just move them to the end, since the behavior of diagonal() is to
     // append the new diagonal axis to the right side / end of the shape.
+    const toDispose: Tracer[] = [];
     let ar: Tracer = this;
     if (axis1 !== ar.ndim - 2 || axis2 !== ar.ndim - 1) {
       const perm = range(ar.ndim)
         .filter((i) => i !== axis1 && i !== axis2)
         .concat(axis1, axis2);
       ar = ar.transpose(perm);
+      toDispose.push(ar);
     }
 
     const [n, m] = ar.shape.slice(-2);
@@ -914,24 +968,31 @@ export abstract class Tracer {
 
     // Pad and reshape ar into a skewed array of shape [..., diagSize, m+1].
     ar = ar.reshape([...ar.shape.slice(0, -2), n * m]);
+    toDispose.push(ar);
     const npad = diagSize * (m + 1) - n * m;
     if (npad > 0) {
       ar = pad(ar, [...rep<Pair>(ar.ndim - 1, [0, 0]), [0, npad]]);
+      toDispose.push(ar);
     } else if (npad < 0) {
       ar = shrink(
         ar,
         [...ar.shape.slice(0, -1), n * m + npad].map<Pair>((x) => [0, x]),
       );
+      toDispose.push(ar);
     }
     ar = ar.reshape([...ar.shape.slice(0, -1), diagSize, m + 1]);
+    toDispose.push(ar);
 
     // Now slice the #offset element of the last axis, and this gives a diagonal.
-    ar = shrink(ar, [
+    const sliced = shrink(ar, [
       ...ar.shape.slice(0, -1).map<Pair>((x) => [0, x]),
       [offset, offset + 1],
-    ]).reshape(ar.shape.slice(0, -1));
+    ]);
+    toDispose.push(sliced);
+    const result = sliced.reshape(ar.shape.slice(0, -1));
 
-    return ar as this;
+    for (const v of toDispose) if (v !== result) v[Symbol.dispose]();
+    return result as this;
   }
 
   /** Flatten the array without changing its data. */
@@ -958,13 +1019,28 @@ export abstract class Tracer {
   *[Symbol.iterator](): IterableIterator<this> {
     if (this.ndim === 0) throw new Error("Cannot iterate over a scalar array");
     let residual: Tracer = this;
+    const n = this.shape[0];
     const subarrayShape = this.shape.slice(1);
-    for (let i = 0; i < this.shape[0]; i++) {
-      const lr = split(residual, 0, [1, residual.shape[0] - 1]);
-      yield lr[0].reshape(subarrayShape) as this;
-      residual = lr[1];
+    for (let i = 0; i < n; i++) {
+      if (i < n - 1) {
+        const lr = split(residual, 0, [1, residual.shape[0] - 1]);
+        // Dispose previous residual (but not `this`)
+        if (residual !== (this as Tracer)) residual[Symbol.dispose]?.();
+        const first = lr[0];
+        const reshaped = first.reshape(subarrayShape);
+        if (first !== reshaped) first[Symbol.dispose]?.();
+        yield reshaped as this;
+        residual = lr[1];
+      } else {
+        // Last element: reshape directly, no split needed.
+        // Avoids creating an empty [0, ...] residual that leaks if the
+        // generator is abandoned (e.g., by array destructuring).
+        const reshaped = residual.reshape(subarrayShape);
+        if (residual !== reshaped && residual !== (this as Tracer))
+          residual[Symbol.dispose]?.();
+        yield reshaped as this;
+      }
     }
-    residual.dispose();
   }
 
   /**
@@ -974,14 +1050,17 @@ export abstract class Tracer {
    */
   sort(axis: number = -1): this {
     axis = checkAxis(axis, this.ndim);
-    if (this.shape[axis] <= 1) return this;
+    if (this.shape[axis] <= 1) return this.reshape(this.shape) as this;
     if (axis === this.ndim - 1) return sort(this) as this;
     const perm = range(this.ndim);
     perm.splice(axis, 1);
     perm.push(axis);
-    return sort(this.transpose(perm)).transpose(
-      invertPermutation(perm),
-    ) as this;
+    const transposed = this.transpose(perm);
+    const sorted = sort(transposed);
+    const result = sorted.transpose(invertPermutation(perm));
+    if (transposed !== (this as Tracer)) transposed[Symbol.dispose]();
+    if (sorted !== result) sorted[Symbol.dispose]();
+    return result as this;
   }
 
   /**
@@ -1001,9 +1080,13 @@ export abstract class Tracer {
     const perm = range(this.ndim);
     perm.splice(axis, 1);
     perm.push(axis);
-    const [y, yi] = argsort(this.transpose(perm));
+    const transposed = this.transpose(perm);
+    const [y, yi] = argsort(transposed);
     y.dispose();
-    return yi.transpose(invertPermutation(perm)) as this;
+    if (transposed !== (this as Tracer)) transposed[Symbol.dispose]();
+    const result = yi.transpose(invertPermutation(perm));
+    if (yi !== result) yi[Symbol.dispose]();
+    return result as this;
   }
 
   /**
@@ -1150,15 +1233,21 @@ export abstract class Tracer {
       basicShape.push(this.shape[axis++]);
     }
     let result = shrink(this, slice);
-    result = needsReshape ? reshape(result, basicShape) : result;
+    if (needsReshape) {
+      const prev = result;
+      result = reshape(result, basicShape);
+      if (prev !== result) prev[Symbol.dispose]?.();
+    }
 
     if (hasAdvancedIdx) {
+      const prev = result;
       result = gather(
         result,
         index.filter((a) => a instanceof Tracer),
         axesForGather,
         outDim,
       );
+      if (prev !== result) prev[Symbol.dispose]?.();
     }
 
     return result as this;
@@ -1231,6 +1320,17 @@ export function getAval(x: TracerValue): AbstractValue {
   }
 }
 
+/**
+ * When non-null, bind() pushes EvalTrace-level results (level 0) into this
+ * array. Used by partialEvalFlat to track intermediate concrete Arrays created
+ * during PE scope — these bypass PE tracking and would otherwise leak.
+ * Activated in the Array constructor when set (not null).
+ */
+export let _peArrayCreationTracker: Tracer[] | null = null;
+export function _setPACT(v: Tracer[] | null) {
+  _peArrayCreationTracker = v;
+}
+
 export function bind<P extends Primitive>(
   prim: P,
   args: TracerValue[],
@@ -1244,7 +1344,16 @@ export function bind<P extends Primitive>(
       `processing rule for ${prim} on ${tracers.map((x) => x.toString())} and got ${outs.map((x) => x.toString())}`,
     );
   }
-  return outs.map((out) => out.fullLower());
+  const lowered = outs.map((out) => out.fullLower());
+  // Dispose freshly-created pureArray intermediates from fullRaise.
+  // Only disposes concrete Arrays (via [Symbol.dispose] which is a no-op on
+  // abstract tracers). Safe because processPrimitive has already consumed them.
+  for (let i = 0; i < args.length; i++) {
+    if (!(args[i] instanceof Tracer)) {
+      tracers[i][Symbol.dispose]();
+    }
+  }
+  return lowered;
 }
 
 function findTopTrace(xs: TracerValue[]): Trace {
@@ -1328,8 +1437,6 @@ export function flattenFunWithAux(
 
 export class UseAfterFreeError extends ReferenceError {
   constructor(tracer: Tracer) {
-    super(
-      `Referenced tracer ${tracer.toString()} has been disposed`,
-    );
+    super(`Referenced tracer ${tracer.toString()} has been disposed`);
   }
 }

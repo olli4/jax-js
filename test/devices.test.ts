@@ -11,38 +11,44 @@ test("setup has wasm and cpu devices", () => {
 });
 
 test("binop moves to committed device", () => {
-  const x = np.array([1, 2, 3], { device: "wasm" });
-  const y = np.array(4);
+  using x = np.array([1, 2, 3], { device: "wasm" });
+  using y = np.array(4);
 
   expect(x.device).not.toBe(y.device);
-  const z = x.add(y);
+  using z = x.add(y);
   expect(z.device).toBe("wasm"); // committed
   expect(z.js()).toEqual([5, 6, 7]);
 });
 
 test("devicePut moves device", async () => {
-  let ar = np.array([1, 2, 3]);
-  expect(ar.device).toBe("cpu");
-  ar = await devicePut(ar, "wasm");
-  expect(ar.device).toBe("wasm");
-  ar = await devicePut(ar, "wasm");
-  expect(ar.device).toBe("wasm");
-  ar.dispose();
+  using ar0 = np.array([1, 2, 3]);
+  expect(ar0.device).toBe("cpu");
+  using ar1 = await devicePut(ar0, "wasm");
+  expect(ar1.device).toBe("wasm");
+  const ar2 = await devicePut(ar1, "wasm");
+  // ar2 may be the same object as ar1 if already on wasm
+  if (ar2 !== ar1) ar2.dispose();
+  expect(ar2.device).toBe("wasm");
 });
 
 test("devicePut can be called with no device", async () => {
-  let ar = np.array([1, 2, 3]);
-  expect(ar.device).toBe("cpu");
-  ar = await devicePut(ar);
-  expect(ar.device).toBe("cpu");
+  using ar0 = np.array([1, 2, 3]);
+  expect(ar0.device).toBe("cpu");
+  const ar1 = await devicePut(ar0);
+  // ar1 may be the same object as ar0 if already on default device
+  if (ar1 !== ar0) ar1.dispose();
+  expect(ar1.device).toBe("cpu");
 
   // ar should still be uncommitted, as devicePut is a no-op in this case.
-  ar = ar.add(np.array(2, { device: "wasm" }));
-  expect(ar.device).toBe("wasm");
-  expect(ar.js()).toEqual([3, 4, 5]);
+  using two = np.array(2, { device: "wasm" });
+  using ar2 = ar0.add(two);
+  expect(ar2.device).toBe("wasm");
+  expect(ar2.js()).toEqual([3, 4, 5]);
 
   // also works for scalars
   const { a, b } = await devicePut({ a: 3, b: true });
+  using _a = a;
+  using _b = b;
   expect(a.dtype).toBe(np.float32);
   expect(b.dtype).toBe(np.bool);
 });

@@ -22,11 +22,11 @@ suite.each(devicesWithLinalg)("device:%s", (device) => {
 
   suite("jax.lax.linalg.cholesky()", () => {
     test("computes lower Cholesky decomposition for 2x2 matrix", () => {
-      const x = np.array([
+      using x = np.array([
         [2.0, 1.0],
         [1.0, 2.0],
       ]);
-      const L = lax.linalg.cholesky(x);
+      using L = lax.linalg.cholesky(x);
 
       // L should be lower triangular
       const LData = L.js();
@@ -34,25 +34,27 @@ suite.each(devicesWithLinalg)("device:%s", (device) => {
       expect(LData[1][0]).not.toBe(0);
 
       // Verify: L @ L^T should equal x
-      const reconstructed = np.matmul(L, L.transpose());
+      using Lt = L.transpose();
+      using reconstructed = np.matmul(L, Lt);
       expect(reconstructed).toBeAllclose(x);
     });
 
     test("computes Cholesky decomposition for 3x3 matrix", () => {
-      const x = np.array([
+      using x = np.array([
         [4.0, 2.0, 1.0],
         [2.0, 5.0, 3.0],
         [1.0, 3.0, 6.0],
       ]);
-      const L = lax.linalg.cholesky(x);
+      using L = lax.linalg.cholesky(x);
 
       // Verify: L @ L^T should equal x
-      const reconstructed = np.matmul(L, L.transpose());
+      using Lt = L.transpose();
+      using reconstructed = np.matmul(L, Lt);
       expect(reconstructed).toBeAllclose(x);
     });
 
     test("throws on non-square matrix", () => {
-      const x = np.array([
+      using x = np.array([
         [1.0, 2.0, 3.0],
         [4.0, 5.0, 6.0],
       ]);
@@ -60,42 +62,53 @@ suite.each(devicesWithLinalg)("device:%s", (device) => {
     });
 
     test("throws on non-2D array", () => {
-      const x = np.array([1.0, 2.0, 3.0]);
+      using x = np.array([1.0, 2.0, 3.0]);
       expect(() => lax.linalg.cholesky(x).js()).toThrow();
     });
 
     test("works with jvp", () => {
-      const x = np.array([
+      using x = np.array([
         [4.0, 2.0],
         [2.0, 5.0],
       ]);
-      const dx = np.array([
+      using dx = np.array([
         [0.1, 0.05],
         [0.05, 0.1],
       ]);
-      const [L, dL] = jvp(lax.linalg.cholesky, [x], [dx]);
+      const jvpResult = jvp(lax.linalg.cholesky, [x], [dx]);
+      using L = jvpResult[0];
+      using dL = jvpResult[1];
 
       // Verify L is correct
-      expect(np.matmul(L, L.transpose())).toBeAllclose(x);
+      using Lt = L.transpose();
+      using LLt = np.matmul(L, Lt);
+      expect(LLt).toBeAllclose(x);
 
       // Verify dL by finite differences: (cholesky(x + eps*dx) - L) / eps ≈ dL
       const eps = 1e-4;
-      const L2 = lax.linalg.cholesky(x.add(dx.mul(eps)));
-      const dL_fd = L2.sub(L).div(eps);
+      using dxe = dx.mul(eps);
+      using xpe = x.add(dxe);
+      using L2 = lax.linalg.cholesky(xpe);
+      using L2subL = L2.sub(L);
+      using dL_fd = L2subL.div(eps);
       expect(dL).toBeAllclose(dL_fd, { rtol: 1e-2, atol: 2e-3 });
     });
 
     test("works with grad", () => {
-      const x = np.array([
+      using x = np.array([
         [4.0, 2.0],
         [2.0, 5.0],
       ]);
       // Loss: sum of squared elements of L
       const f = (x: np.Array) => {
-        x = x.add(x.transpose()).mul(0.5); // Ensure symmetry
-        return np.square(lax.linalg.cholesky(x)).sum();
+        using xt = x.transpose();
+        using xPlusXt = x.add(xt);
+        using sym = xPlusXt.mul(0.5); // Ensure symmetry
+        using L = lax.linalg.cholesky(sym);
+        using sq = np.square(L);
+        return sq.sum();
       };
-      const dx = grad(f)(x);
+      using dx = grad(f)(x);
 
       // Verify gradient by finite differences
       const eps = 1e-4;
@@ -107,8 +120,12 @@ suite.each(devicesWithLinalg)("device:%s", (device) => {
           const xm = xData.map((row) => [...row]);
           xp[i][j] += eps;
           xm[i][j] -= eps;
-          const fp = f(np.array(xp)).js() as number;
-          const fm = f(np.array(xm)).js() as number;
+          using arrP = np.array(xp);
+          using fpArr = f(arrP);
+          const fp = fpArr.js() as number;
+          using arrM = np.array(xm);
+          using fmArr = f(arrM);
+          const fm = fmArr.js() as number;
           expected[i][j] = (fp - fm) / (2 * eps);
         }
       }
@@ -118,11 +135,14 @@ suite.each(devicesWithLinalg)("device:%s", (device) => {
 
   suite("jax.lax.linalg.lu()", () => {
     test("example with partial pivoting", () => {
-      const A = np.array([
+      using A = np.array([
         [4, 3],
         [6, 3],
       ]);
-      const [lu, pivots, permutation] = lax.linalg.lu(A);
+      const luResult = lax.linalg.lu(A);
+      using lu = luResult[0];
+      using pivots = luResult[1];
+      using permutation = luResult[2];
       expect(lu).toBeAllclose([
         [6, 3],
         [0.6666667, 1.0],
@@ -133,57 +153,70 @@ suite.each(devicesWithLinalg)("device:%s", (device) => {
 
     test("P @ A = L @ U holds", () => {
       const n = 30;
-      const A = random.uniform(random.key(0), [n, n]);
-      const [lu, pivots, permutation] = lax.linalg.lu(A);
+      using key = random.key(0);
+      using A = random.uniform(key, [n, n]);
+      const luResult = lax.linalg.lu(A);
+      using lu = luResult[0];
+      using _pivots = luResult[1];
+      using permutation = luResult[2];
+      using eye1 = np.eye(n);
+      using P = eye1.slice(permutation);
+      using trilLu = np.tril(lu, -1);
+      using eye2 = np.eye(n);
+      using L = trilLu.add(eye2);
+      using U = np.triu(lu);
 
-      pivots.dispose(); // Not needed
-      const P = np.eye(n).slice(permutation);
-      const L = np.tril(lu, -1).add(np.eye(n));
-      const U = np.triu(lu);
-
-      const PA = np.matmul(P, A);
-      const LU = np.matmul(L, U);
+      using PA = np.matmul(P, A);
+      using LU = np.matmul(L, U);
       expect(PA).toBeAllclose(LU, { rtol: 1e-5, atol: 1e-6 });
     });
 
     test("works with jvp", () => {
-      const A = np.array([
+      using A = np.array([
         [4.0, 3.0, 6.3],
         [6.0, 3.0, -2.4],
       ]);
-      const dA = np.array([
+      using dA = np.array([
         [0.1, 0.2, -0.2],
         [0.3, 0.4, -0.1],
       ]);
 
       const luFn = (x: np.Array) => {
-        const [lu, pivots, permutation] = lax.linalg.lu(x);
-        pivots.dispose();
-        permutation.dispose();
-        return lu;
+        const luResult = lax.linalg.lu(x);
+        using _pivots = luResult[1];
+        using _perm = luResult[2];
+        return luResult[0];
       };
-      const [lu, dlu] = jvp(luFn, [A], [dA]);
+      const jvpResult = jvp(luFn, [A], [dA]);
+      using lu = jvpResult[0];
+      using dlu = jvpResult[1];
 
       // Verify dlu by finite differences.
       // Use larger eps (1e-3) and looser tolerance because f32 finite
       // differences are inherently noisy (the WASM LU routine uses native
       // f32 arithmetic, amplifying rounding in the FD quotient).
       const eps = 1e-3;
-      const lu2 = lax.linalg.lu(A.add(dA.mul(eps)))[0];
-      const dlu_fd = lu2.sub(lu).div(eps);
+      using dAe = dA.mul(eps);
+      using Ape = A.add(dAe);
+      const lu2Result = lax.linalg.lu(Ape);
+      using lu2 = lu2Result[0];
+      using _lu2p = lu2Result[1];
+      using _lu2perm = lu2Result[2];
+      using lu2sublu = lu2.sub(lu);
+      using dlu_fd = lu2sublu.div(eps);
       expect(dlu).toBeAllclose(dlu_fd, { rtol: 2e-2, atol: 2e-3 });
     });
 
     test("works with jvp (f64)", () => {
       if (device !== "wasm" && device !== "cpu") return; // f64 on CPU + WASM
-      const A = np.array(
+      using A = np.array(
         [
           [4.0, 3.0, 6.3],
           [6.0, 3.0, -2.4],
         ],
         { dtype: np.float64 },
       );
-      const dA = np.array(
+      using dA = np.array(
         [
           [0.1, 0.2, -0.2],
           [0.3, 0.4, -0.1],
@@ -192,17 +225,25 @@ suite.each(devicesWithLinalg)("device:%s", (device) => {
       );
 
       const luFn = (x: np.Array) => {
-        const [lu, pivots, permutation] = lax.linalg.lu(x);
-        pivots.dispose();
-        permutation.dispose();
-        return lu;
+        const luResult = lax.linalg.lu(x);
+        using _pivots = luResult[1];
+        using _perm = luResult[2];
+        return luResult[0];
       };
-      const [lu, dlu] = jvp(luFn, [A], [dA]);
+      const jvpResult = jvp(luFn, [A], [dA]);
+      using lu = jvpResult[0];
+      using dlu = jvpResult[1];
 
       // f64 allows tighter eps and tolerance than f32
       const eps = 1e-6;
-      const lu2 = lax.linalg.lu(A.add(dA.mul(eps)))[0];
-      const dlu_fd = lu2.sub(lu).div(eps);
+      using dAe = dA.mul(eps);
+      using Ape = A.add(dAe);
+      const lu2Result = lax.linalg.lu(Ape);
+      using lu2 = lu2Result[0];
+      using _lu2p = lu2Result[1];
+      using _lu2perm = lu2Result[2];
+      using lu2sublu = lu2.sub(lu);
+      using dlu_fd = lu2sublu.div(eps);
       expect(dlu).toBeAllclose(dlu_fd, { rtol: 1e-4, atol: 1e-5 });
     });
   });
@@ -210,12 +251,13 @@ suite.each(devicesWithLinalg)("device:%s", (device) => {
   suite("jax.lax.linalg.triangularSolve()", () => {
     test("solves lower-triangular system", () => {
       // Solve L @ x = b
-      const L = np.array([
+      using L = np.array([
         [2, 0],
         [1, 3],
       ]);
-      const b = np.array([4, 7]).reshape([2, 1]);
-      const x = lax.linalg.triangularSolve(L, b, {
+      using b0 = np.array([4, 7]);
+      using b = b0.reshape([2, 1]);
+      using x = lax.linalg.triangularSolve(L, b, {
         leftSide: true,
         lower: true,
       });
@@ -223,48 +265,53 @@ suite.each(devicesWithLinalg)("device:%s", (device) => {
     });
 
     test("works with jvp on b", () => {
-      const L = np.array([
+      using L = np.array([
         [2, 0],
         [1, 3],
       ]);
-      const b = np.array([[4], [7]]);
-      const db = np.array([[0.1], [0.2]]);
+      using b = np.array([[4], [7]]);
+      using db = np.array([[0.1], [0.2]]);
 
       const solve = (b: np.Array) =>
         lax.linalg.triangularSolve(L, b, { leftSide: true, lower: true });
-      const [x, dx] = jvp(solve, [b], [db]);
+      const jvpResult = jvp(solve, [b], [db]);
+      using x = jvpResult[0];
+      using dx = jvpResult[1];
 
       // Verify x is correct
-      expect(np.matmul(L, x)).toBeAllclose(b);
+      using Lx = np.matmul(L, x);
+      expect(Lx).toBeAllclose(b);
 
       // Verify dx by finite differences
       const eps = 1e-4;
-      const x2 = lax.linalg.triangularSolve(L, b.add(db.mul(eps)), {
+      using dbe = db.mul(eps);
+      using bpe = b.add(dbe);
+      using x2 = lax.linalg.triangularSolve(L, bpe, {
         leftSide: true,
         lower: true,
       });
-      const dx_fd = x2.sub(x).div(eps);
+      using x2subx = x2.sub(x);
+      using dx_fd = x2subx.div(eps);
       expect(dx).toBeAllclose(dx_fd, { rtol: 1e-2, atol: 1e-3 });
     });
 
     test("works with grad on b", () => {
-      const L = np.array([
+      using L = np.array([
         [2, 0],
         [1, 3],
       ]);
-      const b = np.array([[4], [7]]);
+      using b = np.array([[4], [7]]);
 
       // Loss: sum of squared elements of solution
-      const f = (b: np.Array) =>
-        np
-          .square(
-            lax.linalg.triangularSolve(L, b, {
-              leftSide: true,
-              lower: true,
-            }),
-          )
-          .sum();
-      const db = grad(f)(b);
+      const f = (b: np.Array) => {
+        using sol = lax.linalg.triangularSolve(L, b, {
+          leftSide: true,
+          lower: true,
+        });
+        using sq = np.square(sol);
+        return sq.sum();
+      };
+      using db = grad(f)(b);
 
       // Verify gradient by finite differences
       const eps = 1e-4;
@@ -275,8 +322,12 @@ suite.each(devicesWithLinalg)("device:%s", (device) => {
         const bm = bData.map((row) => [...row]);
         bp[i][0] += eps;
         bm[i][0] -= eps;
-        const fp = f(np.array(bp)).js() as number;
-        const fm = f(np.array(bm)).js() as number;
+        using arrP = np.array(bp);
+        using fpArr = f(arrP);
+        const fp = fpArr.js() as number;
+        using arrM = np.array(bm);
+        using fmArr = f(arrM);
+        const fm = fmArr.js() as number;
         expected[i][0] = (fp - fm) / (2 * eps);
       }
       expect(db).toBeAllclose(expected, { rtol: 1e-2, atol: 1e-3 });
@@ -284,12 +335,12 @@ suite.each(devicesWithLinalg)("device:%s", (device) => {
 
     test("behavior with transposed A", () => {
       // See: https://github.com/ekzhang/jax-js/issues/73
-      const L = np.array([
+      using L = np.array([
         [1, 1000000],
         [1, 1],
       ]);
-      const b = np.array([[1], [1]]);
-      const x = lax.linalg.triangularSolve(L, b, {
+      using b = np.array([[1], [1]]);
+      using x = lax.linalg.triangularSolve(L, b, {
         leftSide: true,
         lower: true,
         transposeA: true,
@@ -299,12 +350,12 @@ suite.each(devicesWithLinalg)("device:%s", (device) => {
 
     test("right-hand side triangular solve", () => {
       // Solve x @ U = b
-      const U = np.array([
+      using U = np.array([
         [2, 1],
         [0, 3],
       ]);
-      const b = np.array([[4, 7]]);
-      const x = lax.linalg.triangularSolve(U, b, {
+      using b = np.array([[4, 7]]);
+      using x = lax.linalg.triangularSolve(U, b, {
         leftSide: false,
         lower: false,
       });

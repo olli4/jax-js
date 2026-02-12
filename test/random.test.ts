@@ -20,20 +20,23 @@ suite.each(devices)("device:%s", (device) => {
   suite("PRNG correctness", () => {
     test("random bits", () => {
       // jax.random.bits(jax.random.key(0))
-      const x = random.bits(random.key(0));
+      using k0 = random.key(0);
+      using x = random.bits(k0);
       expect(x.shape).toEqual([]);
       expect(x.dtype).toEqual(np.uint32);
       expect(x.js()).toEqual(4070199207);
 
       // jax.random.bits(jax.random.key(0), shape=(4,))
-      const y = random.bits(random.key(10), [4]);
+      using k10 = random.key(10);
+      using y = random.bits(k10, [4]);
       expect(y.shape).toEqual([4]);
       expect(y.dtype).toEqual(np.uint32);
       expect(y.js()).toEqual([169096361, 1572511259, 2689743692, 2228103506]);
     });
 
     test("random split is consistent with jax", () => {
-      const splits = random.split(random.key(1), 3);
+      using k1 = random.key(1);
+      using splits = random.split(k1, 3);
       expect(splits.shape).toEqual([3, 2]);
       expect(splits.dtype).toEqual(np.uint32);
       expect(splits.js()).toEqual([
@@ -44,16 +47,20 @@ suite.each(devices)("device:%s", (device) => {
     });
 
     test("generate uniform random", () => {
-      const key = random.key(42);
-      const [a, b, c] = random.split(key, 3);
+      using key = random.key(42);
+      using _splits = random.split(key, 3);
+      const [a, b, c] = _splits;
+      using _a = a;
+      using _b = b;
+      using _c = c;
 
-      const x = random.uniform(a);
+      using x = random.uniform(a);
       expect(x.js()).toBeWithinRange(0, 1);
 
-      const y = random.uniform(b, [0]);
+      using y = random.uniform(b, [0]);
       expect(y.js()).toEqual([]);
 
-      const z = random.uniform(c, [2, 3], { minval: 10, maxval: 15 });
+      using z = random.uniform(c, [2, 3], { minval: 10, maxval: 15 });
       expect(z.shape).toEqual([2, 3]);
       expect(z.dtype).toEqual(np.float32);
       const zx = z.js() as number[][];
@@ -66,25 +73,31 @@ suite.each(devices)("device:%s", (device) => {
 
     test("uniform is consistent with jax", () => {
       // jax.random.uniform(jax.random.key(51), shape=(4,))
-      const x = random.uniform(random.key(51), [4]);
+      using k51 = random.key(51);
+      using x = random.uniform(k51, [4]);
       expect(x).toBeAllclose([0.471269, 0.12344253, 0.17550635, 0.5663593]);
     });
 
     test("vmap random is consistent", () => {
-      const keys = random.split(random.key(1234), 5);
-      const samples = vmap((k: np.Array) => random.uniform(k, [100]))(keys);
+      using k1234 = random.key(1234);
+      using keys = random.split(k1234, 5);
+      using samples = vmap((k: np.Array) => random.uniform(k, [100]))(keys);
       expect(samples.shape).toEqual([5, 100]);
 
       // Also generate samples with looped calls
       const samplesRef: np.Array[] = [];
       for (const key of keys) {
+        using _key = key;
         samplesRef.push(random.uniform(key, [100]));
       }
-      expect(samples).toBeAllclose(np.stack(samplesRef), { rtol: 0, atol: 0 });
+      using stacked = np.stack(samplesRef);
+      expect(samples).toBeAllclose(stacked, { rtol: 0, atol: 0 });
+      for (const s of samplesRef) s.dispose();
     });
 
     test("can vmap a key", () => {
-      const keys = vmap(random.key)(np.arange(5));
+      using arg = np.arange(5);
+      using keys = vmap(random.key)(arg);
       expect(keys.shape).toEqual([5, 2]);
       expect(keys.js()).toEqual([
         [0, 0],
@@ -98,9 +111,10 @@ suite.each(devices)("device:%s", (device) => {
 
   suite("random distributions", () => {
     test("normal distribution", () => {
-      const key = random.key(123);
+      using key = random.key(123);
       const count = 5000;
-      const values: number[] = random.normal(key, [count]).js();
+      using normalArr = random.normal(key, [count]);
+      const values: number[] = normalArr.js();
       let onesigma = 0;
       let twosigma = 0;
       let threesigma = 0;
@@ -116,10 +130,11 @@ suite.each(devices)("device:%s", (device) => {
     });
 
     test("bernoulli distribution", () => {
-      const key = random.key(2024);
+      using key = random.key(2024);
       const count = 500;
-      const p = np.array([[0.25], [0.8]]); // try array of p
-      const samples: boolean[][] = random.bernoulli(key, p, [2, count]).js();
+      using p = np.array([[0.25], [0.8]]); // try array of p
+      using bernoulliArr = random.bernoulli(key, p, [2, count]);
+      const samples: boolean[][] = bernoulliArr.js();
       const trues = [0, 0];
       for (let i = 0; i < 2; i++) {
         for (const s of samples[i]) {
@@ -132,13 +147,13 @@ suite.each(devices)("device:%s", (device) => {
 
     suite("categorical distribution", () => {
       test("samples match expected probabilities", () => {
-        const key = random.key(555);
+        using key = random.key(555);
         const count = 10000;
         const probs = [0.1, 0.2, 0.3, 0.4];
-        const logits = np.log(np.array(probs));
-        const samples: number[] = random
-          .categorical(key, logits, { shape: [count] })
-          .js();
+        using probsArr = np.array(probs);
+        using logits = np.log(probsArr);
+        using catArr = random.categorical(key, logits, { shape: [count] });
+        const samples: number[] = catArr.js();
 
         // Count occurrences of each category
         const counts = samples.reduce(
@@ -153,9 +168,9 @@ suite.each(devices)("device:%s", (device) => {
       });
 
       test("default shape returns scalar", () => {
-        const key = random.key(444);
-        const logits = np.array([1.0, 2.0, 3.0]);
-        const sample = random.categorical(key, logits);
+        using key = random.key(444);
+        using logits = np.array([1.0, 2.0, 3.0]);
+        using sample = random.categorical(key, logits);
 
         // Default shape should be scalar (logits shape with axis removed)
         expect(sample.shape).toEqual([]);
@@ -166,14 +181,14 @@ suite.each(devices)("device:%s", (device) => {
       });
 
       test("batched logits", () => {
-        const key = random.key(333);
+        using key = random.key(333);
         // 2 batches of 3 categories each
-        const logits = np.array([
+        using logits = np.array([
           [10.0, 0.0, 0.0], // strongly prefer category 0
           [0.0, 0.0, 10.0], // strongly prefer category 2
         ]);
         const count = 100;
-        const samples = random.categorical(key, logits, { shape: [count, 2] });
+        using samples = random.categorical(key, logits, { shape: [count, 2] });
 
         expect(samples.shape).toEqual([count, 2]);
 
@@ -186,14 +201,14 @@ suite.each(devices)("device:%s", (device) => {
       });
 
       test("non-default axis", () => {
-        const key = random.key(123);
+        using key = random.key(123);
         // Shape [3, 2]: 3 categories, 2 batches (axis=0 is categories)
-        const logits = np.array([
+        using logits = np.array([
           [10.0, 0.0], // category 0: strongly prefer for batch 0
           [0.0, 10.0], // category 1: strongly prefer for batch 1
           [0.0, 0.0], // category 2: low probability
         ]);
-        const samples = random.categorical(key, logits, {
+        using samples = random.categorical(key, logits, {
           axis: 0,
           shape: [100, 2],
         });
@@ -207,8 +222,8 @@ suite.each(devices)("device:%s", (device) => {
       });
 
       test("shape mismatch throws error", () => {
-        const key = random.key(999);
-        const logits = np.array([
+        using key = random.key(999);
+        using logits = np.array([
           [1.0, 2.0, 3.0],
           [4.0, 5.0, 6.0],
         ]); // shape [2, 3]
@@ -221,8 +236,8 @@ suite.each(devices)("device:%s", (device) => {
       });
 
       test("shape doesn't dominate batch shape throws error", () => {
-        const key = random.key(998);
-        const logits = np.ones([4, 5]); // batchShape = [4] (axis=-1)
+        using key = random.key(998);
+        using logits = np.ones([4, 5]); // batchShape = [4] (axis=-1)
 
         // [1] broadcasts with [4] → [4], but [4] != [1], so our error fires
         expect(() => {
@@ -231,9 +246,9 @@ suite.each(devices)("device:%s", (device) => {
       });
 
       test("multi-dimensional shape prefix", () => {
-        const key = random.key(888);
-        const logits = np.array([1.0, 2.0, 3.0, 4.0, 5.0]); // 5 categories
-        const samples = random.categorical(key, logits, { shape: [2, 3] }); // 6 samples reshaped to [2,3]
+        using key = random.key(888);
+        using logits = np.array([1.0, 2.0, 3.0, 4.0, 5.0]); // 5 categories
+        using samples = random.categorical(key, logits, { shape: [2, 3] }); // 6 samples reshaped to [2,3]
 
         expect(samples.shape).toEqual([2, 3]);
         const js: number[][] = samples.js();
@@ -248,12 +263,12 @@ suite.each(devices)("device:%s", (device) => {
       // Argsort not supported on webgl
       if (device !== "webgl") {
         test("without replacement returns unique samples", () => {
-          const key = random.key(222);
+          using key = random.key(222);
           // 5 categories
-          const logits = np.array([1.0, 2.0, 3.0, 4.0, 5.0]);
+          using logits = np.array([1.0, 2.0, 3.0, 4.0, 5.0]);
 
           // Sample 3 without replacement
-          const samples = random.categorical(key, logits, {
+          using samples = random.categorical(key, logits, {
             shape: [3],
             replace: false,
           });
@@ -272,8 +287,8 @@ suite.each(devices)("device:%s", (device) => {
         });
 
         test("without replacement throws if k > num_categories", () => {
-          const key = random.key(111);
-          const logits = np.array([1.0, 2.0, 3.0]); // 3 categories
+          using key = random.key(111);
+          using logits = np.array([1.0, 2.0, 3.0]); // 3 categories
 
           // Trying to sample 5 without replacement should fail
           expect(() => {
@@ -282,13 +297,13 @@ suite.each(devices)("device:%s", (device) => {
         });
 
         test("batched without replacement", () => {
-          const key = random.key(777);
+          using key = random.key(777);
           // 2 batches of 5 categories each
-          const logits = np.array([
+          using logits = np.array([
             [1.0, 2.0, 3.0, 4.0, 5.0],
             [5.0, 4.0, 3.0, 2.0, 1.0],
           ]);
-          const samples = random.categorical(key, logits, {
+          using samples = random.categorical(key, logits, {
             shape: [3, 2],
             replace: false,
           });
@@ -304,9 +319,9 @@ suite.each(devices)("device:%s", (device) => {
         });
 
         test("k=numCategories samples all categories", () => {
-          const key = random.key(105);
-          const logits = np.array([1.0, 2.0, 3.0, 4.0, 5.0]);
-          const samples = random.categorical(key, logits, {
+          using key = random.key(105);
+          using logits = np.array([1.0, 2.0, 3.0, 4.0, 5.0]);
+          using samples = random.categorical(key, logits, {
             shape: [5],
             replace: false,
           });
@@ -317,35 +332,39 @@ suite.each(devices)("device:%s", (device) => {
         });
 
         test("multi-dimensional shape prefix without replacement", () => {
-          const key = random.key(106);
-          const logits = np.array([1.0, 2.0, 3.0, 4.0, 5.0, 6.0]); // 6 categories
-          const samples = random.categorical(key, logits, {
+          using key = random.key(106);
+          using logits = np.array([1.0, 2.0, 3.0, 4.0, 5.0, 6.0]); // 6 categories
+          using samples = random.categorical(key, logits, {
             shape: [2, 3],
             replace: false,
           });
 
           expect(samples.shape).toEqual([2, 3]);
-          const flat: number[] = samples.ravel().js();
+          using raveled = samples.ravel();
+          const flat: number[] = raveled.js();
           expect(flat.toSorted((a, b) => a - b)).toEqual([0, 1, 2, 3, 4, 5]);
         });
       }
 
       test("3D logits and negative axis", () => {
-        const logits = np.ones([2, 5, 3]); // 5 categories at axis=1
+        using logits = np.ones([2, 5, 3]); // 5 categories at axis=1
 
         // Default shape removes axis
-        const s1 = random.categorical(random.key(100), logits, { axis: 1 });
+        using k100 = random.key(100);
+        using s1 = random.categorical(k100, logits, { axis: 1 });
         expect(s1.shape).toEqual([2, 3]);
 
         // With shape prefix
-        const s2 = random.categorical(random.key(101), logits, {
+        using k101 = random.key(101);
+        using s2 = random.categorical(k101, logits, {
           axis: 1,
           shape: [10, 2, 3],
         });
         expect(s2.shape).toEqual([10, 2, 3]);
 
         // Negative axis (-2 means axis=1)
-        const s3 = random.categorical(random.key(102), logits, {
+        using k102 = random.key(102);
+        using s3 = random.categorical(k102, logits, {
           axis: -2,
           shape: [4, 2, 3],
         });
@@ -354,9 +373,10 @@ suite.each(devices)("device:%s", (device) => {
     });
 
     test("cauchy distribution", () => {
-      const key = random.key(999);
+      using key = random.key(999);
       const count = 20000;
-      const samples: number[] = random.cauchy(key, [count]).js();
+      using cauchyArr = random.cauchy(key, [count]);
+      const samples: number[] = cauchyArr.js();
 
       // Cauchy has heavy tails, so we can't use mean/variance tests.
       // Instead, check that the median is close to 0 and that quartiles
@@ -372,9 +392,10 @@ suite.each(devices)("device:%s", (device) => {
     });
 
     test("laplace distribution", () => {
-      const key = random.key(888);
+      using key = random.key(888);
       const count = 20000;
-      const samples: number[] = random.laplace(key, [count]).js();
+      using laplaceArr = random.laplace(key, [count]);
+      const samples: number[] = laplaceArr.js();
 
       // Laplace(0, 1) has mean 0 and variance 2
       const mean = samples.reduce((a, b) => a + b, 0) / count;
@@ -386,9 +407,10 @@ suite.each(devices)("device:%s", (device) => {
     });
 
     test("gumbel distribution", () => {
-      const key = random.key(777);
+      using key = random.key(777);
       const count = 20000;
-      const samples: number[] = random.gumbel(key, [count]).js();
+      using gumbelArr = random.gumbel(key, [count]);
+      const samples: number[] = gumbelArr.js();
 
       // Gumbel(0, 1) has mean = Euler-Mascheroni constant ≈ 0.5772
       // and variance = π²/6 ≈ 1.6449
@@ -404,18 +426,20 @@ suite.each(devices)("device:%s", (device) => {
     if (device === "cpu" || device === "wasm") {
       // TODO: cholesky not yet supported on webgpu
       test("multivariate normal distribution", () => {
-        const key = random.key(42);
+        using key = random.key(42);
         const count = 5000;
-        const mean = np.array([1.0, 2.0]);
-        const cov = np.array([
+        using mean = np.array([1.0, 2.0]);
+        using cov = np.array([
           [1.0, 0.5],
           [0.5, 2.0],
         ]);
-        const y = random.multivariateNormal(key, mean, cov, [count]);
+        using y = random.multivariateNormal(key, mean, cov, [count]);
         expect(y.shape).toEqual([count, 2]);
 
-        expect(np.mean(y, 0)).toBeAllclose(mean, { atol: 3e-2 });
-        expect(np.cov(y, null, { rowvar: false })).toBeAllclose(cov, {
+        using meanResult = np.mean(y, 0);
+        expect(meanResult).toBeAllclose(mean, { atol: 3e-2 });
+        using covResult = np.cov(y, null, { rowvar: false });
+        expect(covResult).toBeAllclose(cov, {
           atol: 3e-2,
         });
       });

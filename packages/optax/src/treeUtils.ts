@@ -19,9 +19,11 @@ function ipow(a: np.Array, order: number) {
     throw new Error("Order must be a positive integer");
   }
   if (order === 1) return a;
-  let result = a;
-  for (let i = 1; i < order; i++) {
-    result = result.mul(a);
+  let result = a.mul(a);
+  for (let i = 2; i < order; i++) {
+    const next = result.mul(a);
+    result.dispose();
+    result = next;
   }
   return result;
 }
@@ -33,10 +35,16 @@ export function treeUpdateMoment(
   order: number,
 ): JsTree<np.Array> {
   return tree.map(
-    (g: np.Array, t: np.Array) =>
-      ipow(g, order)
-        .mul(1 - decay)
-        .add(t.mul(decay)),
+    (g: np.Array, t: np.Array) => {
+      const gPow = ipow(g, order);
+      const scaledG = gPow.mul(1 - decay);
+      if (order > 1) gPow.dispose();
+      const scaledT = t.mul(decay);
+      const result = scaledG.add(scaledT);
+      scaledG.dispose();
+      scaledT.dispose();
+      return result;
+    },
     updates,
     moments,
   );
@@ -55,16 +63,29 @@ export function treeBiasCorrection(
 /** Sum all elements across all arrays in a pytree. */
 export function treeSum(tr: JsTree<np.Array>): np.Array {
   const [leaves] = tree.flatten(tr);
-  return leaves.reduce((total, leaf) => total.add(np.sum(leaf)), np.array(0.0));
+  let total = np.array(0.0);
+  for (const leaf of leaves) {
+    const s = np.sum(leaf);
+    const next = total.add(s);
+    s.dispose();
+    total.dispose();
+    total = next;
+  }
+  return total;
 }
 
 /** Max of all elements across all arrays in a pytree. */
 export function treeMax(tr: JsTree<np.Array>): np.Array {
   const [leaves] = tree.flatten(tr);
-  return leaves.reduce(
-    (maxVal, leaf) => np.maximum(maxVal, np.max(leaf)),
-    np.array(-Infinity),
-  );
+  let maxVal = np.array(-Infinity);
+  for (const leaf of leaves) {
+    const m = np.max(leaf);
+    const next = np.maximum(maxVal, m);
+    m.dispose();
+    maxVal.dispose();
+    maxVal = next;
+  }
+  return maxVal;
 }
 
 export type NormOrd = 1 | 2 | "inf" | "infinity" | number | null;
@@ -78,15 +99,31 @@ export function treeNorm(
   if (ord === null || ord === 2) {
     const squaredTree = tree.map(np.square, tr);
     const sqNorm = treeSum(squaredTree);
-    return squared ? sqNorm : np.sqrt(sqNorm);
+    tree.dispose(squaredTree);
+    if (squared) return sqNorm;
+    const result = np.sqrt(sqNorm);
+    sqNorm.dispose();
+    return result;
   } else if (ord === 1) {
     const absTree = tree.map(np.abs, tr);
     const result = treeSum(absTree);
-    return squared ? np.square(result) : result;
+    tree.dispose(absTree);
+    if (squared) {
+      const sq = np.square(result);
+      result.dispose();
+      return sq;
+    }
+    return result;
   } else if (ord === "inf" || ord === "infinity" || ord === Infinity) {
     const absTree = tree.map(np.abs, tr);
     const result = treeMax(absTree);
-    return squared ? np.square(result) : result;
+    tree.dispose(absTree);
+    if (squared) {
+      const sq = np.square(result);
+      result.dispose();
+      return sq;
+    }
+    return result;
   } else {
     throw new Error(`Unsupported ord: ${ord}`);
   }

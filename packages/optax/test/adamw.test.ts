@@ -3,54 +3,73 @@ import { adamw, applyUpdates, squaredError } from "@jax-js/optax";
 import { expect, test } from "vitest";
 
 test("adamw optimizer", () => {
+  using ones = np.ones([3]);
   let params = np.array([1.0, 2.0, 3.0]);
 
   const solver = adamw(0.001);
   let optState = solver.init(params);
-  let updates: np.Array;
 
-  const f = (x: np.Array) => squaredError(x, np.ones([3])).sum();
-  const paramsGrad = grad(f)(params);
+  const f = (x: np.Array) => squaredError(x, ones).sum();
+  using paramsGrad = grad(f)(params);
+  let updates: np.Array;
   [updates, optState] = solver.update(paramsGrad, optState, params);
-  params = applyUpdates(params, updates);
+  const newParams = applyUpdates(params, updates);
+  params.dispose();
+  updates.dispose();
+  params = newParams;
 
   expect(params.shape).toEqual([3]);
   expect(params.dtype).toEqual(np.float32);
+  params.dispose();
+  tree.dispose(optState);
 });
 
 test("adamw with custom weight decay", () => {
+  using ones = np.ones([3]);
   let params = np.array([1.0, 2.0, 3.0]);
 
   const solver = adamw(0.001, { weightDecay: 0.01 });
   let optState = solver.init(params);
-  let updates: np.Array;
 
-  const f = (x: np.Array) => squaredError(x, np.ones([3])).sum();
-  const paramsGrad = grad(f)(params);
+  const f = (x: np.Array) => squaredError(x, ones).sum();
+  using paramsGrad = grad(f)(params);
+  let updates: np.Array;
   [updates, optState] = solver.update(paramsGrad, optState, params);
-  params = applyUpdates(params, updates);
+  const newParams = applyUpdates(params, updates);
+  params.dispose();
+  updates.dispose();
+  params = newParams;
 
   expect(params.shape).toEqual([3]);
   expect(params.dtype).toEqual(np.float32);
+  params.dispose();
+  tree.dispose(optState);
 });
 
 test("adamw with nesterov", () => {
+  using ones = np.ones([3]);
   let params = np.array([1.0, 2.0, 3.0]);
 
   const solver = adamw(0.001, { nesterov: true, weightDecay: 0.005 });
   let optState = solver.init(params);
-  let updates: np.Array;
 
-  const f = (x: np.Array) => squaredError(x, np.ones([3])).sum();
-  const paramsGrad = grad(f)(params);
+  const f = (x: np.Array) => squaredError(x, ones).sum();
+  using paramsGrad = grad(f)(params);
+  let updates: np.Array;
   [updates, optState] = solver.update(paramsGrad, optState, params);
-  params = applyUpdates(params, updates);
+  const newParams = applyUpdates(params, updates);
+  params.dispose();
+  updates.dispose();
+  params = newParams;
 
   expect(params.shape).toEqual([3]);
   expect(params.dtype).toEqual(np.float32);
+  params.dispose();
+  tree.dispose(optState);
 });
 
 test("adamw with callable mask", () => {
+  using ones = np.ones([3]);
   let params = np.array([1.0, 2.0, 3.0]);
 
   // Mask function that returns a mask tree - only apply decay to first element
@@ -62,13 +81,18 @@ test("adamw with callable mask", () => {
 
   const solver = adamw(0.001, { weightDecay: 0.01, mask: maskFn });
   let optState = solver.init(params);
-  let updates: np.Array;
 
-  const f = (x: np.Array) => squaredError(x, np.ones([3])).sum();
-  const paramsGrad = grad(f)(params);
+  const f = (x: np.Array) => squaredError(x, ones).sum();
+  using paramsGrad = grad(f)(params);
+  let updates: np.Array;
   [updates, optState] = solver.update(paramsGrad, optState, params);
-  params = applyUpdates(params, updates);
+  const newParams = applyUpdates(params, updates);
+  params.dispose();
+  updates.dispose();
+  params = newParams;
 
   expect(params.shape).toEqual([3]);
   expect(params.dtype).toEqual(np.float32);
+  params.dispose();
+  tree.dispose(optState);
 });
