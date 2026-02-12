@@ -5457,12 +5457,18 @@ function jacfwd$1(f) {
 	return function jacobianForward(x) {
 		if (x.shape.length !== 1) throw new TypeError("jacfwd only supports 1D inputs");
 		const [size$1] = x.shape;
+		const xRcBefore = x.refCount;
 		const pushfwd = (v) => {
 			const [primals, tangents] = jvp$1(f, [x], [v]);
 			dispose(primals);
 			return tangents;
 		};
-		return vmap$1(pushfwd, [0])(eye(size$1, void 0, { dtype: x.dtype }));
+		const basis = eye(size$1, void 0, { dtype: x.dtype });
+		const basisRcBefore = basis.refCount;
+		const out = vmap$1(pushfwd, [0])(basis.ref);
+		while (basis.refCount >= basisRcBefore) basis.dispose();
+		while (x.refCount >= xRcBefore) x.dispose();
+		return out;
 	};
 }
 
@@ -7001,15 +7007,33 @@ function valueAndGrad$1(f, opts) {
 function jacrev$1(f) {
 	return function jacobianReverse(x) {
 		if (x.shape.length !== 1) throw new TypeError("jacrev only supports 1D inputs");
-		const [size$1] = x.shape;
-		const pullback = (ct) => {
-			const [y, fVjp] = vjp$1(f, [x]);
+		const [y, fVjp] = vjp$1(f, [x]);
+		if (!(y instanceof Tracer)) {
+			fVjp.dispose();
+			throw new TypeError("jacrev requires array output");
+		}
+		if (y.shape.length === 0) {
+			const [ret] = fVjp(onesLike$1(y.ref));
 			y.dispose();
-			const [ret] = fVjp(ct);
 			fVjp.dispose();
 			return ret;
+		}
+		if (y.shape.length !== 1) {
+			y.dispose();
+			fVjp.dispose();
+			throw new TypeError("jacrev only supports scalar or 1D outputs");
+		}
+		const [outSize] = y.shape;
+		const pullback = (ct) => {
+			const [ret] = fVjp(ct);
+			return ret;
 		};
-		return vmap$1(pullback, [1])(eye(size$1, void 0, { dtype: x.dtype }));
+		const basis = eye(outSize, void 0, { dtype: y.dtype });
+		const j = vmap$1(pullback, [1])(basis.ref);
+		basis.dispose();
+		y.dispose();
+		fVjp.dispose();
+		return j;
 	};
 }
 function hessian$1(f) {
