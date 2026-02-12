@@ -942,6 +942,11 @@ declare abstract class Tracer {
   abstract get aval(): AbstractValue;
   abstract toString(): string;
   /**
+   * Optional refcount introspection for ownership-sensitive internals.
+   * Concrete array-like tracers override this; wrapper tracers inherit NaN.
+   */
+  get refCount(): number;
+  /**
    * Access an array by reference, incrementing the reference count.
    *
    * jax-js handles freeing arrays by using "move" semantics, like in Rust/C++.

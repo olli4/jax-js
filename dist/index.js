@@ -389,6 +389,13 @@ var Tracer = class Tracer {
 	constructor(trace$1) {
 		this._trace = trace$1;
 	}
+	/**
+	* Optional refcount introspection for ownership-sensitive internals.
+	* Concrete array-like tracers override this; wrapper tracers inherit NaN.
+	*/
+	get refCount() {
+		return NaN;
+	}
 	/** The shape of the array. */
 	get shape() {
 		return this.aval.shape;
@@ -5698,7 +5705,7 @@ const jvpRules = {
 		const [primalsOut, tangentsOut] = [outs.slice(0, n), outs.slice(n)];
 		return [primalsOut, tangentsOut];
 	},
-	[Primitive.DynamicUpdateSlice]([dst, src], [ddst, dsrc], { offset, axis }) {
+	[Primitive.DynamicUpdateSlice]([_dst, _src], [_ddst, _dsrc], { offset: _offset, axis: _axis }) {
 		throw new Error("JVP: dynamic_update_slice is not implemented");
 	},
 	[Primitive.Scan](primals, tangents, { jaxpr, numCarry, numConsts, length, reverse, checkpoint }) {
