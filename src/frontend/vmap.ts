@@ -584,7 +584,6 @@ const vmapRules: Partial<{ [P in Primitive]: VmapRule<P> }> = {
 const vmapJaxprCache = new Map<Jaxpr, Map<string, ClosedJaxpr>>();
 
 _registerJitCacheDisposer(() => {
-  console.log("[vmap] clearing vmapJaxprCache, size:", vmapJaxprCache.size);
   for (const inner of vmapJaxprCache.values()) {
     for (const jaxpr of inner.values()) jaxpr.dispose();
     inner.clear();

@@ -1859,11 +1859,15 @@ function evalJaxpr(jaxpr, args) {
 	const remainingRefs = /* @__PURE__ */ new Map();
 	const read = (x) => {
 		if (x instanceof Var) return env.get(x);
-		else return array(x.value, { dtype: x.dtype });
+		else {
+			const arr = array(x.value, { dtype: x.dtype });
+			if (arr instanceof Array$1) anonymousConstArrays.add(arr);
+			return arr;
+		}
 	};
 	const write = (v, val) => {
 		if (env.has(v)) throw new Error(`Variable already bound: ${v}`);
-		let refCount = usageCount.get(v) ?? 0;
+		const refCount = usageCount.get(v) ?? 0;
 		if (refCount) {
 			env.set(v, val);
 			remainingRefs.set(v, refCount);
@@ -5511,7 +5515,6 @@ const vmapRules = {
 };
 const vmapJaxprCache = /* @__PURE__ */ new Map();
 _registerJitCacheDisposer(() => {
-	console.log("[vmap] clearing vmapJaxprCache, size:", vmapJaxprCache.size);
 	for (const inner$1 of vmapJaxprCache.values()) {
 		for (const jaxpr of inner$1.values()) jaxpr.dispose();
 		inner$1.clear();

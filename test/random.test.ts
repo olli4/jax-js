@@ -83,8 +83,6 @@ suite.each(devices)("device:%s", (device) => {
       using keys = random.split(k1234, 5);
       using samples = vmap((k: np.Array) => random.uniform(k, [100]))(keys);
       expect(samples.shape).toEqual([5, 100]);
-
-      // Also generate samples with looped calls
       const samplesRef: np.Array[] = [];
       for (const key of keys) {
         using _key = key;

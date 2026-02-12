@@ -512,7 +512,14 @@ export function evalJaxpr(jaxpr: Jaxpr, args: Tracer[]): Tracer[] {
     if (x instanceof Var) {
       return env.get(x)!;
     } else {
-      return array(x.value, { dtype: x.dtype });
+      // Mark Lit-created arrays as anonymous so getOrMakeConstTracer (when
+      // running inside a JaxprTrace) treats them as builder-owned and does
+      // NOT call .ref. Without this, the .ref creates an unbalanced refcount:
+      // evalJaxpr doesn't track Lit arrays for disposal, so the extra ref
+      // from getOrMakeConstTracer is never balanced, leaking the backend Slot.
+      const arr = array(x.value, { dtype: x.dtype });
+      if (arr instanceof Array) anonymousConstArrays.add(arr);
+      return arr;
     }
   };
 
