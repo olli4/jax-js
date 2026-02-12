@@ -658,11 +658,21 @@ export function jacfwd(f: any) {
       throw new TypeError("jacfwd only supports 1D inputs");
     }
     const [size] = x.shape;
+    const xRcBefore = x.refCount;
     const pushfwd = (v: Tracer) => {
       const [primals, tangents] = jvp(f, [x], [v]);
       treeDispose(primals); // jacfwd only needs tangents
       return tangents;
     };
-    return vmap(pushfwd, [0])(eye(size, undefined, { dtype: x.dtype }));
+    const basis = eye(size, undefined, { dtype: x.dtype });
+    const basisRcBefore = basis.refCount;
+    const out = vmap(pushfwd, [0])(basis.ref);
+    while (basis.refCount >= basisRcBefore) {
+      basis.dispose();
+    }
+    while (x.refCount >= xRcBefore) {
+      x.dispose();
+    }
+    return out;
   };
 }

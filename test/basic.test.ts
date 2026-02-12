@@ -1,4 +1,12 @@
-import { hessian, jacfwd, jacrev, jvp, numpy as np, vmap } from "@jax-js/jax";
+import {
+  grad,
+  hessian,
+  jacfwd,
+  jacrev,
+  jvp,
+  numpy as np,
+  vmap,
+} from "@jax-js/jax";
 import { expect, suite, test } from "vitest";
 
 test("can create array", () => {
@@ -225,6 +233,14 @@ suite("jax.jacfwd()", () => {
     const jFwd = jacfwd(f)(x.ref);
     const jRev = jacrev(f)(x);
     expect(jFwd).toBeAllclose(jRev);
+  });
+
+  test("jacrev scalar output matches grad", () => {
+    const f = (x: np.Array) => np.sum(np.sin(x.ref).mul(x));
+    const x = np.array([1, 2, 3]);
+    const jRev = jacrev(f)(x.ref);
+    const g = grad(f)(x);
+    expect(jRev).toBeAllclose(g);
   });
 });
 

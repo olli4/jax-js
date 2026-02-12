@@ -17,7 +17,9 @@ import {
   defaultDevice,
   getBackend,
   grad,
+  hessian,
   init,
+  jacrev,
   jit,
   lax,
   numpy as np,
@@ -350,5 +352,61 @@ describe("grad + jit leak detection (CPU)", () => {
     const d5x = grad(grad(grad(grad(grad(f)))))(np.array(1.0));
     await d5x.data();
     expect(slotCount() - before).toBe(0);
+  });
+});
+
+describe("jacrev/hessian leak detection (CPU)", () => {
+  beforeAll(async () => {
+    const devices = await init();
+    previousDevice = devices.includes("webgpu")
+      ? "webgpu"
+      : devices.includes("wasm")
+        ? "wasm"
+        : undefined;
+    defaultDevice("cpu");
+  });
+
+  afterAll(() => {
+    if (previousDevice) defaultDevice(previousDevice as any);
+  });
+
+  it("jacrev(f)(x) does not leak", async () => {
+    const f = (x: np.Array) => np.sin(x.ref).add(np.cos(x));
+    const x = np.array([1.0, 2.0, 3.0]);
+
+    const j = jacrev(f)(x.ref);
+    await j.data();
+    x.dispose();
+  });
+
+  it("jacrev(jit(f))(x) does not leak", async () => {
+    const f = (x: np.Array) => np.sin(x.ref).add(np.cos(x));
+    const x = np.array([1.0, 2.0, 3.0]);
+    const jitted = jit(f);
+
+    const j = jacrev(jitted)(x.ref);
+    await j.data();
+    x.dispose();
+    jitted.dispose();
+  });
+
+  it("hessian(f)(x) does not leak", async () => {
+    const f = (x: np.Array) => np.sum(x.ref.mul(x));
+    const x = np.array([1.0, 2.0, 3.0]);
+
+    const h = hessian(f)(x.ref);
+    await h.data();
+    x.dispose();
+  });
+
+  it("hessian(jit(f))(x) does not leak", async () => {
+    const f = (x: np.Array) => np.sum(x.ref.mul(x));
+    const x = np.array([1.0, 2.0, 3.0]);
+    const jitted = jit(f);
+
+    const h = hessian(jitted)(x.ref);
+    await h.data();
+    x.dispose();
+    jitted.dispose();
   });
 });

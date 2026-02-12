@@ -1989,15 +1989,33 @@ export function jacrev(f: any) {
     if (x.shape.length !== 1) {
       throw new TypeError("jacrev only supports 1D inputs");
     }
-    const [size] = x.shape;
-    const pullback = (ct: Tracer) => {
-      const [y, fVjp] = vjp(f, [x]);
+    const [y, fVjp] = vjp(f, [x]);
+    if (!(y instanceof Tracer)) {
+      fVjp.dispose();
+      throw new TypeError("jacrev requires array output");
+    }
+    if (y.shape.length === 0) {
+      const [ret] = fVjp(onesLike(y.ref));
       y.dispose();
-      const [ret] = fVjp(ct);
       fVjp.dispose();
       return ret;
+    }
+    if (y.shape.length !== 1) {
+      y.dispose();
+      fVjp.dispose();
+      throw new TypeError("jacrev only supports scalar or 1D outputs");
+    }
+    const [outSize] = y.shape;
+    const pullback = (ct: Tracer) => {
+      const [ret] = fVjp(ct);
+      return ret;
     };
-    return vmap(pullback, [1])(eye(size, undefined, { dtype: x.dtype }));
+    const basis = eye(outSize, undefined, { dtype: y.dtype });
+    const j = vmap(pullback, [1])(basis.ref);
+    basis.dispose();
+    y.dispose();
+    fVjp.dispose();
+    return j;
   };
 }
 
