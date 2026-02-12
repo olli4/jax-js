@@ -30,327 +30,8 @@ var __toESM = (mod$1, isNodeMode, target) => (target = mod$1 != null ? __create(
 }) : target, mod$1));
 
 //#endregion
-const require_backend = require('./backend-D_QaxnrG.cjs');
+const require_backend = require('./backend-Sn50-iuE.cjs');
 
-//#region src/frontend/convolution.ts
-/**
-* Check that the shapes and parameters passed to convolution are valid.
-* Expected shapes of the lhs and rhs of the convolution are:
-*
-* - `lhsShape = [*vmapDims, batchSize, inChannels, spatialDims...]`
-* - `rhsShape = [*vmapDims, outChannels, inChannels, kernelSize...]`
-*
-* If the check succeeds, returns the output shape.
-*/
-function checkConvShape(lhsShape, rhsShape, { vmapDims, strides, padding, lhsDilation, rhsDilation }) {
-	if (lhsShape.length !== rhsShape.length) throw new Error(`conv() requires inputs with the same number of dimensions, got ${lhsShape.length} and ${rhsShape.length}`);
-	const n = lhsShape.length - 2 - vmapDims;
-	if (n < 0) throw new Error("conv() requires at least 2D inputs");
-	if (strides.length !== n) throw new Error("conv() strides != spatial dims");
-	if (padding.length !== n) throw new Error("conv() padding != spatial dims");
-	if (lhsDilation.length !== n) throw new Error("conv() lhsDilation != spatial dimensions");
-	if (rhsDilation.length !== n) throw new Error("conv() rhsDilation != spatial dimensions");
-	if (lhsShape[vmapDims + 1] !== rhsShape[vmapDims + 1]) throw new Error(`conv() input channels: ${lhsShape[1]} != ${rhsShape[1]}`);
-	const outShape = [
-		...require_backend.generalBroadcast(lhsShape.slice(0, vmapDims), rhsShape.slice(0, vmapDims)),
-		lhsShape[vmapDims],
-		rhsShape[vmapDims]
-	];
-	for (let i = 0; i < n; i++) {
-		if (strides[i] <= 0 || !Number.isInteger(strides[i])) throw new Error(`conv() strides[${i}] must be a positive integer`);
-		if (padding[i].length !== 2 || !padding[i].every(Number.isInteger)) throw new Error(`conv() padding[${i}] must be a 2-tuple of integers`);
-		if (lhsDilation[i] <= 0 || !Number.isInteger(lhsDilation[i])) throw new Error(`conv() lhsDilation[${i}] must be a positive integer`);
-		if (rhsDilation[i] <= 0 || !Number.isInteger(rhsDilation[i])) throw new Error(`conv() rhsDilation[${i}] must be a positive integer`);
-		const [x, k] = [lhsShape[i + vmapDims + 2], rhsShape[i + vmapDims + 2]];
-		if (k <= 0) throw new Error("conv() kernel size must be positive");
-		const [pl, pr] = padding[i];
-		if (pl < -x || pr < -x || pl + pr < -x) throw new Error(`conv() padding[${i}]=(${pl},${pr}) is too negative for input size ${x}`);
-		const kernelSize = (k - 1) * rhsDilation[i] + 1;
-		const inSize = Math.max((x - 1) * lhsDilation[i] + 1, 0) + pl + pr;
-		if (kernelSize > inSize) throw new Error(`conv() kernel size ${kernelSize} > input size ${inSize} in dimension ${i}`);
-		outShape.push(Math.ceil((inSize - kernelSize + 1) / strides[i]));
-	}
-	return outShape;
-}
-function checkPoolShape(inShape, window, strides) {
-	if (strides.length !== window.length) throw new Error("pool() strides != window dims");
-	if (window.length > inShape.length) throw new Error("pool() window has more dimensions than input");
-	const outShape = inShape.slice(0, inShape.length - window.length);
-	for (let i = 0; i < window.length; i++) {
-		const k = window[i];
-		const s = strides[i];
-		const size$1 = inShape[inShape.length - window.length + i];
-		if (k <= 0 || !Number.isInteger(k)) throw new Error(`pool() window[${i}] must be a positive integer`);
-		if (k > size$1) throw new Error(`pool() window[${i}]=${k} > input size ${size$1}`);
-		if (s <= 0 || !Number.isInteger(s)) throw new Error(`pool() strides[${i}] must be a positive integer`);
-		outShape.push(Math.ceil((size$1 - k + 1) / s));
-	}
-	return outShape.concat(window);
-}
-/**
-* Takes a shape tracker and a kernel size `ks`, then reshapes it so the last
-* `ks.length` dimensions become `2 * ks.length` dimensions by treating them as
-* spatial dimensions convolved with a kernel.
-*
-* The resulting array can be multiplied with a kernel of shape `ks`, then
-* reduced along the last `ks.length` dimensions for a convolution.
-*
-* Reference: https://github.com/tinygrad/tinygrad/blob/v0.10.3/tinygrad/tensor.py#L2097
-*/
-function pool(st, ks, strides = 1, dilation = 1) {
-	if (ks.length === 0) return st;
-	if (st.shape.length < ks.length) throw new Error("pool() called with too many dimensions");
-	if (typeof strides === "number") strides = require_backend.rep(ks.length, strides);
-	if (typeof dilation === "number") dilation = require_backend.rep(ks.length, dilation);
-	if (strides.some((s) => s <= 0 || !Number.isInteger(s))) throw new Error("pool() strides must be positive integers");
-	if (dilation.some((d) => d <= 0 || !Number.isInteger(d))) throw new Error("pool() dilation must be positive integers");
-	const noop = st.shape.slice(0, -ks.length);
-	const i_ = st.shape.slice(-ks.length);
-	const s_ = strides;
-	const d_ = dilation;
-	const o_ = require_backend.zipn(i_, d_, ks, s_).map(([i, d, k, s]) => Math.ceil((i - d * (k - 1)) / s));
-	if (d_.every((d) => d === 1) && ks.every((k, j) => k <= s_[j])) {
-		st = st.padOrShrink([...noop.map(() => [0, 0]), ...require_backend.zipn(i_, o_, s_).map(([i, o, s]) => [0, o * s - i])]);
-		st = st.reshape([...noop, ...require_backend.zip(o_, s_).flatMap(([o, s]) => [o, s])]).shrink([...noop.map((x) => [0, x]), ...require_backend.zip(o_, ks).flatMap(([o, k]) => [[0, o], [0, k]])]);
-		st = st.permute([
-			...require_backend.range(noop.length),
-			...ks.map((_, j) => noop.length + 2 * j),
-			...ks.map((_, j) => noop.length + 2 * j + 1)
-		]);
-		return st;
-	}
-	const f_ = require_backend.zipn(o_, s_, i_, d_, ks).map(([o, s, i, d, k]) => 1 + Number(o * s > i - d * (k - 1)));
-	const kidf = require_backend.zipn(ks, i_, d_, f_);
-	st = st.repeat([...require_backend.rep(noop.length, 1), ...kidf.map(([k, i, d, f]) => Math.ceil(k * (i * f + d) / i))]);
-	st = st.shrink([...noop.map((x) => [0, x]), ...kidf.map(([k, i, d, f]) => [0, k * (i * f + d)])]).reshape([...noop, ...kidf.flatMap(([k, i, d, f]) => [k, i * f + d])]);
-	const kos = require_backend.zipn(ks, o_, s_);
-	st = st.shrink([...noop.map((x) => [0, x]), ...kos.flatMap(([k, o, s]) => [[0, k], [0, o * s]])]).reshape([...noop, ...kos.flat(1)]);
-	st = st.shrink([...noop.map((x) => [0, x]), ...kos.flatMap(([k, o]) => [
-		[0, k],
-		[0, o],
-		[0, 1]
-	])]).reshape([...noop, ...kos.flatMap(([k, o]) => [k, o])]);
-	st = st.permute([
-		...require_backend.range(noop.length),
-		...ks.map((_, j) => noop.length + 2 * j + 1),
-		...ks.map((_, j) => noop.length + 2 * j)
-	]);
-	return st;
-}
-/**
-* Perform the transpose of pool, directly undo-ing a pool() operation.
-*
-* Note that since pool repeats the input, the transpose operation technically
-* should include a sum reduction. This function doesn't perform the reduction,
-* which should be done on the last `k` axes of the returned shape.
-*/
-function poolTranspose(st, inShape, ks, strides = 1, dilation = 1) {
-	if (ks.length === 0) return st;
-	if (typeof strides === "number") strides = require_backend.rep(ks.length, strides);
-	if (typeof dilation === "number") dilation = require_backend.rep(ks.length, dilation);
-	const noop = inShape.slice(0, -ks.length);
-	const i_ = inShape.slice(-ks.length);
-	const s_ = strides;
-	const d_ = dilation;
-	const o_ = require_backend.zipn(i_, d_, ks, s_).map(([i, d, k, s]) => Math.ceil((i - d * (k - 1)) / s));
-	if (d_.every((d) => d === 1) && ks.every((k, j) => k <= s_[j])) {
-		st = st.permute([...require_backend.range(noop.length), ...ks.flatMap((_, j) => [noop.length + j, noop.length + o_.length + j])]);
-		st = st.pad([...noop.map(() => [0, 0]), ...require_backend.zip(s_, ks).flatMap(([s, k]) => [[0, 0], [0, s - k]])]).reshape([...noop, ...require_backend.zip(o_, s_).map(([o, s]) => o * s)]);
-		st = st.padOrShrink([...noop.map(() => [0, 0]), ...require_backend.zipn(i_, o_, s_).map(([i, o, s]) => [0, i - o * s])]);
-		return st.reshape(st.shape.concat(require_backend.rep(ks.length, 1)));
-	}
-	if (!require_backend.deepEqual(o_, st.shape.slice(noop.length, noop.length + ks.length))) throw new Error("poolTranspose() called with mismatched output shape");
-	const f_ = require_backend.zipn(o_, s_, i_, d_, ks).map(([o, s, i, d, k]) => 1 + Number(o * s > i - d * (k - 1)));
-	const kidf = require_backend.zipn(ks, i_, d_, f_);
-	const kos = require_backend.zipn(ks, o_, s_);
-	st = st.permute([...require_backend.range(noop.length), ...ks.flatMap((_, j) => [noop.length + ks.length + j, noop.length + j])]);
-	st = st.reshape([...noop, ...kos.flatMap(([k, o]) => [
-		k,
-		o,
-		1
-	])]).pad([...noop.map(() => [0, 0]), ...s_.flatMap((s) => [
-		[0, 0],
-		[0, 0],
-		[0, s - 1]
-	])]);
-	st = st.reshape([...noop, ...kos.flatMap(([k, o, s]) => [k, o * s])]).pad([...noop.map(() => [0, 0]), ...kidf.flatMap(([_k, i, d, f], j) => [[0, 0], [0, i * f + d - o_[j] * s_[j]]])]);
-	st = st.reshape([...noop, ...kidf.map(([k, i, d, f]) => k * (i * f + d))]).pad([...noop.map(() => [0, 0]), ...kidf.map(([k, i, d, f]) => [0, Math.ceil(k * (i * f + d) / i) * i - k * (i * f + d)])]);
-	st = st.reshape([...noop, ...kidf.flatMap(([k, i, d, f]) => [Math.ceil(k * (i * f + d) / i), i])]).permute([
-		...require_backend.range(noop.length),
-		...ks.map((_, j) => noop.length + 2 * j + 1),
-		...ks.map((_, j) => noop.length + 2 * j)
-	]);
-	return st;
-}
-/** Applies dilation to an array directly, for transposed convolution. */
-function applyDilation(st, dilation) {
-	if (dilation.every((s) => s === 1)) return st;
-	const s_ = dilation;
-	const n = s_.length;
-	const prefix = st.shape.slice(0, -n);
-	const k_ = st.shape.slice(-n);
-	st = st.reshape([...prefix, ...k_.flatMap((k) => [k, 1])]);
-	st = st.pad([...prefix.map(() => [0, 0]), ...s_.flatMap((s) => [[0, 0], [0, s - 1]])]);
-	st = st.reshape([...prefix, ...k_.map((k, i) => k * s_[i])]);
-	st = st.shrink([...prefix.map((p) => [0, p]), ...k_.map((k, i) => [0, (k - 1) * s_[i] + 1])]);
-	return st;
-}
-/**
-* Prepare for a convolution between two arrays.
-*
-* This does not check the validity of the shapes, which should be checked
-* beforehand using `checkConvShape()`.
-*/
-function prepareConv(stX, stY, params) {
-	const v = params.vmapDims;
-	const n = stX.shape.length - 2 - v;
-	const vmapShape = stX.shape.slice(0, v);
-	stX = applyDilation(stX, params.lhsDilation);
-	const ks = stY.shape.slice(v + 2);
-	stX = stX.padOrShrink([...require_backend.rep(v + 2, [0, 0]), ...params.padding]);
-	stX = pool(stX, ks, params.strides, params.rhsDilation);
-	stX = stX.moveaxis(v + 1, v + n + 1).reshape([
-		...vmapShape,
-		stX.shape[v],
-		1,
-		...stX.shape.slice(v + 2, v + n + 2),
-		stX.shape[v + 1] * require_backend.prod(ks)
-	]);
-	stY = stY.reshape([
-		...vmapShape,
-		1,
-		stY.shape[v],
-		...require_backend.rep(n, 1),
-		stY.shape[v + 1] * require_backend.prod(ks)
-	]);
-	return [stX, stY];
-}
-
-//#endregion
-//#region src/tree.ts
-var tree_exports = {};
-__export(tree_exports, {
-	JsTreeDef: () => JsTreeDef,
-	NodeType: () => NodeType,
-	dispose: () => dispose,
-	flatten: () => flatten,
-	leaves: () => leaves,
-	map: () => map,
-	ref: () => ref,
-	structure: () => structure,
-	unflatten: () => unflatten
-});
-const JsArray$2 = globalThis.Array;
-let NodeType = /* @__PURE__ */ function(NodeType$1) {
-	NodeType$1["Array"] = "Array";
-	NodeType$1["Object"] = "Object";
-	NodeType$1["Leaf"] = "Leaf";
-	NodeType$1["None"] = "None";
-	return NodeType$1;
-}({});
-/** Represents the structure of a JsTree. */
-var JsTreeDef = class JsTreeDef {
-	static leaf = new JsTreeDef(NodeType.Leaf, null, []);
-	static none = new JsTreeDef(NodeType.None, null, []);
-	constructor(nodeType, nodeMetadata, childTreedefs) {
-		this.nodeType = nodeType;
-		this.nodeMetadata = nodeMetadata;
-		this.childTreedefs = childTreedefs;
-	}
-	/** Get the total number of leaves in the tree. */
-	get size() {
-		if (this.nodeType === NodeType.None) return 0;
-		return this.nodeType === NodeType.Leaf ? 1 : this.childTreedefs.reduce((a, b) => a + b.size, 0);
-	}
-	/** Returns a string representation of this tree definition. */
-	toString(root = true) {
-		if (root) return "JsTreeDef(" + this.toString(false) + ")";
-		switch (this.nodeType) {
-			case NodeType.Leaf: return "*";
-			case NodeType.None: return "null";
-			case NodeType.Array: return `[${this.childTreedefs.map((x) => x.toString(false)).join(", ")}]`;
-			case NodeType.Object: {
-				const parts = [];
-				for (let i = 0; i < this.childTreedefs.length; i++) parts.push(`${quoteObjectKey(this.nodeMetadata[i])}: ${this.childTreedefs[i].toString(false)}`);
-				return `{${parts.join(", ")}}`;
-			}
-		}
-	}
-	/** Compare this tree definition with another. */
-	equals(other) {
-		return this.nodeType === other.nodeType && require_backend.deepEqual(this.nodeMetadata, other.nodeMetadata) && this.childTreedefs.length === other.childTreedefs.length && this.childTreedefs.every((x, i) => x.equals(other.childTreedefs[i]));
-	}
-};
-function quoteObjectKey(key$1) {
-	if (/^[a-zA-Z_$][a-zA-Z0-9_$]*$/.test(key$1)) return key$1;
-	return JSON.stringify(key$1);
-}
-/** Flatten a structured object, returning the tree definition. */
-function flatten(tree) {
-	const leaves$1 = [];
-	const treedef = _flatten(tree, leaves$1);
-	return [leaves$1, treedef];
-}
-function _flatten(tree, leaves$1) {
-	if (tree === null || tree === void 0) return JsTreeDef.none;
-	if (JsArray$2.isArray(tree)) {
-		const childTrees = tree.map((c) => _flatten(c, leaves$1));
-		return new JsTreeDef(NodeType.Array, null, childTrees);
-	} else if (typeof tree === "object" && tree !== null && tree.constructor === Object) {
-		const [keys, values] = require_backend.unzip2(Object.entries(tree));
-		const childTrees = values.map((c) => _flatten(c, leaves$1));
-		return new JsTreeDef(NodeType.Object, keys, childTrees);
-	} else {
-		leaves$1.push(tree);
-		return JsTreeDef.leaf;
-	}
-}
-/** Get the leaves of a tree. */
-function leaves(tree) {
-	return flatten(tree)[0];
-}
-/** Get the treedef for a tree. */
-function structure(tree) {
-	return flatten(tree)[1];
-}
-/** Reconstruct a structured object from the flattened representation. */
-function unflatten(treedef, leaves$1) {
-	return _unflatten(treedef, leaves$1[Symbol.iterator]());
-}
-function _unflatten(treedef, leaves$1) {
-	switch (treedef.nodeType) {
-		case NodeType.None: return null;
-		case NodeType.Leaf: {
-			const { value, done } = leaves$1.next();
-			if (done) throw new TypeError("Ran out of leaves while unflattening JsTree");
-			return value;
-		}
-		case NodeType.Array: return treedef.childTreedefs.map((c) => _unflatten(c, leaves$1));
-		case NodeType.Object: {
-			const obj = {};
-			for (let i = 0; i < treedef.childTreedefs.length; i++) obj[treedef.nodeMetadata[i]] = _unflatten(treedef.childTreedefs[i], leaves$1);
-			return obj;
-		}
-	}
-}
-/** Maps a multi-input function over pytree args to produce a new pytree. */
-function map(fn, tree, ...rest) {
-	const [leaves$1, treedef] = flatten(tree);
-	const restLeaves = rest.map((x) => flatten(x)[0]);
-	const resultLeaves = [];
-	for (let i = 0; i < leaves$1.length; i++) resultLeaves.push(fn(leaves$1[i], ...restLeaves.map((x) => x[i])));
-	return unflatten(treedef, resultLeaves);
-}
-/** Take a reference of every array in a tree. */
-function ref(tree) {
-	return map((x) => x instanceof Tracer ? x.ref : x, tree);
-}
-/** Dispose every array in a tree. */
-function dispose(tree) {
-	if (tree) map((x) => x instanceof Tracer ? x.dispose() : void 0, tree);
-}
-
-//#endregion
 //#region src/frontend/core.ts
 /**
 * Frontend primitive operations, which are lowered into Kernel objects before
@@ -709,6 +390,10 @@ function newDynamic(main) {
 function currentTraceLevel() {
 	return traceStack[traceStack.length - 1].level;
 }
+/** True when no transformations are active (only the base EvalTrace). */
+function isTopLevel() {
+	return traceStack.length <= 1;
+}
 var Trace = class {
 	constructor(main) {
 		this.main = main;
@@ -906,12 +591,15 @@ var Tracer = class Tracer {
 		if (this.ndim === 0) throw new Error("Cannot iterate over a scalar array");
 		let residual = this;
 		const subarrayShape = this.shape.slice(1);
-		for (let i = 0; i < this.shape[0]; i++) {
-			const lr = split$2(residual, 0, [1, residual.shape[0] - 1]);
-			yield lr[0].reshape(subarrayShape);
-			residual = lr[1];
+		try {
+			for (let i = 0; i < this.shape[0]; i++) {
+				const lr = split$2(residual, 0, [1, residual.shape[0] - 1]);
+				residual = lr[1];
+				yield lr[0].reshape(subarrayShape);
+			}
+		} finally {
+			residual.dispose();
 		}
-		residual.dispose();
 	}
 	/**
 	* Return a sorted copy of an array in ascending order.
@@ -928,18 +616,25 @@ var Tracer = class Tracer {
 		return sort$1(this.transpose(perm)).transpose(require_backend.invertPermutation(perm));
 	}
 	/**
-	* Return the indices that would sort an array. This may not be a stable
-	* sorting algorithm; it need not preserve order of indices in ties.
+	* Return the indices that would sort an array. Unlike `sort`, this is
+	* guaranteed to be a stable sorting algorithm; it always returns the smaller
+	* index first in event of ties.
 	*
 	* See `jax.numpy.argsort` for full docs.
 	*/
 	argsort(axis = -1) {
 		axis = require_backend.checkAxis(axis, this.ndim);
-		if (axis === this.ndim - 1) return argsort$1(this)[1];
+		if (axis === this.ndim - 1) {
+			const [sorted$1, indices$1] = argsort$1(this);
+			sorted$1.dispose();
+			return indices$1;
+		}
 		const perm = require_backend.range(this.ndim);
 		perm.splice(axis, 1);
 		perm.push(axis);
-		return argsort$1(this.transpose(perm))[1].transpose(require_backend.invertPermutation(perm));
+		const [sorted, indices] = argsort$1(this.transpose(perm));
+		sorted.dispose();
+		return indices.transpose(require_backend.invertPermutation(perm));
 	}
 	/**
 	* Slice an array along one or more axes.
@@ -1121,7 +816,10 @@ function flattenFunWithAux(f, inTree) {
 	const flatFun = (...argsFlat) => {
 		const pytreeArgs = unflatten(inTree, argsFlat);
 		const result = f(...pytreeArgs);
-		if (!Array.isArray(result) || result.length !== 2) throw new Error("Function with `hasAux: true` must return [output, aux] tuple");
+		if (!Array.isArray(result) || result.length !== 2) {
+			dispose(result);
+			throw new Error("Function with `hasAux: true` must return [output, aux] tuple");
+		}
 		const [out, aux] = result;
 		const [outFlat, outTree] = flatten(out);
 		store.value = outTree;
@@ -1139,6 +837,325 @@ var UseAfterFreeError = class extends ReferenceError {
 		super(`Referenced tracer ${tracer.toString()} freed, please use .ref move semantics`);
 	}
 };
+
+//#endregion
+//#region src/tree.ts
+var tree_exports = {};
+__export(tree_exports, {
+	JsTreeDef: () => JsTreeDef,
+	NodeType: () => NodeType,
+	dispose: () => dispose,
+	flatten: () => flatten,
+	leaves: () => leaves,
+	map: () => map,
+	ref: () => ref,
+	structure: () => structure,
+	unflatten: () => unflatten
+});
+const JsArray$2 = globalThis.Array;
+let NodeType = /* @__PURE__ */ function(NodeType$1) {
+	NodeType$1["Array"] = "Array";
+	NodeType$1["Object"] = "Object";
+	NodeType$1["Leaf"] = "Leaf";
+	NodeType$1["None"] = "None";
+	return NodeType$1;
+}({});
+/** Represents the structure of a JsTree. */
+var JsTreeDef = class JsTreeDef {
+	static leaf = new JsTreeDef(NodeType.Leaf, null, []);
+	static none = new JsTreeDef(NodeType.None, null, []);
+	constructor(nodeType, nodeMetadata, childTreedefs) {
+		this.nodeType = nodeType;
+		this.nodeMetadata = nodeMetadata;
+		this.childTreedefs = childTreedefs;
+	}
+	/** Get the total number of leaves in the tree. */
+	get size() {
+		if (this.nodeType === NodeType.None) return 0;
+		return this.nodeType === NodeType.Leaf ? 1 : this.childTreedefs.reduce((a, b) => a + b.size, 0);
+	}
+	/** Returns a string representation of this tree definition. */
+	toString(root = true) {
+		if (root) return "JsTreeDef(" + this.toString(false) + ")";
+		switch (this.nodeType) {
+			case NodeType.Leaf: return "*";
+			case NodeType.None: return "null";
+			case NodeType.Array: return `[${this.childTreedefs.map((x) => x.toString(false)).join(", ")}]`;
+			case NodeType.Object: {
+				const parts = [];
+				for (let i = 0; i < this.childTreedefs.length; i++) parts.push(`${quoteObjectKey(this.nodeMetadata[i])}: ${this.childTreedefs[i].toString(false)}`);
+				return `{${parts.join(", ")}}`;
+			}
+		}
+	}
+	/** Compare this tree definition with another. */
+	equals(other) {
+		return this.nodeType === other.nodeType && require_backend.deepEqual(this.nodeMetadata, other.nodeMetadata) && this.childTreedefs.length === other.childTreedefs.length && this.childTreedefs.every((x, i) => x.equals(other.childTreedefs[i]));
+	}
+};
+function quoteObjectKey(key$1) {
+	if (/^[a-zA-Z_$][a-zA-Z0-9_$]*$/.test(key$1)) return key$1;
+	return JSON.stringify(key$1);
+}
+/** Flatten a structured object, returning the tree definition. */
+function flatten(tree) {
+	const leaves$1 = [];
+	const treedef = _flatten(tree, leaves$1);
+	return [leaves$1, treedef];
+}
+function _flatten(tree, leaves$1) {
+	if (tree === null || tree === void 0) return JsTreeDef.none;
+	if (JsArray$2.isArray(tree)) {
+		const childTrees = tree.map((c) => _flatten(c, leaves$1));
+		return new JsTreeDef(NodeType.Array, null, childTrees);
+	} else if (typeof tree === "object" && tree !== null && tree.constructor === Object) {
+		const [keys, values] = require_backend.unzip2(Object.entries(tree));
+		const childTrees = values.map((c) => _flatten(c, leaves$1));
+		return new JsTreeDef(NodeType.Object, keys, childTrees);
+	} else {
+		leaves$1.push(tree);
+		return JsTreeDef.leaf;
+	}
+}
+/** Get the leaves of a tree. */
+function leaves(tree) {
+	return flatten(tree)[0];
+}
+/** Get the treedef for a tree. */
+function structure(tree) {
+	return flatten(tree)[1];
+}
+/** Reconstruct a structured object from the flattened representation. */
+function unflatten(treedef, leaves$1) {
+	return _unflatten(treedef, leaves$1[Symbol.iterator]());
+}
+function _unflatten(treedef, leaves$1) {
+	switch (treedef.nodeType) {
+		case NodeType.None: return null;
+		case NodeType.Leaf: {
+			const { value, done } = leaves$1.next();
+			if (done) throw new TypeError("Ran out of leaves while unflattening JsTree");
+			return value;
+		}
+		case NodeType.Array: return treedef.childTreedefs.map((c) => _unflatten(c, leaves$1));
+		case NodeType.Object: {
+			const obj = {};
+			for (let i = 0; i < treedef.childTreedefs.length; i++) obj[treedef.nodeMetadata[i]] = _unflatten(treedef.childTreedefs[i], leaves$1);
+			return obj;
+		}
+	}
+}
+/** Maps a multi-input function over pytree args to produce a new pytree. */
+function map(fn, tree, ...rest) {
+	const [leaves$1, treedef] = flatten(tree);
+	const restLeaves = rest.map((x) => flatten(x)[0]);
+	const resultLeaves = [];
+	for (let i = 0; i < leaves$1.length; i++) resultLeaves.push(fn(leaves$1[i], ...restLeaves.map((x) => x[i])));
+	return unflatten(treedef, resultLeaves);
+}
+/** Take a reference of every array in a tree. */
+function ref(tree) {
+	return map((x) => x instanceof Tracer ? x.ref : x, tree);
+}
+/** Dispose every array in a tree. */
+function dispose(tree) {
+	if (tree) map((x) => x instanceof Tracer ? x.dispose() : void 0, tree);
+}
+
+//#endregion
+//#region src/frontend/convolution.ts
+/**
+* Check that the shapes and parameters passed to convolution are valid.
+* Expected shapes of the lhs and rhs of the convolution are:
+*
+* - `lhsShape = [*vmapDims, batchSize, inChannels, spatialDims...]`
+* - `rhsShape = [*vmapDims, outChannels, inChannels, kernelSize...]`
+*
+* If the check succeeds, returns the output shape.
+*/
+function checkConvShape(lhsShape, rhsShape, { vmapDims, strides, padding, lhsDilation, rhsDilation }) {
+	if (lhsShape.length !== rhsShape.length) throw new Error(`conv() requires inputs with the same number of dimensions, got ${lhsShape.length} and ${rhsShape.length}`);
+	const n = lhsShape.length - 2 - vmapDims;
+	if (n < 0) throw new Error("conv() requires at least 2D inputs");
+	if (strides.length !== n) throw new Error("conv() strides != spatial dims");
+	if (padding.length !== n) throw new Error("conv() padding != spatial dims");
+	if (lhsDilation.length !== n) throw new Error("conv() lhsDilation != spatial dimensions");
+	if (rhsDilation.length !== n) throw new Error("conv() rhsDilation != spatial dimensions");
+	if (lhsShape[vmapDims + 1] !== rhsShape[vmapDims + 1]) throw new Error(`conv() input channels: ${lhsShape[1]} != ${rhsShape[1]}`);
+	const outShape = [
+		...require_backend.generalBroadcast(lhsShape.slice(0, vmapDims), rhsShape.slice(0, vmapDims)),
+		lhsShape[vmapDims],
+		rhsShape[vmapDims]
+	];
+	for (let i = 0; i < n; i++) {
+		if (strides[i] <= 0 || !Number.isInteger(strides[i])) throw new Error(`conv() strides[${i}] must be a positive integer`);
+		if (padding[i].length !== 2 || !padding[i].every(Number.isInteger)) throw new Error(`conv() padding[${i}] must be a 2-tuple of integers`);
+		if (lhsDilation[i] <= 0 || !Number.isInteger(lhsDilation[i])) throw new Error(`conv() lhsDilation[${i}] must be a positive integer`);
+		if (rhsDilation[i] <= 0 || !Number.isInteger(rhsDilation[i])) throw new Error(`conv() rhsDilation[${i}] must be a positive integer`);
+		const [x, k] = [lhsShape[i + vmapDims + 2], rhsShape[i + vmapDims + 2]];
+		if (k <= 0) throw new Error("conv() kernel size must be positive");
+		const [pl, pr] = padding[i];
+		if (pl < -x || pr < -x || pl + pr < -x) throw new Error(`conv() padding[${i}]=(${pl},${pr}) is too negative for input size ${x}`);
+		const kernelSize = (k - 1) * rhsDilation[i] + 1;
+		const inSize = Math.max((x - 1) * lhsDilation[i] + 1, 0) + pl + pr;
+		if (kernelSize > inSize) throw new Error(`conv() kernel size ${kernelSize} > input size ${inSize} in dimension ${i}`);
+		outShape.push(Math.ceil((inSize - kernelSize + 1) / strides[i]));
+	}
+	return outShape;
+}
+function checkPoolShape(inShape, window, strides) {
+	if (strides.length !== window.length) throw new Error("pool() strides != window dims");
+	if (window.length > inShape.length) throw new Error("pool() window has more dimensions than input");
+	const outShape = inShape.slice(0, inShape.length - window.length);
+	for (let i = 0; i < window.length; i++) {
+		const k = window[i];
+		const s = strides[i];
+		const size$1 = inShape[inShape.length - window.length + i];
+		if (k <= 0 || !Number.isInteger(k)) throw new Error(`pool() window[${i}] must be a positive integer`);
+		if (k > size$1) throw new Error(`pool() window[${i}]=${k} > input size ${size$1}`);
+		if (s <= 0 || !Number.isInteger(s)) throw new Error(`pool() strides[${i}] must be a positive integer`);
+		outShape.push(Math.ceil((size$1 - k + 1) / s));
+	}
+	return outShape.concat(window);
+}
+/**
+* Takes a shape tracker and a kernel size `ks`, then reshapes it so the last
+* `ks.length` dimensions become `2 * ks.length` dimensions by treating them as
+* spatial dimensions convolved with a kernel.
+*
+* The resulting array can be multiplied with a kernel of shape `ks`, then
+* reduced along the last `ks.length` dimensions for a convolution.
+*
+* Reference: https://github.com/tinygrad/tinygrad/blob/v0.10.3/tinygrad/tensor.py#L2097
+*/
+function pool(st, ks, strides = 1, dilation = 1) {
+	if (ks.length === 0) return st;
+	if (st.shape.length < ks.length) throw new Error("pool() called with too many dimensions");
+	if (typeof strides === "number") strides = require_backend.rep(ks.length, strides);
+	if (typeof dilation === "number") dilation = require_backend.rep(ks.length, dilation);
+	if (strides.some((s) => s <= 0 || !Number.isInteger(s))) throw new Error("pool() strides must be positive integers");
+	if (dilation.some((d) => d <= 0 || !Number.isInteger(d))) throw new Error("pool() dilation must be positive integers");
+	const noop = st.shape.slice(0, -ks.length);
+	const i_ = st.shape.slice(-ks.length);
+	const s_ = strides;
+	const d_ = dilation;
+	const o_ = require_backend.zipn(i_, d_, ks, s_).map(([i, d, k, s]) => Math.ceil((i - d * (k - 1)) / s));
+	if (d_.every((d) => d === 1) && ks.every((k, j) => k <= s_[j])) {
+		st = st.padOrShrink([...noop.map(() => [0, 0]), ...require_backend.zipn(i_, o_, s_).map(([i, o, s]) => [0, o * s - i])]);
+		st = st.reshape([...noop, ...require_backend.zip(o_, s_).flatMap(([o, s]) => [o, s])]).shrink([...noop.map((x) => [0, x]), ...require_backend.zip(o_, ks).flatMap(([o, k]) => [[0, o], [0, k]])]);
+		st = st.permute([
+			...require_backend.range(noop.length),
+			...ks.map((_, j) => noop.length + 2 * j),
+			...ks.map((_, j) => noop.length + 2 * j + 1)
+		]);
+		return st;
+	}
+	const f_ = require_backend.zipn(o_, s_, i_, d_, ks).map(([o, s, i, d, k]) => 1 + Number(o * s > i - d * (k - 1)));
+	const kidf = require_backend.zipn(ks, i_, d_, f_);
+	st = st.repeat([...require_backend.rep(noop.length, 1), ...kidf.map(([k, i, d, f]) => Math.ceil(k * (i * f + d) / i))]);
+	st = st.shrink([...noop.map((x) => [0, x]), ...kidf.map(([k, i, d, f]) => [0, k * (i * f + d)])]).reshape([...noop, ...kidf.flatMap(([k, i, d, f]) => [k, i * f + d])]);
+	const kos = require_backend.zipn(ks, o_, s_);
+	st = st.shrink([...noop.map((x) => [0, x]), ...kos.flatMap(([k, o, s]) => [[0, k], [0, o * s]])]).reshape([...noop, ...kos.flat(1)]);
+	st = st.shrink([...noop.map((x) => [0, x]), ...kos.flatMap(([k, o]) => [
+		[0, k],
+		[0, o],
+		[0, 1]
+	])]).reshape([...noop, ...kos.flatMap(([k, o]) => [k, o])]);
+	st = st.permute([
+		...require_backend.range(noop.length),
+		...ks.map((_, j) => noop.length + 2 * j + 1),
+		...ks.map((_, j) => noop.length + 2 * j)
+	]);
+	return st;
+}
+/**
+* Perform the transpose of pool, directly undo-ing a pool() operation.
+*
+* Note that since pool repeats the input, the transpose operation technically
+* should include a sum reduction. This function doesn't perform the reduction,
+* which should be done on the last `k` axes of the returned shape.
+*/
+function poolTranspose(st, inShape, ks, strides = 1, dilation = 1) {
+	if (ks.length === 0) return st;
+	if (typeof strides === "number") strides = require_backend.rep(ks.length, strides);
+	if (typeof dilation === "number") dilation = require_backend.rep(ks.length, dilation);
+	const noop = inShape.slice(0, -ks.length);
+	const i_ = inShape.slice(-ks.length);
+	const s_ = strides;
+	const d_ = dilation;
+	const o_ = require_backend.zipn(i_, d_, ks, s_).map(([i, d, k, s]) => Math.ceil((i - d * (k - 1)) / s));
+	if (d_.every((d) => d === 1) && ks.every((k, j) => k <= s_[j])) {
+		st = st.permute([...require_backend.range(noop.length), ...ks.flatMap((_, j) => [noop.length + j, noop.length + o_.length + j])]);
+		st = st.pad([...noop.map(() => [0, 0]), ...require_backend.zip(s_, ks).flatMap(([s, k]) => [[0, 0], [0, s - k]])]).reshape([...noop, ...require_backend.zip(o_, s_).map(([o, s]) => o * s)]);
+		st = st.padOrShrink([...noop.map(() => [0, 0]), ...require_backend.zipn(i_, o_, s_).map(([i, o, s]) => [0, i - o * s])]);
+		return st.reshape(st.shape.concat(require_backend.rep(ks.length, 1)));
+	}
+	if (!require_backend.deepEqual(o_, st.shape.slice(noop.length, noop.length + ks.length))) throw new Error("poolTranspose() called with mismatched output shape");
+	const f_ = require_backend.zipn(o_, s_, i_, d_, ks).map(([o, s, i, d, k]) => 1 + Number(o * s > i - d * (k - 1)));
+	const kidf = require_backend.zipn(ks, i_, d_, f_);
+	const kos = require_backend.zipn(ks, o_, s_);
+	st = st.permute([...require_backend.range(noop.length), ...ks.flatMap((_, j) => [noop.length + ks.length + j, noop.length + j])]);
+	st = st.reshape([...noop, ...kos.flatMap(([k, o]) => [
+		k,
+		o,
+		1
+	])]).pad([...noop.map(() => [0, 0]), ...s_.flatMap((s) => [
+		[0, 0],
+		[0, 0],
+		[0, s - 1]
+	])]);
+	st = st.reshape([...noop, ...kos.flatMap(([k, o, s]) => [k, o * s])]).pad([...noop.map(() => [0, 0]), ...kidf.flatMap(([_k, i, d, f], j) => [[0, 0], [0, i * f + d - o_[j] * s_[j]]])]);
+	st = st.reshape([...noop, ...kidf.map(([k, i, d, f]) => k * (i * f + d))]).pad([...noop.map(() => [0, 0]), ...kidf.map(([k, i, d, f]) => [0, Math.ceil(k * (i * f + d) / i) * i - k * (i * f + d)])]);
+	st = st.reshape([...noop, ...kidf.flatMap(([k, i, d, f]) => [Math.ceil(k * (i * f + d) / i), i])]).permute([
+		...require_backend.range(noop.length),
+		...ks.map((_, j) => noop.length + 2 * j + 1),
+		...ks.map((_, j) => noop.length + 2 * j)
+	]);
+	return st;
+}
+/** Applies dilation to an array directly, for transposed convolution. */
+function applyDilation(st, dilation) {
+	if (dilation.every((s) => s === 1)) return st;
+	const s_ = dilation;
+	const n = s_.length;
+	const prefix = st.shape.slice(0, -n);
+	const k_ = st.shape.slice(-n);
+	st = st.reshape([...prefix, ...k_.flatMap((k) => [k, 1])]);
+	st = st.pad([...prefix.map(() => [0, 0]), ...s_.flatMap((s) => [[0, 0], [0, s - 1]])]);
+	st = st.reshape([...prefix, ...k_.map((k, i) => k * s_[i])]);
+	st = st.shrink([...prefix.map((p) => [0, p]), ...k_.map((k, i) => [0, (k - 1) * s_[i] + 1])]);
+	return st;
+}
+/**
+* Prepare for a convolution between two arrays.
+*
+* This does not check the validity of the shapes, which should be checked
+* beforehand using `checkConvShape()`.
+*/
+function prepareConv(stX, stY, params) {
+	const v = params.vmapDims;
+	const n = stX.shape.length - 2 - v;
+	const vmapShape = stX.shape.slice(0, v);
+	stX = applyDilation(stX, params.lhsDilation);
+	const ks = stY.shape.slice(v + 2);
+	stX = stX.padOrShrink([...require_backend.rep(v + 2, [0, 0]), ...params.padding]);
+	stX = pool(stX, ks, params.strides, params.rhsDilation);
+	stX = stX.moveaxis(v + 1, v + n + 1).reshape([
+		...vmapShape,
+		stX.shape[v],
+		1,
+		...stX.shape.slice(v + 2, v + n + 2),
+		stX.shape[v + 1] * require_backend.prod(ks)
+	]);
+	stY = stY.reshape([
+		...vmapShape,
+		1,
+		stY.shape[v],
+		...require_backend.rep(n, 1),
+		stY.shape[v + 1] * require_backend.prod(ks)
+	]);
+	return [stX, stY];
+}
 
 //#endregion
 //#region node_modules/.pnpm/@oxc-project+runtime@0.78.0/node_modules/@oxc-project/runtime/src/helpers/usingCtx.js
@@ -1202,7 +1219,7 @@ var require_usingCtx = /* @__PURE__ */ __commonJS({ "node_modules/.pnpm/@oxc-pro
 
 //#endregion
 //#region src/frontend/jaxpr.ts
-var import_usingCtx$2 = /* @__PURE__ */ __toESM(require_usingCtx(), 1);
+var import_usingCtx$3 = /* @__PURE__ */ __toESM(require_usingCtx(), 1);
 /** Variable in a Jaxpr expression. */
 var Var = class Var {
 	static #nextId = 1;
@@ -1493,9 +1510,21 @@ function jaxprAsFun(jaxpr) {
 }
 /** Jaxpr with a collection of associated, traced constants. */
 var ClosedJaxpr = class ClosedJaxpr {
+	/** Callbacks invoked when dispose() is called, for cleaning up derived caches. */
+	static _disposeHooks = [];
+	/** Debug-only: callbacks invoked when a ClosedJaxpr is constructed. */
+	static _createHooks = [];
+	/** Debug-only: callbacks invoked when a ClosedJaxpr is disposed. */
+	static _disposeClosedHooks = [];
 	constructor(jaxpr, consts) {
 		this.jaxpr = jaxpr;
 		this.consts = consts;
+		if (ClosedJaxpr._createHooks.length > 0) {
+			const createdAt = /* @__PURE__ */ new Error();
+			for (const hook of ClosedJaxpr._createHooks) try {
+				hook(this, createdAt);
+			} catch {}
+		}
 	}
 	/** String representation of this Jaxpr. */
 	toString() {
@@ -1508,6 +1537,10 @@ var ClosedJaxpr = class ClosedJaxpr {
 	/** Dispose of the constants in this Jaxpr. */
 	dispose() {
 		for (const c of this.consts) c.dispose();
+		for (const hook of ClosedJaxpr._disposeHooks) hook(this.jaxpr);
+		for (const hook of ClosedJaxpr._disposeClosedHooks) try {
+			hook(this);
+		} catch {}
 	}
 };
 /** Tracer that records its operations to dynamically construct a Jaxpr. */
@@ -1842,7 +1875,7 @@ function joinIdx(n, a, b, argnums) {
 function makeJaxpr$1(f, opts) {
 	return (...argsIn) => {
 		try {
-			var _usingCtx$1 = (0, import_usingCtx$2.default)();
+			var _usingCtx$1 = (0, import_usingCtx$3.default)();
 			const staticArgnums = new Set(opts?.staticArgnums ?? []);
 			const [staticArgs, shapedArgs] = splitIdx(argsIn, staticArgnums);
 			const [avalsIn, inTree] = flatten(shapedArgs);
@@ -1869,8 +1902,26 @@ function makeJaxpr$1(f, opts) {
 		}
 	};
 }
+/** Global registry of all jit caches, for test-time cleanup. */
+const _jitCaches = /* @__PURE__ */ new Set();
+/** Callbacks for clearing derived caches (jvpJaxpr, transposeJaxpr, vmapJaxpr). */
+const _derivedCacheCleanups = [];
+/** Dispose all jit caches and free their constants. Used by checkLeaks. */
+function _disposeAllJitCaches() {
+	for (const cache of _jitCaches) {
+		for (const { jaxpr } of cache.values()) {
+			for (const hook of ClosedJaxpr._disposeHooks) hook(jaxpr.jaxpr);
+			for (const c of jaxpr.consts) try {
+				c.dispose();
+			} catch {}
+		}
+		cache.clear();
+	}
+	for (const cleanup of _derivedCacheCleanups) cleanup();
+}
 function jit$1(f, opts) {
 	const cache = /* @__PURE__ */ new Map();
+	_jitCaches.add(cache);
 	const staticArgnums = new Set(opts?.staticArgnums ?? []);
 	const result = ((...args) => {
 		const [staticArgs, dynamicArgs] = splitIdx(args, staticArgnums);
@@ -1879,7 +1930,7 @@ function jit$1(f, opts) {
 		const avalsIn = unflatten(inTree, avalsInFlat);
 		const jaxprArgs = joinIdx(args.length, staticArgs, avalsIn, staticArgnums);
 		const { jaxpr, treedef: outTree } = require_backend.runWithCache(cache, jaxprArgs, () => makeJaxpr$1(f, opts)(...jaxprArgs));
-		const outs = bind(Primitive.Jit, [...jaxpr.consts.map((c) => c.ref), ...argsFlat], {
+		const outs = bind(Primitive.Jit, [...jaxpr.consts, ...argsFlat], {
 			name: f.name || "closure",
 			jaxpr: jaxpr.jaxpr,
 			numConsts: jaxpr.consts.length
@@ -1888,9 +1939,447 @@ function jit$1(f, opts) {
 	});
 	result.dispose = () => {
 		for (const { jaxpr } of cache.values()) jaxpr.dispose();
+		cache.clear();
+		_jitCaches.delete(cache);
 	};
 	return result;
 }
+
+//#endregion
+//#region src/frontend/check-leaks.ts
+/** True only between start() and stop(). Checked in Array ctor/dispose. */
+let _leakTrackingEnabled = false;
+/**
+* Live tracked Arrays → Error captured at construction time.
+* `new Error()` records V8 frame pointers cheaply; the `.stack` string
+* is only formatted on first access (cold path, inside stop()).
+*/
+const _leakTrackingMap = /* @__PURE__ */ new Map();
+/**
+* When `trackRefs` is enabled, records the last `.ref` call site per array.
+* Only populated when `start({ trackRefs: true })` — checked in array.ts.
+*/
+let _trackRefsEnabled = false;
+const _lastRefMap = /* @__PURE__ */ new Map();
+const _startSlots = /* @__PURE__ */ new Map();
+let _active = false;
+let _closedHookInstalled = false;
+let _closedIdCounter = 0;
+const _closedIds = /* @__PURE__ */ new WeakMap();
+const _closedCreated = /* @__PURE__ */ new Map();
+function ensureClosedJaxprHooks() {
+	if (_closedHookInstalled) return;
+	_closedHookInstalled = true;
+	ClosedJaxpr._createHooks.push((closed, createdAt) => {
+		if (!_active) return;
+		const id = ++_closedIdCounter;
+		_closedIds.set(closed, id);
+		_closedCreated.set(id, {
+			createdAt,
+			consts: closed.consts.length,
+			ref: new WeakRef(closed),
+			disposed: false
+		});
+	});
+	ClosedJaxpr._disposeClosedHooks.push((closed) => {
+		const id = _closedIds.get(closed);
+		if (!id) return;
+		const info = _closedCreated.get(id);
+		if (info) info.disposed = true;
+	});
+}
+/**
+* Library source URL prefix, derived from this module's own URL.
+* Any stack frame whose URL starts with this is library-internal.
+* Computed once at load time (not on the hot path).
+*/
+const _libSrcPrefix = (() => {
+	try {
+		const url = require("url").pathToFileURL(__filename).href;
+		const i = url.lastIndexOf("/src/frontend/check-leaks.");
+		if (i >= 0) return url.slice(0, i + 1) + "src/";
+	} catch {}
+	return null;
+})();
+/**
+* Detect which package a raw frame URL belongs to.
+* Returns the package name (e.g. "@jax-js/jax", "some-lib") or null for user code.
+*/
+function detectPackage(rawUrl) {
+	const nm = rawUrl.match(/node_modules\/((?:@[^/]+\/)?[^/]+)/);
+	if (nm) return nm[1];
+	if (_libSrcPrefix !== null && rawUrl.startsWith(_libSrcPrefix)) return "@jax-js/jax";
+	return null;
+}
+const _B64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+const _b64Lookup = new Uint8Array(128);
+for (let i = 0; i < 64; i++) _b64Lookup[_B64.charCodeAt(i)] = i;
+/** Decode a Base64-VLQ segment into signed deltas. */
+function decodeVlq(encoded) {
+	const result = [];
+	let shift = 0;
+	let value = 0;
+	for (let i = 0; i < encoded.length; i++) {
+		let digit = _b64Lookup[encoded.charCodeAt(i)];
+		const cont = digit & 32;
+		digit &= 31;
+		value += digit << shift;
+		if (cont) shift += 5;
+		else {
+			result.push(value & 1 ? -(value >> 1) : value >> 1);
+			shift = 0;
+			value = 0;
+		}
+	}
+	return result;
+}
+/** url-without-query → parsed source map (or null if unavailable). */
+const _smCache = /* @__PURE__ */ new Map();
+function fetchSourceMap(rawUrl) {
+	const base = rawUrl.replace(/\?.*$/, "");
+	if (_smCache.has(base)) return _smCache.get(base);
+	try {
+		const xhr = new XMLHttpRequest();
+		xhr.open("GET", rawUrl, false);
+		xhr.send();
+		if (xhr.status !== 200) {
+			_smCache.set(base, null);
+			return null;
+		}
+		const m = xhr.responseText.match(/\/\/[#@]\s*sourceMappingURL=data:[^;]+;base64,([A-Za-z0-9+/=]+)/);
+		if (!m) {
+			_smCache.set(base, null);
+			return null;
+		}
+		const map$1 = JSON.parse(atob(m[1]));
+		const sm = {
+			sources: map$1.sources ?? [],
+			mappingLines: map$1.mappings.split(";")
+		};
+		_smCache.set(base, sm);
+		return sm;
+	} catch {
+		_smCache.set(base, null);
+		return null;
+	}
+}
+/**
+* Resolve a generated (line, col) back to the original source position.
+* Returns null when no source map is available or the position can't be mapped.
+*/
+function resolvePosition(rawUrl, genLine, genCol) {
+	const sm = fetchSourceMap(rawUrl);
+	if (!sm) return null;
+	let gCol = 0;
+	let srcFile = 0;
+	let srcLine = 0;
+	let srcCol = 0;
+	let bestLine = -1;
+	let bestCol = -1;
+	let bestFile = -1;
+	for (let i = 0; i < sm.mappingLines.length; i++) {
+		gCol = 0;
+		const segs = sm.mappingLines[i];
+		if (!segs) continue;
+		for (const seg of segs.split(",")) {
+			if (!seg) continue;
+			const d = decodeVlq(seg);
+			gCol += d[0];
+			if (d.length >= 4) {
+				srcFile += d[1];
+				srcLine += d[2];
+				srcCol += d[3];
+			}
+			if (i === genLine - 1 && gCol <= genCol - 1) {
+				bestFile = srcFile;
+				bestLine = srcLine;
+				bestCol = srcCol;
+			}
+		}
+		if (i >= genLine - 1 && bestLine >= 0) break;
+	}
+	if (bestLine < 0) return null;
+	let file = sm.sources[bestFile] ?? rawUrl;
+	if (!file.startsWith("/") && !file.startsWith("http")) try {
+		const dir = rawUrl.substring(0, rawUrl.lastIndexOf("/") + 1);
+		file = new URL(file, dir).href;
+	} catch {}
+	return {
+		file,
+		line: bestLine + 1,
+		col: bestCol + 1
+	};
+}
+/** Convert a Vite/V8 stack location to a workspace-relative path. */
+function toRelativePath(raw) {
+	let loc = raw.replace(/\?[^:]*(?=:\d+:\d+)/, "");
+	loc = loc.replace(/^https?:\/\/[^/]+\//, "");
+	if (loc.startsWith("@fs/")) {
+		loc = loc.slice(4);
+		if (!loc.startsWith("/")) loc = "/" + loc;
+	}
+	loc = loc.replace(/^file:\/\//, "");
+	for (const m of [
+		"/src/",
+		"/test/",
+		"/packages/",
+		"/bench/"
+	]) {
+		const i = loc.indexOf(m);
+		if (i >= 0) return loc.slice(i + 1);
+	}
+	return loc;
+}
+/** Boilerplate frames to skip (Array constructor internals). */
+const SKIP_FUNCS = [
+	"new Array",
+	"new PendingExecute",
+	"Array2",
+	"new Array2"
+];
+/** Dep functions that appear in every creation stack — filtered from via chain. */
+const VIA_SKIP = new Set([
+	"bind",
+	"bind1",
+	"pureArray",
+	"fullLower",
+	"fullRaise"
+]);
+/**
+* Walk the Error's stack to find the creation site.
+* Accessing err.stack here triggers V8's lazy string formatting.
+*/
+function findCreationSite(err) {
+	const stack$1 = err.stack;
+	if (!stack$1) return {
+		location: "(unknown)",
+		via: null,
+		pkg: "(unknown)"
+	};
+	let lastDepLoc = null;
+	let lastDepPkg = null;
+	/** Dep function names (innermost-first) for building via chain. */
+	const depChain = [];
+	let prevClean = null;
+	for (const line of stack$1.split("\n")) {
+		const trimmed = line.trim();
+		if (!trimmed.startsWith("at ")) continue;
+		let rawLoc;
+		let funcName;
+		const m = trimmed.match(/^at\s+(.+?)\s+\((.+)\)$/);
+		if (m) {
+			funcName = m[1];
+			rawLoc = m[2];
+		} else rawLoc = trimmed.slice(3);
+		let location;
+		const lineCol = rawLoc.match(/:(\d+):(\d+)$/);
+		if (lineCol) {
+			const resolved = resolvePosition(rawLoc.replace(/:\d+:\d+$/, ""), +lineCol[1], +lineCol[2]);
+			if (resolved) location = toRelativePath(resolved.file) + `:${resolved.line}:${resolved.col}`;
+			else location = toRelativePath(rawLoc);
+		} else location = toRelativePath(rawLoc);
+		const pathOnly = location.replace(/:\d+:\d+$/, "");
+		if (pathOnly === "<anonymous>" || pathOnly === "native" || pathOnly.startsWith("eval ")) continue;
+		if (funcName && SKIP_FUNCS.some((p) => funcName.startsWith(p))) continue;
+		const pkg = detectPackage(rawLoc);
+		if (pkg && !/\.test\.[jt]sx?$/.test(pathOnly)) {
+			lastDepLoc = location;
+			lastDepPkg = pkg;
+			const clean = funcName?.replace(/^(Module|Object)\./, "") ?? null;
+			if (clean && clean !== prevClean && !VIA_SKIP.has(clean)) {
+				depChain.push(clean);
+				prevClean = clean;
+			}
+			continue;
+		}
+		const chain = depChain.reverse().slice(0, 2);
+		const via = chain.length > 0 ? chain.join(" → ") : null;
+		return {
+			location,
+			via,
+			pkg: null
+		};
+	}
+	return {
+		location: lastDepLoc ?? "(unknown)",
+		via: null,
+		pkg: lastDepPkg ?? "(unknown)"
+	};
+}
+function safeDesc(arr) {
+	try {
+		return arr.toString();
+	} catch {
+		return "(unknown)";
+	}
+}
+function safeRefCountNum(arr) {
+	try {
+		const rc = arr.refCount;
+		return typeof rc === "number" ? rc : 0;
+	} catch {
+		return 0;
+	}
+}
+function safeRefCount(arr) {
+	const rc = safeRefCountNum(arr);
+	return rc > 0 ? ` rc=${rc}` : "";
+}
+const checkLeaks = {
+	start(opts) {
+		if (_active) throw new Error("checkLeaks.start() called while already active. Concurrent leak tracking is not supported — do not use test.concurrent().");
+		_leakTrackingMap.clear();
+		_lastRefMap.clear();
+		_closedCreated.clear();
+		ensureClosedJaxprHooks();
+		_trackRefsEnabled = opts?.trackRefs ?? false;
+		_startSlots.clear();
+		for (const d of require_backend.devices) try {
+			_startSlots.set(d, require_backend.getBackend(d).slotCount());
+		} catch {}
+		_leakTrackingEnabled = true;
+		_active = true;
+	},
+	snapshot() {
+		const entries = [];
+		for (const [arr, err] of _leakTrackingMap) {
+			const site = findCreationSite(err);
+			const refErr = _lastRefMap.get(arr);
+			let lastRef = null;
+			if (refErr) {
+				const refSite = findCreationSite(refErr);
+				lastRef = refSite.location;
+			}
+			entries.push({
+				desc: safeDesc(arr),
+				rc: safeRefCountNum(arr),
+				location: site.location,
+				pkg: site.pkg,
+				lastRef
+			});
+		}
+		return entries;
+	},
+	stop() {
+		if (!_active) return {
+			leaked: 0,
+			summary: "No leaks detected."
+		};
+		_leakTrackingEnabled = false;
+		_trackRefsEnabled = false;
+		_active = false;
+		_disposeAllJitCaches();
+		let leaked = 0;
+		for (const [d, baseline] of _startSlots) try {
+			leaked += require_backend.getBackend(d).slotCount() - baseline;
+		} catch {}
+		_startSlots.clear();
+		if (leaked === 0) {
+			_leakTrackingMap.clear();
+			_lastRefMap.clear();
+			_closedCreated.clear();
+			return {
+				leaked: 0,
+				summary: "No leaks detected."
+			};
+		}
+		const groups = /* @__PURE__ */ new Map();
+		/** Leak counts by package (null key = user code). */
+		const pkgCounts = /* @__PURE__ */ new Map();
+		const leakedArrays = /* @__PURE__ */ new Set();
+		for (const [arr, err] of _leakTrackingMap) {
+			leakedArrays.add(arr);
+			const site = findCreationSite(err);
+			let g = groups.get(site.location);
+			if (!g) {
+				g = {
+					count: 0,
+					descs: [],
+					via: site.via,
+					pkg: site.pkg,
+					maxRc: 0,
+					lastRefLocs: []
+				};
+				groups.set(site.location, g);
+			}
+			g.count++;
+			g.maxRc = Math.max(g.maxRc, safeRefCountNum(arr));
+			const desc = safeDesc(arr) + safeRefCount(arr);
+			if (g.descs.length < 4) g.descs.push(desc);
+			const refErr = _lastRefMap.get(arr);
+			if (refErr && safeRefCountNum(arr) >= 2) {
+				const refSite = findCreationSite(refErr);
+				if (g.lastRefLocs.length < 2 && !g.lastRefLocs.includes(refSite.location)) g.lastRefLocs.push(refSite.location);
+			}
+			pkgCounts.set(site.pkg, (pkgCounts.get(site.pkg) ?? 0) + 1);
+		}
+		const closedHoldingLeaks = [];
+		for (const [id, info] of _closedCreated.entries()) {
+			const closed = info.ref.deref();
+			if (!closed) continue;
+			let holds = false;
+			for (const c of closed.consts) if (leakedArrays.has(c)) {
+				holds = true;
+				break;
+			}
+			if (holds) {
+				const site = findCreationSite(info.createdAt).location;
+				closedHoldingLeaks.push({
+					id,
+					consts: info.consts,
+					site
+				});
+			}
+		}
+		const undisposedClosed = [..._closedCreated.entries()].filter(([, info]) => !info.disposed && info.consts > 0);
+		_leakTrackingMap.clear();
+		_lastRefMap.clear();
+		_closedCreated.clear();
+		const sorted = [...groups.entries()].sort((a, b) => Number(a[1].pkg !== null) - Number(b[1].pkg !== null) || b[1].count - a[1].count);
+		const total = [...pkgCounts.values()].reduce((a, b) => a + b, 0);
+		const lines = [`${leaked} slot(s) leaked (${total} tracked array(s)):\n`];
+		for (const [loc, g] of sorted) {
+			const descs = g.descs.join(", ") + (g.count > g.descs.length ? ", …" : "");
+			const tagParts = [];
+			if (g.pkg) tagParts.push(g.pkg);
+			if (g.via) tagParts.push(`via ${g.via}`);
+			const tag = tagParts.length > 0 ? `  (${tagParts.join(", ")})` : "";
+			lines.push(`  ${loc} — ${g.count}× ${descs}${tag}`);
+			for (const refLoc of g.lastRefLocs) lines.push(`    ↳ last .ref at ${refLoc}`);
+		}
+		const summaryParts = [];
+		for (const [pkg, count] of pkgCounts) summaryParts.push(pkg ? `${count} in ${pkg}` : `${count} from user code`);
+		lines.push("", summaryParts.join(", ") + ".");
+		const tips = [];
+		if (leaked > total) tips.push(`${leaked - total} slot(s) not in tracked list (created before start() or by internal buffers).`);
+		if (total > leaked) tips.push(`Some tracked arrays share backend storage (${total} tracked, ${leaked} slots).`);
+		if (sorted.some(([, g]) => !g.pkg && g.maxRc === 1)) tips.push("rc=1 → never consumed. Call .dispose() or pass to an op.");
+		if (sorted.some(([, g]) => g.maxRc >= 2)) tips.push("rc≥2 → extra .ref without matching .dispose().");
+		if (pkgCounts.size > (pkgCounts.has(null) ? 1 : 0)) tips.push("Package-tagged leaks are library bugs, not user error.");
+		if (tips.length === 0) tips.push("Call .dispose() on unused results, or use .ref to keep arrays alive.");
+		if (undisposedClosed.length > 0) {
+			tips.push(`${undisposedClosed.length} ClosedJaxpr(s) created during checkLeaks were not disposed (may retain const arrays):`);
+			for (const [id, info] of undisposedClosed.slice(0, 6)) {
+				const site = findCreationSite(info.createdAt);
+				tips.push(`  - ClosedJaxpr #${id} consts=${info.consts} at ${site.location}`);
+			}
+			if (undisposedClosed.length > 6) tips.push(`  - … (+${undisposedClosed.length - 6} more)`);
+		}
+		if (closedHoldingLeaks.length > 0) {
+			tips.push(`Leaked arrays are referenced by ${closedHoldingLeaks.length} ClosedJaxpr(s):`);
+			for (const e$1 of closedHoldingLeaks.slice(0, 6)) tips.push(`  - ClosedJaxpr #${e$1.id} consts=${e$1.consts} created at ${e$1.site}`);
+			if (closedHoldingLeaks.length > 6) tips.push(`  - … (+${closedHoldingLeaks.length - 6} more)`);
+		}
+		lines.push("", ...tips);
+		return {
+			leaked,
+			summary: lines.join("\n")
+		};
+	},
+	get active() {
+		return _active;
+	}
+};
 
 //#endregion
 //#region src/frontend/scan-executor.ts
@@ -3298,6 +3787,7 @@ var Array$1 = class Array$1 extends Tracer {
 		this.#pendingSet = new Set(args.pending);
 		if (this.#pendingSet.size === 0) this.#pendingSet = null;
 		else if (this.#source instanceof require_backend.AluExp) throw new Error("internal: AluExp source cannot have pending executes");
+		if (_leakTrackingEnabled) _leakTrackingMap.set(this, /* @__PURE__ */ new Error());
 	}
 	/** @ignore */
 	get aval() {
@@ -3328,7 +3818,26 @@ var Array$1 = class Array$1 extends Tracer {
 	get ref() {
 		this.#check();
 		this.#rc++;
+		if (_trackRefsEnabled) _lastRefMap.set(this, /* @__PURE__ */ new Error());
 		return this;
+	}
+	/**
+	* Create a distinct Array handle that aliases the same underlying data.
+	*
+	* Unlike `.ref`, this does NOT mutate and return the same JS object.
+	* It returns a new Array wrapper and increments the backend slot and
+	* pending-execute reference counts accordingly.
+	*
+	* This is primarily for internal use in transformations (e.g. transpose/VJP)
+	* where a temporary "borrow" must be disposed without affecting the original
+	* owner's object identity.
+	*/
+	borrow() {
+		this.#check();
+		const pending = this.#pending;
+		for (const exe of pending) exe.updateRc(1);
+		if (typeof this.#source === "number") this.#backend.incRef(this.#source);
+		return this.#newArrayFrom({ pending });
 	}
 	/** Get the current reference count (for debugging memory management). */
 	get refCount() {
@@ -3337,6 +3846,7 @@ var Array$1 = class Array$1 extends Tracer {
 	dispose() {
 		this.#check();
 		if (--this.#rc === 0) {
+			if (_leakTrackingMap.size > 0) _leakTrackingMap.delete(this);
 			for (const exe of this.#pending) exe.updateRc(-1);
 			if (typeof this.#source === "number") this.#backend.decRef(this.#source);
 		}
@@ -3968,9 +4478,10 @@ var Array$1 = class Array$1 extends Tracer {
 			[Primitive.TriangularSolve]: Array$1.#routine(Primitive.TriangularSolve),
 			[Primitive.Cholesky]: Array$1.#routine(Primitive.Cholesky),
 			[Primitive.LU]: Array$1.#routine(Primitive.LU),
-			[Primitive.Jit](args, { jaxpr }) {
+			[Primitive.Jit](args, { jaxpr, numConsts }) {
 				if (jaxpr.inBinders.length !== args.length) throw new Error(`jit expects ${jaxpr.inBinders.length} args, got ${args.length}`);
 				const { backend, committed } = Array$1.#computeBackend("jit", args);
+				for (let i = 0; i < numConsts; i++) args[i].ref;
 				args = args.map((ar) => ar._putSync(backend));
 				const slots = args.map((x) => x._realizeSource());
 				for (const ar of args) for (const exe of ar.#pending) {
@@ -4333,32 +4844,26 @@ function fullInternal(aval, fillValue, device) {
 		committed: device != void 0
 	});
 }
-function zerosLike$1(val, dtype) {
-	return fullLike(val, 0, dtype);
+function zerosLike$1(val, opts) {
+	return fullLike(val, 0, opts);
 }
-function onesLike$1(val, dtype) {
-	return fullLike(val, 1, dtype);
+function onesLike$1(val, opts) {
+	return fullLike(val, 1, opts);
 }
-function fullLike(val, fillValue, dtype) {
+function fullLike(val, fillValue, { dtype, shape: shape$1, device } = {}) {
 	const aval = getAval(val);
 	if (val instanceof Tracer) val.dispose();
 	if (fillValue instanceof Tracer) throw new Error("numpy.fullLike() with array argument not implemented yet");
-	const sa = new ShapedArray(aval.shape, dtype ?? aval.dtype, aval.weakType);
-	return fullInternal(sa, fillValue);
+	const sa = new ShapedArray(shape$1 ?? aval.shape, dtype ?? aval.dtype, aval.weakType && dtype === void 0);
+	return fullInternal(sa, fillValue, device);
 }
 /** Return a new array of given shape and type, filled with zeros. */
-function zeros(shape$1, { dtype, device } = {}) {
-	return full(shape$1, 0, {
-		dtype,
-		device
-	});
+function zeros(shape$1, opts) {
+	return full(shape$1, 0, opts);
 }
 /** Return a new array of given shape and type, filled with ones. */
-function ones(shape$1, { dtype, device } = {}) {
-	return full(shape$1, 1, {
-		dtype,
-		device
-	});
+function ones(shape$1, opts) {
+	return full(shape$1, 1, opts);
 }
 /** Return a new array of given shape and type, filled with `fill_value`. */
 function full(shape$1, fillValue, { dtype, device } = {}) {
@@ -4552,14 +5057,14 @@ function aluCompare(a, b, op) {
 
 //#endregion
 //#region src/frontend/vmap.ts
-var import_usingCtx$1 = /* @__PURE__ */ __toESM(require_usingCtx(), 1);
+var import_usingCtx$2 = /* @__PURE__ */ __toESM(require_usingCtx(), 1);
 function mappedAval(batchDim, aval) {
 	const shape$1 = [...aval.shape];
 	shape$1.splice(batchDim, 1);
 	return new ShapedArray(shape$1, aval.dtype, aval.weakType);
 }
 /** Move one axis to a different index. */
-function moveaxis$1(x, src, dst) {
+function moveaxis(x, src, dst) {
 	const t = pureArray(x);
 	src = require_backend.checkAxis(src, t.ndim);
 	dst = require_backend.checkAxis(dst, t.ndim);
@@ -4575,7 +5080,7 @@ function moveBatchAxis(axisSize, src, dst, x) {
 		targetShape.splice(dst, 0, axisSize);
 		return broadcast(x, targetShape, [dst]);
 	} else if (src === dst) return x;
-	else return moveaxis$1(x, src, dst);
+	else return moveaxis(x, src, dst);
 }
 var BatchTracer = class extends Tracer {
 	constructor(trace$1, val, batchDim) {
@@ -4816,7 +5321,7 @@ const vmapRules = {
 	[Primitive.LU]: lastDimsBatcher(Primitive.LU, 2, 3),
 	[Primitive.Jit](axisSize, args, dims, { name, jaxpr }) {
 		const newJaxpr = vmapJaxpr(jaxpr, axisSize, dims);
-		const outs = bind(Primitive.Jit, [...newJaxpr.consts.map((c) => c.ref), ...args], {
+		const outs = bind(Primitive.Jit, [...newJaxpr.consts, ...args], {
 			name: `${name}_vmap`,
 			jaxpr: newJaxpr.jaxpr,
 			numConsts: newJaxpr.consts.length
@@ -4845,7 +5350,7 @@ const vmapRules = {
 					...x.shape.slice(1)
 				];
 				return broadcast(x, newShape, [1]);
-			} else if (xsDims[i] === 0) return moveaxis$1(x, 0, 1);
+			} else if (xsDims[i] === 0) return moveaxis(x, 0, 1);
 			else return moveBatchAxis(axisSize, xsDims[i], 1, x);
 		});
 		const bodyDims = [
@@ -4869,11 +5374,26 @@ const vmapRules = {
 		});
 		const carryOut = results.slice(0, numCarry);
 		const ysOut = results.slice(numCarry);
-		const movedYs = ysOut.map((y) => moveaxis$1(y, 1, 0));
+		const movedYs = ysOut.map((y) => moveaxis(y, 1, 0));
 		return [[...carryOut, ...movedYs], require_backend.rep(numCarry + numY, 0)];
 	}
 };
 const vmapJaxprCache = /* @__PURE__ */ new Map();
+/** Dispose all entries in the vmapJaxpr cache. Called by _disposeAllJitCaches. */
+function _disposeVmapJaxprCache() {
+	for (const map$1 of vmapJaxprCache.values()) for (const entry of map$1.values()) try {
+		entry.dispose();
+	} catch {}
+	vmapJaxprCache.clear();
+}
+_derivedCacheCleanups.push(_disposeVmapJaxprCache);
+ClosedJaxpr._disposeHooks.push((jaxpr) => {
+	const cached = vmapJaxprCache.get(jaxpr);
+	if (cached) {
+		for (const entry of cached.values()) entry.dispose();
+		vmapJaxprCache.delete(jaxpr);
+	}
+});
 function vmapJaxpr(jaxpr, axisSize, dims) {
 	const cacheKey = JSON.stringify([axisSize, dims]);
 	const prevResult = vmapJaxprCache.get(jaxpr)?.get(cacheKey);
@@ -4901,7 +5421,7 @@ function vmapFlat(f, inAxes, args) {
 	if (axisSize === void 0) throw new TypeError("vmap requires at least one mapped axis");
 	let valsOut, bdimsOut;
 	try {
-		var _usingCtx$1 = (0, import_usingCtx$1.default)();
+		var _usingCtx$1 = (0, import_usingCtx$2.default)();
 		const main = _usingCtx$1.u(newMain(BatchTrace, axisSize));
 		const trace$1 = new BatchTrace(main);
 		const tracersIn = args.map((x, i) => inAxes[i] === null ? pureArray(x) : new BatchTracer(trace$1, pureArray(x), inAxes[i]));
@@ -4937,14 +5457,18 @@ function jacfwd$1(f) {
 	return function jacobianForward(x) {
 		if (x.shape.length !== 1) throw new TypeError("jacfwd only supports 1D inputs");
 		const [size$1] = x.shape;
-		const pushfwd = (v) => jvp$1(f, [x], [v])[1];
+		const pushfwd = (v) => {
+			const [primals, tangents] = jvp$1(f, [x], [v]);
+			dispose(primals);
+			return tangents;
+		};
 		return vmap$1(pushfwd, [0])(eye(size$1, void 0, { dtype: x.dtype }));
 	};
 }
 
 //#endregion
 //#region src/frontend/jvp.ts
-var import_usingCtx = /* @__PURE__ */ __toESM(require_usingCtx(), 1);
+var import_usingCtx$1 = /* @__PURE__ */ __toESM(require_usingCtx(), 1);
 var JVPTracer = class extends Tracer {
 	constructor(trace$1, primal, tangent) {
 		super(trace$1);
@@ -5011,7 +5535,7 @@ function batchMatmulT(a, b) {
 }
 /** Batch matrix transpose. */
 function mT(a) {
-	return moveaxis$1(a, -2, -1);
+	return moveaxis(a, -2, -1);
 }
 function sliceAxis(a, axis, p) {
 	const slices = Array(a.shape.length).fill([]);
@@ -5044,7 +5568,7 @@ const jvpRules = {
 	},
 	[Primitive.Neg]: linearTangentsJvp(Primitive.Neg),
 	[Primitive.Reciprocal]([x], [dx]) {
-		const xRecip = reciprocal$1(x.ref);
+		const xRecip = reciprocal$1(x);
 		return [[xRecip.ref], [neg(xRecip.ref.mul(xRecip)).mul(dx)]];
 	},
 	[Primitive.Floor]: zeroTangentsJvp(Primitive.Floor),
@@ -5150,7 +5674,7 @@ const jvpRules = {
 		return [[x], [dx]];
 	},
 	[Primitive.Cholesky]([a], [da]) {
-		const L = cholesky$2(a.ref);
+		const L = cholesky$2(a);
 		da = da.ref.add(mT(da)).mul(.5);
 		const W = triangularSolve$1(L.ref, da, { lower: true });
 		const ST = triangularSolve$1(L.ref, mT(W), { lower: true });
@@ -5192,7 +5716,7 @@ const jvpRules = {
 	[Primitive.Jit](primals, tangents, { name, jaxpr }) {
 		const newJaxpr = jvpJaxpr(jaxpr);
 		const outs = bind(Primitive.Jit, [
-			...newJaxpr.consts.map((c) => c.ref),
+			...newJaxpr.consts,
 			...primals,
 			...tangents
 		], {
@@ -5294,6 +5818,21 @@ const jvpRules = {
 	}
 };
 const jvpJaxprCache = /* @__PURE__ */ new Map();
+/** Dispose all entries in the jvpJaxpr cache. Called by _disposeAllJitCaches. */
+function _disposeJvpJaxprCache() {
+	for (const cached of jvpJaxprCache.values()) try {
+		cached.dispose();
+	} catch {}
+	jvpJaxprCache.clear();
+}
+_derivedCacheCleanups.push(_disposeJvpJaxprCache);
+ClosedJaxpr._disposeHooks.push((jaxpr) => {
+	const cached = jvpJaxprCache.get(jaxpr);
+	if (cached) {
+		cached.dispose();
+		jvpJaxprCache.delete(jaxpr);
+	}
+});
 function jvpJaxpr(jaxpr) {
 	if (jvpJaxprCache.has(jaxpr)) return jvpJaxprCache.get(jaxpr);
 	const inAvals = jaxpr.inBinders.map((v) => v.aval);
@@ -5303,7 +5842,7 @@ function jvpJaxpr(jaxpr) {
 }
 function jvpFlat(f, primals, tangents) {
 	try {
-		var _usingCtx$1 = (0, import_usingCtx.default)();
+		var _usingCtx$1 = (0, import_usingCtx$1.default)();
 		const main = _usingCtx$1.u(newMain(JVPTrace));
 		const trace$1 = new JVPTrace(main);
 		const tracersIn = require_backend.zip(primals, tangents).map(([x, t]) => new JVPTracer(trace$1, pureArray(x), pureArray(t)));
@@ -5323,7 +5862,38 @@ function jvp$1(f, primals, tangents, { hasAux = false } = {}) {
 	let flatFun, outTree, aux;
 	if (hasAux) [flatFun, outTree, aux] = flattenFunWithAux(f, inTree);
 	else [flatFun, outTree] = flattenFun(f, inTree);
-	const [primalsOutFlat, tangentsOutFlat] = jvpFlat(flatFun, primalsFlat, tangentsFlat);
+	const topLevel = isTopLevel();
+	let pFlat = primalsFlat;
+	let tFlat = tangentsFlat;
+	const ownedP = [];
+	const ownedT = [];
+	if (topLevel) {
+		pFlat = primalsFlat.map((x) => {
+			if (x instanceof Tracer) {
+				ownedP.push(false);
+				return x;
+			}
+			ownedP.push(true);
+			return pureArray(x);
+		});
+		tFlat = tangentsFlat.map((x) => {
+			if (x instanceof Tracer) {
+				ownedT.push(false);
+				return x;
+			}
+			ownedT.push(true);
+			return pureArray(x);
+		});
+	}
+	const [primalsOutFlat, tangentsOutFlat] = jvpFlat(flatFun, pFlat, tFlat);
+	if (topLevel) {
+		for (let i = 0; i < pFlat.length; i++) if (ownedP[i]) try {
+			pFlat[i].dispose();
+		} catch {}
+		for (let i = 0; i < tFlat.length; i++) if (ownedT[i]) try {
+			tFlat[i].dispose();
+		} catch {}
+	}
 	if (outTree.value === void 0) throw new Error("outTree was not set in jvp");
 	const primalsOut = unflatten(outTree.value, primalsOutFlat);
 	const tangentsOut = unflatten(outTree.value, tangentsOutFlat);
@@ -5352,6 +5922,7 @@ function lowerAux(aux) {
 
 //#endregion
 //#region src/frontend/linearize.ts
+var import_usingCtx = /* @__PURE__ */ __toESM(require_usingCtx(), 1);
 /** Array value that can either be known or unknown. */
 var PartialVal = class PartialVal {
 	constructor(val, aval) {
@@ -5372,19 +5943,55 @@ var PartialVal = class PartialVal {
 	}
 };
 function partialEvalFlat(f, pvalsIn) {
-	const main = newMain(PartialEvalTrace);
-	const trace$1 = new PartialEvalTrace(main);
-	const tracersIn = pvalsIn.map((pval) => trace$1.newArg(pval));
-	const unknownTracersIn = tracersIn.filter((t) => !t.pval.isKnown).map((t) => t.ref);
-	const outs = f(...tracersIn);
-	const tracersOut = outs.map((out) => fullRaise(trace$1, out));
-	const pvalsOut = tracersOut.map((t) => t.pval);
-	const unknownTracersOut = tracersOut.filter((t) => !t.pval.isKnown);
-	const jaxpr = partialEvalGraphToJaxpr(unknownTracersIn, unknownTracersOut);
-	return {
-		jaxpr,
-		pvalsOut
-	};
+	try {
+		var _usingCtx$1 = (0, import_usingCtx.default)();
+		const peData = { allPets: [] };
+		const main = _usingCtx$1.u(newMain(PartialEvalTrace, peData));
+		const trace$1 = new PartialEvalTrace(main);
+		const tracersIn = pvalsIn.map((pval) => trace$1.newArg(pval));
+		const unknownTracersIn = tracersIn.filter((t) => !t.pval.isKnown).map((t) => t.ref);
+		const outs = f(...tracersIn);
+		const tracersOut = outs.map((out) => fullRaise(trace$1, out));
+		const pvalsOut = tracersOut.map((t) => {
+			if (t.pval.isKnown) return PartialVal.known(t.fullLower());
+			return t.pval;
+		});
+		const unknownTracersOut = tracersOut.filter((t) => !t.pval.isKnown);
+		const jaxpr = partialEvalGraphToJaxpr(unknownTracersIn, unknownTracersOut);
+		const allPets = peData.allPets;
+		const ownedValues = /* @__PURE__ */ new Set();
+		const collectOwned = (val) => {
+			if (!val || ownedValues.has(val)) return;
+			ownedValues.add(val);
+			if ("primal" in val && "tangent" in val) {
+				collectOwned(val.primal);
+				collectOwned(val.tangent);
+			}
+		};
+		for (const c of jaxpr.consts) collectOwned(c);
+		for (const pv of pvalsOut) if (pv.isKnown) collectOwned(pv.val);
+		const sweepOrphans = () => {
+			for (const pet of allPets) {
+				if (pet.refCount <= 0) continue;
+				if (pet.borrowed) continue;
+				if (pet.pval.isKnown && ownedValues.has(pet.pval.val)) continue;
+				while (pet.refCount > 0) try {
+					pet.dispose();
+				} catch {
+					break;
+				}
+			}
+		};
+		return {
+			jaxpr,
+			pvalsOut,
+			sweepOrphans
+		};
+	} catch (_) {
+		_usingCtx$1.e = _;
+	} finally {
+		_usingCtx$1.d();
+	}
 }
 /**
 * Helper function with shared Jaxpr logic between linearize and vjp.
@@ -5400,23 +6007,35 @@ function linearizeFlatUtil(f, primalsIn) {
 		const [primalsOut$1, tangentsOut] = jvp$1(f, x.slice(0, k), x.slice(k, 2 * k));
 		return [...primalsOut$1, ...tangentsOut];
 	};
-	const { jaxpr, pvalsOut } = partialEvalFlat(fJvp, pvalsIn);
-	const primalPvals = pvalsOut.slice(0, pvalsOut.length / 2);
+	const { jaxpr, pvalsOut, sweepOrphans } = partialEvalFlat(fJvp, pvalsIn);
+	const n = pvalsOut.length / 2;
+	const primalPvals = pvalsOut.slice(0, n);
+	const tangentPvals = pvalsOut.slice(n);
 	if (!primalPvals.every((pval) => pval.isKnown)) throw new Error("Not all primal values are known after partial evaluation");
 	const primalsOut = primalPvals.map((pval) => pval.val);
+	const tangentKnown = tangentPvals.map((pval) => pval.isKnown);
+	for (const pval of tangentPvals) if (pval.isKnown) pval.val.dispose();
 	return {
 		primalsOut,
-		jaxpr
+		jaxpr,
+		tangentKnown,
+		sweepOrphans
 	};
 }
 function linearizeFlat(f, primalsIn) {
-	const { primalsOut, jaxpr } = linearizeFlatUtil(f, primalsIn);
-	const fLin = (...tangents) => evalJaxpr(jaxpr.jaxpr, [...jaxpr.consts.map((c) => c.ref), ...tangents]);
+	const { primalsOut, jaxpr, tangentKnown, sweepOrphans } = linearizeFlatUtil(f, primalsIn);
+	const outAvals = primalsOut.map((t) => ShapedArray.fromAval(t.aval));
+	const fLin = (...tangents) => {
+		const jaxprOuts = evalJaxpr(jaxpr.jaxpr, [...jaxpr.consts.map((c) => c.ref), ...tangents]);
+		let j = 0;
+		return tangentKnown.map((known, i) => known ? zeros(outAvals[i].shape, { dtype: outAvals[i].dtype }) : jaxprOuts[j++]);
+	};
 	const dispose$1 = () => jaxpr.dispose();
 	return [
 		primalsOut,
 		fLin,
-		dispose$1
+		dispose$1,
+		sweepOrphans
 	];
 }
 function linearize$1(f, primalsIn, { hasAux = false } = {}) {
@@ -5424,7 +6043,7 @@ function linearize$1(f, primalsIn, { hasAux = false } = {}) {
 	let fFlat, outTree, aux;
 	if (hasAux) [fFlat, outTree, aux] = flattenFunWithAux(f, inTree);
 	else [fFlat, outTree] = flattenFun(f, inTree);
-	const [primalsOutFlat, fLinFlat, dispose$1] = linearizeFlat(fFlat, primalsInFlat.map(pureArray));
+	const [primalsOutFlat, fLinFlat, dispose$1, sweepOrphans] = linearizeFlat(fFlat, primalsInFlat.map(pureArray));
 	if (outTree.value === void 0) throw new Error("outTree was not set in linearize");
 	const primalsOut = unflatten(outTree.value, primalsOutFlat);
 	const fLin = ((...tangentsIn) => {
@@ -5434,11 +6053,16 @@ function linearize$1(f, primalsIn, { hasAux = false } = {}) {
 		return unflatten(outTree.value, tangentsOutFlat);
 	});
 	fLin.dispose = dispose$1;
-	if (hasAux) return [
-		primalsOut,
-		fLin,
-		lowerAux(aux.value)
-	];
+	if (hasAux) {
+		const auxOut = lowerAux(aux.value);
+		sweepOrphans();
+		return [
+			primalsOut,
+			fLin,
+			auxOut
+		];
+	}
+	sweepOrphans();
 	return [primalsOut, fLin];
 }
 var PartialEvalTracer = class extends Tracer {
@@ -5448,6 +6072,16 @@ var PartialEvalTracer = class extends Tracer {
 		this.pval = pval;
 		this.recipe = recipe;
 		this.#rc = 1;
+	}
+	/**
+	* Whether this PET borrows an externally-owned value.
+	* True for PETs created by newArg (wrapping user inputs).
+	* False for PETs created by pure/lift (wrapping intermediates).
+	*/
+	borrowed = false;
+	/** Current PET reference count (for internal lifecycle decisions). */
+	get refCount() {
+		return this.#rc;
 	}
 	get aval() {
 		return this.pval.aval;
@@ -5481,12 +6115,24 @@ var PartialEvalTracer = class extends Tracer {
 	}
 };
 var PartialEvalTrace = class extends Trace {
+	/** Shared PE trace data lives on main.globalData. */
+	get #data() {
+		return this.main.globalData;
+	}
+	#track(pet) {
+		this.#data.allPets.push(pet);
+		return pet;
+	}
 	newArg(pval) {
-		if (pval.isKnown) return new PartialEvalTracer(this, pval, null);
-		return new PartialEvalTracer(this, pval, { type: "LambdaBinding" });
+		if (pval.isKnown) {
+			const pet = this.#track(new PartialEvalTracer(this, pval, null));
+			pet.borrowed = true;
+			return pet;
+		}
+		return this.#track(new PartialEvalTracer(this, pval, { type: "LambdaBinding" }));
 	}
 	pure(val) {
-		return new PartialEvalTracer(this, PartialVal.known(pureArray(val)), null);
+		return this.#track(new PartialEvalTracer(this, PartialVal.known(pureArray(val)), null));
 	}
 	lift = this.pure;
 	instantiateConst(tracer) {
@@ -5495,10 +6141,10 @@ var PartialEvalTrace = class extends Trace {
 			const pval = PartialVal.unknown(ShapedArray.fromAval(tracer.aval));
 			const val = tracer.pval.val.ref;
 			tracer.dispose();
-			return new PartialEvalTracer(this, pval, {
+			return this.#track(new PartialEvalTracer(this, pval, {
 				type: "Const",
 				val
-			});
+			}));
 		}
 	}
 	processPrimitive(primitive, tracers, params) {
@@ -5537,7 +6183,11 @@ var PartialEvalTrace = class extends Trace {
 		const inUnknowns = tracers.map((t) => !t.pval.isKnown);
 		const { jaxpr1, jaxpr2, outUnknowns, numRes } = partialEvalJaxpr(jaxpr, inUnknowns);
 		const [knownTracers, unknownTracers] = require_backend.partitionList(inUnknowns, tracers);
-		const outs1Res = bind(Primitive.Jit, knownTracers.map((t) => t.ref.fullLower()), {
+		const outs1Res = bind(Primitive.Jit, knownTracers.map((t) => {
+			const rc = t.refCount;
+			const val = t.fullLower();
+			return rc === 1 && t.borrowed ? val.ref : val;
+		}), {
 			name: `${name}_peval`,
 			jaxpr: jaxpr1,
 			numConsts: 0
@@ -5982,7 +6632,7 @@ const transposeRules = {
 	},
 	[Primitive.TriangularSolve]([ct], [a, b], { unitDiagonal }) {
 		if (a instanceof UndefPrimal || !(b instanceof UndefPrimal)) throw new NonlinearError(Primitive.TriangularSolve);
-		const ctB = triangularSolve$1(moveaxis$1(a, -2, -1), ct, {
+		const ctB = triangularSolve$1(moveaxis(a, -2, -1), ct, {
 			lower: true,
 			unitDiagonal
 		});
@@ -5993,7 +6643,7 @@ const transposeRules = {
 		const newJaxpr = transposeJaxpr(jaxpr, undefPrimals);
 		const residuals = args.filter((x, i$1) => !undefPrimals[i$1]);
 		const outs = bind(Primitive.Jit, [
-			...newJaxpr.consts.map((c) => c.ref),
+			...newJaxpr.consts,
 			...residuals,
 			...cts
 		], {
@@ -6223,6 +6873,21 @@ const transposeRules = {
 	}
 };
 const transposeJaxprCache = /* @__PURE__ */ new Map();
+/** Dispose all entries in the transposeJaxpr cache. Called by _disposeAllJitCaches. */
+function _disposeTransposeJaxprCache() {
+	for (const map$1 of transposeJaxprCache.values()) for (const entry of map$1.values()) try {
+		entry.dispose();
+	} catch {}
+	transposeJaxprCache.clear();
+}
+_derivedCacheCleanups.push(_disposeTransposeJaxprCache);
+ClosedJaxpr._disposeHooks.push((jaxpr) => {
+	const cached = transposeJaxprCache.get(jaxpr);
+	if (cached) {
+		for (const entry of cached.values()) entry.dispose();
+		transposeJaxprCache.delete(jaxpr);
+	}
+});
 function transposeJaxpr(jaxpr, undefPrimals) {
 	const cacheKey = JSON.stringify(undefPrimals);
 	const prevResult = transposeJaxprCache.get(jaxpr)?.get(cacheKey);
@@ -6242,16 +6907,21 @@ function transposeJaxpr(jaxpr, undefPrimals) {
 	return newJaxpr;
 }
 function vjpFlat(f, primalsIn) {
-	const { primalsOut, jaxpr } = linearizeFlatUtil(f, primalsIn);
+	const { primalsOut, jaxpr, tangentKnown, sweepOrphans } = linearizeFlatUtil(f, primalsIn);
+	const inAvals = primalsIn.map((t) => ShapedArray.fromAval(t.aval));
 	const fVjp = (...cotangents) => {
-		const transposeInputs = [...jaxpr.consts.map((c) => c.ref), ...primalsIn.map((t) => new UndefPrimal(t.aval))];
-		return evalJaxprTransposed(jaxpr.jaxpr, transposeInputs, cotangents);
+		const unknownCts = [];
+		for (let i = 0; i < cotangents.length; i++) if (tangentKnown[i]) cotangents[i].dispose();
+		else unknownCts.push(cotangents[i]);
+		const transposeInputs = [...jaxpr.consts.map((c) => c.ref), ...inAvals.map((aval) => new UndefPrimal(aval))];
+		return evalJaxprTransposed(jaxpr.jaxpr, transposeInputs, unknownCts);
 	};
 	const dispose$1 = () => jaxpr.dispose();
 	return [
 		primalsOut,
 		fVjp,
-		dispose$1
+		dispose$1,
+		sweepOrphans
 	];
 }
 function vjp$1(f, primalsIn, { hasAux = false } = {}) {
@@ -6259,7 +6929,9 @@ function vjp$1(f, primalsIn, { hasAux = false } = {}) {
 	let fFlat, outTree, aux;
 	if (hasAux) [fFlat, outTree, aux] = flattenFunWithAux(f, inTree);
 	else [fFlat, outTree] = flattenFun(f, inTree);
-	const [primalsOutFlat, fVjpFlat, dispose$1] = vjpFlat(fFlat, primalsInFlat.map(pureArray));
+	const pureArgs = primalsInFlat.map(pureArray);
+	const rcBeforeTrace = pureArgs.map((a) => a.refCount);
+	const [primalsOutFlat, fVjpFlat, disposeJaxpr, sweepOrphans] = vjpFlat(fFlat, pureArgs);
 	if (outTree.value === void 0) throw new Error("outTree was not set in vjp");
 	const primalsOut = unflatten(outTree.value, primalsOutFlat);
 	const fVjp = ((cotangentsOut) => {
@@ -6268,12 +6940,20 @@ function vjp$1(f, primalsIn, { hasAux = false } = {}) {
 		const cotangentsInFlat = fVjpFlat(...cotangentsOutFlat.map(pureArray));
 		return unflatten(inTree, cotangentsInFlat);
 	});
-	fVjp.dispose = dispose$1;
-	if (hasAux) return [
-		primalsOut,
-		fVjp,
-		lowerAux(aux.value)
-	];
+	fVjp.dispose = () => {
+		disposeJaxpr();
+		for (let i = 0; i < pureArgs.length; i++) if (pureArgs[i].refCount >= rcBeforeTrace[i]) pureArgs[i].dispose();
+	};
+	if (hasAux) {
+		const auxOut = lowerAux(aux.value);
+		sweepOrphans();
+		return [
+			primalsOut,
+			fVjp,
+			auxOut
+		];
+	}
+	sweepOrphans();
 	return [primalsOut, fVjp];
 }
 function grad$1(f, opts) {
@@ -6299,8 +6979,18 @@ function valueAndGrad$1(f, opts) {
 		if (x.length === 0) throw new Error("grad requires at least one argument to differentiate");
 		for (let i = 0; i < x.length; i++) if (!argnumsSet.has(i)) x[i] = map(stopGradient, x[i]);
 		const [y, fVjp, aux] = vjp$1(f, x, { hasAux });
-		if (!(y instanceof Tracer) || ndim$1(y) !== 0) throw new TypeError("grad requires a scalar output");
-		if (!require_backend.isFloatDtype(y.dtype)) throw new TypeError("grad only supports floating-point dtypes");
+		if (!(y instanceof Tracer) || ndim$1(y) !== 0) {
+			dispose(y);
+			fVjp.dispose();
+			if (hasAux) dispose(aux);
+			throw new TypeError("grad requires a scalar output");
+		}
+		if (!require_backend.isFloatDtype(y.dtype)) {
+			dispose(y);
+			fVjp.dispose();
+			if (hasAux) dispose(aux);
+			throw new TypeError("grad only supports floating-point dtypes");
+		}
 		const cts = fVjp(onesLike$1(y.ref));
 		fVjp.dispose();
 		for (let i = 0; i < cts.length; i++) if (!argnumsSet.has(i)) dispose(cts[i]);
@@ -6700,7 +7390,7 @@ function lstsq(a, b) {
 			lower: true,
 			transposeA: true
 		});
-		return matmul(at, llb.ref);
+		return matmul(at, llb);
 	} else {
 		const ata = matmul(at.ref, a);
 		const l = cholesky(ata, { symmetrizeInput: false });
@@ -6791,7 +7481,7 @@ function solve(a, b) {
 		lower: true,
 		unitDiagonal: true
 	});
-	let x = triangularSolve(lu$2, LPb.ref, {
+	let x = triangularSolve(lu$2, LPb, {
 		leftSide: true,
 		lower: false
 	});
@@ -6996,7 +7686,7 @@ __export(numpy_exports, {
 	meshgrid: () => meshgrid,
 	min: () => min,
 	minimum: () => minimum,
-	moveaxis: () => moveaxis,
+	moveaxis: () => moveaxis$1,
 	multiply: () => multiply,
 	nan: () => nan,
 	nanToNum: () => nanToNum,
@@ -7136,7 +7826,7 @@ const reshape = reshape$1;
 * @function
 * Move axes of an array to new positions. Other axes retain original order.
 */
-const moveaxis = moveaxis$1;
+const moveaxis$1 = moveaxis;
 /**
 * @function
 * Add padding (zeros) to an array.
@@ -7284,9 +7974,9 @@ function cumsum(a, axis) {
 		axis = 0;
 	} else axis = require_backend.checkAxis(axis, a.ndim);
 	const n = a.shape[axis];
-	a = moveaxis(a, axis, -1);
+	a = moveaxis$1(a, axis, -1);
 	a = broadcast(a, a.shape.concat(n), [-2]);
-	return moveaxis(tril(a).sum(-1), -1, axis);
+	return moveaxis$1(tril(a).sum(-1), -1, axis);
 }
 /** Reverse the elements in an array along the given axes. */
 function flip(x, axis = null) {
@@ -7448,7 +8138,7 @@ function swapaxes(a, axis1, axis2) {
 /** Transpose the last two dimensions of an array. */
 function matrixTranspose(a) {
 	if (ndim(a) < 2) throw new Error(`matrixTranspose: input array must be at least 2D`);
-	return moveaxis(a, -1, -2);
+	return moveaxis$1(a, -1, -2);
 }
 /** Return a 1-D flattened array containing the elements of the input. */
 function ravel(a) {
@@ -7602,8 +8292,9 @@ function sort(a, axis = -1) {
 	return fudgeArray(a).sort(axis);
 }
 /**
-* Return indices that would sort an array. This may be an unstable sorting
-* algorithm; it need not preserve order of indices in ties.
+* Return indices that would sort an array. Unlike `sort`, this is guaranteed to
+* be a stable sorting algorithm; it always returns the smaller index first in
+* event of ties.
 *
 * Returns an array of `int32` indices.
 *
@@ -7816,8 +8507,8 @@ function vecdot(x, y, { axis } = {}) {
 	const xaxis = require_backend.checkAxis(axis ?? -1, ndim(x));
 	const yaxis = require_backend.checkAxis(axis ?? -1, ndim(y));
 	if (shape(x)[xaxis] !== shape(y)[yaxis]) throw new Error(`vecdot: shapes ${JSON.stringify(shape(x))} and ${JSON.stringify(shape(y))} not aligned along axis ${axis}: ${shape(x)[xaxis]} != ${shape(y)[yaxis]}`);
-	x = moveaxis(x, xaxis, -1);
-	y = moveaxis(y, yaxis, -1);
+	x = moveaxis$1(x, xaxis, -1);
+	y = moveaxis$1(y, yaxis, -1);
 	return dot$2(x, y);
 }
 /**
@@ -7905,7 +8596,7 @@ function absolute(x) {
 /** Return an element-wise indication of sign of the input. */
 function sign(x) {
 	x = fudgeArray(x);
-	return where(notEqual(x.ref, 0), where(less(x.ref, 0), -1, 1), 0);
+	return where(notEqual(x.ref, 0), where(less(x, 0), -1, 1), 0);
 }
 /** @function Return element-wise positive values of the input (no-op). */
 const positive = fudgeArray;
@@ -8320,7 +9011,7 @@ __export(lax_linalg_exports, {
 */
 function cholesky$1(a, { upper = false } = {}) {
 	const L = cholesky$2(a);
-	return upper ? moveaxis(L, -2, -1) : L;
+	return upper ? moveaxis$1(L, -2, -1) : L;
 }
 /**
 * LU decomposition with partial pivoting.
@@ -8372,16 +9063,16 @@ function triangularSolve(a, b, { leftSide = false, lower = false, transposeA = f
 	a = fudgeArray(a);
 	b = fudgeArray(b);
 	if (!leftSide) transposeA = !transposeA;
-	else b = moveaxis(b, -2, -1);
+	else b = moveaxis$1(b, -2, -1);
 	if (transposeA) {
-		a = moveaxis(a, -2, -1);
+		a = moveaxis$1(a, -2, -1);
 		lower = !lower;
 	}
 	let x = triangularSolve$1(a, b, {
 		lower,
 		unitDiagonal
 	});
-	if (leftSide) x = moveaxis(x, -2, -1);
+	if (leftSide) x = moveaxis$1(x, -2, -1);
 	return x;
 }
 
@@ -8729,7 +9420,8 @@ __export(lax_exports, {
 	linalg: () => lax_linalg_exports,
 	reduceWindow: () => reduceWindow,
 	scan: () => scan,
-	stopGradient: () => stopGradient$1
+	stopGradient: () => stopGradient$1,
+	topK: () => topK
 });
 const JsArray = globalThis.Array;
 /**
@@ -8823,7 +9515,7 @@ function convGeneralDilated(lhs, rhs, windowStrides, padding, { lhsDilation, rhs
 		if (C_in % G !== 0) throw new Error(`featureGroupCount=${G} must divide input channels=${C_in}`);
 		if (C_out % G !== 0) throw new Error(`featureGroupCount=${G} must divide output channels=${C_out}`);
 		if (C_in / G !== C_in_per_group) throw new Error(`rhs input channels=${C_in_per_group} must equal lhs input channels / groups=${C_in / G}`);
-		const lhsGrouped = moveaxis$1(lhs.reshape([
+		const lhsGrouped = moveaxis(lhs.reshape([
 			N,
 			G,
 			C_in / G,
@@ -8843,7 +9535,7 @@ function convGeneralDilated(lhs, rhs, windowStrides, padding, { lhsDilation, rhs
 			rhsDilation
 		});
 		const ys = result.shape.slice(3);
-		return moveaxis$1(result, 0, 1).reshape([
+		return moveaxis(result, 0, 1).reshape([
 			N,
 			C_out,
 			...ys
@@ -8898,7 +9590,7 @@ function convTranspose(lhs, rhs, strides, padding, { rhsDilation, transposeKerne
 	const pads = effectiveKernel.map((k, i) => convTransposePadding(k, strides[i], typeof padding === "string" ? padding : padding[i]));
 	if (transposeKernel) {
 		rhs = flip$1(rhs, require_backend.range(2, rhs.ndim));
-		rhs = moveaxis$1(rhs, 0, 1);
+		rhs = moveaxis(rhs, 0, 1);
 	}
 	return convGeneralDilated(lhs, rhs, require_backend.rep(lhs.ndim - 2, 1), pads, {
 		lhsDilation: strides,
@@ -8952,6 +9644,39 @@ function erfc(x) {
 */
 function stopGradient$1(x) {
 	return stopGradient(x);
+}
+/**
+* Returns top `k` values and their indices along the specified axis of operand.
+*
+* This is a _stable_ algorithm: If two elements are equal, the lower-index
+* element appears first.
+*
+* @returns A tuple of `(values, indices)`, where `values` and `indices` have
+* the same shape as `x`, except along `axis` where they have size `k`.
+*/
+function topK(x, k, axis = -1) {
+	x = fudgeArray(x);
+	axis = require_backend.checkAxis(axis, x.ndim);
+	const size$1 = x.shape[axis];
+	if (k < 0 || k > size$1) throw new Error(`topK: k must be in the range [0, ${size$1}], got ${k}`);
+	if (k === 0) {
+		const outShape = x.shape.slice();
+		outShape[axis] = 0;
+		const y$1 = zerosLike$1(x.ref, { shape: outShape });
+		const yi$1 = zerosLike$1(x, {
+			dtype: require_backend.DType.Int32,
+			shape: outShape
+		});
+		return [y$1, yi$1];
+	}
+	x = flip$1(x, [axis]);
+	x = moveaxis(x, axis, -1);
+	const [y, yi] = argsort$1(x);
+	const extract = (a) => {
+		a = a.slice(...require_backend.rep(a.ndim - 1, []), [-k]);
+		return flip$1(moveaxis(a, -1, axis), [axis]);
+	};
+	return [extract(y), extract(yi.neg().add(size$1 - 1))];
 }
 
 //#endregion
@@ -9144,7 +9869,7 @@ const gelu = jit$1(function gelu$1(x, opts) {
 	if (opts?.approximate ?? true) {
 		const SQRT_2_OVER_PI = Math.sqrt(2 / Math.PI);
 		return x.ref.mul(.5).mul(tanh(x.ref.mul(x.ref.mul(x).mul(.044715).add(1)).mul(SQRT_2_OVER_PI)).add(1));
-	} else return x.ref.mul(.5).mul(erfc$1(negative(x.ref.mul(Math.SQRT1_2))));
+	} else return x.ref.mul(.5).mul(erfc$1(negative(x.mul(Math.SQRT1_2))));
 }, { staticArgnums: [1] });
 /**
 * Gated linear unit (GLU) activation function.
@@ -9430,7 +10155,9 @@ function getK01(key$1) {
 function key(seed) {
 	seed = array(seed, { dtype: require_backend.DType.Uint32 });
 	if (seed.ndim !== 0) throw new Error(`key: seed must be a scalar integer, but got shape ${seed.shape} - use jax.vmap for batching.`);
-	return stack([0, seed]);
+	const key$1 = stack([0, seed]);
+	if (key$1 instanceof Array$1) key$1._realizeSource();
+	return key$1;
 }
 /** Splits a PRNG key into `num` new keys by adding a leading axis. */
 function split(key$1, num = 2) {
@@ -9508,8 +10235,9 @@ const categorical = jit$1(function categorical$1(key$1, logits, { axis = -1, sha
 		const k = shapePrefix.reduce((a, b) => a * b, 1);
 		if (k > numCategories) throw new Error(`Number of samples without replacement (${k}) cannot exceed number of categories (${numCategories}).`);
 		const noise = gumbel(key$1, logits.shape);
-		const movedLogits = moveaxis(noise.add(logits), axis, 0);
-		return argsort(movedLogits, 0).slice([-k]).reshape(shape$1);
+		const [values, indices] = topK(noise.add(logits), k, axis);
+		values.dispose();
+		return indices.reshape(shape$1);
 	}
 }, { staticArgnums: [2] });
 /**
@@ -9789,6 +10517,7 @@ exports.ClosedJaxpr = ClosedJaxpr;
 exports.DType = require_backend.DType;
 exports.Jaxpr = Jaxpr;
 exports.blockUntilReady = blockUntilReady;
+exports.checkLeaks = checkLeaks;
 exports.defaultDevice = require_backend.defaultDevice;
 exports.devicePut = devicePut;
 exports.devices = require_backend.devices;

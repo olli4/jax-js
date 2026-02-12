@@ -1313,6 +1313,10 @@ var Reduction = class {
 		this.epilogue = epilogue;
 		if (!AluGroup.Reduce.has(op)) throw new TypeError(`Unsupported reduction: ${op}`);
 		this.epilogue = epilogue.simplify();
+		if (this.dtype === DType.Float16 && this.op === AluOp.Add) {
+			this.epilogue = this.epilogue.substitute({ acc: AluExp.cast(this.dtype, AluVar.acc(DType.Float32)) });
+			this.dtype = DType.Float32;
+		}
 	}
 	hash(state) {
 		state.update(this.dtype).update(this.op).update(this.size).update(this.epilogue);
@@ -1480,9 +1484,14 @@ var Routine = class {
 };
 /** One of the valid `Routine` that can be dispatched to backend. */
 let Routines = /* @__PURE__ */ function(Routines$1) {
-	/** Stable sorting algorithm along the last axis. */
+	/**
+	* Sort along the last axis.
+	*
+	* This may be _unstable_ but it often doesn't matter, sorting numbers is
+	* bitwise unique up to signed zeros and NaNs.
+	*/
 	Routines$1["Sort"] = "Sort";
-	/** Returns `int32` indices of the stably sorted array. */
+	/** Stable sorting, returns `int32` indices and values of the sorted array. */
 	Routines$1["Argsort"] = "Argsort";
 	/**
 	* Solve a triangular system of equations.
@@ -1546,7 +1555,13 @@ function runArgsort(type, [x], [y, yi]) {
 		const out = y.subarray(offset, offset + n);
 		const outi = yi.subarray(offset, offset + n);
 		for (let i = 0; i < n; i++) outi[i] = i;
-		outi.sort((a, b) => ar[a] - ar[b]);
+		outi.sort((a, b) => {
+			const x$1 = ar[a];
+			const y$1 = ar[b];
+			if (isNaN(x$1)) return isNaN(y$1) ? 0 : 1;
+			if (isNaN(y$1)) return -1;
+			return x$1 === y$1 ? 0 : x$1 < y$1 ? -1 : 1;
+		});
 		for (let i = 0; i < n; i++) out[i] = ar[outi[i]];
 	}
 }
@@ -2256,11 +2271,15 @@ var TuneDims = class {
 };
 /** Tuning step that does not apply any optimization. */
 function tuneNullopt(kernel) {
+	let exp = kernel.exp;
 	const vars = {};
 	vars.gidx = AluExp.special(DType.Int32, "gidx", kernel.size);
-	if (kernel.reduction) vars.ridx = AluExp.special(DType.Int32, "ridx", kernel.reduction.size);
+	if (kernel.reduction) {
+		vars.ridx = AluExp.special(DType.Int32, "ridx", kernel.reduction.size);
+		if (exp.dtype !== kernel.reduction.dtype) exp = AluExp.cast(kernel.reduction.dtype, exp);
+	}
 	return {
-		exp: kernel.exp.substitute(vars).rewriteGlobalViews().simplify(),
+		exp: exp.substitute(vars).rewriteGlobalViews().simplify(),
 		epilogue: kernel.reduction?.epilogue.substitute({ gidx: vars.gidx }).rewriteGlobalViews().simplify(),
 		outputIdxExp: vars.gidx,
 		threadCount: kernel.size,
@@ -2269,8 +2288,9 @@ function tuneNullopt(kernel) {
 }
 /** Tuning for WebGPU kernels. */
 function tuneWebgpu(kernel) {
-	const { exp, reduction } = kernel;
+	const reduction = kernel.reduction;
 	if (!reduction) return tuneNullopt(kernel);
+	const exp = AluExp.cast(reduction.dtype, kernel.exp);
 	const globalIndexes = exp.collect((exp$1) => exp$1.op === AluOp.GlobalIndex);
 	if (globalIndexes.length > 0) {
 		if (DEBUG >= 4) console.info("Tuning: Found GlobalIndex ops, skipping opt.");
@@ -2322,7 +2342,7 @@ function tuneWebgpu(kernel) {
 	if (!/Mobi|Android/i.test(navigator.userAgent) && dim.reduce < dim.unroll && (prod(dim.st.shape.slice(dim.unroll)) <= 4 || dim.unroll === dim.upcast && prod(dim.st.shape.slice(dim.upcast)) < 64)) {
 		const s = dim.st.shape[dim.unroll - 1];
 		if (0 < s && s <= 32) dim.applyUnroll(dim.reduce, s);
-		else for (const splits of [8, 4]) if (s % splits === 0) {
+		else for (const splits of [4, 2]) if (s % splits === 0) {
 			dim.applyUnroll(dim.unroll - 1, splits);
 			break;
 		}
@@ -7094,7 +7114,7 @@ async function createBackend(device) {
 		if (!navigator.gpu) return null;
 		const adapter = await navigator.gpu.requestAdapter({ powerPreference: "high-performance" });
 		if (!adapter) return null;
-		const { WebGPUBackend } = await Promise.resolve().then(() => require("./webgpu-CJKgI9S8.cjs"));
+		const { WebGPUBackend } = await Promise.resolve().then(() => require("./webgpu-aBiFcUn0.cjs"));
 		const importantLimits = [
 			"maxBufferSize",
 			"maxComputeInvocationsPerWorkgroup",
@@ -7132,7 +7152,7 @@ async function createBackend(device) {
 		});
 		if (!gl) return null;
 		if (!gl.getExtension("EXT_color_buffer_float")) return null;
-		const { WebGLBackend } = await Promise.resolve().then(() => require("./webgl-pZiiTzw6.cjs"));
+		const { WebGLBackend } = await Promise.resolve().then(() => require("./webgl-D9rOFqLp.cjs"));
 		return new WebGLBackend(gl);
 	} else throw new Error(`Backend not found: ${device}`);
 }

@@ -438,9 +438,14 @@ declare class Routine {
 }
 /** One of the valid `Routine` that can be dispatched to backend. */
 declare enum Routines {
-  /** Stable sorting algorithm along the last axis. */
+  /**
+   * Sort along the last axis.
+   *
+   * This may be _unstable_ but it often doesn't matter, sorting numbers is
+   * bitwise unique up to signed zeros and NaNs.
+   */
   Sort = "Sort",
-  /** Returns `int32` indices of the stably sorted array. */
+  /** Stable sorting, returns `int32` indices and values of the sorted array. */
   Argsort = "Argsort",
   /**
    * Solve a triangular system of equations.
@@ -527,6 +532,8 @@ interface Backend {
   prepareRoutine(routine: Routine): Promise<Executable>;
   /** Prepare an advanced routine to be executed later, blocking variant. */
   prepareRoutineSync(routine: Routine): Executable;
+  /** Return the number of live (allocated, not yet freed) slots. */
+  slotCount(): number;
   /**
    * Run a backend operation that was previously prepared.
    *
@@ -687,6 +694,12 @@ declare class Jaxpr implements FpHashable {
 declare class ClosedJaxpr {
   readonly jaxpr: Jaxpr;
   readonly consts: Tracer[];
+  /** Callbacks invoked when dispose() is called, for cleaning up derived caches. */
+  static _disposeHooks: ((jaxpr: Jaxpr) => void)[];
+  /** Debug-only: callbacks invoked when a ClosedJaxpr is constructed. */
+  static _createHooks: ((closed: ClosedJaxpr, createdAt: Error) => void)[];
+  /** Debug-only: callbacks invoked when a ClosedJaxpr is disposed. */
+  static _disposeClosedHooks: ((closed: ClosedJaxpr) => void)[];
   constructor(jaxpr: Jaxpr, consts: Tracer[]);
   /** String representation of this Jaxpr. */
   toString(): string;
@@ -757,9 +770,9 @@ declare enum Primitive {
   Pad = "pad",
   DynamicUpdateSlice = "dynamic_update_slice",
   Sort = "sort",
-  // sort(x, axis=-1)
+  // sort(x, axis=-1), unstable
   Argsort = "argsort",
-  // argsort(x, axis=-1)
+  // argsort(x, axis=-1), stable
   TriangularSolve = "triangular_solve",
   // A is upper triangular, A @ X.T = B.T
   Cholesky = "cholesky",
@@ -1057,8 +1070,9 @@ declare abstract class Tracer {
    */
   sort(axis?: number): this;
   /**
-   * Return the indices that would sort an array. This may not be a stable
-   * sorting algorithm; it need not preserve order of indices in ties.
+   * Return the indices that would sort an array. Unlike `sort`, this is
+   * guaranteed to be a stable sorting algorithm; it always returns the smaller
+   * index first in event of ties.
    *
    * See `jax.numpy.argsort` for full docs.
    */
@@ -1140,6 +1154,12 @@ type DTypeAndDevice = {
   dtype?: DType;
   device?: Device;
 };
+/** @inline */
+type DTypeShapeAndDevice = {
+  dtype?: DType;
+  shape?: number[];
+  device?: Device;
+};
 type ArrayConstructorArgs = {
   source: AluExp | Slot;
   st: ShapeTracker;
@@ -1174,6 +1194,18 @@ declare class Array extends Tracer {
   toString(): string;
   get device(): Device;
   get ref(): this;
+  /**
+   * Create a distinct Array handle that aliases the same underlying data.
+   *
+   * Unlike `.ref`, this does NOT mutate and return the same JS object.
+   * It returns a new Array wrapper and increments the backend slot and
+   * pending-execute reference counts accordingly.
+   *
+   * This is primarily for internal use in transformations (e.g. transpose/VJP)
+   * where a temporary "borrow" must be disposed without affecting the original
+   * owner's object identity.
+   */
+  borrow(): Array;
   /** Get the current reference count (for debugging memory management). */
   get refCount(): number;
   dispose(): void;
@@ -1249,15 +1281,9 @@ declare function array(values: Array | DataArray | RecursiveArray<number> | Recu
 type ImplRule<P extends Primitive> = (tracers: Array[], params: PrimitiveParams<P>) => Array[];
 declare const implRules: { [P in Primitive]: ImplRule<P> };
 /** Return a new array of given shape and type, filled with zeros. */
-declare function zeros(shape: number[], {
-  dtype,
-  device
-}?: DTypeAndDevice): Array;
+declare function zeros(shape: number[], opts?: DTypeAndDevice): Array;
 /** Return a new array of given shape and type, filled with ones. */
-declare function ones(shape: number[], {
-  dtype,
-  device
-}?: DTypeAndDevice): Array;
+declare function ones(shape: number[], opts?: DTypeAndDevice): Array;
 /** Return a new array of given shape and type, filled with `fill_value`. */
 declare function full(shape: number[], fillValue: number | boolean | Array, {
   dtype,
@@ -1341,6 +1367,68 @@ declare function logspace(start: number, stop: number, num?: number, endpoint?: 
   dtype,
   device
 }?: DTypeAndDevice): Array;
+//#endregion
+//#region src/frontend/check-leaks.d.ts
+/** Result returned by {@link checkLeaks.stop}. */
+interface LeakReport {
+  /** Number of unreleased backend slots (0 = no leaks). */
+  leaked: number;
+  /** Human-readable summary with source-mapped file:line:col locations. */
+  summary: string;
+}
+/** A single entry from {@link checkLeaks.snapshot}. */
+interface SnapshotEntry {
+  /** Array description (dtype, shape). */
+  desc: string;
+  /** Current reference count. */
+  rc: number;
+  /** Source-mapped creation location. */
+  location: string;
+  /** Package name, or null for user code. */
+  pkg: string | null;
+  /** Last .ref call site (only when trackRefs enabled). */
+  lastRef: string | null;
+}
+declare const checkLeaks: {
+  /**
+   * Begin tracking array allocations.
+   *
+   * Records the current backend slot count as a baseline and enables
+   * per-allocation tracking. Call this before the code you want to check,
+   * then call {@link stop} afterwards to get a leak report.
+   *
+   * Can be called once per test in a `beforeEach` hook, or manually around
+   * any section of code.
+   *
+   * @param opts.trackRefs - When `true`, also records each `.ref` call site
+   *   so the leak report can show `↳ last .ref at <location>` for rc≥2 leaks.
+   *   Adds one `Map.set` per `.ref` call. Off by default.
+   */
+  start(opts?: {
+    trackRefs?: boolean;
+  }): void;
+  /**
+   * Return a snapshot of all currently-tracked arrays without stopping.
+   *
+   * Useful for mid-session debugging — you can inspect which arrays are
+   * still alive at any point between `start()` and `stop()`.
+   */
+  snapshot(): SnapshotEntry[];
+  /**
+   * Stop tracking and return a leak report.
+   *
+   * Flushes all JIT caches (freeing their cached constants), computes the
+   * backend slot delta since `start()`, and — when leaks are found — builds
+   * a human-readable summary with source-mapped creation sites, reference
+   * counts, and diagnostic tips.
+   *
+   * @returns `{ leaked: 0, summary }` when clean. When leaks exist,
+   *   `leaked` is the number of unreleased backend slots and `summary`
+   *   contains a formatted multi-line report.
+   */
+  stop(): LeakReport;
+  readonly active: boolean;
+};
 //#endregion
 //#region src/frontend/linearize.d.ts
 /** @inline */
@@ -1769,7 +1857,7 @@ interface ScanOptions {
  */
 declare function scan<Carry extends JsTree<Array>, X extends JsTree<Array> | null, Y extends JsTree<Array> | null>(f: (carry: Carry, x: X) => [Carry, Y], init: Carry, xs: X, options?: ScanOptions): [Carry, Y];
 declare namespace lax_d_exports {
-  export { DotDimensionNumbers, PaddingType, ScanOptions, conv, convGeneralDilated, convTranspose, convWithGeneralPadding, dot$1 as dot, erf, erfc, lax_linalg_d_exports as linalg, reduceWindow, scan, stopGradient };
+  export { DotDimensionNumbers, PaddingType, ScanOptions, conv, convGeneralDilated, convTranspose, convWithGeneralPadding, dot$1 as dot, erf, erfc, lax_linalg_d_exports as linalg, reduceWindow, scan, stopGradient, topK };
 }
 /**
  * Dimension numbers for general `dot()` primitive.
@@ -1875,6 +1963,16 @@ declare function erfc(x: ArrayLike): Array;
  * forward or reverse-mode automatic differentiation.
  */
 declare function stopGradient(x: ArrayLike): Array;
+/**
+ * Returns top `k` values and their indices along the specified axis of operand.
+ *
+ * This is a _stable_ algorithm: If two elements are equal, the lower-index
+ * element appears first.
+ *
+ * @returns A tuple of `(values, indices)`, where `values` and `indices` have
+ * the same shape as `x`, except along `axis` where they have size `k`.
+ */
+declare function topK(x: ArrayLike, k: number, axis?: number): [Array, Array];
 declare namespace numpy_fft_d_exports {
   export { ComplexPair, fft, ifft };
 }
@@ -2100,17 +2198,17 @@ declare const shape$1: (x: ArrayLike) => number[];
  * @function
  * Return an array of zeros with the same shape and type as a given array.
  */
-declare const zerosLike: (a: ArrayLike, dtype?: DType) => Array;
+declare const zerosLike: (a: ArrayLike, opts?: DTypeShapeAndDevice) => Array;
 /**
  * @function
  * Return an array of ones with the same shape and type as a given array.
  */
-declare const onesLike: (a: ArrayLike, dtype?: DType) => Array;
+declare const onesLike: (a: ArrayLike, opts?: DTypeShapeAndDevice) => Array;
 /**
  * @function
  * Return a full array with the same shape and type as a given array.
  */
-declare const fullLike: (a: ArrayLike, fillValue: number | boolean | Array, dtype?: DType) => Array;
+declare const fullLike: (a: ArrayLike, fillValue: number | boolean | Array, opts?: DTypeShapeAndDevice) => Array;
 /**
  * Return the number of elements in an array, optionally along an axis.
  * Does not consume array reference.
@@ -2299,8 +2397,9 @@ declare function trace(a: ArrayLike, offset?: number, axis1?: number, axis2?: nu
  */
 declare function sort(a: ArrayLike, axis?: number): Array;
 /**
- * Return indices that would sort an array. This may be an unstable sorting
- * algorithm; it need not preserve order of indices in ties.
+ * Return indices that would sort an array. Unlike `sort`, this is guaranteed to
+ * be a stable sorting algorithm; it always returns the smaller index first in
+ * event of ties.
  *
  * Returns an array of `int32` indices.
  *
@@ -3188,4 +3287,4 @@ declare function blockUntilReady<T extends JsTree<any>>(x: T): Promise<T>;
  */
 declare function devicePut<T extends JsTree<any>>(x: T, device?: Device): Promise<MapJsTree<T, number | boolean, Array>>;
 //#endregion
-export { Array, ClosedJaxpr, DType, type Device, Jaxpr, type JsTree, type JsTreeDef, type OwnedFunction, type ScanPath, blockUntilReady, defaultDevice, devicePut, devices, getBackend, grad, hessian, init, jacfwd, jacrev as jacobian, jacrev, jit, jvp, lax_d_exports as lax, linearize, makeJaxpr, nn_d_exports as nn, numpy_d_exports as numpy, random_d_exports as random, scipy_special_d_exports as scipySpecial, setDebug, tree_d_exports as tree, valueAndGrad, vjp, vmap };
+export { Array, ClosedJaxpr, DType, type Device, Jaxpr, type JsTree, type JsTreeDef, type LeakReport, type OwnedFunction, type ScanPath, type SnapshotEntry, blockUntilReady, checkLeaks, defaultDevice, devicePut, devices, getBackend, grad, hessian, init, jacfwd, jacrev as jacobian, jacrev, jit, jvp, lax_d_exports as lax, linearize, makeJaxpr, nn_d_exports as nn, numpy_d_exports as numpy, random_d_exports as random, scipy_special_d_exports as scipySpecial, setDebug, tree_d_exports as tree, valueAndGrad, vjp, vmap };
