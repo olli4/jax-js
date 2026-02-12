@@ -256,6 +256,109 @@ describe("scan fallback leak detection (CPU)", () => {
   });
 });
 
+describe("scan failure/recovery ownership (CPU)", () => {
+  beforeAll(async () => {
+    const devices = await init();
+    previousDevice = devices.includes("webgpu")
+      ? "webgpu"
+      : devices.includes("wasm")
+        ? "wasm"
+        : undefined;
+    defaultDevice("cpu");
+  });
+
+  afterAll(() => {
+    if (previousDevice) defaultDevice(previousDevice as any);
+  });
+
+  it("body throw surfaces error and runtime recovers", async () => {
+    checkLeaks.stop();
+    const xs = np.array([
+      [1, 2],
+      [3, 4],
+    ]);
+    const initC = np.array([10, 20]);
+
+    const step = (_carry: any, _x: any): [any, null] => {
+      throw new Error("scan-body-failure");
+    };
+
+    expect(() => lax.scan(step, initC.ref, xs.ref)).toThrow(
+      "scan-body-failure",
+    );
+    xs.dispose();
+    initC.dispose();
+    checkLeaks.start();
+
+    const xs2 = np.array([
+      [1, 2],
+      [3, 4],
+    ]);
+    const init2 = np.array([0, 0]);
+    const [carry] = lax.scan(
+      (c: any, x: any) => [np.add(c, x), null],
+      init2.ref,
+      xs2.ref,
+    );
+    await carry.data();
+    xs2.dispose();
+    init2.dispose();
+  });
+
+  it("acceptPath throw does not prevent later clean scan", async () => {
+    checkLeaks.stop();
+
+    const xs = np.array([
+      [1, 2],
+      [3, 4],
+    ]);
+    const initC = np.array([10, 20]);
+
+    const step = (carry: any, x: any): [any, null] => [np.add(carry, x), null];
+    expect(() =>
+      lax.scan(step, initC.ref, xs.ref, { acceptPath: "compiled-loop" }),
+    ).toThrow();
+
+    xs.dispose();
+    initC.dispose();
+    checkLeaks.start();
+
+    const xs2 = np.array([
+      [1, 2],
+      [3, 4],
+      [5, 6],
+    ]);
+    const init2 = np.array([1, 1]);
+    const [carry] = lax.scan(step, init2.ref, xs2.ref);
+    await carry.data();
+    xs2.dispose();
+    init2.dispose();
+  });
+
+  it("caller-owned arrays remain disposable after thrown scan", () => {
+    checkLeaks.stop();
+
+    const xs = np.array([
+      [1, 2],
+      [3, 4],
+    ]);
+    const initC = np.array([10, 20]);
+    const step = (_carry: any, _x: any): [any, null] => {
+      throw new Error("scan-failure-dispose");
+    };
+
+    expect(() => lax.scan(step, initC.ref, xs.ref)).toThrow(
+      "scan-failure-dispose",
+    );
+    expect(() => {
+      xs.dispose();
+      initC.dispose();
+    }).not.toThrow();
+
+    checkLeaks.start();
+  });
+});
+
 /**
  * Regression tests for grad + jit memory leaks.
  *
