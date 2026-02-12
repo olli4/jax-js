@@ -7479,6 +7479,7 @@ function valueAndGrad$1(f, opts) {
 			throw new TypeError("grad only supports floating-point dtypes");
 		}
 		const seed = onesLike$1(y);
+		anonymousConstArrays.add(seed);
 		const cts = fVjp(seed);
 		if (!insideTrace()) {
 			seed.dispose();
@@ -7728,6 +7729,7 @@ const fftUpdate = jit$1(function fftUpdate$1(i, { real, imag }) {
 	real = real.reshape([-1, 2 * half]);
 	imag = imag.reshape([-1, 2 * half]);
 	const k = arange(0, half, 1, { dtype: real.dtype });
+	anonymousConstArrays.add(k);
 	const theta = k.mul(-Math.PI / half);
 	const wr = cos(theta);
 	const wi = sin(theta);

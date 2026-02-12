@@ -18,7 +18,7 @@ import {
   toposort,
   unzip2,
 } from "../utils";
-import { array, eye, onesLike, pureArray, zeros } from "./array";
+import { anonymousConstArrays, array, eye, onesLike, pureArray, zeros } from "./array";
 import {
   _leakTrackingEnabled,
   _leakTrackingOwnedFns,
@@ -2165,6 +2165,10 @@ export function valueAndGrad(f: (...primals: any) => Tracer, opts?: GradOpts) {
       throw new TypeError("grad only supports floating-point dtypes");
     }
     const seed = onesLike(y);
+    // seed is anonymous when inside a trace: nobody holds a reference outside.
+    // Mark so getOrMakeConstTracer skips .ref. In eager mode, the explicit
+    // seed.dispose() below handles cleanup; the mark is harmless.
+    anonymousConstArrays.add(seed);
     const cts = fVjp(seed); // backprop from scalar 1
     // Only dispose fVjp internals in eager mode. Inside a trace (makeJaxpr,
     // jit, vmap), ClosedJaxpr consts may be tracers from an outer trace that
