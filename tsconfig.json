@@ -16,6 +16,7 @@
     "**/node_modules",
     "**/*.config.js",
     "**/dist",
+    "tmp",
     "website",
     "test/deno"
   ]

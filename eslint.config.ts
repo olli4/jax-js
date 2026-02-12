@@ -5,7 +5,14 @@ import globals from "globals";
 import ts from "typescript-eslint";
 
 export default defineConfig([
-  globalIgnores(["**/dist/", "docs/", "website/", "coverage/", "test/deno/"]),
+  globalIgnores([
+    "**/dist/",
+    "docs/",
+    "website/",
+    "coverage/",
+    "test/deno/",
+    "tmp/",
+  ]),
   js.configs.recommended,
   ts.configs.recommendedTypeChecked,
   {

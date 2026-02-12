@@ -1,5 +1,4 @@
 import {
-  checkLeaks,
   grad,
   jit,
   jvp,

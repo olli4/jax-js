@@ -106,7 +106,8 @@ When deciding what to work on, prefer work in this order:
 - **Core library** (`@jax-js/jax`, root `src/`): array API, autodiff (`grad`, `jvp`, `vjp`), JIT
   compilation, device placement.
   - Frontend modules in `src/frontend/`: `array.ts` (Array class), `jit.ts` (kernel fusion),
-    `jvp.ts`/`linearize.ts` (forward/reverse AD), `vmap.ts` (vectorization), `convolution.ts`.
+    `jvp.ts`/`linearize.ts` (forward/reverse AD), `vmap.ts` (vectorization), `convolution.ts`,
+    `check-leaks.ts` (runtime memory-leak diagnostics).
   - Library namespaces in `src/library/`: `numpy.ts`, `lax.ts`, `nn.ts`, `random.ts`,
     `scipy-special.ts`, `numpy-linalg.ts`, `numpy-fft.ts`.
 - **Backends** (`src/backend/`): `cpu.ts` (debug only), `wasm.ts` + `wasm/`, `webgl.ts` + `webgl/`,
@@ -642,7 +643,7 @@ All public symbols must be exported from `src/index.ts`. Key exports:
   `hessian`, `linearize`, `makeJaxpr`
 - Device control: `init`, `defaultDevice`, `devicePut`, `blockUntilReady`, `devices`, `getBackend`
 - Namespaces: `numpy`, `lax`, `nn`, `random`, `scipySpecial`, `tree`
-- Testing utilities: `ScanPath` (type)
+- Testing utilities: `ScanPath` (type), `checkLeaks`, `LeakReport`, `SnapshotEntry`
 
 ## Extending the codebase
 
@@ -722,8 +723,8 @@ The `Kernel` class is single-output: `new Kernel(nargs, size, exp, reduction?)`.
 
 > ⚠️ **IMPORTANT: Deno WebGPU test isolation** - Due to Deno's module caching and GPU state
 > persistence between test files, running all Deno tests together in a single process causes
-> spurious memory leak failures. The `test:deno` script chains separate `deno test` commands for
-> each file to ensure proper isolation:
+> spurious memory leak failures. The `test:deno` script runs each Deno test file in its own process
+> to ensure proper isolation:
 >
 > ```bash
 > pnpm run test:deno  # Runs each file separately (RECOMMENDED)
@@ -1232,7 +1233,7 @@ The scan body's consumption rules work at both trace time and execution time via
 mechanisms:
 
 **Trace time (JaxprTracer):** When `makeJaxpr` traces the body function, `carry` and `x` are
-`JaxprTracer` objects with explicit reference counting (`src/frontend/jaxpr.ts:567-590`):
+`JaxprTracer` objects with explicit reference counting (`src/frontend/jaxpr.ts:~592`):
 
 ```typescript
 class JaxprTracer extends Tracer {
@@ -2008,13 +2009,14 @@ contributors should be aware of:
 
 ### Test files
 
-| File                         | Purpose                                        |
-| ---------------------------- | ---------------------------------------------- |
-| `test/lax-scan.test.ts`      | Main scan test suite (~1700 lines)             |
-| `test/scan-backends.test.ts` | Backend coverage & `copyBufferToBuffer` checks |
-| `test/scan-bench.test.ts`    | Scan benchmark tests                           |
-| `test/deno/webgpu.test.ts`   | Headless WebGPU tests via Deno                 |
-| `test/deno/scan.bench.ts`    | Deno WebGPU scan benchmarks                    |
+| File                           | Purpose                                        |
+| ------------------------------ | ---------------------------------------------- |
+| `test/lax-scan.test.ts`        | Main scan test suite (~1700 lines)             |
+| `test/scan-backends.test.ts`   | Backend coverage & `copyBufferToBuffer` checks |
+| `test/scan-bench.test.ts`      | Scan benchmark tests                           |
+| `test/leak-diagnostic.test.ts` | Memory-leak diagnostic tests                   |
+| `test/deno/webgpu.test.ts`     | Headless WebGPU tests via Deno                 |
+| `test/deno/scan.bench.ts`      | Deno WebGPU scan benchmarks                    |
 
 ### Deno WebGPU test guidelines
 
