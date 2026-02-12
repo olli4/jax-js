@@ -253,6 +253,25 @@ export class Array extends Tracer {
     return this;
   }
 
+  /**
+   * Create a distinct Array handle that aliases the same underlying data.
+   *
+   * Unlike `.ref`, this does NOT mutate and return the same JS object.
+   * It returns a new Array wrapper and increments the backend slot and
+   * pending-execute reference counts accordingly.
+   *
+   * This is primarily for internal use in transformations (e.g. transpose/VJP)
+   * where a temporary "borrow" must be disposed without affecting the original
+   * owner's object identity.
+   */
+  borrow(): Array {
+    this.#check();
+    const pending = this.#pending;
+    for (const exe of pending) exe.updateRc(+1);
+    if (typeof this.#source === "number") this.#backend.incRef(this.#source);
+    return this.#newArrayFrom({ pending });
+  }
+
   /** Get the current reference count (for debugging memory management). */
   get refCount(): number {
     return this.#rc;

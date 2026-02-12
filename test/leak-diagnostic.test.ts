@@ -16,7 +16,9 @@ import {
   checkLeaks,
   defaultDevice,
   getBackend,
+  grad,
   init,
+  jit,
   lax,
   numpy as np,
 } from "@jax-js/jax";
@@ -249,5 +251,104 @@ describe("scan fallback leak detection (CPU)", () => {
     xs.dispose();
     initC.dispose();
     checkLeaks.start();
+  });
+});
+
+/**
+ * Regression tests for grad + jit memory leaks.
+ *
+ * Before the rcBeforeTrace fix in linearize.ts, every level of grad()
+ * applied to a jit-wrapped function leaked exactly 1 backend slot.
+ * The root cause: partial evaluation (PE) tracing in the jit path
+ * borrows the input (doesn't consume it), but vjp's fVjp.dispose()
+ * assumed PE always consumed inputs. The fix captures refcounts before
+ * PE tracing and after disposeJaxpr(), disposing any arg whose refcount
+ * was not reduced by PE.
+ *
+ * These tests use the CPU backend for precise slot counting.
+ */
+describe("grad + jit leak detection (CPU)", () => {
+  beforeAll(async () => {
+    const devices = await init();
+    previousDevice = devices.includes("webgpu")
+      ? "webgpu"
+      : devices.includes("wasm")
+        ? "wasm"
+        : undefined;
+    defaultDevice("cpu");
+  });
+
+  afterAll(() => {
+    if (previousDevice) defaultDevice(previousDevice as any);
+  });
+
+  it("grad(f)(x) does not leak", async () => {
+    // f(x) = x^2, scalar in → scalar out
+    const f = (x: any) => np.multiply(x.ref, x);
+
+    const before = slotCount();
+    const dx = grad(f)(np.array(3.0));
+    await dx.data();
+    expect(slotCount() - before).toBe(0);
+  });
+
+  it("grad(jit(f))(x) does not leak", async () => {
+    const f = jit((x: any) => np.multiply(x.ref, x));
+
+    const before = slotCount();
+    const dx = grad(f)(np.array(3.0));
+    await dx.data();
+    f.dispose();
+    expect(slotCount() - before).toBe(0);
+  });
+
+  it("grad(grad(f))(x) does not leak", async () => {
+    // f(x) = x^2 → f'(x) = 2x → f''(x) = 2
+    const f = (x: any) => np.multiply(x.ref, x);
+
+    const before = slotCount();
+    const ddx = grad(grad(f))(np.array(3.0));
+    await ddx.data();
+    expect(slotCount() - before).toBe(0);
+  });
+
+  it("grad(grad(jit(f)))(x) does not leak", async () => {
+    const f = jit((x: any) => np.multiply(x.ref, x));
+
+    const before = slotCount();
+    const ddx = grad(grad(f))(np.array(3.0));
+    await ddx.data();
+    f.dispose();
+    expect(slotCount() - before).toBe(0);
+  });
+
+  it("grad^3(jit(f))(x) does not leak", async () => {
+    // f(x) = x^4 → f'''(x) = 24x (use x^4 to ensure 3rd derivative nonzero)
+    const f = jit((x: any) => {
+      const x2 = np.multiply(x.ref, x);
+      return np.multiply(x2.ref, x2);
+    });
+
+    const before = slotCount();
+    const dddx = grad(grad(grad(f)))(np.array(2.0));
+    await dddx.data();
+    f.dispose();
+    expect(slotCount() - before).toBe(0);
+  });
+
+  it("grad^5(f)(x) does not leak", async () => {
+    // f(x) = x^6 → f^(5)(x) = 720x (nonzero at all derivative levels)
+    // x is used many times, so each use except the last needs .ref
+    const f = (x: any) => {
+      const x2 = np.multiply(x.ref, x.ref);
+      const x3 = np.multiply(x2, x.ref);
+      const x6 = np.multiply(x3.ref, x3);
+      return np.multiply(x6, np.array(1.0)); // keep scalar; x fully consumed
+    };
+
+    const before = slotCount();
+    const d5x = grad(grad(grad(grad(grad(f)))))(np.array(1.0));
+    await d5x.data();
+    expect(slotCount() - before).toBe(0);
   });
 });

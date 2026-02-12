@@ -250,7 +250,7 @@ suite("jax.vjp()", () => {
     ]);
 
     const x = np.array([1, 2, 3]);
-    // No .ref: jit-wrapped vjp traces symbolically without consuming primals.
+    // vjp consumes primals — ownership of x is transferred.
     const [loss, vjpFn, aux] = vjp(f, [x], { hasAux: true });
 
     expect(loss).toBeAllclose(6);
@@ -260,7 +260,6 @@ suite("jax.vjp()", () => {
 
     vjpFn.dispose();
     f.dispose();
-    x.dispose();
   });
 
   test("hasAux works inside jit", () => {
@@ -450,12 +449,12 @@ suite("jax.grad()", () => {
     ]);
 
     const x = np.array([1, 2, 3]);
+    // grad consumes x — ownership transferred.
     const [gradient, aux] = grad(f, { hasAux: true })(x);
 
     expect(gradient).toBeAllclose([1, 1, 1]);
     expect(aux).toBeAllclose([2, 4, 6]);
     f.dispose();
-    x.dispose();
   });
 
   test("hasAux throws on non-scalar output", () => {

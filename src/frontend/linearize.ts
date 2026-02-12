@@ -92,11 +92,18 @@ class PartialVal {
   }
 }
 
+/** Shared tracking data for all PartialEvalTrace instances on the same MainTrace. */
+type PETraceData = {
+  /** All PETs created by any trace instance, for orphan sweep. */
+  allPets: PartialEvalTracer[];
+};
+
 function partialEvalFlat(
   f: (...args: any[]) => any,
   pvalsIn: PartialVal[],
-): { jaxpr: ClosedJaxpr; pvalsOut: PartialVal[] } {
-  using main = newMain(PartialEvalTrace);
+): { jaxpr: ClosedJaxpr; pvalsOut: PartialVal[]; sweepOrphans: () => void } {
+  const peData: PETraceData = { allPets: [] };
+  using main = newMain(PartialEvalTrace, peData);
   const trace = new PartialEvalTrace(main);
   const tracersIn = pvalsIn.map((pval) => trace.newArg(pval));
   const unknownTracersIn = tracersIn
@@ -121,7 +128,55 @@ function partialEvalFlat(
   });
   const unknownTracersOut = tracersOut.filter((t) => !t.pval.isKnown);
   const jaxpr = partialEvalGraphToJaxpr(unknownTracersIn, unknownTracersOut);
-  return { jaxpr, pvalsOut };
+
+  // Build a sweep function that disposes orphaned known PETs.
+  // These are PETs created during the PE session whose values are not
+  // captured in pvalsOut, the jaxpr consts, or as inputs. They represent
+  // intermediate computation results that were never consumed.
+  //
+  // The sweep MUST be called AFTER any external extraction of PET values
+  // (e.g., lowerAux for hasAux paths) because those paths call fullLower()
+  // which properly transfers ownership before the PET reaches rc=0.
+  const allPets = peData.allPets;
+  // Collect values that are owned by the ClosedJaxpr or pvalsOut — skip these.
+  // Must recursively walk JVPTracer-like values since owned values may be
+  // JVPTracers whose primal/tangent are PET-held values.
+  const ownedValues = new Set<Tracer>();
+  const collectOwned = (val: any) => {
+    if (!val || ownedValues.has(val)) return;
+    ownedValues.add(val);
+    // Duck-type JVPTracer: has primal and tangent children
+    if ("primal" in val && "tangent" in val) {
+      collectOwned(val.primal);
+      collectOwned(val.tangent);
+    }
+  };
+  for (const c of jaxpr.consts) collectOwned(c);
+  for (const pv of pvalsOut) {
+    if (pv.isKnown) collectOwned(pv.val!);
+  }
+  const sweepOrphans = () => {
+    // Sweep orphaned PETs (intermediate PETs not in output/consts).
+    for (const pet of allPets) {
+      if (pet.refCount <= 0) continue;
+      // Never dispose borrowed PETs — their values belong to the caller.
+      if (pet.borrowed) continue;
+      // Skip PETs whose values are owned by the jaxpr consts or output pvals.
+      // Disposing these would over-decrement shared Array refcounts.
+      if (pet.pval.isKnown && ownedValues.has(pet.pval.val!)) continue;
+      // Drain any surviving orphaned PETs. This handles known intermediate
+      // PETs (recipe=null) not in any output or jaxpr const.
+      while (pet.refCount > 0) {
+        try {
+          pet.dispose();
+        } catch {
+          break; // UseAfterFreeError — already cleaned up
+        }
+      }
+    }
+  };
+
+  return { jaxpr, pvalsOut, sweepOrphans };
 }
 
 /**
@@ -134,7 +189,12 @@ function partialEvalFlat(
 function linearizeFlatUtil(
   f: (...args: any[]) => any,
   primalsIn: Tracer[],
-): { primalsOut: Tracer[]; jaxpr: ClosedJaxpr; tangentKnown: boolean[] } {
+): {
+  primalsOut: Tracer[];
+  jaxpr: ClosedJaxpr;
+  tangentKnown: boolean[];
+  sweepOrphans: () => void;
+} {
   const pvalsIn = [
     ...primalsIn.map(PartialVal.known),
     ...primalsIn.map((t) => PartialVal.unknown(t.aval)),
@@ -145,7 +205,7 @@ function linearizeFlatUtil(
     const [primalsOut, tangentsOut] = jvp(f, x.slice(0, k), x.slice(k, 2 * k));
     return [...primalsOut, ...tangentsOut];
   };
-  const { jaxpr, pvalsOut } = partialEvalFlat(fJvp, pvalsIn);
+  const { jaxpr, pvalsOut, sweepOrphans } = partialEvalFlat(fJvp, pvalsIn);
   const n = pvalsOut.length / 2;
   const primalPvals = pvalsOut.slice(0, n);
   const tangentPvals = pvalsOut.slice(n);
@@ -161,14 +221,17 @@ function linearizeFlatUtil(
   for (const pval of tangentPvals) {
     if (pval.isKnown) pval.val!.dispose();
   }
-  return { primalsOut, jaxpr, tangentKnown };
+  return { primalsOut, jaxpr, tangentKnown, sweepOrphans };
 }
 
 function linearizeFlat(
   f: (...args: any[]) => any,
   primalsIn: Tracer[],
-): [Tracer[], (...args: Tracer[]) => Tracer[], () => void] {
-  const { primalsOut, jaxpr, tangentKnown } = linearizeFlatUtil(f, primalsIn);
+): [Tracer[], (...args: Tracer[]) => Tracer[], () => void, () => void] {
+  const { primalsOut, jaxpr, tangentKnown, sweepOrphans } = linearizeFlatUtil(
+    f,
+    primalsIn,
+  );
   // Capture avals now since primalsOut tracers may be consumed before fLin runs.
   const outAvals = primalsOut.map((t) => ShapedArray.fromAval(t.aval));
   const fLin = (...tangents: Tracer[]) => {
@@ -186,7 +249,7 @@ function linearizeFlat(
     );
   };
   const dispose = () => jaxpr.dispose();
-  return [primalsOut, fLin, dispose];
+  return [primalsOut, fLin, dispose, sweepOrphans];
 }
 
 export function linearize(
@@ -201,7 +264,7 @@ export function linearize(
   } else {
     [fFlat, outTree] = flattenFun(f, inTree);
   }
-  const [primalsOutFlat, fLinFlat, dispose] = linearizeFlat(
+  const [primalsOutFlat, fLinFlat, dispose, sweepOrphans] = linearizeFlat(
     fFlat,
     primalsInFlat.map(pureArray),
   );
@@ -219,8 +282,11 @@ export function linearize(
   }) as OwnedFunction<(...tangents: any[]) => any>;
   fLin.dispose = dispose;
   if (hasAux) {
-    return [primalsOut, fLin, lowerAux(aux!.value)];
+    const auxOut = lowerAux(aux!.value);
+    sweepOrphans(); // Safe now: lowerAux has extracted all aux PET values
+    return [primalsOut, fLin, auxOut];
   }
+  sweepOrphans(); // No aux — safe to sweep immediately
   return [primalsOut, fLin];
 }
 
@@ -318,17 +384,31 @@ class PartialEvalTracer extends Tracer {
 }
 
 class PartialEvalTrace extends Trace {
+  /** Shared PE trace data lives on main.globalData. */
+  get #data(): PETraceData {
+    return this.main.globalData as PETraceData;
+  }
+
+  #track(pet: PartialEvalTracer): PartialEvalTracer {
+    this.#data.allPets.push(pet);
+    return pet;
+  }
+
   newArg(pval: PartialVal) {
     if (pval.isKnown) {
-      const pet = new PartialEvalTracer(this, pval, null);
+      const pet = this.#track(new PartialEvalTracer(this, pval, null));
       pet.borrowed = true; // Value is externally owned (user input)
       return pet;
     }
-    return new PartialEvalTracer(this, pval, { type: "LambdaBinding" });
+    return this.#track(
+      new PartialEvalTracer(this, pval, { type: "LambdaBinding" }),
+    );
   }
 
   pure(val: TracerValue): Tracer {
-    return new PartialEvalTracer(this, PartialVal.known(pureArray(val)), null);
+    return this.#track(
+      new PartialEvalTracer(this, PartialVal.known(pureArray(val)), null),
+    );
   }
   lift = this.pure;
 
@@ -340,7 +420,9 @@ class PartialEvalTrace extends Trace {
       const pval = PartialVal.unknown(ShapedArray.fromAval(tracer.aval));
       const val = tracer.pval.val!.ref;
       tracer.dispose();
-      return new PartialEvalTracer(this, pval, { type: "Const", val });
+      return this.#track(
+        new PartialEvalTracer(this, pval, { type: "Const", val }),
+      );
     }
   }
 
@@ -1741,8 +1823,14 @@ function transposeJaxpr(jaxpr: Jaxpr, undefPrimals: boolean[]): ClosedJaxpr {
 function vjpFlat(
   f: (...x: Tracer[]) => Tracer[],
   primalsIn: Tracer[],
-): [Tracer[], (...cotangents: Tracer[]) => Tracer[], () => void] {
-  const { primalsOut, jaxpr, tangentKnown } = linearizeFlatUtil(f, primalsIn);
+): [Tracer[], (...cotangents: Tracer[]) => Tracer[], () => void, () => void] {
+  const { primalsOut, jaxpr, tangentKnown, sweepOrphans } = linearizeFlatUtil(
+    f,
+    primalsIn,
+  );
+  // Save avals before consuming inputs — only .aval is needed for the backward
+  // pass (UndefPrimal just carries shape/dtype metadata).
+  const inAvals = primalsIn.map((t) => ShapedArray.fromAval(t.aval));
   const fVjp = (...cotangents: Tracer[]) => {
     // Dispose cotangents for tangent outputs that were known at trace time
     // (e.g. zero tangents from non-differentiable ops). Only forward the
@@ -1757,12 +1845,12 @@ function vjpFlat(
     }
     const transposeInputs = [
       ...jaxpr.consts.map((c) => c.ref),
-      ...primalsIn.map((t) => new UndefPrimal(t.aval)),
+      ...inAvals.map((aval) => new UndefPrimal(aval)),
     ];
     return evalJaxprTransposed(jaxpr.jaxpr, transposeInputs, unknownCts);
   };
   const dispose = () => jaxpr.dispose();
-  return [primalsOut, fVjp, dispose];
+  return [primalsOut, fVjp, dispose, sweepOrphans];
 }
 
 export function vjp(
@@ -1778,12 +1866,14 @@ export function vjp(
     [fFlat, outTree] = flattenFun(f, inTree);
   }
   const pureArgs = primalsInFlat.map(pureArray);
-  // Track which args were newly created by pureArray (i.e., numbers → Array).
-  // vjp owns these; if jit-wrapped f doesn't consume them, we must dispose.
-  const vjpOwns = primalsInFlat.map(
-    (x, i) => !(x instanceof Tracer) && pureArgs[i] !== x,
+  // Capture refcounts before PE tracing. The PE trace's all-known path
+  // (non-jit) consumes args via PET disposal, while the jit path borrows
+  // them. We compare after tracing to know which args need manual cleanup.
+  const rcBeforeTrace = pureArgs.map((a) => a.refCount);
+  const [primalsOutFlat, fVjpFlat, disposeJaxpr, sweepOrphans] = vjpFlat(
+    fFlat,
+    pureArgs,
   );
-  const [primalsOutFlat, fVjpFlat, disposeJaxpr] = vjpFlat(fFlat, pureArgs);
   if (outTree.value === undefined) {
     throw new Error("outTree was not set in vjp");
   }
@@ -1800,22 +1890,26 @@ export function vjp(
   }) as OwnedFunction<(...cotangents: any) => any>;
   fVjp.dispose = () => {
     disposeJaxpr();
-    // Dispose any pureArray-created inputs that weren't consumed during tracing
-    // (e.g. jit-wrapped f traces symbolically without consuming concrete primals).
+    // After jaxpr disposal (which frees captured constants), check if
+    // each primal arg was fully consumed. In the non-jit case, PE tracing
+    // consumes via PET disposal (-1) and adds as jaxpr const (+1); after
+    // disposeJaxpr frees the const (-1), rc is < rcBefore → consumed.
+    // In the jit case, PE borrows the PET (no consumption) and adds as
+    // const (+1); disposeJaxpr frees the const (-1), rc stays == rcBefore
+    // → NOT consumed. We must dispose to match calling convention.
     for (let i = 0; i < pureArgs.length; i++) {
-      if (vjpOwns[i]) {
-        try {
-          pureArgs[i].dispose();
-        } catch {
-          /* already consumed by eager evaluation */
-        }
+      if (pureArgs[i].refCount >= rcBeforeTrace[i]) {
+        pureArgs[i].dispose();
       }
     }
   };
 
   if (hasAux) {
-    return [primalsOut, fVjp, lowerAux(aux!.value)];
+    const auxOut = lowerAux(aux!.value);
+    sweepOrphans(); // Safe now: lowerAux has extracted all aux PET values
+    return [primalsOut, fVjp, auxOut];
   }
+  sweepOrphans(); // No aux — safe to sweep immediately
   return [primalsOut, fVjp];
 }
 

@@ -542,10 +542,27 @@ export class ClosedJaxpr {
   /** Callbacks invoked when dispose() is called, for cleaning up derived caches. */
   static _disposeHooks: ((jaxpr: Jaxpr) => void)[] = [];
 
+  /** Debug-only: callbacks invoked when a ClosedJaxpr is constructed. */
+  static _createHooks: ((closed: ClosedJaxpr, createdAt: Error) => void)[] = [];
+
+  /** Debug-only: callbacks invoked when a ClosedJaxpr is disposed. */
+  static _disposeClosedHooks: ((closed: ClosedJaxpr) => void)[] = [];
+
   constructor(
     readonly jaxpr: Jaxpr,
     readonly consts: Tracer[],
-  ) {}
+  ) {
+    if (ClosedJaxpr._createHooks.length > 0) {
+      const createdAt = new Error();
+      for (const hook of ClosedJaxpr._createHooks) {
+        try {
+          hook(this, createdAt);
+        } catch {
+          /* debug hook */
+        }
+      }
+    }
+  }
 
   /** String representation of this Jaxpr. */
   toString(): string {
@@ -561,6 +578,13 @@ export class ClosedJaxpr {
   dispose() {
     for (const c of this.consts) c.dispose();
     for (const hook of ClosedJaxpr._disposeHooks) hook(this.jaxpr);
+    for (const hook of ClosedJaxpr._disposeClosedHooks) {
+      try {
+        hook(this);
+      } catch {
+        /* debug hook */
+      }
+    }
   }
 }
 

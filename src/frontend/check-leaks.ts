@@ -117,7 +117,7 @@
  */
 
 import { type Device, devices, getBackend } from "../backend";
-import { _disposeAllJitCaches } from "./jaxpr";
+import { _disposeAllJitCaches, ClosedJaxpr } from "./jaxpr";
 // ── Tracking state (checked on the hot path) ──
 
 /** True only between start() and stop(). Checked in Array ctor/dispose. */
@@ -141,6 +141,43 @@ export const _lastRefMap = new Map<object, Error>();
 
 const _startSlots = new Map<Device, number>();
 let _active = false;
+
+// ── ClosedJaxpr lifetime tracking (debug-only, enabled only while active) ──
+
+let _closedHookInstalled = false;
+let _closedIdCounter = 0;
+const _closedIds = new WeakMap<ClosedJaxpr, number>();
+const _closedCreated = new Map<
+  number,
+  {
+    createdAt: Error;
+    consts: number;
+    ref: WeakRef<ClosedJaxpr>;
+    disposed: boolean;
+  }
+>();
+
+function ensureClosedJaxprHooks() {
+  if (_closedHookInstalled) return;
+  _closedHookInstalled = true;
+  ClosedJaxpr._createHooks.push((closed, createdAt) => {
+    if (!_active) return;
+    const id = ++_closedIdCounter;
+    _closedIds.set(closed, id);
+    _closedCreated.set(id, {
+      createdAt,
+      consts: closed.consts.length,
+      ref: new WeakRef(closed),
+      disposed: false,
+    });
+  });
+  ClosedJaxpr._disposeClosedHooks.push((closed) => {
+    const id = _closedIds.get(closed);
+    if (!id) return;
+    const info = _closedCreated.get(id);
+    if (info) info.disposed = true;
+  });
+}
 
 // ── Cold-path helpers (only called when leaks are detected) ──
 
@@ -496,6 +533,8 @@ export const checkLeaks = {
     }
     _leakTrackingMap.clear();
     _lastRefMap.clear();
+    _closedCreated.clear();
+    ensureClosedJaxprHooks();
     // _smCache is intentionally NOT cleared — source maps are session-level.
     _trackRefsEnabled = opts?.trackRefs ?? false;
 
@@ -578,6 +617,7 @@ export const checkLeaks = {
     if (leaked === 0) {
       _leakTrackingMap.clear();
       _lastRefMap.clear();
+      _closedCreated.clear();
       return { leaked: 0, summary: "No leaks detected." };
     }
 
@@ -597,7 +637,9 @@ export const checkLeaks = {
     /** Leak counts by package (null key = user code). */
     const pkgCounts = new Map<string | null, number>();
 
+    const leakedArrays = new Set<object>();
     for (const [arr, err] of _leakTrackingMap) {
+      leakedArrays.add(arr);
       const site = findCreationSite(err);
       let g = groups.get(site.location);
       if (!g) {
@@ -628,8 +670,37 @@ export const checkLeaks = {
       }
       pkgCounts.set(site.pkg, (pkgCounts.get(site.pkg) ?? 0) + 1);
     }
+
+    const closedHoldingLeaks: Array<{
+      id: number;
+      consts: number;
+      site: string;
+    }> = [];
+    for (const [id, info] of _closedCreated.entries()) {
+      const closed = info.ref.deref();
+      if (!closed) continue;
+      // If any leaked Array object is directly referenced by this ClosedJaxpr.consts,
+      // it's a strong indicator that the jaxpr (or a closure holding it) is the owner.
+      let holds = false;
+      for (const c of closed.consts) {
+        if (leakedArrays.has(c as any)) {
+          holds = true;
+          break;
+        }
+      }
+      if (holds) {
+        const site = findCreationSite(info.createdAt).location;
+        closedHoldingLeaks.push({ id, consts: info.consts, site });
+      }
+    }
+
+    const undisposedClosed = [..._closedCreated.entries()].filter(
+      ([, info]) => !info.disposed && info.consts > 0,
+    );
+
     _leakTrackingMap.clear();
     _lastRefMap.clear();
+    _closedCreated.clear();
 
     // User-code sites first (most actionable), then dependency, by count desc
     const sorted = [...groups.entries()].sort(
@@ -689,6 +760,35 @@ export const checkLeaks = {
       tips.push(
         "Call .dispose() on unused results, or use .ref to keep arrays alive.",
       );
+    }
+
+    if (undisposedClosed.length > 0) {
+      tips.push(
+        `${undisposedClosed.length} ClosedJaxpr(s) created during checkLeaks were not disposed (may retain const arrays):`,
+      );
+      for (const [id, info] of undisposedClosed.slice(0, 6)) {
+        const site = findCreationSite(info.createdAt);
+        tips.push(
+          `  - ClosedJaxpr #${id} consts=${info.consts} at ${site.location}`,
+        );
+      }
+      if (undisposedClosed.length > 6) {
+        tips.push(`  - … (+${undisposedClosed.length - 6} more)`);
+      }
+    }
+
+    if (closedHoldingLeaks.length > 0) {
+      tips.push(
+        `Leaked arrays are referenced by ${closedHoldingLeaks.length} ClosedJaxpr(s):`,
+      );
+      for (const e of closedHoldingLeaks.slice(0, 6)) {
+        tips.push(
+          `  - ClosedJaxpr #${e.id} consts=${e.consts} created at ${e.site}`,
+        );
+      }
+      if (closedHoldingLeaks.length > 6) {
+        tips.push(`  - … (+${closedHoldingLeaks.length - 6} more)`);
+      }
     }
     lines.push("", ...tips);
 
