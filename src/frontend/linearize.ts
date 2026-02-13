@@ -264,9 +264,14 @@ export function linearize(
   } else {
     [fFlat, outTree] = flattenFun(f, inTree);
   }
+  const pureArgs = primalsInFlat.map(pureArray);
+  // Match vjp() ownership behavior: non-jit PE tracing consumes inputs via PET
+  // disposal, while jit PE can borrow inputs and capture them as jaxpr consts.
+  // We compare post-dispose refcounts to decide whether manual cleanup is needed.
+  const rcBeforeTrace = pureArgs.map((a) => a.refCount);
   const [primalsOutFlat, fLinFlat, dispose, sweepOrphans] = linearizeFlat(
     fFlat,
-    primalsInFlat.map(pureArray),
+    pureArgs,
   );
   if (outTree.value === undefined) {
     throw new Error("outTree was not set in linearize");
@@ -280,7 +285,14 @@ export function linearize(
     const tangentsOutFlat = fLinFlat(...tangentsInFlat.map(pureArray));
     return treeUnflatten(outTree.value!, tangentsOutFlat);
   }) as OwnedFunction<(...tangents: any[]) => any>;
-  fLin.dispose = dispose;
+  fLin.dispose = () => {
+    dispose();
+    for (let i = 0; i < pureArgs.length; i++) {
+      if (pureArgs[i].refCount >= rcBeforeTrace[i]) {
+        pureArgs[i].dispose();
+      }
+    }
+  };
   if (hasAux) {
     const auxOut = lowerAux(aux!.value);
     sweepOrphans(); // Safe now: lowerAux has extracted all aux PET values
@@ -1279,7 +1291,7 @@ const transposeRules: Partial<{ [P in Primitive]: TransposeRule<P> }> = {
     const residuals = args.filter((x, i) => !undefPrimals[i]) as Tracer[];
     const outs = bind(
       Primitive.Jit,
-      [...newJaxpr.consts, ...residuals, ...cts],
+      [...newJaxpr.consts.map((c) => c.ref), ...residuals, ...cts],
       {
         name: `${name}_t`,
         jaxpr: newJaxpr.jaxpr,

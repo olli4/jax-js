@@ -187,6 +187,20 @@ What this means is that all functions in jax-js must _take ownership_ of their a
 references. Whenever you would like to pass an Array as argument, you can pass it directly to
 dispose of it, or use `.ref` if you'd like to use it again later.
 
+#### Guiding principles (complete model)
+
+Move semantics is necessary, but not sufficient by itself. The full ownership model is:
+
+1. **Conservation of handles**: every handle you receive/create must end as exactly one of transfer,
+   dispose, or explicit retention.
+2. **Explicit retention boundaries**: if a value outlives scope (captured consts, cached compiled
+   functions, pending work), retention must take an explicit extra handle (`.ref` / borrow).
+3. **Symmetric release**: each retained handle must have exactly one release path (`dispose` hook,
+   cache eviction, or owner teardown), including on error paths.
+
+For the full maintainer + user checklist, see
+[`docs/ownership-principles.md`](docs/ownership-principles.md).
+
 **You must follow these rules on your own functions as well!** All combinators like `jvp`, `grad`,
 `jit` assume that you are following these conventions on how arguments are passed, and they will
 respect them as well.
@@ -223,8 +237,8 @@ function bar_good(x: np.Array, skip: boolean) {
 }
 ```
 
-You can assume that every function in jax-js takes ownership properly, except with a couple of very
-rare exceptions that are documented.
+Ownership behavior should follow the same contract across all transforms (`grad`, `jvp`, `vjp`,
+`vmap`, `jit`, `linearize`, `scan`) and untransformed code.
 
 ### grad(), vmap() and jit()
 

@@ -214,6 +214,140 @@ sudo usermod -a -G render,video $USER  # then log out/in
 
 ## Reference-counting & ownership (critical)
 
+Canonical ownership model (must hold everywhere):
+
+1. **Conserve handles** — every handle received/created must end as exactly one of: transfer,
+   dispose, or explicit retention.
+2. **Make retention boundaries explicit** — if a value crosses scope lifetime boundaries (jaxpr
+   consts, caches, pending work, closures), create an independent retained handle (`.ref` / borrow).
+3. **Release retained handles symmetrically** — every retained handle has exactly one release path
+   (dispose hook, eviction, teardown), including error paths.
+
+Actionable interpretation (to avoid redundancy):
+
+- **Invariant:** Conserve handles (what must be true).
+- **Enforcement A:** Make retention boundaries explicit (when to create independent ownership).
+- **Enforcement B:** Release retained handles symmetrically (where retention is guaranteed to end).
+
+In practice, principle 1 is the proof target; principles 2–3 are coding rules that make it hold.
+
+Quick apply checklist for transform edits:
+
+1. Enumerate handles received/created/retained in this layer.
+2. For each handle, assign exactly one terminal action: transfer, dispose, retained owner.
+3. Verify throw paths use `try/finally` (or equivalent) with same cleanup as success.
+4. Verify `dispose()` releases retained state, then disposes wrapped inner function.
+
+Condensed maintainer rules (non-overlapping):
+
+1. **Make retention boundaries explicit and per-handle** (`.ref`/borrow + single owner).
+2. **Preserve transform transparency** (transformed function preserves untransformed ownership
+   contract).
+3. **Enforce release symmetry with error parity** (one release path + equivalent throw-path
+   cleanup).
+4. **Treat temporaries as local liabilities** (transfer/dispose in the same layer that created
+   them).
+
+See `docs/ownership-principles.md` for full user + maintainer rules and review checklist.
+
+### Ideal transform architecture (from the toy model)
+
+A toy system in `tmp/toy-principles-system.ts` validates the three principles exhaustively across
+all 780 ordered transform compositions (depth 1–4 of {grad, jit, vmap, linearize, vjp}), in both
+success and error paths. The toy maps directly to jax-js and defines the target architecture for
+every transform implementation.
+
+**Conceptual mapping:**
+
+| Toy concept            | jax-js equivalent                                        |
+| ---------------------- | -------------------------------------------------------- |
+| `Runtime` (slot pool)  | `Backend` (`Map<Slot, {ptr/buffer, ref}>`)               |
+| `Handle` (ref/dispose) | `Array` (`.ref` / `.dispose()`)                          |
+| `FnNode`               | Transform wrapper (closure/object returned by transform) |
+| `FnNode.inner`         | Wrapped function — **owned** by the wrapper              |
+| `FnNode.retained`      | `ClosedJaxpr.consts`, `JitProgram` cached state          |
+| `FnNode.call(x)`       | Invoking the transformed function                        |
+| `FnNode.dispose()`     | `jitF.dispose()`, `vjpFn.dispose()`                      |
+
+**The FnNode pattern — every transform must follow this:**
+
+Each transform returns an **owned wrapper** (FnNode) that has three responsibilities:
+
+1. **Owns the inner function** — creates a tree of ownership. `dispose()` propagates down.
+2. **Holds retained handles** — jit constants, cached closures, etc. Listed at construction time.
+3. **Obeys conservation on every call** — the `call()` body consumes input, manages temporaries via
+   `try/finally`, and returns exactly one output. Error paths clean up identically.
+
+```
+grad(f):
+  owns: inner f
+  retains: nothing
+  call(x):
+    y = f(x)                // consumes x (transfer to inner)
+    try: return alloc()     // grad output
+    finally: dispose(y)     // intermediate consumed
+
+jit(f):
+  owns: inner f
+  retains: [compileConst]   // allocated at construction
+  call(x):
+    borrowed = compileConst.ref()   // borrow for this call
+    try: return f(x)                // transfer x to inner
+    finally: dispose(borrowed)      // release temporary borrow
+  dispose():
+    dispose(compileConst)           // release retained handle
+    f.dispose()                     // propagate to inner
+
+vmap(f):
+  owns: inner f
+  retains: nothing
+  call(x):
+    x2 = x.ref()                   // explicit handle for second use
+    try:
+      y1 = f(x)                    // first use consumes x
+      y2 = f(x2)                   // second use consumes x2
+      return alloc()               // vmap output
+    finally: dispose(y1, y2, x2)   // clean up all temporaries+borrows
+
+linearize(f):
+  owns: inner f
+  retains: nothing
+  call(x):
+    try:
+      y = f(x)                     // consumes x
+      linClosure = y.ref()         // retained closure for linear fn
+      tangent = alloc()            // tangent computation
+      return alloc()               // linearize output
+    finally: dispose(tangent, linClosure, y)
+
+vjp(f):
+  owns: inner f
+  retains: nothing
+  call(x):
+    try:
+      y = f(x)                     // consumes x
+      pullback = y.ref()           // retained closure for pullback fn
+      cotangent = alloc()          // cotangent computation
+      return alloc()               // vjp output
+    finally: dispose(cotangent, pullback, y)
+```
+
+**Why this works for all compositions:** Because each wrapper only touches its own scope — it
+transfers input to its inner function, manages its own temporaries in `try/finally`, and releases
+its retained handles in `dispose()`. Nesting `grad(jit(vmap(f)))` produces a chain of FnNodes where
+each layer is independently correct. The outermost `dispose()` cascades down the chain.
+
+**Applying to jax-js code reviews:** When modifying a transform in `src/frontend/`, verify the
+implementation matches the FnNode pattern:
+
+1. **What is owned?** The inner function/jaxpr and any retained state (consts, caches).
+2. **What happens on call?** Input consumed once (transfer or dispose), temporaries in try/finally.
+3. **What happens on dispose?** Retained handles released, then inner disposed.
+4. **What happens on error?** Same as success — the finally block handles it.
+
+If any of these four questions yields "it depends" or "sometimes", the ownership is underspecified
+and the transform will leak or double-free under some composition.
+
 Function arguments are **consumed by default** (refcount −1). Reuse an array by accessing `.ref`
 (refcount +1). The `.data()` method also **consumes the array** after reading.
 

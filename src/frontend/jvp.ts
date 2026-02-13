@@ -399,16 +399,22 @@ const jvpRules: { [P in Primitive]: JvpRule<P> } = {
     ];
   },
   [Primitive.Jit](primals, tangents, { name, jaxpr }) {
-    const newJaxpr = jvpJaxpr(jaxpr);
-    const outs = bind(
-      Primitive.Jit,
-      [...newJaxpr.consts, ...primals, ...tangents],
-      {
-        name: `${name}_jvp`,
-        jaxpr: newJaxpr.jaxpr,
-        numConsts: newJaxpr.consts.length,
-      },
-    );
+    const newJaxpr = jvpJaxpr(jaxpr, { cache: false });
+    const outs = (() => {
+      try {
+        return bind(
+          Primitive.Jit,
+          [...newJaxpr.consts.map((c) => c.ref), ...primals, ...tangents],
+          {
+            name: `${name}_jvp`,
+            jaxpr: newJaxpr.jaxpr,
+            numConsts: newJaxpr.consts.length,
+          },
+        );
+      } finally {
+        newJaxpr.dispose();
+      }
+    })();
     const n = outs.length / 2;
     if (!Number.isInteger(n))
       throw new Error("internal: JVP Jaxpr output length is not even");
@@ -455,7 +461,10 @@ const jvpRules: { [P in Primitive]: JvpRule<P> } = {
     const numY = jaxpr.outs.length - numCarry;
 
     // Transform the body jaxpr to compute JVP
-    const jvpBody = jvpJaxpr(jaxpr);
+    const inJaxprTrace =
+      primals.length > 0 &&
+      primals[0]._trace.main.traceType.name === "JaxprTrace";
+    const jvpBody = jvpJaxpr(jaxpr, { cache: !inJaxprTrace });
 
     // jvpBody.jaxpr.inBinders = [jvpConsts..., primals..., tangents...]
     //   where primals = [constsP, carryP, xP] and tangents = [constsT, carryT, xT]
@@ -578,6 +587,7 @@ const jvpRules: { [P in Primitive]: JvpRule<P> } = {
     // Dispose the wrapper jaxpr (not cached)
     // Note: jvpBody is cached via jvpJaxprCache, so we don't dispose it
     wrapperJaxpr.dispose();
+    if (inJaxprTrace) jvpBody.dispose();
 
     // Results layout from wrapper: [carryP..., carryT..., yP..., yT...]
     const carryOutP = results.slice(0, numCarry);
@@ -616,8 +626,11 @@ ClosedJaxpr._disposeHooks.push((jaxpr: Jaxpr) => {
   }
 });
 
-function jvpJaxpr(jaxpr: Jaxpr): ClosedJaxpr {
-  if (jvpJaxprCache.has(jaxpr)) {
+function jvpJaxpr(
+  jaxpr: Jaxpr,
+  { cache = true }: { cache?: boolean } = {},
+): ClosedJaxpr {
+  if (cache && jvpJaxprCache.has(jaxpr)) {
     return jvpJaxprCache.get(jaxpr)!;
   }
 
@@ -634,7 +647,7 @@ function jvpJaxpr(jaxpr: Jaxpr): ClosedJaxpr {
       jvpFlat(jaxprAsFun(jaxpr), primals, tangents),
   )(inAvals, inAvals);
 
-  jvpJaxprCache.set(jaxpr, newJaxpr);
+  if (cache) jvpJaxprCache.set(jaxpr, newJaxpr);
   return newJaxpr;
 }
 

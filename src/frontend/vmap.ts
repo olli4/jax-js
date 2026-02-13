@@ -408,12 +408,22 @@ const vmapRules: Partial<{ [P in Primitive]: VmapRule<P> }> = {
   [Primitive.Cholesky]: lastDimsBatcher(Primitive.Cholesky, 2),
   [Primitive.LU]: lastDimsBatcher(Primitive.LU, 2, 3),
   [Primitive.Jit](axisSize, args, dims, { name, jaxpr }) {
-    const newJaxpr = vmapJaxpr(jaxpr, axisSize, dims);
-    const outs = bind(Primitive.Jit, [...newJaxpr.consts, ...args], {
-      name: `${name}_vmap`,
-      jaxpr: newJaxpr.jaxpr,
-      numConsts: newJaxpr.consts.length,
-    });
+    const newJaxpr = vmapJaxpr(jaxpr, axisSize, dims, { cache: false });
+    const outs = (() => {
+      try {
+        return bind(
+          Primitive.Jit,
+          [...newJaxpr.consts.map((c) => c.ref), ...args],
+          {
+            name: `${name}_vmap`,
+            jaxpr: newJaxpr.jaxpr,
+            numConsts: newJaxpr.consts.length,
+          },
+        );
+      } finally {
+        newJaxpr.dispose();
+      }
+    })();
     return [outs, rep(outs.length, 0)];
   },
   [Primitive.DynamicUpdateSlice]() {
@@ -478,7 +488,11 @@ const vmapRules: Partial<{ [P in Primitive]: VmapRule<P> }> = {
     ];
 
     // Create vmapped body jaxpr
-    const vmappedBody = vmapJaxpr(jaxpr, axisSize, bodyDims);
+    const inJaxprTrace =
+      args.length > 0 && args[0]._trace.main.traceType.name === "JaxprTrace";
+    const vmappedBody = vmapJaxpr(jaxpr, axisSize, bodyDims, {
+      cache: !inJaxprTrace,
+    });
 
     // Build scan args with moved arrays
     const scanArgs = [
@@ -496,6 +510,7 @@ const vmapRules: Partial<{ [P in Primitive]: VmapRule<P> }> = {
       length,
       reverse,
     });
+    if (inJaxprTrace) vmappedBody.dispose();
 
     // Results: carry has batch at axis 0, ys has batch at axis 1
     // Move ys batch from axis 1 to axis 0
@@ -538,9 +553,12 @@ function vmapJaxpr(
   jaxpr: Jaxpr,
   axisSize: number,
   dims: (number | null)[],
+  { cache = true }: { cache?: boolean } = {},
 ): ClosedJaxpr {
   const cacheKey = JSON.stringify([axisSize, dims]); // deterministic
-  const prevResult = vmapJaxprCache.get(jaxpr)?.get(cacheKey);
+  const prevResult = cache
+    ? vmapJaxprCache.get(jaxpr)?.get(cacheKey)
+    : undefined;
   if (prevResult) return prevResult;
 
   // Consts in the Jaxpr become real inputs after vmap transformation, which is
@@ -559,8 +577,10 @@ function vmapJaxpr(
     vmapFlat(jaxprAsFun(jaxpr), dims, args),
   )(inAvals);
 
-  if (!vmapJaxprCache.has(jaxpr)) vmapJaxprCache.set(jaxpr, new Map());
-  vmapJaxprCache.get(jaxpr)!.set(cacheKey, newJaxpr);
+  if (cache) {
+    if (!vmapJaxprCache.has(jaxpr)) vmapJaxprCache.set(jaxpr, new Map());
+    vmapJaxprCache.get(jaxpr)!.set(cacheKey, newJaxpr);
+  }
   return newJaxpr;
 }
 
@@ -667,8 +687,13 @@ export function jacfwd(f: any) {
     const basis = eye(size, undefined, { dtype: x.dtype });
     const basisRcBefore = basis.refCount;
     const out = vmap(pushfwd, [0])(basis.ref);
-    while (basis.refCount >= basisRcBefore) {
-      basis.dispose();
+    const inJaxprTrace = x._trace.main.traceType.name === "JaxprTrace";
+    if (inJaxprTrace) {
+      if (basis.refCount > 0) basis.dispose();
+    } else {
+      while (basis.refCount >= basisRcBefore) {
+        basis.dispose();
+      }
     }
     while (x.refCount >= xRcBefore) {
       x.dispose();
