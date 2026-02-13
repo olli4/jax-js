@@ -575,19 +575,23 @@ const jvpRules: { [P in Primitive]: JvpRule<P> } = {
       ...xsT.map((x) => x.ref),
     ];
 
-    const results = bind(Primitive.Scan, scanArgsJvp, {
-      jaxpr: wrapperJaxpr.jaxpr,
-      numCarry: numCarry * 2,
-      numConsts: wrapperJaxpr.consts.length + numConsts * 2,
-      length,
-      reverse,
-      checkpoint,
-    });
-
-    // Dispose the wrapper jaxpr (not cached)
-    // Note: jvpBody is cached via jvpJaxprCache, so we don't dispose it
-    wrapperJaxpr.dispose();
-    if (inJaxprTrace) jvpBody.dispose();
+    const results = (() => {
+      try {
+        return bind(Primitive.Scan, scanArgsJvp, {
+          jaxpr: wrapperJaxpr.jaxpr,
+          numCarry: numCarry * 2,
+          numConsts: wrapperJaxpr.consts.length + numConsts * 2,
+          length,
+          reverse,
+          checkpoint,
+        });
+      } finally {
+        // Dispose the wrapper jaxpr (not cached)
+        // Note: jvpBody is cached via jvpJaxprCache, so we don't dispose it
+        wrapperJaxpr.dispose();
+        if (inJaxprTrace) jvpBody.dispose();
+      }
+    })();
 
     // Results layout from wrapper: [carryP..., carryT..., yP..., yT...]
     const carryOutP = results.slice(0, numCarry);

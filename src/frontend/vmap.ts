@@ -503,14 +503,19 @@ const vmapRules: Partial<{ [P in Primitive]: VmapRule<P> }> = {
     ];
 
     // Run the scan
-    const results = bind(Primitive.Scan, scanArgs, {
-      jaxpr: vmappedBody.jaxpr,
-      numCarry,
-      numConsts: vmappedBody.consts.length,
-      length,
-      reverse,
-    });
-    if (inJaxprTrace) vmappedBody.dispose();
+    const results = (() => {
+      try {
+        return bind(Primitive.Scan, scanArgs, {
+          jaxpr: vmappedBody.jaxpr,
+          numCarry,
+          numConsts: vmappedBody.consts.length,
+          length,
+          reverse,
+        });
+      } finally {
+        if (inJaxprTrace) vmappedBody.dispose();
+      }
+    })();
 
     // Results: carry has batch at axis 0, ys has batch at axis 1
     // Move ys batch from axis 1 to axis 0
