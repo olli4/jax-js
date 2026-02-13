@@ -5027,30 +5027,6 @@ function aluCompare(a, b, op) {
 }
 
 //#endregion
-//#region src/frontend/symbolic-zero.ts
-/**
-* Symbolic zero tangent/cotangent value for AD internals.
-*
-* Represents a mathematically-zero value without allocating backend storage
-* until materialization is required by a primitive rule.
-*/
-var SymbolicZero = class {
-	aval;
-	constructor(aval) {
-		this.aval = ShapedArray.fromAval(aval);
-	}
-	materialize() {
-		return zeros(this.aval.shape, { dtype: this.aval.dtype });
-	}
-	toString() {
-		return `SymbolicZero(${this.aval.toString()})`;
-	}
-};
-function isSymbolicZero(x) {
-	return x instanceof SymbolicZero;
-}
-
-//#endregion
 //#region src/frontend/vmap.ts
 function mappedAval(batchDim, aval) {
 	const shape$1 = [...aval.shape];
@@ -5499,13 +5475,12 @@ var JVPTracer = class extends Tracer {
 		return `JVPTracer(${this.primal.toString()}, ${this.tangent.toString()})`;
 	}
 	get ref() {
-		this.primal.ref;
-		if (this.tangent instanceof Tracer) this.tangent.ref;
+		this.primal.ref, this.tangent.ref;
 		return this;
 	}
 	dispose() {
 		this.primal.dispose();
-		if (this.tangent instanceof Tracer) this.tangent.dispose();
+		this.tangent.dispose();
 	}
 };
 var JVPTrace = class extends Trace {
@@ -5513,32 +5488,13 @@ var JVPTrace = class extends Trace {
 		return this.lift(pureArray(val));
 	}
 	lift(val) {
-		return new JVPTracer(this, val, new SymbolicZero(val.aval));
+		return new JVPTracer(this, val, zerosLike$1(val.ref));
 	}
 	processPrimitive(primitive, tracers, params) {
-		const [primalsIn, tangentsInRaw] = unzip2(tracers.map((x) => [x.primal, x.tangent]));
-		const materializedZeros = [];
-		const tangentsIn = tangentsInRaw.map((t) => {
-			if (isSymbolicZero(t)) {
-				const z = t.materialize();
-				materializedZeros.push(z);
-				return z;
-			}
-			return t;
-		});
+		const [primalsIn, tangentsIn] = unzip2(tracers.map((x) => [x.primal, x.tangent]));
 		const jvpRule = jvpRules[primitive];
 		if (jvpRule === void 0) throw new Error(`No JVP rule for: ${primitive}`);
 		const [primalsOut, tangentsOut] = jvpRule(primalsIn, tangentsIn, params);
-		if (primalsIn.every((p) => p instanceof Array$1)) {
-			const tangentOutSet = new Set(tangentsOut.filter((t) => t instanceof Tracer));
-			for (const z of materializedZeros) {
-				if (!(z instanceof Array$1)) continue;
-				if (tangentOutSet.has(z)) continue;
-				try {
-					z.dispose();
-				} catch {}
-			}
-		}
 		return zip(primalsOut, tangentsOut).map(([x, t]) => new JVPTracer(this, x, t));
 	}
 };
@@ -5563,7 +5519,7 @@ function zeroTangentsJvp(primitive) {
 	return (primals, tangents, params) => {
 		for (const t of tangents) t.dispose();
 		const ys = bind(primitive, primals, params);
-		return [ys, ys.map((y) => new SymbolicZero(y.aval))];
+		return [ys, ys.map((y) => zerosLike$1(y.ref))];
 	};
 }
 /** Compute `a @ b.T`, batched to last two axes. */
@@ -5935,8 +5891,7 @@ function jvp$1(f, primals, tangents, { hasAux = false } = {}) {
 			return pureArray(x);
 		});
 	}
-	const [primalsOutFlat, tangentsOutFlatRaw] = jvpFlat(flatFun, pFlat, tFlat);
-	const tangentsOutFlat = tangentsOutFlatRaw.map((t) => isSymbolicZero(t) ? t.materialize() : t);
+	const [primalsOutFlat, tangentsOutFlat] = jvpFlat(flatFun, pFlat, tFlat);
 	if (topLevel) {
 		for (let i = 0; i < pFlat.length; i++) if (ownedP[i]) try {
 			pFlat[i].dispose();
@@ -5960,7 +5915,7 @@ function lowerAux(aux) {
 	const level = currentTraceLevel();
 	return map((x) => {
 		if (x instanceof Tracer) while (x._trace.main.level > level) if (x instanceof JVPTracer) {
-			if (x.tangent instanceof Tracer) x.tangent.dispose();
+			x.tangent.dispose();
 			x = x.primal;
 		} else {
 			const y = x.fullLower();
@@ -6018,7 +5973,6 @@ function partialEvalFlat(f, pvalsIn) {
 				collectOwned(val.tangent);
 			}
 		};
-		for (const c of jaxpr.consts) collectOwned(c);
 		for (const pv of pvalsOut) if (pv.isKnown) collectOwned(pv.val);
 		const sweepOrphans = () => {
 			for (const pet of allPets) {
