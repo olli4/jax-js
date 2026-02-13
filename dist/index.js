@@ -5343,14 +5343,19 @@ const vmapRules = {
 			...movedCarry,
 			...movedXs
 		];
-		const results = bind(Primitive.Scan, scanArgs, {
-			jaxpr: vmappedBody.jaxpr,
-			numCarry,
-			numConsts: vmappedBody.consts.length,
-			length,
-			reverse
-		});
-		if (inJaxprTrace) vmappedBody.dispose();
+		const results = (() => {
+			try {
+				return bind(Primitive.Scan, scanArgs, {
+					jaxpr: vmappedBody.jaxpr,
+					numCarry,
+					numConsts: vmappedBody.consts.length,
+					length,
+					reverse
+				});
+			} finally {
+				if (inJaxprTrace) vmappedBody.dispose();
+			}
+		})();
 		const carryOut = results.slice(0, numCarry);
 		const ysOut = results.slice(numCarry);
 		const movedYs = ysOut.map((y) => moveaxis(y, 1, 0));
@@ -5795,16 +5800,21 @@ const jvpRules = {
 			...xsP.map((x) => x.ref),
 			...xsT.map((x) => x.ref)
 		];
-		const results = bind(Primitive.Scan, scanArgsJvp, {
-			jaxpr: wrapperJaxpr.jaxpr,
-			numCarry: numCarry * 2,
-			numConsts: wrapperJaxpr.consts.length + numConsts * 2,
-			length,
-			reverse,
-			checkpoint
-		});
-		wrapperJaxpr.dispose();
-		if (inJaxprTrace) jvpBody.dispose();
+		const results = (() => {
+			try {
+				return bind(Primitive.Scan, scanArgsJvp, {
+					jaxpr: wrapperJaxpr.jaxpr,
+					numCarry: numCarry * 2,
+					numConsts: wrapperJaxpr.consts.length + numConsts * 2,
+					length,
+					reverse,
+					checkpoint
+				});
+			} finally {
+				wrapperJaxpr.dispose();
+				if (inJaxprTrace) jvpBody.dispose();
+			}
+		})();
 		const carryOutP = results.slice(0, numCarry);
 		const carryOutT = results.slice(numCarry, numCarry * 2);
 		const ysP = results.slice(numCarry * 2, numCarry * 2 + numY);
