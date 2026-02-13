@@ -5291,12 +5291,18 @@ const vmapRules = {
 	[Primitive.Cholesky]: lastDimsBatcher(Primitive.Cholesky, 2),
 	[Primitive.LU]: lastDimsBatcher(Primitive.LU, 2, 3),
 	[Primitive.Jit](axisSize, args, dims, { name, jaxpr }) {
-		const newJaxpr = vmapJaxpr(jaxpr, axisSize, dims);
-		const outs = bind(Primitive.Jit, [...newJaxpr.consts, ...args], {
-			name: `${name}_vmap`,
-			jaxpr: newJaxpr.jaxpr,
-			numConsts: newJaxpr.consts.length
-		});
+		const newJaxpr = vmapJaxpr(jaxpr, axisSize, dims, { cache: false });
+		const outs = (() => {
+			try {
+				return bind(Primitive.Jit, [...newJaxpr.consts.map((c) => c.ref), ...args], {
+					name: `${name}_vmap`,
+					jaxpr: newJaxpr.jaxpr,
+					numConsts: newJaxpr.consts.length
+				});
+			} finally {
+				newJaxpr.dispose();
+			}
+		})();
 		return [outs, rep(outs.length, 0)];
 	},
 	[Primitive.DynamicUpdateSlice]() {
@@ -5329,7 +5335,8 @@ const vmapRules = {
 			...rep(numCarry, 0),
 			...rep(numX, 0)
 		];
-		const vmappedBody = vmapJaxpr(jaxpr, axisSize, bodyDims);
+		const inJaxprTrace = args.length > 0 && args[0]._trace.main.traceType.name === "JaxprTrace";
+		const vmappedBody = vmapJaxpr(jaxpr, axisSize, bodyDims, { cache: !inJaxprTrace });
 		const scanArgs = [
 			...vmappedBody.consts.map((c) => c.ref),
 			...movedConsts,
@@ -5343,6 +5350,7 @@ const vmapRules = {
 			length,
 			reverse
 		});
+		if (inJaxprTrace) vmappedBody.dispose();
 		const carryOut = results.slice(0, numCarry);
 		const ysOut = results.slice(numCarry);
 		const movedYs = ysOut.map((y) => moveaxis(y, 1, 0));
@@ -5365,9 +5373,9 @@ ClosedJaxpr._disposeHooks.push((jaxpr) => {
 		vmapJaxprCache.delete(jaxpr);
 	}
 });
-function vmapJaxpr(jaxpr, axisSize, dims) {
+function vmapJaxpr(jaxpr, axisSize, dims, { cache = true } = {}) {
 	const cacheKey = JSON.stringify([axisSize, dims]);
-	const prevResult = vmapJaxprCache.get(jaxpr)?.get(cacheKey);
+	const prevResult = cache ? vmapJaxprCache.get(jaxpr)?.get(cacheKey) : void 0;
 	if (prevResult) return prevResult;
 	const inAvals = jaxpr.inBinders.map((v, i) => {
 		if (dims[i] === null) return v.aval;
@@ -5376,8 +5384,10 @@ function vmapJaxpr(jaxpr, axisSize, dims) {
 		return new ShapedArray(shape$1, v.aval.dtype, v.aval.weakType);
 	});
 	const { jaxpr: newJaxpr } = makeJaxpr$1((args) => vmapFlat(jaxprAsFun(jaxpr), dims, args))(inAvals);
-	if (!vmapJaxprCache.has(jaxpr)) vmapJaxprCache.set(jaxpr, /* @__PURE__ */ new Map());
-	vmapJaxprCache.get(jaxpr).set(cacheKey, newJaxpr);
+	if (cache) {
+		if (!vmapJaxprCache.has(jaxpr)) vmapJaxprCache.set(jaxpr, /* @__PURE__ */ new Map());
+		vmapJaxprCache.get(jaxpr).set(cacheKey, newJaxpr);
+	}
 	return newJaxpr;
 }
 function vmapFlat(f, inAxes, args) {
@@ -5437,7 +5447,10 @@ function jacfwd$1(f) {
 		const basis = eye(size$1, void 0, { dtype: x.dtype });
 		const basisRcBefore = basis.refCount;
 		const out = vmap$1(pushfwd, [0])(basis.ref);
-		while (basis.refCount >= basisRcBefore) basis.dispose();
+		const inJaxprTrace = x._trace.main.traceType.name === "JaxprTrace";
+		if (inJaxprTrace) {
+			if (basis.refCount > 0) basis.dispose();
+		} else while (basis.refCount >= basisRcBefore) basis.dispose();
 		while (x.refCount >= xRcBefore) x.dispose();
 		return out;
 	};
@@ -5690,16 +5703,22 @@ const jvpRules = {
 		]];
 	},
 	[Primitive.Jit](primals, tangents, { name, jaxpr }) {
-		const newJaxpr = jvpJaxpr(jaxpr);
-		const outs = bind(Primitive.Jit, [
-			...newJaxpr.consts,
-			...primals,
-			...tangents
-		], {
-			name: `${name}_jvp`,
-			jaxpr: newJaxpr.jaxpr,
-			numConsts: newJaxpr.consts.length
-		});
+		const newJaxpr = jvpJaxpr(jaxpr, { cache: false });
+		const outs = (() => {
+			try {
+				return bind(Primitive.Jit, [
+					...newJaxpr.consts.map((c) => c.ref),
+					...primals,
+					...tangents
+				], {
+					name: `${name}_jvp`,
+					jaxpr: newJaxpr.jaxpr,
+					numConsts: newJaxpr.consts.length
+				});
+			} finally {
+				newJaxpr.dispose();
+			}
+		})();
 		const n = outs.length / 2;
 		if (!Number.isInteger(n)) throw new Error("internal: JVP Jaxpr output length is not even");
 		const [primalsOut, tangentsOut] = [outs.slice(0, n), outs.slice(n)];
@@ -5711,7 +5730,8 @@ const jvpRules = {
 	[Primitive.Scan](primals, tangents, { jaxpr, numCarry, numConsts, length, reverse, checkpoint }) {
 		const numX = primals.length - numConsts - numCarry;
 		const numY = jaxpr.outs.length - numCarry;
-		const jvpBody = jvpJaxpr(jaxpr);
+		const inJaxprTrace = primals.length > 0 && primals[0]._trace.main.traceType.name === "JaxprTrace";
+		const jvpBody = jvpJaxpr(jaxpr, { cache: !inJaxprTrace });
 		const numJvpConsts = jvpBody.consts.length;
 		const numBodyInputs = numConsts + numCarry + numX;
 		const jvpOrderAvals = jvpBody.jaxpr.inBinders.slice(numJvpConsts).map((v) => v.aval);
@@ -5784,6 +5804,7 @@ const jvpRules = {
 			checkpoint
 		});
 		wrapperJaxpr.dispose();
+		if (inJaxprTrace) jvpBody.dispose();
 		const carryOutP = results.slice(0, numCarry);
 		const carryOutT = results.slice(numCarry, numCarry * 2);
 		const ysP = results.slice(numCarry * 2, numCarry * 2 + numY);
@@ -5809,11 +5830,11 @@ ClosedJaxpr._disposeHooks.push((jaxpr) => {
 		jvpJaxprCache.delete(jaxpr);
 	}
 });
-function jvpJaxpr(jaxpr) {
-	if (jvpJaxprCache.has(jaxpr)) return jvpJaxprCache.get(jaxpr);
+function jvpJaxpr(jaxpr, { cache = true } = {}) {
+	if (cache && jvpJaxprCache.has(jaxpr)) return jvpJaxprCache.get(jaxpr);
 	const inAvals = jaxpr.inBinders.map((v) => v.aval);
 	const { jaxpr: newJaxpr } = makeJaxpr$1((primals, tangents) => jvpFlat(jaxprAsFun(jaxpr), primals, tangents))(inAvals, inAvals);
-	jvpJaxprCache.set(jaxpr, newJaxpr);
+	if (cache) jvpJaxprCache.set(jaxpr, newJaxpr);
 	return newJaxpr;
 }
 function jvpFlat(f, primals, tangents) {
@@ -6018,7 +6039,9 @@ function linearize$1(f, primalsIn, { hasAux = false } = {}) {
 	let fFlat, outTree, aux;
 	if (hasAux) [fFlat, outTree, aux] = flattenFunWithAux(f, inTree);
 	else [fFlat, outTree] = flattenFun(f, inTree);
-	const [primalsOutFlat, fLinFlat, dispose$1, sweepOrphans] = linearizeFlat(fFlat, primalsInFlat.map(pureArray));
+	const pureArgs = primalsInFlat.map(pureArray);
+	const rcBeforeTrace = pureArgs.map((a) => a.refCount);
+	const [primalsOutFlat, fLinFlat, dispose$1, sweepOrphans] = linearizeFlat(fFlat, pureArgs);
 	if (outTree.value === void 0) throw new Error("outTree was not set in linearize");
 	const primalsOut = unflatten(outTree.value, primalsOutFlat);
 	const fLin = ((...tangentsIn) => {
@@ -6027,7 +6050,10 @@ function linearize$1(f, primalsIn, { hasAux = false } = {}) {
 		const tangentsOutFlat = fLinFlat(...tangentsInFlat.map(pureArray));
 		return unflatten(outTree.value, tangentsOutFlat);
 	});
-	fLin.dispose = dispose$1;
+	fLin.dispose = () => {
+		dispose$1();
+		for (let i = 0; i < pureArgs.length; i++) if (pureArgs[i].refCount >= rcBeforeTrace[i]) pureArgs[i].dispose();
+	};
 	if (hasAux) {
 		const auxOut = lowerAux(aux.value);
 		sweepOrphans();
@@ -6618,7 +6644,7 @@ const transposeRules = {
 		const newJaxpr = transposeJaxpr(jaxpr, undefPrimals);
 		const residuals = args.filter((x, i$1) => !undefPrimals[i$1]);
 		const outs = bind(Primitive.Jit, [
-			...newJaxpr.consts,
+			...newJaxpr.consts.map((c) => c.ref),
 			...residuals,
 			...cts
 		], {
