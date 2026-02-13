@@ -201,6 +201,9 @@ Move semantics is necessary, but not sufficient by itself. The full ownership mo
 For the full maintainer + user checklist, see
 [`docs/ownership-principles.md`](docs/ownership-principles.md).
 
+For test governance during large refactors, including architectural-mode expected-failure
+accounting, see [`docs/testing-policy.md`](docs/testing-policy.md).
+
 **You must follow these rules on your own functions as well!** All combinators like `jvp`, `grad`,
 `jit` assume that you are following these conventions on how arguments are passed, and they will
 respect them as well.

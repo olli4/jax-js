@@ -1,9 +1,19 @@
 pnpm exec lint-staged
 
-# Run the full test suite before committing to catch regressions early
-pnpm vitest run
+# Architectural mode is opt-in for large refactors:
+#   JAX_ARCH_MODE=1 git commit -m "..."
+# In this mode, full-suite failures are allowed only if declared in
+# .ci/expected-failures.json with owner/reason/expiry, and core invariant
+# suites still run strictly.
+if [ "${JAX_ARCH_MODE:-0}" = "1" ]; then
+	pnpm run test:arch
+	pnpm run build
+else
+	# Default strict mode: no expected-failure debt accepted.
+	pnpm run test:policy:strict
 
-# Run Deno WebGPU tests (requires build for dist/ imports)
-pnpm run build
-pnpm run test:deno
+	# Run Deno WebGPU tests (requires build for dist/ imports)
+	pnpm run build
+	pnpm run test:deno
+fi
 
