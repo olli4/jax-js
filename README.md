@@ -201,6 +201,9 @@ Move semantics is necessary, but not sufficient by itself. The full ownership mo
 For the full maintainer + user checklist, see
 [`docs/ownership-principles.md`](docs/ownership-principles.md).
 
+For user-facing linting guidance (how to enable linting, what it catches, and which principles are
+user-level vs maintainer-level), see [`docs/ownership-linting.md`](docs/ownership-linting.md).
+
 For test governance during large refactors, including architectural-mode expected-failure
 accounting, see [`docs/testing-policy.md`](docs/testing-policy.md).
 
@@ -402,6 +405,20 @@ Then you can run tests in a headless browser using [Vitest](https://vitest.dev/)
 ```bash
 pnpm exec playwright install
 pnpm test
+```
+
+For full validation (including hardware WebGPU coverage and policy checks), run:
+
+```bash
+pnpm run test:deno         # Deno WebGPU lane (headless GPU)
+pnpm run test:all          # Vitest + Deno umbrella lane
+pnpm run test:policy:strict
+```
+
+If you're touching ownership/lifecycle-sensitive code, also run the local rule tests:
+
+```bash
+pnpm run lint:ownership:test
 ```
 
 We are currently on an older version of Playwright that supports using WebGPU in headless mode;

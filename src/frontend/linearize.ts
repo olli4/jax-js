@@ -8,11 +8,12 @@ import {
   unflatten as treeUnflatten,
 } from "../tree";
 import {
-  checkInts,
   DEBUG,
   deepEqual,
   generalBroadcast,
+  IndexSpec,
   invertPermutation,
+  normalizeIndexSpec,
   partitionList,
   range,
   toposort,
@@ -138,7 +139,7 @@ function partialEvalFlat(
   // (e.g., lowerAux for hasAux paths) because those paths call fullLower()
   // which properly transfers ownership before the PET reaches rc=0.
   const allPets = peData.allPets;
-  // Collect values that are owned by the ClosedJaxpr or pvalsOut — skip these.
+  // Collect values that are still externally owned (pvalsOut) — skip these.
   // Must recursively walk JVPTracer-like values since owned values may be
   // JVPTracers whose primal/tangent are PET-held values.
   const ownedValues = new Set<Tracer>();
@@ -151,7 +152,6 @@ function partialEvalFlat(
       collectOwned(val.tangent);
     }
   };
-  for (const c of jaxpr.consts) collectOwned(c);
   for (const pv of pvalsOut) {
     if (pv.isKnown) collectOwned(pv.val!);
   }
@@ -994,6 +994,7 @@ function evalJaxprTransposed(
     if (!rule) {
       throw new TypeError(`Backward pass not implemented for ${eqn.primitive}`);
     }
+
     const cotangentsIn = rule(cotangentsOut, primalsIn, eqn.params as any);
     for (let j = 0; j < eqn.inputs.length; j++) {
       const v = eqn.inputs[j];
@@ -1577,8 +1578,9 @@ const transposeRules: Partial<{ [P in Primitive]: TransposeRule<P> }> = {
 
     // Initialize running cotangent for carry (tangent carry cotangents only)
     let ctCarryRunning = ctCarryAll.slice(numPrimalCarry).map((c) => c.ref);
-    // Dispose primal carry cotangents
-    for (let i = 0; i < numPrimalCarry; i++) ctCarryAll[i].dispose();
+    // Consume all incoming carry cotangent handles. Tangent entries are retained
+    // via ctCarryRunning refs above; primal entries are not needed.
+    for (const ct of ctCarryAll) ct.dispose();
 
     // Accumulate cotangents for xs and consts
     const ctXsAccum: Tracer[][] = [];
@@ -1765,7 +1767,9 @@ const transposeRules: Partial<{ [P in Primitive]: TransposeRule<P> }> = {
 
     // Cleanup
     primalForwardJaxpr.dispose();
-    transposedBody.dispose();
+    // Disposing tangentBody triggers transpose cache cleanup for its jaxpr,
+    // including transposedBody.
+    tangentBody.dispose();
     for (const c of constResiduals) c.dispose();
     for (const c of carryResiduals) c.dispose();
     for (const c of xsResiduals) c.dispose();
@@ -1933,7 +1937,7 @@ export type GradOpts = {
    *
    * Defaults to `0` (the first argument).
    */
-  argnums?: number | number[];
+  argnums?: IndexSpec;
 
   /**
    * The input function returns a pair of `[out, aux]` including an auxiliary
@@ -1959,10 +1963,11 @@ export function grad(f: (...primals: any) => Tracer, opts?: GradOpts) {
 }
 
 export function valueAndGrad(f: (...primals: any) => Tracer, opts?: GradOpts) {
-  const argnums = opts?.argnums ?? 0; // By default, differentiate w.r.t. first arg.
+  const argnumsSpec = opts?.argnums ?? 0; // By default, differentiate w.r.t. first arg.
   const hasAux = opts?.hasAux ?? false;
-  checkInts(argnums);
-  const argnumsSet = new Set(typeof argnums === "number" ? [argnums] : argnums);
+  const argnums = normalizeIndexSpec(argnumsSpec, "argnums");
+  const argnumsSet = new Set(argnums);
+  const returnSingleGrad = typeof argnumsSpec === "number";
   return (...x: any) => {
     if (x.length === 0) {
       throw new Error("grad requires at least one argument to differentiate");
@@ -1989,8 +1994,9 @@ export function valueAndGrad(f: (...primals: any) => Tracer, opts?: GradOpts) {
     for (let i = 0; i < cts.length; i++) {
       if (!argnumsSet.has(i)) treeDispose(cts[i]);
     }
-    const grads =
-      typeof argnums === "number" ? cts[argnums] : argnums.map((i) => cts[i]);
+    const grads = returnSingleGrad
+      ? cts[argnums[0]]
+      : argnums.map((i) => cts[i]);
     return hasAux ? [[y, aux], grads] : [y, grads];
   };
 }

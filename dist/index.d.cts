@@ -141,6 +141,15 @@ declare class ShapeTracker {
 declare function setDebug(level: number): void;
 /** The execution strategy chosen for a scan loop. */
 type ScanPath = "compiled-loop" | "preencoded-routine" | "fallback";
+/**
+ * Index spec accepted by argnums/staticArgnums-style options.
+ *
+ * Supports classic positional forms (`number`, `number[]`) and JS-style
+ * dictionary forms (`{ "0": true, "2": true }`).
+ */
+type IndexSpec = number | number[] | Record<number | string, boolean>;
+/** Normalize index specs to a validated sorted list of unique integers. */
+
 /** @inline */
 type RecursiveArray<T> = T | RecursiveArray<T>[];
 interface FpHashable {
@@ -710,7 +719,7 @@ declare class ClosedJaxpr {
 }
 /** @inline */
 type JitOpts = {
-  staticArgnums?: number[];
+  staticArgnums?: IndexSpec;
 };
 //#endregion
 //#region src/frontend/core.d.ts
@@ -1444,7 +1453,7 @@ type GradOpts = {
    *
    * Defaults to `0` (the first argument).
    */
-  argnums?: number | number[];
+  argnums?: IndexSpec;
   /**
    * The input function returns a pair of `[out, aux]` including an auxiliary
    * value. This `aux` is not differentiated, but is returned alongside the
@@ -3202,7 +3211,9 @@ declare const vjp: <F extends (...args: any[]) => JsTree<Array>, const HA extend
   hasAux?: HA;
 }) => HA extends true ? ReturnType<F> extends [infer Out, infer Aux] ? [Out, OwnedFunction<(cotangents: MapJsTree<Out, Array, ArrayLike>) => MapJsTree<Parameters<F>, ArrayLike, Array>>, Aux] : never : [ReturnType<F>, OwnedFunction<(cotangents: MapJsTree<ReturnType<F>, Array, ArrayLike>) => MapJsTree<Parameters<F>, ArrayLike, Array>>];
 /** @inline */
-type GradOutputType<I, F extends (...args: any[]) => any> = MapJsTree<I extends undefined ? Parameters<F>[0] : I extends number ? Parameters<F>[I] : I extends number[] ? { [K in keyof I]: I[K] extends number ? Parameters<F>[I[K]] : never } : never, ArrayLike, Array>;
+type ObjectIndexSpec = Record<number | string, boolean>;
+/** @inline */
+type GradOutputType<I, F extends (...args: any[]) => any> = MapJsTree<I extends undefined ? Parameters<F>[0] : I extends number ? Parameters<F>[I] : I extends number[] ? { [K in keyof I]: I[K] extends number ? Parameters<F>[I[K]] : never } : I extends ObjectIndexSpec ? Parameters<F>[number][] : never, ArrayLike, Array>;
 /**
  * @function
  * Compute the gradient of a scalar-valued function `f` with respect to its
@@ -3226,7 +3237,7 @@ type GradOutputType<I, F extends (...args: any[]) => any> = MapJsTree<I extends 
  * const [gradient, aux] = grad(f, { hasAux: true })(x);
  * ```
  */
-declare const grad: <F extends (...args: any[]) => JsTree<Array>, const I extends undefined | number | number[] = undefined, const HA extends boolean = false>(f: F, opts?: Omit<GradOpts, "argnums" | "hasAux"> & {
+declare const grad: <F extends (...args: any[]) => JsTree<Array>, const I extends undefined | number | number[] | ObjectIndexSpec = undefined, const HA extends boolean = false>(f: F, opts?: Omit<GradOpts, "argnums" | "hasAux"> & {
   argnums?: I;
   hasAux?: HA;
 }) => (...primals: MapJsTree<Parameters<F>, Array, ArrayLike>) => HA extends true ? ReturnType<F> extends [any, infer Aux] ? [GradOutputType<I, F>, Aux] : never : GradOutputType<I, F>;
@@ -3246,7 +3257,7 @@ declare const grad: <F extends (...args: any[]) => JsTree<Array>, const I extend
  * const [[value, aux], gradient] = valueAndGrad(f, { hasAux: true })(x);
  * ```
  */
-declare const valueAndGrad: <F extends (...args: any[]) => JsTree<Array>, const I extends undefined | number | number[] = undefined, const HA extends boolean = false>(f: F, opts?: Omit<GradOpts, "argnums"> & {
+declare const valueAndGrad: <F extends (...args: any[]) => JsTree<Array>, const I extends undefined | number | number[] | ObjectIndexSpec = undefined, const HA extends boolean = false>(f: F, opts?: Omit<GradOpts, "argnums"> & {
   argnums?: I;
   hasAux?: HA;
 }) => (...primals: MapJsTree<Parameters<F>, Array, ArrayLike>) => [ReturnType<F>, GradOutputType<I, F>];

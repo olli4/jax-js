@@ -4,6 +4,8 @@ import * as eslintImport from "eslint-plugin-import";
 import globals from "globals";
 import ts from "typescript-eslint";
 
+import ownershipPlugin from "./scripts/eslint-plugin-ownership/index.mjs";
+
 export default defineConfig([
   globalIgnores([
     "**/dist/",
@@ -28,8 +30,15 @@ export default defineConfig([
     },
   },
   {
-    plugins: { import: eslintImport },
+    files: ["scripts/eslint-plugin-ownership/**/*.mjs"],
+    ...ts.configs.disableTypeChecked,
+  },
+  {
+    plugins: { import: eslintImport, "@ownership": ownershipPlugin as any },
     rules: {
+      "@ownership/require-retained-release": "warn",
+      "@ownership/require-try-finally-symmetry": "warn",
+      "@ownership/require-wrapper-dispose-symmetry": "warn",
       "@typescript-eslint/consistent-type-exports": "error",
       "@typescript-eslint/no-array-constructor": "off",
       "@typescript-eslint/no-empty-object-type": "off",
@@ -78,6 +87,12 @@ export default defineConfig([
           memberSyntaxSortOrder: ["none", "all", "multiple", "single"],
         },
       ],
+    },
+  },
+  {
+    files: ["scripts/eslint-plugin-ownership/**/*.mjs"],
+    rules: {
+      "@typescript-eslint/consistent-type-exports": "off",
     },
   },
 ]);

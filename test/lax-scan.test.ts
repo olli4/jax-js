@@ -1321,7 +1321,8 @@ describe("scan autodiff", () => {
           return [newCarry, newCarry.ref];
         };
         const initVal = np.zeros([1]);
-        const [_, ys] = lax.scan(step, initVal, xs);
+        const [carry, ys] = lax.scan(step, initVal, xs);
+        carry.dispose();
         return ys.sum();
       };
 
@@ -1385,7 +1386,8 @@ describe("scan autodiff", () => {
 
       const sumOfCumsum = (xs: np.Array) => {
         const initVal = np.zeros([1]);
-        const [_, ys] = lax.scan(step, initVal, xs);
+        const [carry, ys] = lax.scan(step, initVal, xs);
+        carry.dispose();
         return ys.sum();
       };
 

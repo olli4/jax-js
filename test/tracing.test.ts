@@ -328,6 +328,14 @@ suite("jax.grad()", () => {
     expect(dy1.js()).toEqual([1, 1]);
   });
 
+  test("supports object-style argnums spec", () => {
+    const f = (x: np.Array, y: np.Array) => x.ref.mul(y).sum();
+    const dfdBoth = grad(f, { argnums: { 1: true, 0: true } });
+    const [dx, dy] = dfdBoth(np.array([2, 3]), np.array([4, 5]));
+    expect(dx.js()).toEqual([4, 5]);
+    expect(dy.js()).toEqual([2, 3]);
+  });
+
   test("backprops through auto-broadcast", () => {
     const [dx, dy] = grad(([x, y]: [np.Array, np.Array]) => x.mul(y).sum())([
       np.array([[2], [4]]),
@@ -564,6 +572,14 @@ suite("jax.jit()", () => {
     expect(f(np.arange(20), 0).js()).toEqual(0);
     expect(f(np.arange(20), 3).js()).toEqual(3);
     expect(f(np.array([30, 1, 20, 11]), 3).js()).toEqual(11);
+  });
+
+  test("supports object-style staticArgnums", () => {
+    const f = jit((x: np.Array, idx: number) => x.slice(idx), {
+      staticArgnums: { 1: true },
+    });
+    expect(f(np.arange(10), 4).js()).toEqual(4);
+    expect(f(np.array([9, 8, 7, 6, 5]), 2).js()).toEqual(7);
   });
 
   test("jit-of-jit", () => {

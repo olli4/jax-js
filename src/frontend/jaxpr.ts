@@ -12,6 +12,8 @@ import {
   FpHash,
   FpHashable,
   generalBroadcast,
+  IndexSpec,
+  normalizeIndexSpec,
   runWithCache,
   unzip2,
   zip,
@@ -734,12 +736,11 @@ class JaxprBuilder {
 
     // Inline any scalar constants as Lit and remove from the input list.
     typecheckJaxpr(jaxpr);
-    const cjaxpr = new ClosedJaxpr(jaxpr, consts);
-    return _inlineLiterals(cjaxpr);
+    return _inlineLiterals(jaxpr, consts);
   }
 }
 
-function _inlineLiterals({ jaxpr, consts }: ClosedJaxpr): ClosedJaxpr {
+function _inlineLiterals(jaxpr: Jaxpr, consts: Tracer[]): ClosedJaxpr {
   const literals = new Map<Atom, Lit>();
   const constBinders: Var[] = [];
   const newConsts: Tracer[] = [];
@@ -1113,7 +1114,7 @@ function joinIdx(n: number, a: any[], b: any[], argnums: Set<number>): any[] {
 
 /** @inline */
 export type JitOpts = {
-  staticArgnums?: number[];
+  staticArgnums?: IndexSpec;
 };
 
 export function makeJaxpr(
@@ -1121,7 +1122,9 @@ export function makeJaxpr(
   opts?: JitOpts,
 ): (...argsIn: any) => { jaxpr: ClosedJaxpr; treedef: JsTreeDef } {
   return (...argsIn) => {
-    const staticArgnums = new Set(opts?.staticArgnums ?? []);
+    const staticArgnums = new Set(
+      normalizeIndexSpec(opts?.staticArgnums ?? [], "staticArgnums"),
+    );
     const [staticArgs, shapedArgs] = splitIdx(argsIn, staticArgnums);
 
     const [avalsIn, inTree] = treeFlatten(shapedArgs);
@@ -1191,7 +1194,9 @@ export function jit<F extends (...args: any[]) => any>(
 > {
   const cache = new Map<string, ReturnType<ReturnType<typeof makeJaxpr>>>();
   _jitCaches.add(cache);
-  const staticArgnums = new Set(opts?.staticArgnums ?? []);
+  const staticArgnums = new Set(
+    normalizeIndexSpec(opts?.staticArgnums ?? [], "staticArgnums"),
+  );
 
   const result = ((...args) => {
     const [staticArgs, dynamicArgs] = splitIdx(args, staticArgnums);

@@ -567,12 +567,12 @@ const jvpRules: { [P in Primitive]: JvpRule<P> } = {
     // [wrapperConsts..., constsP, constsT, carryP, carryT, xsP, xsT]
     const scanArgsJvp = [
       ...wrapperJaxpr.consts.map((c) => c.ref),
-      ...constsP.map((c) => c.ref),
-      ...constsT.map((c) => c.ref),
-      ...carryP.map((c) => c.ref),
-      ...carryT.map((c) => c.ref),
-      ...xsP.map((x) => x.ref),
-      ...xsT.map((x) => x.ref),
+      ...constsP,
+      ...constsT,
+      ...carryP,
+      ...carryT,
+      ...xsP,
+      ...xsT,
     ];
 
     const results = (() => {

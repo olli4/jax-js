@@ -1,5 +1,5 @@
 import { __export } from "./chunk-Cl8Af3a2.js";
-import { AluExp, AluGroup, AluOp, AluVar, DEBUG, DType, FpHash, Kernel, PPrint, Reduction, Routine, Routines, ShapeTracker, accessorAluExp, accessorGlobal, assertNonNull, byteWidth, checkAxis, checkInts, deepEqual, defaultDevice, devices, dtypedArray, dtypedJsArray, generalBroadcast, getBackend, getScanRoutineInfo, init, invertPermutation, isFloatDtype, isNumberPair, isPermutation, normalizeAxis, partitionList, prod, promoteTypes, range, recursiveFlatten, rep, runWithCache, setDebug, toposort, unravelAlu, unzip2, zip, zipn } from "./backend-i3OPGFxB.js";
+import { AluExp, AluGroup, AluOp, AluVar, DEBUG, DType, FpHash, Kernel, PPrint, Reduction, Routine, Routines, ShapeTracker, accessorAluExp, accessorGlobal, assertNonNull, byteWidth, checkAxis, deepEqual, defaultDevice, devices, dtypedArray, dtypedJsArray, generalBroadcast, getBackend, getScanRoutineInfo, init, invertPermutation, isFloatDtype, isNumberPair, isPermutation, normalizeAxis, normalizeIndexSpec, partitionList, prod, promoteTypes, range, recursiveFlatten, rep, runWithCache, setDebug, toposort, unravelAlu, unzip2, zip, zipn } from "./backend-B2qhdi92.js";
 
 //#region src/frontend/core.ts
 /**
@@ -1616,11 +1616,10 @@ var JaxprBuilder = class {
 		const outVars = outTracers.map(t2v);
 		const jaxpr = new Jaxpr(inBinders, this.eqns, outVars);
 		typecheckJaxpr(jaxpr);
-		const cjaxpr = new ClosedJaxpr(jaxpr, consts);
-		return _inlineLiterals(cjaxpr);
+		return _inlineLiterals(jaxpr, consts);
 	}
 };
-function _inlineLiterals({ jaxpr, consts }) {
+function _inlineLiterals(jaxpr, consts) {
 	const literals = /* @__PURE__ */ new Map();
 	const constBinders = [];
 	const newConsts = [];
@@ -1848,7 +1847,7 @@ function makeJaxpr$1(f, opts) {
 	return (...argsIn) => {
 		try {
 			var _usingCtx$1 = _usingCtx();
-			const staticArgnums = new Set(opts?.staticArgnums ?? []);
+			const staticArgnums = new Set(normalizeIndexSpec(opts?.staticArgnums ?? [], "staticArgnums"));
 			const [staticArgs, shapedArgs] = splitIdx(argsIn, staticArgnums);
 			const [avalsIn, inTree] = flatten(shapedArgs);
 			const [fFlat, outTree] = flattenFun((...dynamicArgs) => {
@@ -1894,7 +1893,7 @@ function _disposeAllJitCaches() {
 function jit$1(f, opts) {
 	const cache = /* @__PURE__ */ new Map();
 	_jitCaches.add(cache);
-	const staticArgnums = new Set(opts?.staticArgnums ?? []);
+	const staticArgnums = new Set(normalizeIndexSpec(opts?.staticArgnums ?? [], "staticArgnums"));
 	const result = ((...args) => {
 		const [staticArgs, dynamicArgs] = splitIdx(args, staticArgnums);
 		const [argsFlat, inTree] = flatten(dynamicArgs);
@@ -5028,6 +5027,30 @@ function aluCompare(a, b, op) {
 }
 
 //#endregion
+//#region src/frontend/symbolic-zero.ts
+/**
+* Symbolic zero tangent/cotangent value for AD internals.
+*
+* Represents a mathematically-zero value without allocating backend storage
+* until materialization is required by a primitive rule.
+*/
+var SymbolicZero = class {
+	aval;
+	constructor(aval) {
+		this.aval = ShapedArray.fromAval(aval);
+	}
+	materialize() {
+		return zeros(this.aval.shape, { dtype: this.aval.dtype });
+	}
+	toString() {
+		return `SymbolicZero(${this.aval.toString()})`;
+	}
+};
+function isSymbolicZero(x) {
+	return x instanceof SymbolicZero;
+}
+
+//#endregion
 //#region src/frontend/vmap.ts
 function mappedAval(batchDim, aval) {
 	const shape$1 = [...aval.shape];
@@ -5476,12 +5499,13 @@ var JVPTracer = class extends Tracer {
 		return `JVPTracer(${this.primal.toString()}, ${this.tangent.toString()})`;
 	}
 	get ref() {
-		this.primal.ref, this.tangent.ref;
+		this.primal.ref;
+		if (this.tangent instanceof Tracer) this.tangent.ref;
 		return this;
 	}
 	dispose() {
 		this.primal.dispose();
-		this.tangent.dispose();
+		if (this.tangent instanceof Tracer) this.tangent.dispose();
 	}
 };
 var JVPTrace = class extends Trace {
@@ -5489,13 +5513,32 @@ var JVPTrace = class extends Trace {
 		return this.lift(pureArray(val));
 	}
 	lift(val) {
-		return new JVPTracer(this, val, zerosLike$1(val.ref));
+		return new JVPTracer(this, val, new SymbolicZero(val.aval));
 	}
 	processPrimitive(primitive, tracers, params) {
-		const [primalsIn, tangentsIn] = unzip2(tracers.map((x) => [x.primal, x.tangent]));
+		const [primalsIn, tangentsInRaw] = unzip2(tracers.map((x) => [x.primal, x.tangent]));
+		const materializedZeros = [];
+		const tangentsIn = tangentsInRaw.map((t) => {
+			if (isSymbolicZero(t)) {
+				const z = t.materialize();
+				materializedZeros.push(z);
+				return z;
+			}
+			return t;
+		});
 		const jvpRule = jvpRules[primitive];
 		if (jvpRule === void 0) throw new Error(`No JVP rule for: ${primitive}`);
 		const [primalsOut, tangentsOut] = jvpRule(primalsIn, tangentsIn, params);
+		if (primalsIn.every((p) => p instanceof Array$1)) {
+			const tangentOutSet = new Set(tangentsOut.filter((t) => t instanceof Tracer));
+			for (const z of materializedZeros) {
+				if (!(z instanceof Array$1)) continue;
+				if (tangentOutSet.has(z)) continue;
+				try {
+					z.dispose();
+				} catch {}
+			}
+		}
 		return zip(primalsOut, tangentsOut).map(([x, t]) => new JVPTracer(this, x, t));
 	}
 };
@@ -5520,7 +5563,7 @@ function zeroTangentsJvp(primitive) {
 	return (primals, tangents, params) => {
 		for (const t of tangents) t.dispose();
 		const ys = bind(primitive, primals, params);
-		return [ys, ys.map((y) => zerosLike$1(y.ref))];
+		return [ys, ys.map((y) => new SymbolicZero(y.aval))];
 	};
 }
 /** Compute `a @ b.T`, batched to last two axes. */
@@ -5793,12 +5836,12 @@ const jvpRules = {
 		const xsT = tangents.slice(numConsts + numCarry);
 		const scanArgsJvp = [
 			...wrapperJaxpr.consts.map((c) => c.ref),
-			...constsP.map((c) => c.ref),
-			...constsT.map((c) => c.ref),
-			...carryP.map((c) => c.ref),
-			...carryT.map((c) => c.ref),
-			...xsP.map((x) => x.ref),
-			...xsT.map((x) => x.ref)
+			...constsP,
+			...constsT,
+			...carryP,
+			...carryT,
+			...xsP,
+			...xsT
 		];
 		const results = (() => {
 			try {
@@ -5892,7 +5935,8 @@ function jvp$1(f, primals, tangents, { hasAux = false } = {}) {
 			return pureArray(x);
 		});
 	}
-	const [primalsOutFlat, tangentsOutFlat] = jvpFlat(flatFun, pFlat, tFlat);
+	const [primalsOutFlat, tangentsOutFlatRaw] = jvpFlat(flatFun, pFlat, tFlat);
+	const tangentsOutFlat = tangentsOutFlatRaw.map((t) => isSymbolicZero(t) ? t.materialize() : t);
 	if (topLevel) {
 		for (let i = 0; i < pFlat.length; i++) if (ownedP[i]) try {
 			pFlat[i].dispose();
@@ -5916,7 +5960,7 @@ function lowerAux(aux) {
 	const level = currentTraceLevel();
 	return map((x) => {
 		if (x instanceof Tracer) while (x._trace.main.level > level) if (x instanceof JVPTracer) {
-			x.tangent.dispose();
+			if (x.tangent instanceof Tracer) x.tangent.dispose();
 			x = x.primal;
 		} else {
 			const y = x.fullLower();
@@ -6776,7 +6820,7 @@ const transposeRules = {
 		const ctCarryAll = cts.slice(0, numCarry);
 		const ctYsAll = cts.slice(numCarry);
 		let ctCarryRunning = ctCarryAll.slice(numPrimalCarry).map((c) => c.ref);
-		for (let i = 0; i < numPrimalCarry; i++) ctCarryAll[i].dispose();
+		for (const ct of ctCarryAll) ct.dispose();
 		const ctXsAccum = [];
 		for (let i = 0; i < numTangentX; i++) ctXsAccum.push([]);
 		let ctConstsAccum = null;
@@ -6876,7 +6920,7 @@ const transposeRules = {
 			else result.push(ctXsStacked[ctXIdx++]);
 		}
 		primalForwardJaxpr.dispose();
-		transposedBody.dispose();
+		tangentBody.dispose();
 		for (const c of constResiduals) c.dispose();
 		for (const c of carryResiduals) c.dispose();
 		for (const c of xsResiduals) c.dispose();
@@ -6982,10 +7026,11 @@ function grad$1(f, opts) {
 	};
 }
 function valueAndGrad$1(f, opts) {
-	const argnums = opts?.argnums ?? 0;
+	const argnumsSpec = opts?.argnums ?? 0;
 	const hasAux = opts?.hasAux ?? false;
-	checkInts(argnums);
-	const argnumsSet = new Set(typeof argnums === "number" ? [argnums] : argnums);
+	const argnums = normalizeIndexSpec(argnumsSpec, "argnums");
+	const argnumsSet = new Set(argnums);
+	const returnSingleGrad = typeof argnumsSpec === "number";
 	return (...x) => {
 		if (x.length === 0) throw new Error("grad requires at least one argument to differentiate");
 		for (let i = 0; i < x.length; i++) if (!argnumsSet.has(i)) x[i] = map(stopGradient, x[i]);
@@ -7005,7 +7050,7 @@ function valueAndGrad$1(f, opts) {
 		const cts = fVjp(onesLike$1(y.ref));
 		fVjp.dispose();
 		for (let i = 0; i < cts.length; i++) if (!argnumsSet.has(i)) dispose(cts[i]);
-		const grads = typeof argnums === "number" ? cts[argnums] : argnums.map((i) => cts[i]);
+		const grads = returnSingleGrad ? cts[argnums[0]] : argnums.map((i) => cts[i]);
 		return hasAux ? [[y, aux], grads] : [y, grads];
 	};
 }

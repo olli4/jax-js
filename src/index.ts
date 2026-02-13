@@ -204,6 +204,9 @@ export const vjp = linearizeModule.vjp as <
     ];
 
 /** @inline */
+type ObjectIndexSpec = Record<number | string, boolean>;
+
+/** @inline */
 type GradOutputType<I, F extends (...args: any[]) => any> = MapJsTree<
   I extends undefined
     ? Parameters<F>[0]
@@ -211,7 +214,9 @@ type GradOutputType<I, F extends (...args: any[]) => any> = MapJsTree<
       ? Parameters<F>[I]
       : I extends number[]
         ? { [K in keyof I]: I[K] extends number ? Parameters<F>[I[K]] : never }
-        : never,
+        : I extends ObjectIndexSpec
+          ? Parameters<F>[number][]
+          : never,
   ArrayLike,
   Array
 >;
@@ -241,7 +246,7 @@ type GradOutputType<I, F extends (...args: any[]) => any> = MapJsTree<
  */
 export const grad = linearizeModule.grad as <
   F extends (...args: any[]) => JsTree<Array>,
-  const I extends undefined | number | number[] = undefined,
+  const I extends undefined | number | number[] | ObjectIndexSpec = undefined,
   const HA extends boolean = false,
 >(
   f: F,
@@ -275,7 +280,7 @@ export const grad = linearizeModule.grad as <
  */
 export const valueAndGrad = linearizeModule.valueAndGrad as <
   F extends (...args: any[]) => JsTree<Array>,
-  const I extends undefined | number | number[] = undefined,
+  const I extends undefined | number | number[] | ObjectIndexSpec = undefined,
   const HA extends boolean = false,
 >(
   f: F,

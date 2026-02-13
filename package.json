@@ -43,6 +43,7 @@
     "format": "prettier --write .",
     "format:check": "prettier --check .",
     "lint": "eslint",
+    "lint:ownership:test": "node scripts/eslint-plugin-ownership/test.mjs",
     "prepare": "husky || true",
     "test": "vitest",
     "test:report": "vitest run --reporter=json --outputFile tmp/vitest-report.json",

@@ -203,6 +203,40 @@ export function checkInts(indices: number | number[]) {
   }
 }
 
+/**
+ * Index spec accepted by argnums/staticArgnums-style options.
+ *
+ * Supports classic positional forms (`number`, `number[]`) and JS-style
+ * dictionary forms (`{ "0": true, "2": true }`).
+ */
+export type IndexSpec = number | number[] | Record<number | string, boolean>;
+
+/** Normalize index specs to a validated sorted list of unique integers. */
+export function normalizeIndexSpec(
+  spec: IndexSpec,
+  name: string = "indices",
+): number[] {
+  let indices: number[];
+  if (typeof spec === "number") {
+    indices = [spec];
+  } else if (Array.isArray(spec)) {
+    indices = [...spec];
+  } else {
+    indices = [];
+    for (const [key, enabled] of Object.entries(spec)) {
+      if (!enabled) continue;
+      if (!/^-?\d+$/.test(key)) {
+        throw new TypeError(
+          `${name} dictionary keys must be integer strings, got ${key}`,
+        );
+      }
+      indices.push(Number(key));
+    }
+  }
+  checkInts(indices);
+  return indices;
+}
+
 export function range(
   start: number,
   stop?: number,

@@ -876,6 +876,10 @@ The `Kernel` class is single-output: `new Kernel(nargs, size, exp, reduction?)`.
    run linting and the _full test suite_ automatically when you commit.
 3. Run strict test policy locally (`pnpm run test:policy:strict`) after finishing code changes to
    verify there are no regressions.
+4. Run the umbrella test lane (`pnpm run test:all`) when changes affect transforms, memory
+   ownership, backend dispatch, or tracing behavior.
+5. Run local ownership rule tests (`pnpm run lint:ownership:test`) when touching ownership semantics
+   or lint rules.
 
 - For deliberate large refactors, you may use architectural mode (`pnpm run test:arch`) and commit
   with `JAX_ARCH_MODE=1`, but any temporary failing tests MUST be declared in
@@ -883,11 +887,11 @@ The `Kernel` class is single-output: `new Kernel(nargs, size, exp, reduction?)`.
 - To quickly sync the manifest to currently failing tests, use `pnpm run test:arch:record`, then
   review metadata for new entries.
 
-4. Update documentation when adding new features or APIs
-5. Add/adjust tests exercising `.ref` and `.dispose()` for new behavior — add focused unit tests for
+6. Update documentation when adding new features or APIs
+7. Add/adjust tests exercising `.ref` and `.dispose()` for new behavior — add focused unit tests for
    any bugfixes or edge cases
-6. Export new public symbols from `src/index.ts`
-7. Update `FEATURES.md` for user-visible changes
+8. Export new public symbols from `src/index.ts`
+9. Update `FEATURES.md` for user-visible changes
 
 ## Documentation files
 
