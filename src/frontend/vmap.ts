@@ -12,7 +12,6 @@ import {
   flip,
   fullRaise,
   gather,
-  insideTrace,
   ndim,
   newMain,
   pad,

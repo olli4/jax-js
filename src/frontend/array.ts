@@ -45,7 +45,6 @@ import {
   exp as coreExp,
   mul as coreMul,
   getAval,
-  insideTrace,
   ndim,
   newMain,
   Primitive,

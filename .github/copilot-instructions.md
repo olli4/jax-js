@@ -139,9 +139,9 @@ Husky runs `lint-staged` on commit, which auto-fixes ESLint and Prettier issues 
 pre-commit hook also runs the full Vitest suite and Deno WebGPU tests (`pnpm vitest run` +
 `pnpm run build` + `pnpm run test:deno`).
 
-> **TEMPORARY (`feat/non-consuming-ops` branch):** The pre-commit hook uses `|| true` so known
-> test failures don't block commits. Search `.husky/pre-commit` for `TODO(merge-to-main)` to find
-> the relaxed lines. See `MERGE_CHECKLIST.md` for the full list of items to resolve before merge.
+> **TEMPORARY (`feat/non-consuming-ops` branch):** The pre-commit hook uses `|| true` so known test
+> failures don't block commits. Search `.husky/pre-commit` for `TODO(merge-to-main)` to find the
+> relaxed lines. See `MERGE_CHECKLIST.md` for the full list of items to resolve before merge.
 
 **Before any commit**, also run these checks manually to catch issues early:
 
@@ -934,21 +934,20 @@ grep -rn 'KNOWN_BUG(' test/
 
 **Current inventory:**
 
-| Tag                  | File                           | Issue                                     | Workaround in tests      |
-| -------------------- | ------------------------------ | ----------------------------------------- | ------------------------ |
-| `depth4-grad-leak`   | transform-compositions.test.ts | `grad⁴(f)` leaks intermediates            | `jvp(grad³(f))` for f⁴   |
-| `depth4-vjp-uaf`     | transform-compositions.test.ts | `vjp(grad³(f))` UAF at depth 4            | Cap vjp at depth 3       |
-| `bare-vmap-leak`     | transform-compositions.test.ts | `vmap(grad(f))` leaks without jit         | `jit(vmap(grad(f)))`     |
-| `bare-jacfwd-leak`   | transform-compositions.test.ts | `jacfwd(f)` leaks without jit             | `jit(jacfwd(f))`         |
-| `bare-jacrev-leak`   | transform-compositions.test.ts | `jacrev(f)` leaks without jit             | `jit(jacrev(f))`         |
-| `bare-hessian-leak`  | transform-compositions.test.ts | `hessian(f)` leaks without jit            | `jit(hessian(f))`        |
-| `makejaxpr-jvp`      | tracing.test.ts                | `makeJaxpr` does not compose with `jvp`   | None (test.skip → test)  |
-| `sign-nan`           | numpy.test.ts                  | `sign(NaN)` returns 1 instead of NaN      | None                     |
-| `sort-grad`          | numpy.test.ts                  | `sort` grad needs scatter (not impl)      | None                     |
+| Tag                 | File                           | Issue                                   | Workaround in tests     |
+| ------------------- | ------------------------------ | --------------------------------------- | ----------------------- |
+| `depth4-grad-leak`  | transform-compositions.test.ts | `grad⁴(f)` leaks intermediates          | `jvp(grad³(f))` for f⁴  |
+| `depth4-vjp-uaf`    | transform-compositions.test.ts | `vjp(grad³(f))` UAF at depth 4          | Cap vjp at depth 3      |
+| `bare-vmap-leak`    | transform-compositions.test.ts | `vmap(grad(f))` leaks without jit       | `jit(vmap(grad(f)))`    |
+| `bare-jacfwd-leak`  | transform-compositions.test.ts | `jacfwd(f)` leaks without jit           | `jit(jacfwd(f))`        |
+| `bare-jacrev-leak`  | transform-compositions.test.ts | `jacrev(f)` leaks without jit           | `jit(jacrev(f))`        |
+| `bare-hessian-leak` | transform-compositions.test.ts | `hessian(f)` leaks without jit          | `jit(hessian(f))`       |
+| `makejaxpr-jvp`     | tracing.test.ts                | `makeJaxpr` does not compose with `jvp` | None (test.skip → test) |
+| `sort-grad`         | numpy.test.ts                  | `sort` grad needs scatter (not impl)    | None                    |
 
-**Test status:** See `pnpm vitest run` output. Known failures are expected and tracked above.
-The LU JVP finite-difference test was previously failing because the WASM LU routine uses native
-f32 arithmetic; fixed by using larger eps and looser tolerance. All previously-failing cross-device
+**Test status:** See `pnpm vitest run` output. Known failures are expected and tracked above. The LU
+JVP finite-difference test was previously failing because the WASM LU routine uses native f32
+arithmetic; fixed by using larger eps and looser tolerance. All previously-failing cross-device
 tests (FFT, random, linalg on WASM after CPU) are fixed — see `_put`/`_putSync` in
 [Common pitfalls](#common-pitfalls).
 
@@ -971,8 +970,9 @@ tests (FFT, random, linalg on WASM after CPU) are fixed — see `_put`/`_putSync
 1. Run pre-commit CI checks (see above)
 2. Ensure the **pre-commit hook** is installed (run `pnpm prepare` if needed). The repository will
    run linting and the _full test suite_ automatically when you commit.
-3. Run the _full test suite_ locally (`pnpm vitest run`) after finishing code changes. Verify no
-   NEW failures beyond the known `KNOWN_BUG` tests (see [Known framework bugs](#known-framework-bugs-known_bug-tests)).
+3. Run the _full test suite_ locally (`pnpm vitest run`) after finishing code changes. Verify no NEW
+   failures beyond the known `KNOWN_BUG` tests (see
+   [Known framework bugs](#known-framework-bugs-known_bug-tests)).
 4. Update documentation when adding new features or APIs
 5. Add/adjust tests exercising `.dispose()` for new behavior — add focused unit tests for any
    bugfixes or edge cases
@@ -983,13 +983,13 @@ tests (FFT, random, linalg on WASM after CPU) are fixed — see `_put`/`_putSync
 
 ## Documentation files
 
-| File                              | Purpose                                     | When to update                 |
-| --------------------------------- | ------------------------------------------- | ------------------------------ |
-| `README.md`                       | Main project intro, tutorial                | Major features, API changes    |
-| `FEATURES.md`                     | JAX/NumPy API compatibility table           | New supported functions        |
-| `.github/copilot-instructions.md` | AI agent onboarding, scan feature tracking  | New patterns, scan development |
-| `MERGE_CHECKLIST.md`              | Branch merge tasks & KNOWN_BUG inventory    | New/fixed known bugs           |
-| `packages/*/README.md`            | Package-specific docs                       | Package feature changes        |
+| File                              | Purpose                                    | When to update                 |
+| --------------------------------- | ------------------------------------------ | ------------------------------ |
+| `README.md`                       | Main project intro, tutorial               | Major features, API changes    |
+| `FEATURES.md`                     | JAX/NumPy API compatibility table          | New supported functions        |
+| `.github/copilot-instructions.md` | AI agent onboarding, scan feature tracking | New patterns, scan development |
+| `MERGE_CHECKLIST.md`              | Branch merge tasks & KNOWN_BUG inventory   | New/fixed known bugs           |
+| `packages/*/README.md`            | Package-specific docs                      | Package feature changes        |
 
 ## Where to start reading
 
@@ -2935,8 +2935,8 @@ backend Slot.
   calls must be removed (they conflict with the global wrapper). See autoref.test.ts,
   recycle.test.ts for examples of tests that had inner calls removed.
 - Anonymous constants in scan/jit bodies (e.g., `np.array([2, 3])` inline) get rc=2 from
-  `getOrMakeConstTracer`'s `.ref`. After `_disposeAllJitCaches`, rc drops to 1. Extract constants
-  to named variables and dispose them manually.
+  `getOrMakeConstTracer`'s `.ref`. After `_disposeAllJitCaches`, rc drops to 1. Extract constants to
+  named variables and dispose them manually.
 
 **Why this is better than `tidy()`:** Zero overhead in production. Educates users toward `jit()`
 rather than providing a weaker alternative. Keeps the API surface JAX-compatible.

@@ -41,7 +41,7 @@ import {
   flattenFunWithAux,
   flip,
   fullRaise,
-  insideTrace,
+  insideAbstractTrace,
   mul,
   ndim,
   neg,
@@ -118,7 +118,7 @@ function partialEvalFlat(
   let literalIntermediates: Tracer[];
   {
     using main = newMain(PartialEvalTrace);
-    main.isTransform = true;
+    main.isAbstract = true;
     const trace = new PartialEvalTrace(main);
     const tracersIn = pvalsIn.map((pval) => trace.newArg(pval));
     const unknownTracersIn = tracersIn
@@ -182,6 +182,21 @@ function partialEvalFlat(
   };
 }
 /**
+ * Unwrap tracer wrappers (BatchTracer, etc.) to find the underlying concrete
+ * Array. Chases the `.val` chain until it reaches a non-wrapper value.
+ * Returns the input unchanged if it's already a concrete Array.
+ */
+function unwrapToConcreteArray(t: Tracer): Tracer {
+  let current: any = t;
+  while (current && typeof current === "object" && "val" in current) {
+    const inner = current.val;
+    if (inner === current || !(inner instanceof Tracer)) break;
+    current = inner;
+  }
+  return current;
+}
+
+/**
  * Dispose PE intermediates that aren't outputs or externally captured.
  * During PE, all-known evaluations create concrete arrays. Output values
  * (in protectedVals) are returned to the caller. ClosedJaxpr consts have
@@ -194,13 +209,37 @@ function disposePeIntermediates(
   _literalIntermediates: Tracer[],
   protectedVals: Set<Tracer>,
 ): void {
-  if (insideTrace()) return;
+  if (insideAbstractTrace()) return;
+  // Build a protection set that includes both the wrapper tracers and their
+  // underlying concrete arrays. PE-created arrays (peIntermediates) are raw
+  // Arrays, but protectedVals may contain BatchTracers wrapping those arrays.
+  // Without unwrapping, identity checks fail through the wrapper layer.
+  //
+  // CRITICAL: Multiple wrappers can share the same underlying concrete array
+  // (e.g., Reduce with axis=[] returns the input as-is, so both the
+  // intermediate and the output wrap the same raw Array). We must protect
+  // the concrete array from disposal via ANY wrapper, not just the one
+  // in protectedVals.
+  const allProtected = new Set<Tracer>(protectedVals);
+  for (const v of protectedVals) {
+    const concrete = unwrapToConcreteArray(v);
+    if (concrete !== v) allProtected.add(concrete);
+  }
   const targets = peIntermediates;
   const disposed = new Set<Tracer>();
   for (const t of targets) {
-    if (protectedVals.has(t)) continue;
+    if (allProtected.has(t)) continue;
     if (disposed.has(t)) continue;
+    // Before disposing a wrapper, check if its underlying concrete array
+    // is protected. If so, skip this disposal entirely — cascading would
+    // free the protected array.
+    const concrete = unwrapToConcreteArray(t);
+    if (concrete !== t && allProtected.has(concrete)) continue;
     disposed.add(t);
+    // Mark the unwrapped concrete array as disposed too, so the raw Array
+    // entry in peIntermediates (from _peArrayCreationTracker) won't
+    // double-free it.
+    if (concrete !== t) disposed.add(concrete);
     try {
       t.dispose();
     } catch {
@@ -304,7 +343,7 @@ export function linearize(
   // wrappers are only used for .aval (shape/dtype metadata), which is safe
   // to read after disposal. Skip wrappers that appear in primalsOutFlat
   // (identity function case: output IS the input primal).
-  if (!insideTrace()) {
+  if (!insideAbstractTrace()) {
     const primalsOutSet = new Set(primalsOutFlat);
     for (let i = 0; i < wrappedPrimals.length; i++) {
       if (
@@ -1138,7 +1177,7 @@ function evalJaxprTransposed(
   // results carry unsubmitted PEs while intermediates are disposed, shared
   // PE refcounts never reach zero and the slots they reference leak.
   // Submitting first releases those cross-references cleanly.
-  if (!insideTrace()) {
+  if (!insideAbstractTrace()) {
     for (const r of results) {
       if (r instanceof JaxArray) {
         r._flushPendingSync();
@@ -1166,11 +1205,12 @@ function evalJaxprTransposed(
   }
 
   // Dispose internally-created arrays and computed primals.
-  // When inside a trace (e.g., inner grad running during outer grad's tracing),
-  // computed primals and internal arrays may be tracers from outer traces.
-  // Disposing them would cascade (JVPTracer.dispose → primal.dispose) and free
-  // values still needed by outer evaluations. Skip all disposal in trace mode.
-  if (!insideTrace()) {
+  // When inside an abstract trace (e.g., inner grad running during outer grad's
+  // tracing), computed primals and internal arrays may be tracers from outer
+  // traces. Disposing them would cascade (JVPTracer.dispose → primal.dispose)
+  // and free values still needed by outer evaluations. Skip disposal when
+  // abstract traces are on the stack. BatchTrace is safe — values are concrete.
+  if (!insideAbstractTrace()) {
     const returnedSet = new Set(results);
 
     // 1. For computed primals (created by getOrComputePrimal forward recomputation):
@@ -2107,7 +2147,7 @@ function vjpFlat(
   // inherit these PEs (via pending-chain propagation) would keep Slots
   // alive even after all arrays are disposed, because shared PE refcounts
   // never reach zero without submission.
-  if (!insideTrace()) {
+  if (!insideAbstractTrace()) {
     for (const p of primalsOut) {
       if (p instanceof JaxArray) {
         p._flushPendingSync();
@@ -2151,7 +2191,7 @@ export function vjp(
   // wrappers are only used for .aval (shape/dtype metadata), which is safe
   // to read after disposal. Skip wrappers that appear in primalsOutFlat
   // (identity function case: output IS the input primal).
-  if (!insideTrace()) {
+  if (!insideAbstractTrace()) {
     const primalsOutSet = new Set(primalsOutFlat);
     for (let i = 0; i < wrappedPrimals.length; i++) {
       if (
@@ -2176,7 +2216,7 @@ export function vjp(
     // Wrap scalar cotangents to Arrays; dispose wrappers after transpose.
     const wrappedCots = cotangentsOutFlat.map(pureArray);
     const cotangentsInFlat = fVjpFlat(...wrappedCots);
-    if (!insideTrace()) {
+    if (!insideAbstractTrace()) {
       for (let i = 0; i < wrappedCots.length; i++) {
         if (wrappedCots[i] !== cotangentsOutFlat[i]) {
           wrappedCots[i].dispose();
@@ -2217,11 +2257,11 @@ export function grad(f: (...primals: any) => Tracer, opts?: GradOpts) {
   return (...x: any) => {
     if (opts?.hasAux) {
       const [[y, aux], dx] = valueAndGradFn(...x);
-      if (!insideTrace()) y.dispose();
+      if (!insideAbstractTrace()) y.dispose();
       return [dx, aux];
     } else {
       const [y, dx] = valueAndGradFn(...x);
-      if (!insideTrace()) y.dispose();
+      if (!insideAbstractTrace()) y.dispose();
       return dx;
     }
   };
@@ -2257,7 +2297,7 @@ export function valueAndGrad(f: (...primals: any) => Tracer, opts?: GradOpts) {
     }
     const [y, fVjp, aux] = vjp(f, x, { hasAux });
     if (!(y instanceof Tracer) || ndim(y) !== 0) {
-      if (!insideTrace()) {
+      if (!insideAbstractTrace()) {
         fVjp.dispose();
         treeDispose(y);
         if (hasAux) treeDispose(aux);
@@ -2268,7 +2308,7 @@ export function valueAndGrad(f: (...primals: any) => Tracer, opts?: GradOpts) {
       throw new TypeError("grad requires a scalar output");
     }
     if (!isFloatDtype(y.dtype)) {
-      if (!insideTrace()) {
+      if (!insideAbstractTrace()) {
         fVjp.dispose();
         treeDispose(y);
         if (hasAux) treeDispose(aux);
@@ -2295,14 +2335,14 @@ export function valueAndGrad(f: (...primals: any) => Tracer, opts?: GradOpts) {
       if (seedEscapes) break;
     }
     const shouldDisposeSeed = !seedEscapes;
-    if (!insideTrace()) {
+    if (!insideAbstractTrace()) {
       for (const a of sgArrays) {
         if (!sgOriginals.has(a)) a.dispose();
       }
     }
     fVjp.dispose();
     if (shouldDisposeSeed) {
-      if (!insideTrace()) {
+      if (!insideAbstractTrace()) {
         seed.dispose();
       } else if (
         currentTraceLevel() === 1 &&

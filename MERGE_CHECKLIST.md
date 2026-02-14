@@ -4,16 +4,16 @@ This file tracks items that must be resolved before merging this branch to main.
 
 ## Pre-merge tasks
 
-- [ ] **Fix all KNOWN_BUG tests** — search for `KNOWN_BUG(` across `test/` to find them.
-      Every `KNOWN_BUG` test should either pass (fix the underlying bug) or be intentionally
-      removed with justification (document in copilot-instructions.md as a known limitation).
+- [ ] **Fix all KNOWN_BUG tests** — search for `KNOWN_BUG(` across `test/` to find them. Every
+      `KNOWN_BUG` test should either pass (fix the underlying bug) or be intentionally removed with
+      justification (document in copilot-instructions.md as a known limitation).
 
   ```bash
   grep -rn 'KNOWN_BUG(' test/
   ```
 
-- [ ] **Restore strict pre-commit hook** — search `.husky/pre-commit` for `TODO(merge-to-main)`
-      and remove the `|| true` suffixes so test failures block commits again.
+- [ ] **Restore strict pre-commit hook** — search `.husky/pre-commit` for `TODO(merge-to-main)` and
+      remove the `|| true` suffixes so test failures block commits again.
 
   ```bash
   grep -n 'TODO(merge-to-main)' .husky/pre-commit
@@ -25,14 +25,19 @@ This file tracks items that must be resolved before merging this branch to main.
 
 ## Current KNOWN_BUG inventory
 
-| Tag                      | File                              | Description                                |
-| ------------------------ | --------------------------------- | ------------------------------------------ |
-| `depth4-grad-leak`       | transform-compositions.test.ts    | `grad⁴(f)` leaks intermediates             |
-| `depth4-vjp-uaf`         | transform-compositions.test.ts    | `vjp(grad³(f))` UAF at depth 4             |
-| `bare-vmap-leak`         | transform-compositions.test.ts    | `vmap(grad(f))` leaks without jit wrapper  |
-| `bare-jacfwd-leak`       | transform-compositions.test.ts    | `jacfwd(f)` leaks without jit wrapper      |
-| `bare-jacrev-leak`       | transform-compositions.test.ts    | `jacrev(f)` leaks without jit wrapper      |
-| `bare-hessian-leak`      | transform-compositions.test.ts    | `hessian(f)` leaks without jit wrapper     |
-| `makejaxpr-jvp`          | tracing.test.ts                   | `makeJaxpr` does not compose with `jvp`    |
-| `sign-nan`               | numpy.test.ts                     | `sign(NaN)` returns 1 instead of NaN       |
-| `sort-grad`              | numpy.test.ts                     | `sort` grad needs scatter (not impl)       |
+| Tag                 | File                           | Description                               |
+| ------------------- | ------------------------------ | ----------------------------------------- |
+| `depth4-grad-leak`  | transform-compositions.test.ts | `grad⁴(f)` leaks intermediates            |
+| `depth4-vjp-uaf`    | transform-compositions.test.ts | `vjp(grad³(f))` UAF at depth 4            |
+| `bare-vmap-leak`    | transform-compositions.test.ts | `vmap(grad(f))` leaks without jit wrapper |
+| `bare-jacfwd-leak`  | transform-compositions.test.ts | `jacfwd(f)` leaks without jit wrapper     |
+| `bare-jacrev-leak`  | transform-compositions.test.ts | `jacrev(f)` leaks without jit wrapper     |
+| `bare-hessian-leak` | transform-compositions.test.ts | `hessian(f)` leaks without jit wrapper    |
+| `makejaxpr-jvp`     | tracing.test.ts                | `makeJaxpr` does not compose with `jvp`   |
+| `sort-grad`         | numpy.test.ts                  | `sort` grad needs scatter (not impl)      |
+
+### Resolved KNOWN_BUGs
+
+| Tag        | Resolution                                                                 |
+| ---------- | -------------------------------------------------------------------------- |
+| `sign-nan` | Fixed: NaN propagation via `notEqual(x, x)` + `where` in `numpy.ts sign()` |

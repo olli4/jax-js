@@ -587,7 +587,15 @@ type MainTrace = {
   level: number;
   traceType: new (main: MainTrace) => Trace; // Concrete Trace subclass.
   globalData: any | null;
-  isTransform?: boolean; // True for JVP/vmap/PartialEval traces (ref validation)
+  /**
+   * True for graph-building traces where values are abstract or shared with
+   * the outer trace (JaxprTrace, PartialEvalTrace, JVPTrace). These traces
+   * hold values that must not be disposed by inner cleanup code.
+   *
+   * False/unset for concrete-value traces (EvalTrace, BatchTrace) where
+   * operations produce fresh arrays that can be safely disposed.
+   */
+  isAbstract?: boolean;
 };
 
 const traceStack: MainTrace[] = []; // Global trace stack, mutable
@@ -641,6 +649,38 @@ export function currentTraceLevel(): number {
  */
 export function insideTrace(): boolean {
   return traceStack.length > 1;
+}
+
+/**
+ * Returns true if any abstract (graph-building) trace is on the stack.
+ *
+ * Unlike `insideTrace()`, this returns false when only concrete-value traces
+ * like BatchTrace are active. Cleanup of intermediate arrays is safe when
+ * no abstract traces are present — BatchTrace wraps concrete arrays that are
+ * independently owned, so disposing them doesn't affect outer trace state.
+ *
+ * Use this instead of `insideTrace()` at cleanup sites where the values being
+ * disposed are concrete arrays (not abstract tracers from a graph-building trace).
+ */
+export function insideAbstractTrace(): boolean {
+  for (let i = 1; i < traceStack.length; i++) {
+    if (traceStack[i].isAbstract) return true;
+  }
+  return false;
+}
+
+/**
+ * Returns true if any abstract trace exists below the given level on the stack.
+ *
+ * Used by jvpFlat to decide whether its own intermediate cleanup is safe.
+ * When only BatchTraces are below, cleanup is safe. When PE or JaxprTrace
+ * is below, the intermediates are managed by that outer trace.
+ */
+export function hasAbstractTraceBelow(level: number): boolean {
+  for (let i = 1; i < level && i < traceStack.length; i++) {
+    if (traceStack[i].isAbstract) return true;
+  }
+  return false;
 }
 
 export type TracerValue = Tracer | number | boolean;

@@ -40,6 +40,7 @@ import {
   flattenFunWithAux,
   fullRaise,
   gather,
+  hasAbstractTraceBelow,
   idiv,
   less,
   log,
@@ -725,6 +726,7 @@ function jvpFlat(
     liftedTangents: [],
   };
   using main = newMain(JVPTrace, jvpData);
+  main.isAbstract = true;
   const trace = new JVPTrace(main);
   // Track arrays newly created by pureArray from raw values (e.g., scalar 3 → Array).
   // These are not in intermediateTracers (only processPrimitive adds there)
@@ -748,11 +750,10 @@ function jvpFlat(
   // The refCount > 0 guard prevents double-free when nested jvp calls
   // (e.g., deriv(deriv(f))) dispose intermediates via user code before
   // the outer jvpFlat's cleanup runs.
-  // Skip cleanup when inside an outer trace (makeJaxpr, jit, etc.) because
-  // the outer trace's compiler manages intermediate lifetimes and the
-  // primals/tangents may be tracers from the outer trace that must remain
-  // alive for graph construction.
-  if (main.level <= 1) {
+  // Skip cleanup when an abstract trace (PE, JaxprTrace, outer JVP) is below
+  // this JVP on the stack — those traces manage lifetimes and own the values.
+  // Cleanup IS safe when only BatchTrace is below (vmap(jvp(...))).
+  if (!hasAbstractTraceBelow(main.level)) {
     const outputSet = new Set<JVPTracer>(tracersOut);
     for (const t of jvpData.intermediates) {
       if (!outputSet.has(t)) {

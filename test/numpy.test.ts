@@ -1167,9 +1167,10 @@ suite.each(devices)("device:%s", (device) => {
       expect(y.js()).toEqual([-1, 0, 1]);
     });
 
-    // KNOWN_BUG(sign-nan): sign(NaN) returns 1 instead of NaN
-    test("KNOWN_BUG(sign-nan): works with NaN", () => {
-      expect(np.sign(NaN).js()).toBeNaN();
+    test("works with NaN", () => {
+      using x = np.array(NaN);
+      using s = np.sign(x);
+      expect(s.js()).toBeNaN();
     });
   });
 

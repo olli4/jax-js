@@ -1457,7 +1457,11 @@ export function sign(x: ArrayLike): Array {
   using neq = notEqual(x, 0);
   using lt = less(x, 0);
   using inner = where(lt, -1, 1);
-  return where(neq, inner, 0);
+  using result = where(neq, inner, 0);
+  // Propagate NaN: NaN != NaN is true per IEEE 754, so notEqual(x, x)
+  // detects NaN values. Return x (NaN) for those positions.
+  using isnan = notEqual(x, x);
+  return where(isnan, x, result);
 }
 
 /** @function Return element-wise positive values of the input (no-op). */

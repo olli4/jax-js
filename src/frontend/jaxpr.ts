@@ -1153,6 +1153,7 @@ export function makeJaxpr(
 
     const builder = new JaxprBuilder();
     using main = newMain(JaxprTrace, builder);
+    main.isAbstract = true;
     using _dynamic = newDynamic(main);
 
     const trace = new JaxprTrace(main);
