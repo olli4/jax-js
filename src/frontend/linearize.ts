@@ -18,7 +18,14 @@ import {
   toposort,
   unzip2,
 } from "../utils";
-import { anonymousConstArrays, array, eye, onesLike, pureArray, zeros } from "./array";
+import {
+  array,
+  eye,
+  Array as JaxArray,
+  onesLike,
+  pureArray,
+  zeros,
+} from "./array";
 import {
   _leakTrackingEnabled,
   _leakTrackingOwnedFns,
@@ -33,6 +40,7 @@ import {
   broadcast,
   concatenate,
   conv,
+  currentTraceLevel,
   flattenFun,
   flattenFunWithAux,
   flip,
@@ -102,10 +110,16 @@ class PartialVal {
 function partialEvalFlat(
   f: (...args: any[]) => any,
   pvalsIn: PartialVal[],
-): { jaxpr: ClosedJaxpr; pvalsOut: PartialVal[]; peIntermediates: Tracer[] } {
+): {
+  jaxpr: ClosedJaxpr;
+  pvalsOut: PartialVal[];
+  peIntermediates: Tracer[];
+  literalIntermediates: Tracer[];
+} {
   let jaxpr: ClosedJaxpr;
   let pvalsOut: PartialVal[];
   let knownIntermediates: Tracer[];
+  let literalIntermediates: Tracer[];
   {
     using main = newMain(PartialEvalTrace);
     main.isTransform = true;
@@ -159,11 +173,17 @@ function partialEvalFlat(
     }
 
     knownIntermediates = trace.knownIntermediates;
+    literalIntermediates = trace.literalIntermediates;
     // Merge PE-scope Array creations into knownIntermediates for disposal.
     knownIntermediates.push(...peCreatedArrays);
   }
 
-  return { jaxpr, pvalsOut, peIntermediates: knownIntermediates };
+  return {
+    jaxpr,
+    pvalsOut,
+    peIntermediates: knownIntermediates,
+    literalIntermediates,
+  };
 }
 /**
  * Dispose PE intermediates that aren't outputs or externally captured.
@@ -175,18 +195,20 @@ function partialEvalFlat(
  */
 function disposePeIntermediates(
   peIntermediates: Tracer[],
+  _literalIntermediates: Tracer[],
   protectedVals: Set<Tracer>,
 ): void {
   if (insideTrace()) return;
+  const targets = peIntermediates;
   const disposed = new Set<Tracer>();
-  for (const t of peIntermediates) {
-    if (!protectedVals.has(t) && !disposed.has(t)) {
-      disposed.add(t);
-      try {
-        t.dispose();
-      } catch {
-        // Already disposed.
-      }
+  for (const t of targets) {
+    if (protectedVals.has(t)) continue;
+    if (disposed.has(t)) continue;
+    disposed.add(t);
+    try {
+      t.dispose();
+    } catch {
+      // Already disposed.
     }
   }
 }
@@ -216,7 +238,12 @@ function collectConcreteArrays(value: any): Tracer[] {
 function linearizeFlatUtil(
   f: (...args: any[]) => any,
   primalsIn: Tracer[],
-): { primalsOut: Tracer[]; jaxpr: ClosedJaxpr; peIntermediates: Tracer[] } {
+): {
+  primalsOut: Tracer[];
+  jaxpr: ClosedJaxpr;
+  peIntermediates: Tracer[];
+  literalIntermediates: Tracer[];
+} {
   const pvalsIn = [
     ...primalsIn.map(PartialVal.known),
     ...primalsIn.map((t) => PartialVal.unknown(t.aval)),
@@ -227,13 +254,14 @@ function linearizeFlatUtil(
     const [primalsOut, tangentsOut] = jvp(f, x.slice(0, k), x.slice(k, 2 * k));
     return [...primalsOut, ...tangentsOut];
   };
-  const { jaxpr, pvalsOut, peIntermediates } = partialEvalFlat(fJvp, pvalsIn);
+  const { jaxpr, pvalsOut, peIntermediates, literalIntermediates } =
+    partialEvalFlat(fJvp, pvalsIn);
   const primalPvals = pvalsOut.slice(0, pvalsOut.length / 2);
   if (!primalPvals.every((pval) => pval.isKnown)) {
     throw new Error("Not all primal values are known after partial evaluation");
   }
   const primalsOut = primalPvals.map((pval) => pval.val!);
-  return { primalsOut, jaxpr, peIntermediates };
+  return { primalsOut, jaxpr, peIntermediates, literalIntermediates };
 }
 
 function linearizeFlat(
@@ -241,10 +269,8 @@ function linearizeFlat(
   primalsIn: Tracer[],
   auxStore?: { value: any },
 ): [Tracer[], (...args: Tracer[]) => Tracer[], () => void] {
-  const { primalsOut, jaxpr, peIntermediates } = linearizeFlatUtil(
-    f,
-    primalsIn,
-  );
+  const { primalsOut, jaxpr, peIntermediates, literalIntermediates } =
+    linearizeFlatUtil(f, primalsIn);
   // Protect primalsOut + concrete arrays underlying aux captures
   const protectedVals = new Set<Tracer>(primalsOut);
   if (auxStore?.value != null) {
@@ -252,7 +278,7 @@ function linearizeFlat(
       protectedVals.add(arr);
     }
   }
-  disposePeIntermediates(peIntermediates, protectedVals);
+  disposePeIntermediates(peIntermediates, literalIntermediates, protectedVals);
   const fLin = (...tangents: Tracer[]) =>
     evalJaxpr(jaxpr.jaxpr, [...jaxpr.consts.map((c) => c.ref), ...tangents]);
   const dispose = () => jaxpr.dispose();
@@ -413,6 +439,7 @@ class PartialEvalTrace extends Trace {
     // a backend slot each.
     if (!(val instanceof Tracer)) {
       this.knownIntermediates.push(arr);
+      this.literalIntermediates.push(arr);
     }
     return new PartialEvalTracer(this, PartialVal.known(arr), null);
   }
@@ -427,6 +454,19 @@ class PartialEvalTrace extends Trace {
       arr = [];
       if (!this.main.globalData) (this.main as any).globalData = {};
       this.main.globalData._knownIntermediates = arr;
+    }
+    return arr;
+  }
+
+  // Track Arrays created from non-Tracer literals in pure(). These are safe
+  // to dispose even while tracing, unlike general knownIntermediates which can
+  // include tracer-backed values from nested transforms.
+  get literalIntermediates(): Tracer[] {
+    let arr = this.main.globalData?._literalIntermediates;
+    if (!arr) {
+      arr = [];
+      if (!this.main.globalData) (this.main as any).globalData = {};
+      this.main.globalData._literalIntermediates = arr;
     }
     return arr;
   }
@@ -637,11 +677,14 @@ class PartialEvalTrace extends Trace {
     const numPrimalY = numY / 2;
 
     // Run primal-only computation using known inputs + zeros for tangent
+    const synthesizedZeroInputs: Tracer[] = [];
     const fullInputs = tracers.map((t) => {
       if (t.pval.isKnown) {
         return (t.pval.val as Tracer).ref;
       } else {
-        return zeros(t.pval.aval.shape, { dtype: t.pval.aval.dtype });
+        const z = zeros(t.pval.aval.shape, { dtype: t.pval.aval.dtype });
+        synthesizedZeroInputs.push(z);
+        return z;
       }
     });
 
@@ -703,6 +746,20 @@ class PartialEvalTrace extends Trace {
           recipe,
         ),
       );
+    }
+
+    const retainedKnownOutputs = new Set<Tracer>();
+    for (let i = 0; i < numPrimalCarry; i++) {
+      retainedKnownOutputs.add(fullOuts[i]);
+    }
+    for (let i = 0; i < numPrimalY; i++) {
+      retainedKnownOutputs.add(fullOuts[numCarry + i]);
+    }
+
+    for (const inp of fullInputs) {
+      if (!retainedKnownOutputs.has(inp) && inp.refCount > 0) {
+        inp.dispose();
+      }
     }
 
     // tracerRefsOut: known positions get null ref
@@ -972,9 +1029,6 @@ function evalJaxprTransposed(
   // Now collect actual Tracer values for known input variables
   const knownPrimals = new Map<Var, Tracer>();
   const argPrimals = new Set<Var>(); // Track which primals are from args (owned by caller)
-  // Snapshot initial refCount for arg primals before any getOrComputePrimal calls.
-  // Used in cleanup to undo only the NET ref increments from getOrComputePrimal,
-  // without disturbing refs from the user or ClosedJaxpr.
   const argPrimalInitRc = new Map<Var, number>();
   for (let i = 0; i < jaxpr.inBinders.length; i++) {
     if (!(args[i] instanceof UndefPrimal)) {
@@ -1084,6 +1138,38 @@ function evalJaxprTransposed(
     }
   }
 
+  // Flush result arrays' pending backend dispatches before disposing
+  // intermediates. Pending operations hold incRef on their I/O slots; if
+  // results carry unsubmitted PEs while intermediates are disposed, shared
+  // PE refcounts never reach zero and the slots they reference leak.
+  // Submitting first releases those cross-references cleanly.
+  if (!insideTrace()) {
+    for (const r of results) {
+      if (r instanceof JaxArray) {
+        r._flushPendingSync();
+      }
+    }
+  }
+
+  // Always restore input-known primals to their initial refcount.
+  // This balances temporary .ref borrows from getOrComputePrimal even when
+  // running inside a trace (e.g. grad(scan) checkpoint path).
+  for (const v of argPrimals) {
+    const val = knownPrimals.get(v);
+    const initialRc = argPrimalInitRc.get(v);
+    if (val && initialRc !== undefined) {
+      const excess = val.refCount - initialRc;
+      for (let i = 0; i < excess; i++) {
+        if (val.refCount <= 0) break;
+        try {
+          val.dispose();
+        } catch {
+          break;
+        }
+      }
+    }
+  }
+
   // Dispose internally-created arrays and computed primals.
   // When inside a trace (e.g., inner grad running during outer grad's tracing),
   // computed primals and internal arrays may be tracers from outer traces.
@@ -1092,27 +1178,7 @@ function evalJaxprTransposed(
   if (!insideTrace()) {
     const returnedSet = new Set(results);
 
-    // 1. For arg primals (owned by caller/ClosedJaxpr): undo only the NET
-    //    ref increments from getOrComputePrimal. Transpose rules may have
-    //    already disposed some .ref copies, so we compute:
-    //    excess = currentRc - initialRc (snapshot taken before any work).
-    //    This preserves the caller's and ClosedJaxpr's ownership.
-    for (const v of argPrimals) {
-      const val = knownPrimals.get(v);
-      const initialRc = argPrimalInitRc.get(v);
-      if (val && initialRc !== undefined) {
-        const excess = val.refCount - initialRc;
-        for (let i = 0; i < excess; i++) {
-          try {
-            val.dispose();
-          } catch {
-            break;
-          }
-        }
-      }
-    }
-
-    // 2. For computed primals (created by getOrComputePrimal forward recomputation):
+    // 1. For computed primals (created by getOrComputePrimal forward recomputation):
     //    Fully dispose — nobody else owns them.
     for (const [v, t] of knownPrimals.entries()) {
       if (!argPrimals.has(v) && !returnedSet.has(t)) {
@@ -1124,7 +1190,7 @@ function evalJaxprTransposed(
       }
     }
 
-    // 3. Dispose internal arrays (zeros, accumulated sums, literal arrays).
+    // 2. Dispose internal arrays (zeros, accumulated sums, literal arrays).
     //    Skip arg primals (same objects due to .ref returning `this`).
     //    Skip returned results and externally-owned cotangents.
     for (const arr of internalArrays) {
@@ -1599,13 +1665,15 @@ const transposeRules: Partial<{ [P in Primitive]: TransposeRule<P> }> = {
       const dataIdx = reverse ? length - 1 - iter : iter;
       const xSlices: Tracer[] = [];
       for (const xs of xsResiduals) {
-        const slice = shrink(xs.ref, [
+        const slice = shrink(xs, [
           [dataIdx, dataIdx + 1],
           ...xs.shape
             .slice(1)
             .map((_, i) => [0, xs.shape[i + 1]] as [number, number]),
         ]);
-        xSlices.push(reshape(slice, xs.shape.slice(1)));
+        const reshaped = reshape(slice, xs.shape.slice(1));
+        slice.dispose();
+        xSlices.push(reshaped);
       }
       const forwardInputs = [
         ...constResiduals.map((c) => c.ref),
@@ -1619,6 +1687,9 @@ const transposeRules: Partial<{ [P in Primitive]: TransposeRule<P> }> = {
       const newCarry = forwardOuts.slice(0, numPrimalCarry);
       for (let i = numPrimalCarry; i < forwardOuts.length; i++) {
         forwardOuts[i].dispose();
+      }
+      for (const x of xSlices) {
+        if (x.refCount > 0) x.dispose();
       }
       return newCarry;
     };
@@ -1758,26 +1829,30 @@ const transposeRules: Partial<{ [P in Primitive]: TransposeRule<P> }> = {
       // Slice primal xs for this iteration
       const xSlices: Tracer[] = [];
       for (const xs of xsResiduals) {
-        const slice = shrink(xs.ref, [
+        const slice = shrink(xs, [
           [dataIdx, dataIdx + 1],
           ...xs.shape
             .slice(1)
             .map((_, i) => [0, xs.shape[i + 1]] as [number, number]),
         ]);
-        xSlices.push(reshape(slice, xs.shape.slice(1)));
+        const reshaped = reshape(slice, xs.shape.slice(1));
+        slice.dispose();
+        xSlices.push(reshaped);
       }
 
       // Slice cotangent of y for this iteration
       const ctYSlices: Tracer[] = [];
       for (let i = Math.floor(numY / 2); i < ctYsAll.length; i++) {
         const ctY = ctYsAll[i];
-        const slice = shrink(ctY.ref, [
+        const slice = shrink(ctY, [
           [dataIdx, dataIdx + 1],
           ...ctY.shape
             .slice(1)
             .map((_, j) => [0, ctY.shape[j + 1]] as [number, number]),
         ]);
-        ctYSlices.push(reshape(slice, ctY.shape.slice(1)));
+        const reshaped = reshape(slice, ctY.shape.slice(1));
+        slice.dispose();
+        ctYSlices.push(reshaped);
       }
 
       // Build cotangents for tangentBody outputs
@@ -1818,7 +1893,14 @@ const transposeRules: Partial<{ [P in Primitive]: TransposeRule<P> }> = {
       if (ctConstsAccum === null) {
         ctConstsAccum = ctConstsIter;
       } else {
-        ctConstsAccum = ctConstsAccum.map((ct, i) => add(ct, ctConstsIter[i]));
+        const next: Tracer[] = [];
+        for (let i = 0; i < ctConstsAccum.length; i++) {
+          const summed = add(ctConstsAccum[i], ctConstsIter[i]);
+          ctConstsAccum[i].dispose();
+          ctConstsIter[i].dispose();
+          next.push(summed);
+        }
+        ctConstsAccum = next;
       }
 
       // Store x cotangents (will stack later)
@@ -1891,6 +1973,19 @@ const transposeRules: Partial<{ [P in Primitive]: TransposeRule<P> }> = {
         broadcast(ct, [1, ...ct.shape], [0]),
       );
       const stacked = concatenate(expanded, 0);
+      const disposed = new Set<Tracer>();
+      for (const ct of expanded) {
+        if (!disposed.has(ct)) {
+          disposed.add(ct);
+          ct.dispose();
+        }
+      }
+      for (const ct of reversed) {
+        if (!disposed.has(ct)) {
+          disposed.add(ct);
+          ct.dispose();
+        }
+      }
       ctXsStacked.push(stacked);
     }
 
@@ -1924,6 +2019,18 @@ const transposeRules: Partial<{ [P in Primitive]: TransposeRule<P> }> = {
       } else {
         result.push(ctXsStacked[ctXIdx++]);
       }
+    }
+
+    if (ctConstsAccum) {
+      for (let i = ctConstIdx; i < ctConstsAccum.length; i++) {
+        ctConstsAccum[i].dispose();
+      }
+    }
+    for (let i = ctCarryIdx; i < ctCarryRunning.length; i++) {
+      ctCarryRunning[i].dispose();
+    }
+    for (let i = ctXIdx; i < ctXsStacked.length; i++) {
+      ctXsStacked[i].dispose();
     }
 
     // Cleanup
@@ -1988,10 +2095,8 @@ function vjpFlat(
   primalsIn: Tracer[],
   auxStore?: { value: any },
 ): [Tracer[], (...cotangents: Tracer[]) => Tracer[], () => void] {
-  const { primalsOut, jaxpr, peIntermediates } = linearizeFlatUtil(
-    f,
-    primalsIn,
-  );
+  const { primalsOut, jaxpr, peIntermediates, literalIntermediates } =
+    linearizeFlatUtil(f, primalsIn);
   // Protect primalsOut + concrete arrays underlying aux captures
   const protectedVals = new Set<Tracer>(primalsOut);
   if (auxStore?.value != null) {
@@ -1999,7 +2104,22 @@ function vjpFlat(
       protectedVals.add(arr);
     }
   }
-  disposePeIntermediates(peIntermediates, protectedVals);
+  disposePeIntermediates(peIntermediates, literalIntermediates, protectedVals);
+
+  // Flush primals' pending backend dispatches. PE tracing created concrete
+  // forward-pass arrays with lazy PendingExecute chains. Submitting them
+  // here prevents orphaned Slot references: downstream operations that
+  // inherit these PEs (via pending-chain propagation) would keep Slots
+  // alive even after all arrays are disposed, because shared PE refcounts
+  // never reach zero without submission.
+  if (!insideTrace()) {
+    for (const p of primalsOut) {
+      if (p instanceof JaxArray) {
+        p._flushPendingSync();
+      }
+    }
+  }
+
   // Pullback cotangents to the UndefPrimal transpose inputs.
   const fVjp = (...cotangents: Tracer[]) => {
     const transposeInputs = [
@@ -2165,19 +2285,37 @@ export function valueAndGrad(f: (...primals: any) => Tracer, opts?: GradOpts) {
       throw new TypeError("grad only supports floating-point dtypes");
     }
     const seed = onesLike(y);
-    // seed is anonymous when inside a trace: nobody holds a reference outside.
-    // Mark so getOrMakeConstTracer skips .ref. In eager mode, the explicit
-    // seed.dispose() below handles cleanup; the mark is harmless.
-    anonymousConstArrays.add(seed);
     const cts = fVjp(seed); // backprop from scalar 1
-    // Only dispose fVjp internals in eager mode. Inside a trace (makeJaxpr,
-    // jit, vmap), ClosedJaxpr consts may be tracers from an outer trace that
-    // must remain alive for graph construction.
+    let seedEscapes = false;
+    for (const ct of cts) {
+      if (ct === seed) {
+        seedEscapes = true;
+        break;
+      }
+      for (const arr of collectConcreteArrays(ct)) {
+        if (arr === seed) {
+          seedEscapes = true;
+          break;
+        }
+      }
+      if (seedEscapes) break;
+    }
+    const shouldDisposeSeed = !seedEscapes;
     if (!insideTrace()) {
-      seed.dispose();
-      fVjp.dispose();
       for (const a of sgArrays) {
         if (!sgOriginals.has(a)) a.dispose();
+      }
+    }
+    fVjp.dispose();
+    if (shouldDisposeSeed) {
+      if (!insideTrace()) {
+        seed.dispose();
+      } else if (
+        currentTraceLevel() === 1 &&
+        seed instanceof JaxArray &&
+        seed.refCount > 0
+      ) {
+        seed.dispose();
       }
     }
     for (let i = 0; i < cts.length; i++) {

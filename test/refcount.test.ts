@@ -8,11 +8,12 @@ suite("refcount through grad", () => {
     const f = (x: np.Array) => x.add(x).sum();
     const df = grad(f);
 
-    const x = np.array([1, 2, 3, 4]);
-    expect(df(x).js()).toEqual([2, 2, 2, 2]);
+    using x = np.array([1, 2, 3, 4]);
+    using r1 = df(x);
+    expect(r1.js()).toEqual([2, 2, 2, 2]);
     // grad does NOT consume x — it's still alive
-    expect(df(x).js()).toEqual([2, 2, 2, 2]);
-    x.dispose();
+    using r2 = df(x);
+    expect(r2.js()).toEqual([2, 2, 2, 2]);
   });
 
   test("multiply and sum", () => {

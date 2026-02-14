@@ -1265,6 +1265,13 @@ declare class Array extends Tracer {
   static _implRules(): typeof implRules;
   /** @private */
   _realizeSource(): number;
+  /**
+   * Submit all pending backend dispatches without reading data back.
+   * Used by evalJaxprTransposed to flush result arrays' PE chains before
+   * disposing intermediates — prevents orphaned Slot references.
+   * @private
+   */
+  _flushPendingSync(): void;
   /** @private Put this array on a new backend, asynchronously. */
   _put(backend: Backend): Promise<Array>;
   /** @private Put this array on a new backend, synchronously. */

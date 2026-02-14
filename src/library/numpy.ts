@@ -564,11 +564,18 @@ export function stack(xs: ArrayLike[], axis: number = 0): Array {
   }
   axis = checkAxis(axis, shapes[0].length + 1); // +1 for the new axis
   const newShape = shapes[0].toSpliced(axis, 0, 1);
-  const newArrays = xs.map((x) => fudgeArray(x).reshape(newShape));
+  // Track fudgeArray intermediates separately from reshape results.
+  // When xs contains non-Array elements (numbers, TypedArrays), fudgeArray
+  // creates a new Array, then .reshape() creates a view. Both must be
+  // disposed, but they are different objects.
+  const fudged = xs.map((x) => fudgeArray(x));
+  const newlyCreated = fudged.filter((f, i) => f !== xs[i]);
+  const newArrays = fudged.map((x) => x.reshape(newShape));
   try {
     return concatenate(newArrays, axis) as Array;
   } finally {
     for (const a of newArrays) a[Symbol.dispose]();
+    for (const a of newlyCreated) a[Symbol.dispose]();
   }
 }
 

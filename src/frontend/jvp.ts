@@ -122,6 +122,11 @@ class JVPTrace extends Trace {
     // jvpJaxpr/transposeJaxpr would leak the zero array (rc=2 from .ref,
     // dispose only drops to 1).
     if (zero instanceof Array) anonymousConstArrays.add(zero);
+    // Track the zero tangent for cleanup in jvpFlat. Lifted JVPTracers
+    // (from fullRaise) aren't tracked in intermediates, so their zero
+    // tangents would leak if not disposed explicitly.
+    const data = this.main.globalData as JvpGlobalData | null;
+    if (data) data.liftedTangents.push(zero);
     return new JVPTracer(this, val, zero);
   }
 
@@ -142,13 +147,19 @@ class JVPTrace extends Trace {
       ([x, t]) => new JVPTracer(this, x, t),
     );
     // Track intermediates for cleanup in jvpFlat. globalData is the shared
-    // JVPTracer[] array — safe because all JVPTrace instances from the same
+    // JvpGlobalData — safe because all JVPTrace instances from the same
     // main share the same globalData reference.
-    const intermediates = this.main.globalData as JVPTracer[] | undefined;
-    if (intermediates) intermediates.push(...result);
+    const data = this.main.globalData as JvpGlobalData | null;
+    if (data) data.intermediates.push(...result);
     return result;
   }
 }
+
+/** Data shared between JVPTrace instances from the same main for cleanup. */
+type JvpGlobalData = {
+  intermediates: JVPTracer[];
+  liftedTangents: Tracer[];
+};
 
 type JvpRule<P extends Primitive> = (
   primals: Tracer[],
@@ -417,15 +428,27 @@ const jvpRules: { [P in Primitive]: JvpRule<P> } = {
     const k = Math.min(m, n);
     // Extract full L: lower triangular with unit diagonal, shape [..., m, m]
     using luSliceL = sliceAxis(luMatrix, -1, [0, k]);
-    using lLower = tril(luSliceL as any, -1);
-    using lPadded = m > k ? padAxis(lLower, -1, [0, m - k]) : lLower.ref;
+    // Note: lLower/uUpper are NOT declared with `using` when m<=k / n<=k
+    // because in that case they alias lPadded/uPadded directly. During PE
+    // tracing, [Symbol.dispose] is a no-op, so .ref's extra refcount would
+    // never be balanced. Instead we let disposePeIntermediates handle them.
+    const lLower = tril(luSliceL as any, -1);
+    const lPaddedNeedsDispose = m > k;
+    const lPadded = lPaddedNeedsDispose
+      ? padAxis(lLower, -1, [0, m - k])
+      : lLower;
     using eyeM = eye(m);
     using L = lPadded.add(eyeM);
+    if (lPaddedNeedsDispose) lPadded[Symbol.dispose]();
+    lLower[Symbol.dispose]();
     // Extract full U: upper triangular, shape [..., n, n]
     // U = triu(lu[:k, :]) padded to [..., n, n] + eye for remaining rows
     using luSliceU = sliceAxis(luMatrix, -2, [0, k]);
-    using uUpper = triu(luSliceU as any);
-    using uPadded = n > k ? padAxis(uUpper, -2, [0, n - k]) : uUpper.ref;
+    const uUpper = triu(luSliceU as any);
+    const uPaddedNeedsDispose = n > k;
+    const uPadded = uPaddedNeedsDispose
+      ? padAxis(uUpper, -2, [0, n - k])
+      : uUpper;
     using uEye =
       n > k
         ? (() => {
@@ -435,6 +458,8 @@ const jvpRules: { [P in Primitive]: JvpRule<P> } = {
           })()
         : zerosLike(uPadded);
     using U = uPadded.add(uEye);
+    if (uPaddedNeedsDispose) uPadded[Symbol.dispose]();
+    uUpper[Symbol.dispose]();
     // Apply permutation to da: P @ da (reorder rows)
     using permReshaped = permutation.reshape([...permutation.shape, 1]);
     using arangeM = arange(m);
@@ -695,8 +720,11 @@ function jvpFlat(
   primals: TracerValue[],
   tangents: TracerValue[],
 ): [Tracer[], Tracer[]] {
-  const intermediateTracers: JVPTracer[] = [];
-  using main = newMain(JVPTrace, intermediateTracers);
+  const jvpData: JvpGlobalData = {
+    intermediates: [],
+    liftedTangents: [],
+  };
+  using main = newMain(JVPTrace, jvpData);
   const trace = new JVPTrace(main);
   // Track arrays newly created by pureArray from raw values (e.g., scalar 3 → Array).
   // These are not in intermediateTracers (only processPrimitive adds there)
@@ -726,7 +754,7 @@ function jvpFlat(
   // alive for graph construction.
   if (main.level <= 1) {
     const outputSet = new Set<JVPTracer>(tracersOut);
-    for (const t of intermediateTracers) {
+    for (const t of jvpData.intermediates) {
       if (!outputSet.has(t)) {
         if (t.primal.refCount > 0) t.primal[Symbol.dispose]();
         if (t.tangent.refCount > 0) t.tangent[Symbol.dispose]();
@@ -734,12 +762,23 @@ function jvpFlat(
     }
     // Dispose arrays created from raw values for input primals/tangents.
     // These are anonymous (created by pureArray, not user-owned) and are
-    // not tracked by intermediateTracers. Skip arrays that appear in the
+    // not tracked by jvpData.intermediates. Skip arrays that appear in the
     // output (identity function case: output IS the input primal/tangent).
     const outputArrays = new Set<Tracer>([...result[0], ...result[1]]);
     for (const a of newlyCreatedInputs) {
       if (!outputArrays.has(a) && a.refCount > 0) {
         a[Symbol.dispose]?.();
+      }
+    }
+    // Dispose zero tangents created by JVPTrace.lift() for lifted inputs.
+    // These are created when fullRaise lifts a lower-level tracer (e.g.,
+    // a captured constant) into the JVP trace. The zero Array is not
+    // tracked in intermediates and would leak if not disposed here.
+    // Skip zeros that are in the output tangents (identity/passthrough).
+    const outputTangents = new Set<Tracer>(result[1]);
+    for (const z of jvpData.liftedTangents) {
+      if (!outputTangents.has(z) && z.refCount > 0) {
+        z[Symbol.dispose]?.();
       }
     }
   }

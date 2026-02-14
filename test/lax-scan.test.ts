@@ -1346,7 +1346,6 @@ describe("scan autodiff", () => {
           return [newCarry, newCarry];
         };
         const [finalCarry, _outputs] = lax.scan(step, initVal, xs);
-        using _finalCarry = finalCarry;
         using __outputs = _outputs;
         return finalCarry;
       };
@@ -1370,7 +1369,6 @@ describe("scan autodiff", () => {
           return [newCarry, newCarry];
         };
         const [finalCarry, _outputs] = lax.scan(step, initVal, xs);
-        using _finalCarry = finalCarry;
         using __outputs = _outputs;
         return finalCarry;
       };
@@ -1394,7 +1392,6 @@ describe("scan autodiff", () => {
           return [newCarry, newCarry];
         };
         const [finalCarry, _] = lax.scan(step, initVal, xs, { reverse: true });
-        using _finalCarry = finalCarry;
         using __ = _;
         return finalCarry;
       };

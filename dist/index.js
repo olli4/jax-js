@@ -4728,6 +4728,19 @@ var Array$1 = class Array$1 extends Tracer {
 		this.#realize();
 		return this.#source;
 	}
+	/**
+	* Submit all pending backend dispatches without reading data back.
+	* Used by evalJaxprTransposed to flush result arrays' PE chains before
+	* disposing intermediates — prevents orphaned Slot references.
+	* @private
+	*/
+	_flushPendingSync() {
+		this.#realize();
+		for (const p of this.#pending) {
+			p.prepareSync();
+			p.submit();
+		}
+	}
 	/** @private Put this array on a new backend, asynchronously. */
 	async _put(backend) {
 		if (this.#backend === backend) return this;
@@ -5643,6 +5656,8 @@ var JVPTrace = class extends Trace {
 	lift(val) {
 		const zero = zerosLike$1(val);
 		if (zero instanceof Array$1) anonymousConstArrays.add(zero);
+		const data = this.main.globalData;
+		if (data) data.liftedTangents.push(zero);
 		return new JVPTracer(this, val, zero);
 	}
 	processPrimitive(primitive, tracers, params) {
@@ -5651,8 +5666,8 @@ var JVPTrace = class extends Trace {
 		if (jvpRule === void 0) throw new Error(`No JVP rule for: ${primitive}`);
 		const [primalsOut, tangentsOut] = jvpRule(primalsIn, tangentsIn, params);
 		const result = zip(primalsOut, tangentsOut).map(([x, t]) => new JVPTracer(this, x, t));
-		const intermediates = this.main.globalData;
-		if (intermediates) intermediates.push(...result);
+		const data = this.main.globalData;
+		if (data) data.intermediates.push(...result);
 		return result;
 	}
 };
@@ -6004,13 +6019,17 @@ const jvpRules = {
 			const [m, n] = a.shape.slice(-2);
 			const k = Math.min(m, n);
 			const luSliceL = _usingCtx20.u(sliceAxis(luMatrix, -1, [0, k]));
-			const lLower = _usingCtx20.u(tril(luSliceL, -1));
-			const lPadded = _usingCtx20.u(m > k ? padAxis(lLower, -1, [0, m - k]) : lLower.ref);
+			const lLower = tril(luSliceL, -1);
+			const lPaddedNeedsDispose = m > k;
+			const lPadded = lPaddedNeedsDispose ? padAxis(lLower, -1, [0, m - k]) : lLower;
 			const eyeM = _usingCtx20.u(eye(m));
 			const L = _usingCtx20.u(lPadded.add(eyeM));
+			if (lPaddedNeedsDispose) lPadded[Symbol.dispose]();
+			lLower[Symbol.dispose]();
 			const luSliceU = _usingCtx20.u(sliceAxis(luMatrix, -2, [0, k]));
-			const uUpper = _usingCtx20.u(triu(luSliceU));
-			const uPadded = _usingCtx20.u(n > k ? padAxis(uUpper, -2, [0, n - k]) : uUpper.ref);
+			const uUpper = triu(luSliceU);
+			const uPaddedNeedsDispose = n > k;
+			const uPadded = uPaddedNeedsDispose ? padAxis(uUpper, -2, [0, n - k]) : uUpper;
 			const uEye = _usingCtx20.u(n > k ? (() => {
 				try {
 					var _usingCtx21 = _usingCtx();
@@ -6024,6 +6043,8 @@ const jvpRules = {
 				}
 			})() : zerosLike$1(uPadded));
 			const U = _usingCtx20.u(uPadded.add(uEye));
+			if (uPaddedNeedsDispose) uPadded[Symbol.dispose]();
+			uUpper[Symbol.dispose]();
 			const permReshaped = _usingCtx20.u(permutation.reshape([...permutation.shape, 1]));
 			const arangeM = _usingCtx20.u(arange(m));
 			const permEq = _usingCtx20.u(permReshaped.equal(arangeM));
@@ -6181,8 +6202,11 @@ function jvpJaxpr(jaxpr) {
 function jvpFlat(f, primals, tangents) {
 	try {
 		var _usingCtx22 = _usingCtx();
-		const intermediateTracers = [];
-		const main = _usingCtx22.u(newMain(JVPTrace, intermediateTracers));
+		const jvpData = {
+			intermediates: [],
+			liftedTangents: []
+		};
+		const main = _usingCtx22.u(newMain(JVPTrace, jvpData));
 		const trace$1 = new JVPTrace(main);
 		const newlyCreatedInputs = [];
 		const tracersIn = zip(primals, tangents).map(([x, t]) => {
@@ -6197,12 +6221,14 @@ function jvpFlat(f, primals, tangents) {
 		const result = unzip2(tracersOut.map((t) => [t.primal, t.tangent]));
 		if (main.level <= 1) {
 			const outputSet = new Set(tracersOut);
-			for (const t of intermediateTracers) if (!outputSet.has(t)) {
+			for (const t of jvpData.intermediates) if (!outputSet.has(t)) {
 				if (t.primal.refCount > 0) t.primal[Symbol.dispose]();
 				if (t.tangent.refCount > 0) t.tangent[Symbol.dispose]();
 			}
 			const outputArrays = new Set([...result[0], ...result[1]]);
 			for (const a of newlyCreatedInputs) if (!outputArrays.has(a) && a.refCount > 0) a[Symbol.dispose]?.();
+			const outputTangents = new Set(result[1]);
+			for (const z of jvpData.liftedTangents) if (!outputTangents.has(z) && z.refCount > 0) z[Symbol.dispose]?.();
 		}
 		return result;
 	} catch (_) {
@@ -6268,6 +6294,7 @@ function partialEvalFlat(f, pvalsIn) {
 	let jaxpr;
 	let pvalsOut;
 	let knownIntermediates;
+	let literalIntermediates;
 	try {
 		var _usingCtx$1 = _usingCtx();
 		const main = _usingCtx$1.u(newMain(PartialEvalTrace));
@@ -6295,6 +6322,7 @@ function partialEvalFlat(f, pvalsIn) {
 		jaxpr = partialEvalGraphToJaxpr(unknownTracersIn, unknownTracersOut);
 		for (const ct of trace$1.allConstPETracers) if (ct.isAlive) ct.dispose();
 		knownIntermediates = trace$1.knownIntermediates;
+		literalIntermediates = trace$1.literalIntermediates;
 		knownIntermediates.push(...peCreatedArrays);
 	} catch (_) {
 		_usingCtx$1.e = _;
@@ -6304,7 +6332,8 @@ function partialEvalFlat(f, pvalsIn) {
 	return {
 		jaxpr,
 		pvalsOut,
-		peIntermediates: knownIntermediates
+		peIntermediates: knownIntermediates,
+		literalIntermediates
 	};
 }
 /**
@@ -6315,10 +6344,13 @@ function partialEvalFlat(f, pvalsIn) {
 * else (pure intermediates AND computed consts) needs one dispose here
 * to balance the rc=1 from creation.
 */
-function disposePeIntermediates(peIntermediates, protectedVals) {
+function disposePeIntermediates(peIntermediates, _literalIntermediates, protectedVals) {
 	if (insideTrace()) return;
+	const targets = peIntermediates;
 	const disposed = /* @__PURE__ */ new Set();
-	for (const t of peIntermediates) if (!protectedVals.has(t) && !disposed.has(t)) {
+	for (const t of targets) {
+		if (protectedVals.has(t)) continue;
+		if (disposed.has(t)) continue;
 		disposed.add(t);
 		try {
 			t.dispose();
@@ -6353,21 +6385,22 @@ function linearizeFlatUtil(f, primalsIn) {
 		const [primalsOut$1, tangentsOut] = jvp$1(f, x.slice(0, k), x.slice(k, 2 * k));
 		return [...primalsOut$1, ...tangentsOut];
 	};
-	const { jaxpr, pvalsOut, peIntermediates } = partialEvalFlat(fJvp, pvalsIn);
+	const { jaxpr, pvalsOut, peIntermediates, literalIntermediates } = partialEvalFlat(fJvp, pvalsIn);
 	const primalPvals = pvalsOut.slice(0, pvalsOut.length / 2);
 	if (!primalPvals.every((pval) => pval.isKnown)) throw new Error("Not all primal values are known after partial evaluation");
 	const primalsOut = primalPvals.map((pval) => pval.val);
 	return {
 		primalsOut,
 		jaxpr,
-		peIntermediates
+		peIntermediates,
+		literalIntermediates
 	};
 }
 function linearizeFlat(f, primalsIn, auxStore) {
-	const { primalsOut, jaxpr, peIntermediates } = linearizeFlatUtil(f, primalsIn);
+	const { primalsOut, jaxpr, peIntermediates, literalIntermediates } = linearizeFlatUtil(f, primalsIn);
 	const protectedVals = new Set(primalsOut);
 	if (auxStore?.value != null) for (const arr of collectConcreteArrays(auxStore.value)) protectedVals.add(arr);
-	disposePeIntermediates(peIntermediates, protectedVals);
+	disposePeIntermediates(peIntermediates, literalIntermediates, protectedVals);
 	const fLin = (...tangents) => evalJaxpr(jaxpr.jaxpr, [...jaxpr.consts.map((c) => c.ref), ...tangents]);
 	const dispose$1 = () => jaxpr.dispose();
 	return [
@@ -6448,7 +6481,10 @@ var PartialEvalTrace = class extends Trace {
 	}
 	pure(val) {
 		const arr = pureArray(val);
-		if (!(val instanceof Tracer)) this.knownIntermediates.push(arr);
+		if (!(val instanceof Tracer)) {
+			this.knownIntermediates.push(arr);
+			this.literalIntermediates.push(arr);
+		}
 		return new PartialEvalTracer(this, PartialVal.known(arr), null);
 	}
 	lift = this.pure;
@@ -6458,6 +6494,15 @@ var PartialEvalTrace = class extends Trace {
 			arr = [];
 			if (!this.main.globalData) this.main.globalData = {};
 			this.main.globalData._knownIntermediates = arr;
+		}
+		return arr;
+	}
+	get literalIntermediates() {
+		let arr = this.main.globalData?._literalIntermediates;
+		if (!arr) {
+			arr = [];
+			if (!this.main.globalData) this.main.globalData = {};
+			this.main.globalData._literalIntermediates = arr;
 		}
 		return arr;
 	}
@@ -6592,9 +6637,14 @@ var PartialEvalTrace = class extends Trace {
 		}
 		const numPrimalCarry = numCarry / 2;
 		const numPrimalY = numY / 2;
+		const synthesizedZeroInputs = [];
 		const fullInputs = tracers.map((t) => {
 			if (t.pval.isKnown) return t.pval.val.ref;
-			else return zeros(t.pval.aval.shape, { dtype: t.pval.aval.dtype });
+			else {
+				const z = zeros(t.pval.aval.shape, { dtype: t.pval.aval.dtype });
+				synthesizedZeroInputs.push(z);
+				return z;
+			}
 		});
 		const fullOuts = bind(Primitive.Scan, fullInputs, params);
 		const tracersIn = tracers.map((t) => this.instantiateConst(t));
@@ -6621,6 +6671,10 @@ var PartialEvalTrace = class extends Trace {
 			tracersIn.forEach((t) => t.ref);
 			tracersOut.push(new PartialEvalTracer(this, PartialVal.unknown(avalsOut[numCarry + i]), recipe));
 		}
+		const retainedKnownOutputs = /* @__PURE__ */ new Set();
+		for (let i = 0; i < numPrimalCarry; i++) retainedKnownOutputs.add(fullOuts[i]);
+		for (let i = 0; i < numPrimalY; i++) retainedKnownOutputs.add(fullOuts[numCarry + i]);
+		for (const inp of fullInputs) if (!retainedKnownOutputs.has(inp) && inp.refCount > 0) inp.dispose();
 		recipe.tracerRefsOut = tracersOut.map((t) => t.pval.isKnown ? null : new WeakRef(t));
 		return tracersOut;
 	}
@@ -6820,19 +6874,25 @@ function evalJaxprTransposed(jaxpr, args, cotangents) {
 	const results = [];
 	for (let i = 0; i < jaxpr.inBinders.length; i++) if (args[i] instanceof UndefPrimal) results.push(readCotangent(jaxpr.inBinders[i]));
 	if (!insideTrace()) {
-		const returnedSet = new Set(results);
-		for (const v of argPrimals) {
-			const val = knownPrimals.get(v);
-			const initialRc = argPrimalInitRc.get(v);
-			if (val && initialRc !== void 0) {
-				const excess = val.refCount - initialRc;
-				for (let i = 0; i < excess; i++) try {
+		for (const r of results) if (r instanceof Array$1) r._flushPendingSync();
+	}
+	for (const v of argPrimals) {
+		const val = knownPrimals.get(v);
+		const initialRc = argPrimalInitRc.get(v);
+		if (val && initialRc !== void 0) {
+			const excess = val.refCount - initialRc;
+			for (let i = 0; i < excess; i++) {
+				if (val.refCount <= 0) break;
+				try {
 					val.dispose();
 				} catch {
 					break;
 				}
 			}
 		}
+	}
+	if (!insideTrace()) {
+		const returnedSet = new Set(results);
 		for (const [v, t] of knownPrimals.entries()) if (!argPrimals.has(v) && !returnedSet.has(t)) try {
 			while (t.refCount > 0) t.dispose();
 		} catch {}
@@ -7153,8 +7213,10 @@ const transposeRules = {
 			const dataIdx = reverse ? length - 1 - iter : iter;
 			const xSlices = [];
 			for (const xs of xsResiduals) {
-				const slice = shrink(xs.ref, [[dataIdx, dataIdx + 1], ...xs.shape.slice(1).map((_, i) => [0, xs.shape[i + 1]])]);
-				xSlices.push(reshape$1(slice, xs.shape.slice(1)));
+				const slice = shrink(xs, [[dataIdx, dataIdx + 1], ...xs.shape.slice(1).map((_, i) => [0, xs.shape[i + 1]])]);
+				const reshaped = reshape$1(slice, xs.shape.slice(1));
+				slice.dispose();
+				xSlices.push(reshaped);
 			}
 			const forwardInputs = [
 				...constResiduals.map((c) => c.ref),
@@ -7164,6 +7226,7 @@ const transposeRules = {
 			const forwardOuts = evalJaxpr(primalForwardJaxpr.jaxpr, [...primalForwardJaxpr.consts.map((c) => c.ref), ...forwardInputs]);
 			const newCarry = forwardOuts.slice(0, numPrimalCarry);
 			for (let i = numPrimalCarry; i < forwardOuts.length; i++) forwardOuts[i].dispose();
+			for (const x of xSlices) if (x.refCount > 0) x.dispose();
 			return newCarry;
 		};
 		const useCheckpointing = checkpoint !== false;
@@ -7217,14 +7280,18 @@ const transposeRules = {
 			const dataIdx = reverse ? length - 1 - iter : iter;
 			const xSlices = [];
 			for (const xs of xsResiduals) {
-				const slice = shrink(xs.ref, [[dataIdx, dataIdx + 1], ...xs.shape.slice(1).map((_, i) => [0, xs.shape[i + 1]])]);
-				xSlices.push(reshape$1(slice, xs.shape.slice(1)));
+				const slice = shrink(xs, [[dataIdx, dataIdx + 1], ...xs.shape.slice(1).map((_, i) => [0, xs.shape[i + 1]])]);
+				const reshaped = reshape$1(slice, xs.shape.slice(1));
+				slice.dispose();
+				xSlices.push(reshaped);
 			}
 			const ctYSlices = [];
 			for (let i = Math.floor(numY / 2); i < ctYsAll.length; i++) {
 				const ctY = ctYsAll[i];
-				const slice = shrink(ctY.ref, [[dataIdx, dataIdx + 1], ...ctY.shape.slice(1).map((_, j) => [0, ctY.shape[j + 1]])]);
-				ctYSlices.push(reshape$1(slice, ctY.shape.slice(1)));
+				const slice = shrink(ctY, [[dataIdx, dataIdx + 1], ...ctY.shape.slice(1).map((_, j) => [0, ctY.shape[j + 1]])]);
+				const reshaped = reshape$1(slice, ctY.shape.slice(1));
+				slice.dispose();
+				ctYSlices.push(reshaped);
 			}
 			const bodyOutCotangents = [];
 			bodyOutCotangents.push(...ctCarryRunning.map((c) => c.ref));
@@ -7246,7 +7313,16 @@ const transposeRules = {
 			const ctXIter = [];
 			for (let i = 0; i < numTangentX; i++) ctXIter.push(transposedOuts[outIdx++]);
 			if (ctConstsAccum === null) ctConstsAccum = ctConstsIter;
-			else ctConstsAccum = ctConstsAccum.map((ct, i) => add$1(ct, ctConstsIter[i]));
+			else {
+				const next = [];
+				for (let i = 0; i < ctConstsAccum.length; i++) {
+					const summed = add$1(ctConstsAccum[i], ctConstsIter[i]);
+					ctConstsAccum[i].dispose();
+					ctConstsIter[i].dispose();
+					next.push(summed);
+				}
+				ctConstsAccum = next;
+			}
 			for (let i = 0; i < numTangentX; i++) ctXsAccum[i].push(ctXIter[i]);
 			for (const c of ctCarryRunning) c.dispose();
 			ctCarryRunning = ctCarryNew;
@@ -7290,6 +7366,15 @@ const transposeRules = {
 			if (reverse) reversed.reverse();
 			const expanded = reversed.map((ct) => broadcast(ct, [1, ...ct.shape], [0]));
 			const stacked = concatenate$1(expanded, 0);
+			const disposed = /* @__PURE__ */ new Set();
+			for (const ct of expanded) if (!disposed.has(ct)) {
+				disposed.add(ct);
+				ct.dispose();
+			}
+			for (const ct of reversed) if (!disposed.has(ct)) {
+				disposed.add(ct);
+				ct.dispose();
+			}
 			ctXsStacked.push(stacked);
 		}
 		const actualUndefMask = args.map((x) => x instanceof UndefPrimal);
@@ -7308,6 +7393,9 @@ const transposeRules = {
 			else if (i < numConsts + numCarry) result.push(ctCarryRunning[ctCarryIdx++]);
 			else result.push(ctXsStacked[ctXIdx++]);
 		}
+		if (ctConstsAccum) for (let i = ctConstIdx; i < ctConstsAccum.length; i++) ctConstsAccum[i].dispose();
+		for (let i = ctCarryIdx; i < ctCarryRunning.length; i++) ctCarryRunning[i].dispose();
+		for (let i = ctXIdx; i < ctXsStacked.length; i++) ctXsStacked[i].dispose();
 		primalForwardJaxpr.dispose();
 		transposedBody.dispose();
 		for (const c of constResiduals) c.dispose();
@@ -7340,10 +7428,13 @@ function transposeJaxpr(jaxpr, undefPrimals) {
 	return newJaxpr;
 }
 function vjpFlat(f, primalsIn, auxStore) {
-	const { primalsOut, jaxpr, peIntermediates } = linearizeFlatUtil(f, primalsIn);
+	const { primalsOut, jaxpr, peIntermediates, literalIntermediates } = linearizeFlatUtil(f, primalsIn);
 	const protectedVals = new Set(primalsOut);
 	if (auxStore?.value != null) for (const arr of collectConcreteArrays(auxStore.value)) protectedVals.add(arr);
-	disposePeIntermediates(peIntermediates, protectedVals);
+	disposePeIntermediates(peIntermediates, literalIntermediates, protectedVals);
+	if (!insideTrace()) {
+		for (const p of primalsOut) if (p instanceof Array$1) p._flushPendingSync();
+	}
 	const fVjp = (...cotangents) => {
 		const transposeInputs = [...jaxpr.consts, ...primalsIn.map((t) => new UndefPrimal(t.aval))];
 		return evalJaxprTransposed(jaxpr.jaxpr, transposeInputs, cotangents);
@@ -7439,12 +7530,27 @@ function valueAndGrad$1(f, opts) {
 			throw new TypeError("grad only supports floating-point dtypes");
 		}
 		const seed = onesLike$1(y);
-		anonymousConstArrays.add(seed);
 		const cts = fVjp(seed);
+		let seedEscapes = false;
+		for (const ct of cts) {
+			if (ct === seed) {
+				seedEscapes = true;
+				break;
+			}
+			for (const arr of collectConcreteArrays(ct)) if (arr === seed) {
+				seedEscapes = true;
+				break;
+			}
+			if (seedEscapes) break;
+		}
+		const shouldDisposeSeed = !seedEscapes;
 		if (!insideTrace()) {
-			seed.dispose();
-			fVjp.dispose();
 			for (const a of sgArrays) if (!sgOriginals.has(a)) a.dispose();
+		}
+		fVjp.dispose();
+		if (shouldDisposeSeed) {
+			if (!insideTrace()) seed.dispose();
+			else if (currentTraceLevel() === 1 && seed instanceof Array$1 && seed.refCount > 0) seed.dispose();
 		}
 		for (let i = 0; i < cts.length; i++) if (!argnumsSet.has(i)) dispose(cts[i]);
 		const grads = typeof argnums === "number" ? cts[argnums] : argnums.map((i) => cts[i]);
@@ -8719,11 +8825,14 @@ function stack(xs, axis = 0) {
 	if (!shapes.every((s) => deepEqual(s, shapes[0]))) throw new Error(`Cannot stack arrays with different shapes: ${JSON.stringify(shapes)}`);
 	axis = checkAxis(axis, shapes[0].length + 1);
 	const newShape = shapes[0].toSpliced(axis, 0, 1);
-	const newArrays = xs.map((x) => fudgeArray(x).reshape(newShape));
+	const fudged = xs.map((x) => fudgeArray(x));
+	const newlyCreated = fudged.filter((f, i) => f !== xs[i]);
+	const newArrays = fudged.map((x) => x.reshape(newShape));
 	try {
 		return concatenate(newArrays, axis);
 	} finally {
 		for (const a of newArrays) a[Symbol.dispose]();
+		for (const a of newlyCreated) a[Symbol.dispose]();
 	}
 }
 /**

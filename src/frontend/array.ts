@@ -1494,6 +1494,20 @@ export class Array extends Tracer {
     return this.#source as number; // Because #realize() was called.
   }
 
+  /**
+   * Submit all pending backend dispatches without reading data back.
+   * Used by evalJaxprTransposed to flush result arrays' PE chains before
+   * disposing intermediates — prevents orphaned Slot references.
+   * @private
+   */
+  _flushPendingSync(): void {
+    this.#realize();
+    for (const p of this.#pending) {
+      p.prepareSync();
+      p.submit();
+    }
+  }
+
   /** @private Put this array on a new backend, asynchronously. */
   async _put(backend: Backend): Promise<Array> {
     if (this.#backend === backend) return this;
