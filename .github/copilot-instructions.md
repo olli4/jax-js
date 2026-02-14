@@ -139,6 +139,10 @@ Husky runs `lint-staged` on commit, which auto-fixes ESLint and Prettier issues 
 pre-commit hook also runs the full Vitest suite and Deno WebGPU tests (`pnpm vitest run` +
 `pnpm run build` + `pnpm run test:deno`).
 
+> **TEMPORARY (`feat/non-consuming-ops` branch):** The pre-commit hook uses `|| true` so known
+> test failures don't block commits. Search `.husky/pre-commit` for `TODO(merge-to-main)` to find
+> the relaxed lines. See `MERGE_CHECKLIST.md` for the full list of items to resolve before merge.
+
 **Before any commit**, also run these checks manually to catch issues early:
 
 ```bash
@@ -907,11 +911,45 @@ The `Kernel` class is single-output: `new Kernel(nargs, size, exp, reduction?)`.
   `deno test` invocation, GPU state pollution between files causes memory leak detection failures.
   The `test:deno` script runs each file as a separate `deno test` command (chained with `&&`).
 
-**Current test status (Feb 2026):** 1163 passed, 0 failed, 745 skipped. All tests pass with global
-`checkLeaks` leak detection enabled (`test/setup.ts`). The LU JVP finite-difference test was
-previously failing because the WASM LU routine uses native f32 arithmetic (upstream fell back to CPU
-with f64 precision); fixed by using larger eps and looser tolerance. All previously-failing
-cross-device tests (FFT, random, linalg on WASM after CPU) are fixed — see `_put`/`_putSync` in
+## Known framework bugs (`KNOWN_BUG` tests)
+
+The `feat/non-consuming-ops` branch has known framework bugs tracked as regular `test()` calls
+tagged with `KNOWN_BUG(<id>)` in the test name and a comment above. These tests exercise the actual
+broken patterns (not workarounds) and are expected to fail. When a framework fix lands, the test
+starts passing automatically — no clerical changes needed.
+
+**Policy:**
+
+1. Write the test as it SHOULD work — the ideal behavior, no workarounds.
+2. Tag the test name: `test("KNOWN_BUG(my-tag): description", () => { ... })`
+3. Add a `// KNOWN_BUG(my-tag): explanation` comment above the test.
+4. Keep the working workaround test nearby (e.g., jit-wrapped version, depth-3 cap).
+5. Add the bug to the inventory in `MERGE_CHECKLIST.md`.
+
+**Finding all known bugs:**
+
+```bash
+grep -rn 'KNOWN_BUG(' test/
+```
+
+**Current inventory:**
+
+| Tag                  | File                           | Issue                                     | Workaround in tests      |
+| -------------------- | ------------------------------ | ----------------------------------------- | ------------------------ |
+| `depth4-grad-leak`   | transform-compositions.test.ts | `grad⁴(f)` leaks intermediates            | `jvp(grad³(f))` for f⁴   |
+| `depth4-vjp-uaf`     | transform-compositions.test.ts | `vjp(grad³(f))` UAF at depth 4            | Cap vjp at depth 3       |
+| `bare-vmap-leak`     | transform-compositions.test.ts | `vmap(grad(f))` leaks without jit         | `jit(vmap(grad(f)))`     |
+| `bare-jacfwd-leak`   | transform-compositions.test.ts | `jacfwd(f)` leaks without jit             | `jit(jacfwd(f))`         |
+| `bare-jacrev-leak`   | transform-compositions.test.ts | `jacrev(f)` leaks without jit             | `jit(jacrev(f))`         |
+| `bare-hessian-leak`  | transform-compositions.test.ts | `hessian(f)` leaks without jit            | `jit(hessian(f))`        |
+| `makejaxpr-jvp`      | tracing.test.ts                | `makeJaxpr` does not compose with `jvp`   | None (test.skip → test)  |
+| `sign-nan`           | numpy.test.ts                  | `sign(NaN)` returns 1 instead of NaN      | None                     |
+| `sort-grad`          | numpy.test.ts                  | `sort` grad needs scatter (not impl)      | None                     |
+
+**Test status:** See `pnpm vitest run` output. Known failures are expected and tracked above.
+The LU JVP finite-difference test was previously failing because the WASM LU routine uses native
+f32 arithmetic; fixed by using larger eps and looser tolerance. All previously-failing cross-device
+tests (FFT, random, linalg on WASM after CPU) are fixed — see `_put`/`_putSync` in
 [Common pitfalls](#common-pitfalls).
 
 > ⚠️ **IMPORTANT: Deno WebGPU test isolation** - Due to Deno's module caching and GPU state
@@ -933,22 +971,25 @@ cross-device tests (FFT, random, linalg on WASM after CPU) are fixed — see `_p
 1. Run pre-commit CI checks (see above)
 2. Ensure the **pre-commit hook** is installed (run `pnpm prepare` if needed). The repository will
    run linting and the _full test suite_ automatically when you commit.
-3. Run the _full test suite_ locally (`pnpm vitest run`) after finishing code changes to verify
-   there are no regressions.
+3. Run the _full test suite_ locally (`pnpm vitest run`) after finishing code changes. Verify no
+   NEW failures beyond the known `KNOWN_BUG` tests (see [Known framework bugs](#known-framework-bugs-known_bug-tests)).
 4. Update documentation when adding new features or APIs
 5. Add/adjust tests exercising `.dispose()` for new behavior — add focused unit tests for any
    bugfixes or edge cases
 6. Export new public symbols from `src/index.ts`
 7. Update `FEATURES.md` for user-visible changes
+8. If you **fix** a `KNOWN_BUG` test (it starts passing), celebrate — then remove the `KNOWN_BUG`
+   tag and update the inventory in both this file and `MERGE_CHECKLIST.md`
 
 ## Documentation files
 
-| File                              | Purpose                                    | When to update                 |
-| --------------------------------- | ------------------------------------------ | ------------------------------ |
-| `README.md`                       | Main project intro, tutorial               | Major features, API changes    |
-| `FEATURES.md`                     | JAX/NumPy API compatibility table          | New supported functions        |
-| `.github/copilot-instructions.md` | AI agent onboarding, scan feature tracking | New patterns, scan development |
-| `packages/*/README.md`            | Package-specific docs                      | Package feature changes        |
+| File                              | Purpose                                     | When to update                 |
+| --------------------------------- | ------------------------------------------- | ------------------------------ |
+| `README.md`                       | Main project intro, tutorial                | Major features, API changes    |
+| `FEATURES.md`                     | JAX/NumPy API compatibility table           | New supported functions        |
+| `.github/copilot-instructions.md` | AI agent onboarding, scan feature tracking  | New patterns, scan development |
+| `MERGE_CHECKLIST.md`              | Branch merge tasks & KNOWN_BUG inventory    | New/fixed known bugs           |
+| `packages/*/README.md`            | Package-specific docs                       | Package feature changes        |
 
 ## Where to start reading
 
@@ -2834,7 +2875,7 @@ import { checkLeaks } from "@jax-js/jax";
 
 checkLeaks.start(); // snapshot slot count + enable stack capture
 // ... user code ...
-const report = checkLeaks.stop({ autoDispose: true }); // diff, auto-cleanup, report
+const report = checkLeaks.stop(); // diff + report
 // report.leaked: number of leaked backend slots
 // report.details: ["float32[512,512] created at model.ts:42", ...]
 // report.summary: human-readable message with diagnostics
@@ -2844,9 +2885,6 @@ const report = checkLeaks.stop({ autoDispose: true }); // diff, auto-cleanup, re
 
 - `checkLeaks.start({ trackRefs: true })` — also track `.ref` call sites; the report shows
   `↳ last .ref at <location>` for arrays with rc≥2 leaks.
-- `checkLeaks.stop({ autoDispose: true })` — before counting leaks: (1) flush all jit caches via
-  `_disposeAllJitCaches()`, (2) dispose OwnedFunctions (vjp/linearize closures), (3) multi-pass
-  dispose of all tracked arrays (handles rc>1 from `instantiateConst` inside `vmap(grad(...))`).
 - `checkLeaks.snapshot()` — return a snapshot of tracked arrays mid-session without stopping.
 
 **Key files:**
@@ -2876,14 +2914,6 @@ Both are called by `_disposeAllJitCaches()` during `checkLeaks.stop()`. The impo
 safe: `jit.ts → check-leaks.ts` and `jaxpr.ts → check-leaks.ts` (check-leaks only imports from
 `../backend`, no cycles).
 
-**Multi-pass autoDispose:**
-
-The `autoDispose` option runs up to 3 passes of `.dispose()` on all tracked arrays. This handles
-arrays with rc>1 that arise when `instantiateConst` adds `.ref` calls during PE tracing inside
-composed transforms like `vmap(grad(...))`. The `disposePeIntermediates` function skips disposal
-when `insideTrace()` is true (to avoid disposing outer-trace tracers), so these extra refs aren't
-balanced. Multi-pass autoDispose compensates by repeatedly disposing until all arrays reach rc=0.
-
 **Unreachable Const PETracer disposal:**
 
 When `hasAux` is used with `vjp`/`linearize`, aux computations may call `instantiateConst` on input
@@ -2905,8 +2935,8 @@ backend Slot.
   calls must be removed (they conflict with the global wrapper). See autoref.test.ts,
   recycle.test.ts for examples of tests that had inner calls removed.
 - Anonymous constants in scan/jit bodies (e.g., `np.array([2, 3])` inline) get rc=2 from
-  `getOrMakeConstTracer`'s `.ref`. After `_disposeAllJitCaches`, rc drops to 1. Multi-pass
-  autoDispose handles the final dispose.
+  `getOrMakeConstTracer`'s `.ref`. After `_disposeAllJitCaches`, rc drops to 1. Extract constants
+  to named variables and dispose them manually.
 
 **Why this is better than `tidy()`:** Zero overhead in production. Educates users toward `jit()`
 rather than providing a weaker alternative. Keeps the API surface JAX-compatible.

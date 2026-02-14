@@ -1167,8 +1167,8 @@ suite.each(devices)("device:%s", (device) => {
       expect(y.js()).toEqual([-1, 0, 1]);
     });
 
-    // TODO: Fix sign(NaN) returning 1 instead of NaN
-    test.fails("works with NaN", () => {
+    // KNOWN_BUG(sign-nan): sign(NaN) returns 1 instead of NaN
+    test("KNOWN_BUG(sign-nan): works with NaN", () => {
       expect(np.sign(NaN).js()).toBeNaN();
     });
   });
@@ -2439,10 +2439,10 @@ suite.each(devices)("device:%s", (device) => {
         expect(dy.js()).toEqual([20, 30, 10]);
       });
 
-      // Won't work until scatter is implemented.
-      test.fails("works with grad", () => {
+      // KNOWN_BUG(sort-grad): Won't work until scatter is implemented.
+      test("KNOWN_BUG(sort-grad): works with grad", () => {
         using x = np.array([3, 1, 4, 2]);
-        using f = (x: np.Array) => np.sort(x).slice([0, 2]).sum();
+        const f = (x: np.Array) => np.sort(x).slice([0, 2]).sum();
         using dx = grad(f)(x);
         expect(dx.js()).toEqual([0, 1, 0, 1]);
       });

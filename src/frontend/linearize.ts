@@ -26,11 +26,7 @@ import {
   pureArray,
   zeros,
 } from "./array";
-import {
-  _leakTrackingEnabled,
-  _leakTrackingOwnedFns,
-  _registerJitCacheDisposer,
-} from "./check-leaks";
+import { _registerJitCacheDisposer } from "./check-leaks";
 import {
   _peArrayCreationTracker,
   _setPACT,
@@ -336,7 +332,6 @@ export function linearize(
   }) as OwnedFunction<(...tangents: any[]) => any>;
   fLin.dispose = dispose;
   fLin[Symbol.dispose] = dispose;
-  if (_leakTrackingEnabled) _leakTrackingOwnedFns.add(fLin as any);
   if (hasAux) {
     return [primalsOut, fLin, lowerAux(aux!.value)];
   }
@@ -2192,7 +2187,6 @@ export function vjp(
   }) as OwnedFunction<(...cotangents: any) => any>;
   fVjp.dispose = innerDispose;
   fVjp[Symbol.dispose] = innerDispose;
-  if (_leakTrackingEnabled) _leakTrackingOwnedFns.add(fVjp as any);
 
   if (hasAux) {
     return [primalsOut, fVjp, lowerAux(aux!.value)];

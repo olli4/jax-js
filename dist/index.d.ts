@@ -1429,17 +1429,12 @@ declare const checkLeaks: {
   /**
    * Stop tracking and return a report of leaked backend slots.
    *
-   * Flushes all JIT caches (freeing their cached constants), optionally
-   * auto-disposes tracked arrays, computes the backend slot delta since
-   * `start()`, and — when leaks are found — builds a human-readable
-   * summary with creation sites, reference counts, and diagnostic tips.
-   *
-   * @param options.autoDispose If true, auto-dispose all tracked arrays and
-   *   OwnedFunctions before checking the slot count delta.
+   * Flushes all JIT caches (freeing their cached constants),
+   * computes the backend slot delta since `start()`, and — when
+   * leaks are found — builds a human-readable summary with creation
+   * sites, reference counts, and diagnostic tips.
    */
-  stop(options?: {
-    autoDispose?: boolean;
-  }): LeakReport;
+  stop(): LeakReport;
   /** Whether leak tracking is currently active. */
   readonly active: boolean;
 };

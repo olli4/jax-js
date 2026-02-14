@@ -100,9 +100,6 @@ export const _leakTrackingMap = new Map<object, Error>();
 export let _trackRefsEnabled = false;
 export const _lastRefMap = new Map<object, Error>();
 
-/** Set of OwnedFunction objects (linearize/vjp results) created during tracking. */
-export const _leakTrackingOwnedFns = new Set<{ dispose(): void }>();
-
 // ── Snapshot state ──
 
 const _startSlots = new Map<Device, number>();
@@ -354,15 +351,12 @@ export const checkLeaks = {
   /**
    * Stop tracking and return a report of leaked backend slots.
    *
-   * Flushes all JIT caches (freeing their cached constants), optionally
-   * auto-disposes tracked arrays, computes the backend slot delta since
-   * `start()`, and — when leaks are found — builds a human-readable
-   * summary with creation sites, reference counts, and diagnostic tips.
-   *
-   * @param options.autoDispose If true, auto-dispose all tracked arrays and
-   *   OwnedFunctions before checking the slot count delta.
+   * Flushes all JIT caches (freeing their cached constants),
+   * computes the backend slot delta since `start()`, and — when
+   * leaks are found — builds a human-readable summary with creation
+   * sites, reference counts, and diagnostic tips.
    */
-  stop(options?: { autoDispose?: boolean }): LeakReport {
+  stop(): LeakReport {
     if (!_active) {
       return { leaked: 0, details: [], summary: "No leaks detected." };
     }
@@ -373,38 +367,6 @@ export const checkLeaks = {
 
     // Flush all jit caches so their const arrays are freed before counting.
     _disposeAllJitCaches();
-
-    if (options?.autoDispose) {
-      // First, dispose any OwnedFunction objects (linearize/vjp results).
-      for (const fn of _leakTrackingOwnedFns) {
-        try {
-          fn.dispose();
-        } catch {
-          // Already disposed or other error — skip.
-        }
-      }
-      _leakTrackingOwnedFns.clear();
-
-      // Then auto-dispose all tracked arrays. Multiple passes handle arrays
-      // whose rc > 1 (e.g., PE intermediates inside vmap(grad(...)) that get
-      // extra .ref from instantiateConst but can't be disposed by
-      // disposePeIntermediates when insideTrace() is true).
-      for (let pass = 0; pass < 3; pass++) {
-        let anyDisposed = false;
-        for (const [arr] of _leakTrackingMap) {
-          const rc = safeRefCountNum(arr);
-          if (rc > 0) {
-            try {
-              (arr as any).dispose();
-              anyDisposed = true;
-            } catch {
-              // Already freed or error — skip.
-            }
-          }
-        }
-        if (!anyDisposed) break;
-      }
-    }
 
     // Sum slot deltas across ALL backends.
     let leaked = 0;
@@ -420,7 +382,6 @@ export const checkLeaks = {
     if (leaked === 0) {
       _leakTrackingMap.clear();
       _lastRefMap.clear();
-      _leakTrackingOwnedFns.clear();
       return { leaked: 0, details: [], summary: "No leaks detected." };
     }
 
@@ -478,7 +439,6 @@ export const checkLeaks = {
 
     _leakTrackingMap.clear();
     _lastRefMap.clear();
-    _leakTrackingOwnedFns.clear();
 
     // User-code sites first (most actionable), then dependency, by count desc
     const sorted = [...groups.entries()].sort(

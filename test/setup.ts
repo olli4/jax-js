@@ -6,7 +6,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
-  const result = checkLeaks.stop({ autoDispose: false });
+    const result = checkLeaks.stop();
   expect(result.leaked, result.summary).toBe(0);
 });
 

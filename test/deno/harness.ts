@@ -17,9 +17,117 @@
  */
 
 import { assertEquals } from "https://deno.land/std@0.224.0/assert/mod.ts";
-import { checkLeaks, getBackend, defaultDevice } from "../../dist/index.js";
+import {
+  checkLeaks,
+  getBackend,
+  defaultDevice,
+  init,
+  numpy as np,
+} from "../../dist/index.js";
 
 export { checkLeaks };
+
+// Cached init result
+let _initResult: string[] | null = null;
+
+/**
+ * Ensure jax-js is initialized with WebGPU and set as default device.
+ * Caches the init result for performance across tests.
+ */
+export async function initWebGPU(): Promise<boolean> {
+  if (!_initResult) _initResult = await init();
+  if (!_initResult.includes("webgpu")) return false;
+  defaultDevice("webgpu");
+  return true;
+}
+
+/**
+ * Check if WebGPU is available in this environment.
+ */
+export const hasWebGPU =
+  typeof navigator !== "undefined" && "gpu" in navigator;
+
+/**
+ * Assert that two arrays (or ArrayLike values) are element-wise close.
+ * Mirrors the Vitest `toBeAllclose` custom matcher.
+ *
+ * NOTE: This calls np.allclose which uses dataSync() internally.
+ * On Deno WebGPU, dataSync() requires OffscreenCanvas (not available).
+ * Use assertAllcloseAsync() for Deno WebGPU tests instead.
+ */
+export function assertAllclose(
+  actual: any,
+  expected: any,
+  options?: { rtol?: number; atol?: number },
+): void {
+  const pass = np.allclose(actual, expected, options);
+  if (!pass) {
+    const actualJs =
+      actual != null && typeof actual.js === "function" ? actual.js() : actual;
+    const expectedJs =
+      expected != null && typeof expected.js === "function"
+        ? expected.js()
+        : expected;
+    throw new Error(
+      `Arrays not allclose:\n  actual:   ${JSON.stringify(actualJs)}\n  expected: ${JSON.stringify(expectedJs)}`,
+    );
+  }
+}
+
+/**
+ * Async version of assertAllclose that uses .data() instead of dataSync().
+ * Safe for Deno WebGPU where OffscreenCanvas is not available.
+ */
+export async function assertAllcloseAsync(
+  actual: any,
+  expected: any,
+  options?: { rtol?: number; atol?: number },
+): Promise<void> {
+  const rtol = options?.rtol ?? 1e-5;
+  const atol = options?.atol ?? 1e-6;
+
+  // Convert actual to flat array
+  let actualArr: number[];
+  if (actual != null && typeof actual.data === "function") {
+    const d = await actual.data();
+    actualArr = Array.from(d);
+  } else if (actual != null && typeof actual.js === "function") {
+    actualArr = actual.js().flat(Infinity);
+  } else if (Array.isArray(actual)) {
+    actualArr = actual.flat(Infinity);
+  } else {
+    actualArr = [actual];
+  }
+
+  // Convert expected to flat array
+  let expectedArr: number[];
+  if (expected != null && typeof expected.data === "function") {
+    const d = await expected.data();
+    expectedArr = Array.from(d);
+  } else if (expected != null && typeof expected.js === "function") {
+    expectedArr = expected.js().flat(Infinity);
+  } else if (Array.isArray(expected)) {
+    expectedArr = expected.flat(Infinity);
+  } else {
+    expectedArr = [expected];
+  }
+
+  if (actualArr.length !== expectedArr.length) {
+    throw new Error(
+      `Arrays have different lengths: actual=${actualArr.length}, expected=${expectedArr.length}`,
+    );
+  }
+
+  for (let i = 0; i < actualArr.length; i++) {
+    const diff = Math.abs(actualArr[i] - expectedArr[i]);
+    const tol = atol + rtol * Math.abs(expectedArr[i]);
+    if (diff > tol) {
+      throw new Error(
+        `Arrays not allclose at index ${i}: actual=${actualArr[i]}, expected=${expectedArr[i]}, diff=${diff}, tol=${tol}\n  actual:   ${JSON.stringify(actualArr)}\n  expected: ${JSON.stringify(expectedArr)}`,
+      );
+    }
+  }
+}
 
 /**
  * Get the current slot count from the active backend.

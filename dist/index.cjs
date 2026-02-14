@@ -63,8 +63,6 @@ const _leakTrackingMap = /* @__PURE__ */ new Map();
 */
 let _trackRefsEnabled = false;
 const _lastRefMap = /* @__PURE__ */ new Map();
-/** Set of OwnedFunction objects (linearize/vjp results) created during tracking. */
-const _leakTrackingOwnedFns = /* @__PURE__ */ new Set();
 const _startSlots = /* @__PURE__ */ new Map();
 let _active = false;
 /**
@@ -231,7 +229,7 @@ const checkLeaks = {
 		}
 		return entries;
 	},
-	stop(options) {
+	stop() {
 		if (!_active) return {
 			leaked: 0,
 			details: [],
@@ -241,23 +239,6 @@ const checkLeaks = {
 		_trackRefsEnabled = false;
 		_active = false;
 		_disposeAllJitCaches();
-		if (options?.autoDispose) {
-			for (const fn of _leakTrackingOwnedFns) try {
-				fn.dispose();
-			} catch {}
-			_leakTrackingOwnedFns.clear();
-			for (let pass = 0; pass < 3; pass++) {
-				let anyDisposed = false;
-				for (const [arr] of _leakTrackingMap) {
-					const rc = safeRefCountNum(arr);
-					if (rc > 0) try {
-						arr.dispose();
-						anyDisposed = true;
-					} catch {}
-				}
-				if (!anyDisposed) break;
-			}
-		}
 		let leaked = 0;
 		for (const [d, baseline] of _startSlots) try {
 			leaked += require_backend.getBackend(d).slotCount() - baseline;
@@ -266,7 +247,6 @@ const checkLeaks = {
 		if (leaked === 0) {
 			_leakTrackingMap.clear();
 			_lastRefMap.clear();
-			_leakTrackingOwnedFns.clear();
 			return {
 				leaked: 0,
 				details: [],
@@ -305,7 +285,6 @@ const checkLeaks = {
 		}
 		_leakTrackingMap.clear();
 		_lastRefMap.clear();
-		_leakTrackingOwnedFns.clear();
 		const sorted = [...groups.entries()].sort((a, b) => Number(a[1].pkg !== null) - Number(b[1].pkg !== null) || b[1].count - a[1].count);
 		const total = [...pkgCounts.values()].reduce((a, b) => a + b, 0);
 		const lines = [`${leaked} slot(s) leaked (${total} tracked array(s)):\n`];
@@ -6470,7 +6449,6 @@ function linearize$1(f, primalsIn, { hasAux = false } = {}) {
 	});
 	fLin.dispose = dispose$1;
 	fLin[Symbol.dispose] = dispose$1;
-	if (_leakTrackingEnabled) _leakTrackingOwnedFns.add(fLin);
 	if (hasAux) return [
 		primalsOut,
 		fLin,
@@ -7511,7 +7489,6 @@ function vjp$1(f, primalsIn, { hasAux = false } = {}) {
 	});
 	fVjp.dispose = innerDispose;
 	fVjp[Symbol.dispose] = innerDispose;
-	if (_leakTrackingEnabled) _leakTrackingOwnedFns.add(fVjp);
 	if (hasAux) return [
 		primalsOut,
 		fVjp,
