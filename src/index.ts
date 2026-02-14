@@ -1,6 +1,11 @@
 import { DType } from "./alu";
 import { defaultDevice, Device, devices, getBackend, init } from "./backend";
 import { Array, ArrayLike } from "./frontend/array";
+import {
+  checkLeaks,
+  type LeakReport,
+  type SnapshotEntry,
+} from "./frontend/check-leaks";
 import * as jaxprModule from "./frontend/jaxpr";
 import { ClosedJaxpr, Jaxpr, OwnedFunction } from "./frontend/jaxpr";
 import * as jvpModule from "./frontend/jvp";
@@ -14,10 +19,14 @@ import * as scipySpecial from "./library/scipy-special";
 import * as tree from "./tree";
 import type { JsTree, JsTreeDef, MapJsTree } from "./tree";
 import { setDebug } from "./utils";
+import type { ScanPath } from "./utils";
 
 import "./polyfills";
 
 export {
+  checkLeaks,
+  type LeakReport,
+  type SnapshotEntry,
   init,
   Array,
   ClosedJaxpr,
@@ -25,6 +34,7 @@ export {
   type Device,
   devices,
   DType,
+  getBackend,
   Jaxpr,
   type JsTree,
   type JsTreeDef,
@@ -35,6 +45,7 @@ export {
   random,
   setDebug,
   scipySpecial,
+  type ScanPath,
   tree,
 };
 
@@ -193,6 +204,9 @@ export const vjp = linearizeModule.vjp as <
     ];
 
 /** @inline */
+type ObjectIndexSpec = Record<number | string, boolean>;
+
+/** @inline */
 type GradOutputType<I, F extends (...args: any[]) => any> = MapJsTree<
   I extends undefined
     ? Parameters<F>[0]
@@ -200,7 +214,9 @@ type GradOutputType<I, F extends (...args: any[]) => any> = MapJsTree<
       ? Parameters<F>[I]
       : I extends number[]
         ? { [K in keyof I]: I[K] extends number ? Parameters<F>[I[K]] : never }
-        : never,
+        : I extends ObjectIndexSpec
+          ? Parameters<F>[number][]
+          : never,
   ArrayLike,
   Array
 >;
@@ -230,7 +246,7 @@ type GradOutputType<I, F extends (...args: any[]) => any> = MapJsTree<
  */
 export const grad = linearizeModule.grad as <
   F extends (...args: any[]) => JsTree<Array>,
-  const I extends undefined | number | number[] = undefined,
+  const I extends undefined | number | number[] | ObjectIndexSpec = undefined,
   const HA extends boolean = false,
 >(
   f: F,
@@ -264,7 +280,7 @@ export const grad = linearizeModule.grad as <
  */
 export const valueAndGrad = linearizeModule.valueAndGrad as <
   F extends (...args: any[]) => JsTree<Array>,
-  const I extends undefined | number | number[] = undefined,
+  const I extends undefined | number | number[] | ObjectIndexSpec = undefined,
   const HA extends boolean = false,
 >(
   f: F,

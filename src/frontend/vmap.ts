@@ -34,7 +34,14 @@ import {
   flatten as treeFlatten,
   unflatten as treeUnflatten,
 } from "../tree";
-import { ClosedJaxpr, Jaxpr, jaxprAsFun, makeJaxpr } from "./jaxpr";
+import { dispose as treeDispose } from "../tree";
+import {
+  _derivedCacheCleanups,
+  ClosedJaxpr,
+  Jaxpr,
+  jaxprAsFun,
+  makeJaxpr,
+} from "./jaxpr";
 import { jvp } from "./jvp";
 
 function mappedAval(batchDim: number, aval: AbstractValue) {
@@ -401,29 +408,162 @@ const vmapRules: Partial<{ [P in Primitive]: VmapRule<P> }> = {
   [Primitive.Cholesky]: lastDimsBatcher(Primitive.Cholesky, 2),
   [Primitive.LU]: lastDimsBatcher(Primitive.LU, 2, 3),
   [Primitive.Jit](axisSize, args, dims, { name, jaxpr }) {
-    const newJaxpr = vmapJaxpr(jaxpr, axisSize, dims);
-    const outs = bind(
-      Primitive.Jit,
-      [...newJaxpr.consts.map((c) => c.ref), ...args],
-      {
-        name: `${name}_vmap`,
-        jaxpr: newJaxpr.jaxpr,
-        numConsts: newJaxpr.consts.length,
-      },
-    );
+    const newJaxpr = vmapJaxpr(jaxpr, axisSize, dims, { cache: false });
+    const outs = (() => {
+      try {
+        return bind(
+          Primitive.Jit,
+          [...newJaxpr.consts.map((c) => c.ref), ...args],
+          {
+            name: `${name}_vmap`,
+            jaxpr: newJaxpr.jaxpr,
+            numConsts: newJaxpr.consts.length,
+          },
+        );
+      } finally {
+        newJaxpr.dispose();
+      }
+    })();
     return [outs, rep(outs.length, 0)];
+  },
+  [Primitive.DynamicUpdateSlice]() {
+    throw new Error("DynamicUpdateSlice vmap: not yet implemented");
+  },
+  [Primitive.Scan](
+    axisSize,
+    args,
+    dims,
+    { jaxpr, numCarry, numConsts, length, reverse },
+  ) {
+    // vmap of scan: batch over independent scans
+    //
+    // Scan args layout: [...consts, ...initCarry, ...xs]
+    // Body takes: [...consts, ...carry, ...x_slice] -> [...new_carry, ...y]
+    //
+    // Move all batch dimensions to consistent positions:
+    // - consts: batch at axis 0
+    // - carry: batch at axis 0
+    // - xs: batch at axis 1 (axis 0 is scan length)
+    // Then vmap the body to handle the batch dimension.
+
+    const numX = args.length - numConsts - numCarry;
+    const numY = jaxpr.outs.length - numCarry;
+
+    // Split args
+    const consts = args.slice(0, numConsts);
+    const initCarry = args.slice(numConsts, numConsts + numCarry);
+    const xs = args.slice(numConsts + numCarry);
+
+    const constDims = dims.slice(0, numConsts);
+    const carryDims = dims.slice(numConsts, numConsts + numCarry);
+    const xsDims = dims.slice(numConsts + numCarry);
+
+    // Move batch dims to consistent positions
+    const movedConsts = consts.map((c, i) =>
+      moveBatchAxis(axisSize, constDims[i], 0, c),
+    );
+    const movedCarry = initCarry.map((c, i) =>
+      moveBatchAxis(axisSize, carryDims[i], 0, c),
+    );
+    // For xs, move batch to axis 1 (after the length axis)
+    const movedXs = xs.map((x, i) => {
+      if (xsDims[i] === null) {
+        // Not mapped - broadcast batch dim at axis 1
+        const newShape = [x.shape[0], axisSize, ...x.shape.slice(1)];
+        return broadcast(x, newShape, [1]);
+      } else if (xsDims[i] === 0) {
+        // Batch at axis 0, need it at axis 1 (after length)
+        return moveaxis(x, 0, 1);
+      } else {
+        // Batch at some other axis - move to axis 1
+        return moveBatchAxis(axisSize, xsDims[i], 1, x);
+      }
+    });
+
+    // Body dims: all at axis 0 (consts, carry, x_slice all have batch at axis 0)
+    const bodyDims: (number | null)[] = [
+      ...rep(numConsts, 0),
+      ...rep(numCarry, 0),
+      ...rep(numX, 0),
+    ];
+
+    // Create vmapped body jaxpr
+    const inJaxprTrace =
+      args.length > 0 && args[0]._trace.main.traceType.name === "JaxprTrace";
+    const vmappedBody = vmapJaxpr(jaxpr, axisSize, bodyDims, {
+      cache: !inJaxprTrace,
+    });
+
+    // Build scan args with moved arrays
+    const scanArgs = [
+      ...vmappedBody.consts.map((c) => c.ref),
+      ...movedConsts,
+      ...movedCarry,
+      ...movedXs,
+    ];
+
+    // Run the scan
+    const results = (() => {
+      try {
+        return bind(Primitive.Scan, scanArgs, {
+          jaxpr: vmappedBody.jaxpr,
+          numCarry,
+          numConsts: vmappedBody.consts.length,
+          length,
+          reverse,
+        });
+      } finally {
+        if (inJaxprTrace) vmappedBody.dispose();
+      }
+    })();
+
+    // Results: carry has batch at axis 0, ys has batch at axis 1
+    // Move ys batch from axis 1 to axis 0
+    const carryOut = results.slice(0, numCarry);
+    const ysOut = results.slice(numCarry);
+
+    const movedYs = ysOut.map((y) => moveaxis(y, 1, 0));
+
+    return [[...carryOut, ...movedYs], rep(numCarry + numY, 0)];
   },
 };
 
 const vmapJaxprCache = new Map<Jaxpr, Map<string, ClosedJaxpr>>();
 
+/** Dispose all entries in the vmapJaxpr cache. Called by _disposeAllJitCaches. */
+export function _disposeVmapJaxprCache(): void {
+  for (const map of vmapJaxprCache.values()) {
+    for (const entry of map.values()) {
+      try {
+        entry.dispose();
+      } catch {
+        /* already freed */
+      }
+    }
+  }
+  vmapJaxprCache.clear();
+}
+_derivedCacheCleanups.push(_disposeVmapJaxprCache);
+
+// Clean up vmapJaxprCache entries when a jaxpr's ClosedJaxpr is disposed.
+ClosedJaxpr._disposeHooks.push((jaxpr: Jaxpr) => {
+  const cached = vmapJaxprCache.get(jaxpr);
+  if (cached) {
+    for (const entry of cached.values()) entry.dispose();
+    vmapJaxprCache.delete(jaxpr);
+  }
+});
+
 function vmapJaxpr(
   jaxpr: Jaxpr,
   axisSize: number,
   dims: (number | null)[],
+  { cache = true }: { cache?: boolean } = {},
 ): ClosedJaxpr {
   const cacheKey = JSON.stringify([axisSize, dims]); // deterministic
-  const prevResult = vmapJaxprCache.get(jaxpr)?.get(cacheKey);
+  const prevResult = cache
+    ? vmapJaxprCache.get(jaxpr)?.get(cacheKey)
+    : undefined;
   if (prevResult) return prevResult;
 
   // Consts in the Jaxpr become real inputs after vmap transformation, which is
@@ -442,8 +582,10 @@ function vmapJaxpr(
     vmapFlat(jaxprAsFun(jaxpr), dims, args),
   )(inAvals);
 
-  if (!vmapJaxprCache.has(jaxpr)) vmapJaxprCache.set(jaxpr, new Map());
-  vmapJaxprCache.get(jaxpr)!.set(cacheKey, newJaxpr);
+  if (cache) {
+    if (!vmapJaxprCache.has(jaxpr)) vmapJaxprCache.set(jaxpr, new Map());
+    vmapJaxprCache.get(jaxpr)!.set(cacheKey, newJaxpr);
+  }
   return newJaxpr;
 }
 
@@ -541,7 +683,26 @@ export function jacfwd(f: any) {
       throw new TypeError("jacfwd only supports 1D inputs");
     }
     const [size] = x.shape;
-    const pushfwd = (v: Tracer) => jvp(f, [x], [v])[1];
-    return vmap(pushfwd, [0])(eye(size, undefined, { dtype: x.dtype }));
+    const xRcBefore = x.refCount;
+    const pushfwd = (v: Tracer) => {
+      const [primals, tangents] = jvp(f, [x], [v]);
+      treeDispose(primals); // jacfwd only needs tangents
+      return tangents;
+    };
+    const basis = eye(size, undefined, { dtype: x.dtype });
+    const basisRcBefore = basis.refCount;
+    const out = vmap(pushfwd, [0])(basis.ref);
+    const inJaxprTrace = x._trace.main.traceType.name === "JaxprTrace";
+    if (inJaxprTrace) {
+      if (basis.refCount > 0) basis.dispose();
+    } else {
+      while (basis.refCount >= basisRcBefore) {
+        basis.dispose();
+      }
+    }
+    while (x.refCount >= xRcBefore) {
+      x.dispose();
+    }
+    return out;
   };
 }

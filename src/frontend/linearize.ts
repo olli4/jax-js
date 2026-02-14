@@ -8,11 +8,12 @@ import {
   unflatten as treeUnflatten,
 } from "../tree";
 import {
-  checkInts,
   DEBUG,
   deepEqual,
   generalBroadcast,
+  IndexSpec,
   invertPermutation,
+  normalizeIndexSpec,
   partitionList,
   range,
   toposort,
@@ -53,6 +54,7 @@ import {
   where,
 } from "./core";
 import {
+  _derivedCacheCleanups,
   abstractEvalRules,
   ClosedJaxpr,
   evalJaxpr,
@@ -91,11 +93,18 @@ class PartialVal {
   }
 }
 
+/** Shared tracking data for all PartialEvalTrace instances on the same MainTrace. */
+type PETraceData = {
+  /** All PETs created by any trace instance, for orphan sweep. */
+  allPets: PartialEvalTracer[];
+};
+
 function partialEvalFlat(
   f: (...args: any[]) => any,
   pvalsIn: PartialVal[],
-): { jaxpr: ClosedJaxpr; pvalsOut: PartialVal[] } {
-  const main = newMain(PartialEvalTrace);
+): { jaxpr: ClosedJaxpr; pvalsOut: PartialVal[]; sweepOrphans: () => void } {
+  const peData: PETraceData = { allPets: [] };
+  using main = newMain(PartialEvalTrace, peData);
   const trace = new PartialEvalTrace(main);
   const tracersIn = pvalsIn.map((pval) => trace.newArg(pval));
   const unknownTracersIn = tracersIn
@@ -107,10 +116,67 @@ function partialEvalFlat(
     fullRaise(trace, out),
   );
 
-  const pvalsOut = tracersOut.map((t) => t.pval); // Ownership either transferred here, or in the next line.
+  const pvalsOut = tracersOut.map((t) => {
+    if (t.pval.isKnown) {
+      // Transfer ownership from the PE tracer to the returned PartialVal.
+      // fullLower() refs the value and disposes the PE wrapper, so the
+      // value's RC is unchanged and the wrapper is properly cleaned up.
+      // Without this, the PE wrapper is abandoned (never disposed) and
+      // the value leaks — JavaScript has no destructor to clean it up.
+      return PartialVal.known(t.fullLower());
+    }
+    return t.pval;
+  });
   const unknownTracersOut = tracersOut.filter((t) => !t.pval.isKnown);
   const jaxpr = partialEvalGraphToJaxpr(unknownTracersIn, unknownTracersOut);
-  return { jaxpr, pvalsOut };
+
+  // Build a sweep function that disposes orphaned known PETs.
+  // These are PETs created during the PE session whose values are not
+  // captured in pvalsOut, the jaxpr consts, or as inputs. They represent
+  // intermediate computation results that were never consumed.
+  //
+  // The sweep MUST be called AFTER any external extraction of PET values
+  // (e.g., lowerAux for hasAux paths) because those paths call fullLower()
+  // which properly transfers ownership before the PET reaches rc=0.
+  const allPets = peData.allPets;
+  // Collect values that are still externally owned (pvalsOut) — skip these.
+  // Must recursively walk JVPTracer-like values since owned values may be
+  // JVPTracers whose primal/tangent are PET-held values.
+  const ownedValues = new Set<Tracer>();
+  const collectOwned = (val: any) => {
+    if (!val || ownedValues.has(val)) return;
+    ownedValues.add(val);
+    // Duck-type JVPTracer: has primal and tangent children
+    if ("primal" in val && "tangent" in val) {
+      collectOwned(val.primal);
+      collectOwned(val.tangent);
+    }
+  };
+  for (const pv of pvalsOut) {
+    if (pv.isKnown) collectOwned(pv.val!);
+  }
+  const sweepOrphans = () => {
+    // Sweep orphaned PETs (intermediate PETs not in output/consts).
+    for (const pet of allPets) {
+      if (pet.refCount <= 0) continue;
+      // Never dispose borrowed PETs — their values belong to the caller.
+      if (pet.borrowed) continue;
+      // Skip PETs whose values are owned by the jaxpr consts or output pvals.
+      // Disposing these would over-decrement shared Array refcounts.
+      if (pet.pval.isKnown && ownedValues.has(pet.pval.val!)) continue;
+      // Drain any surviving orphaned PETs. This handles known intermediate
+      // PETs (recipe=null) not in any output or jaxpr const.
+      while (pet.refCount > 0) {
+        try {
+          pet.dispose();
+        } catch {
+          break; // UseAfterFreeError — already cleaned up
+        }
+      }
+    }
+  };
+
+  return { jaxpr, pvalsOut, sweepOrphans };
 }
 
 /**
@@ -123,7 +189,12 @@ function partialEvalFlat(
 function linearizeFlatUtil(
   f: (...args: any[]) => any,
   primalsIn: Tracer[],
-): { primalsOut: Tracer[]; jaxpr: ClosedJaxpr } {
+): {
+  primalsOut: Tracer[];
+  jaxpr: ClosedJaxpr;
+  tangentKnown: boolean[];
+  sweepOrphans: () => void;
+} {
   const pvalsIn = [
     ...primalsIn.map(PartialVal.known),
     ...primalsIn.map((t) => PartialVal.unknown(t.aval)),
@@ -134,24 +205,51 @@ function linearizeFlatUtil(
     const [primalsOut, tangentsOut] = jvp(f, x.slice(0, k), x.slice(k, 2 * k));
     return [...primalsOut, ...tangentsOut];
   };
-  const { jaxpr, pvalsOut } = partialEvalFlat(fJvp, pvalsIn);
-  const primalPvals = pvalsOut.slice(0, pvalsOut.length / 2);
+  const { jaxpr, pvalsOut, sweepOrphans } = partialEvalFlat(fJvp, pvalsIn);
+  const n = pvalsOut.length / 2;
+  const primalPvals = pvalsOut.slice(0, n);
+  const tangentPvals = pvalsOut.slice(n);
   if (!primalPvals.every((pval) => pval.isKnown)) {
     throw new Error("Not all primal values are known after partial evaluation");
   }
   const primalsOut = primalPvals.map((pval) => pval.val!);
-  return { primalsOut, jaxpr };
+  // Track which tangent outputs are already known (e.g. zero tangents from
+  // non-differentiable ops like Compare, Argsort, Floor, etc.).
+  const tangentKnown = tangentPvals.map((pval) => pval.isKnown);
+  // Dispose concrete arrays for known tangent outputs — they are not in the
+  // jaxpr and would otherwise leak.
+  for (const pval of tangentPvals) {
+    if (pval.isKnown) pval.val!.dispose();
+  }
+  return { primalsOut, jaxpr, tangentKnown, sweepOrphans };
 }
 
 function linearizeFlat(
   f: (...args: any[]) => any,
   primalsIn: Tracer[],
-): [Tracer[], (...args: Tracer[]) => Tracer[], () => void] {
-  const { primalsOut, jaxpr } = linearizeFlatUtil(f, primalsIn);
-  const fLin = (...tangents: Tracer[]) =>
-    evalJaxpr(jaxpr.jaxpr, [...jaxpr.consts.map((c) => c.ref), ...tangents]);
+): [Tracer[], (...args: Tracer[]) => Tracer[], () => void, () => void] {
+  const { primalsOut, jaxpr, tangentKnown, sweepOrphans } = linearizeFlatUtil(
+    f,
+    primalsIn,
+  );
+  // Capture avals now since primalsOut tracers may be consumed before fLin runs.
+  const outAvals = primalsOut.map((t) => ShapedArray.fromAval(t.aval));
+  const fLin = (...tangents: Tracer[]) => {
+    const jaxprOuts = evalJaxpr(jaxpr.jaxpr, [
+      ...jaxpr.consts.map((c) => c.ref),
+      ...tangents,
+    ]);
+    // Reconstruct the full tangent output, inserting zeros where the
+    // tangent was known at trace time (non-differentiable ops).
+    let j = 0;
+    return tangentKnown.map((known, i) =>
+      known
+        ? zeros(outAvals[i].shape, { dtype: outAvals[i].dtype })
+        : jaxprOuts[j++],
+    );
+  };
   const dispose = () => jaxpr.dispose();
-  return [primalsOut, fLin, dispose];
+  return [primalsOut, fLin, dispose, sweepOrphans];
 }
 
 export function linearize(
@@ -166,9 +264,14 @@ export function linearize(
   } else {
     [fFlat, outTree] = flattenFun(f, inTree);
   }
-  const [primalsOutFlat, fLinFlat, dispose] = linearizeFlat(
+  const pureArgs = primalsInFlat.map(pureArray);
+  // Match vjp() ownership behavior: non-jit PE tracing consumes inputs via PET
+  // disposal, while jit PE can borrow inputs and capture them as jaxpr consts.
+  // We compare post-dispose refcounts to decide whether manual cleanup is needed.
+  const rcBeforeTrace = pureArgs.map((a) => a.refCount);
+  const [primalsOutFlat, fLinFlat, dispose, sweepOrphans] = linearizeFlat(
     fFlat,
-    primalsInFlat.map(pureArray),
+    pureArgs,
   );
   if (outTree.value === undefined) {
     throw new Error("outTree was not set in linearize");
@@ -182,10 +285,20 @@ export function linearize(
     const tangentsOutFlat = fLinFlat(...tangentsInFlat.map(pureArray));
     return treeUnflatten(outTree.value!, tangentsOutFlat);
   }) as OwnedFunction<(...tangents: any[]) => any>;
-  fLin.dispose = dispose;
+  fLin.dispose = () => {
+    dispose();
+    for (let i = 0; i < pureArgs.length; i++) {
+      if (pureArgs[i].refCount >= rcBeforeTrace[i]) {
+        pureArgs[i].dispose();
+      }
+    }
+  };
   if (hasAux) {
-    return [primalsOut, fLin, lowerAux(aux!.value)];
+    const auxOut = lowerAux(aux!.value);
+    sweepOrphans(); // Safe now: lowerAux has extracted all aux PET values
+    return [primalsOut, fLin, auxOut];
   }
+  sweepOrphans(); // No aux — safe to sweep immediately
   return [primalsOut, fLin];
 }
 
@@ -221,6 +334,18 @@ class PartialEvalTracer extends Tracer {
   ) {
     super(trace);
     this.#rc = 1;
+  }
+
+  /**
+   * Whether this PET borrows an externally-owned value.
+   * True for PETs created by newArg (wrapping user inputs).
+   * False for PETs created by pure/lift (wrapping intermediates).
+   */
+  borrowed = false;
+
+  /** Current PET reference count (for internal lifecycle decisions). */
+  get refCount(): number {
+    return this.#rc;
   }
 
   get aval(): AbstractValue {
@@ -271,13 +396,31 @@ class PartialEvalTracer extends Tracer {
 }
 
 class PartialEvalTrace extends Trace {
+  /** Shared PE trace data lives on main.globalData. */
+  get #data(): PETraceData {
+    return this.main.globalData as PETraceData;
+  }
+
+  #track(pet: PartialEvalTracer): PartialEvalTracer {
+    this.#data.allPets.push(pet);
+    return pet;
+  }
+
   newArg(pval: PartialVal) {
-    if (pval.isKnown) return new PartialEvalTracer(this, pval, null);
-    return new PartialEvalTracer(this, pval, { type: "LambdaBinding" });
+    if (pval.isKnown) {
+      const pet = this.#track(new PartialEvalTracer(this, pval, null));
+      pet.borrowed = true; // Value is externally owned (user input)
+      return pet;
+    }
+    return this.#track(
+      new PartialEvalTracer(this, pval, { type: "LambdaBinding" }),
+    );
   }
 
   pure(val: TracerValue): Tracer {
-    return new PartialEvalTracer(this, PartialVal.known(pureArray(val)), null);
+    return this.#track(
+      new PartialEvalTracer(this, PartialVal.known(pureArray(val)), null),
+    );
   }
   lift = this.pure;
 
@@ -289,7 +432,9 @@ class PartialEvalTrace extends Trace {
       const pval = PartialVal.unknown(ShapedArray.fromAval(tracer.aval));
       const val = tracer.pval.val!.ref;
       tracer.dispose();
-      return new PartialEvalTracer(this, pval, { type: "Const", val });
+      return this.#track(
+        new PartialEvalTracer(this, pval, { type: "Const", val }),
+      );
     }
   }
 
@@ -312,6 +457,13 @@ class PartialEvalTrace extends Trace {
       const { name, jaxpr, numConsts } =
         params as PrimitiveParams<Primitive.Jit>;
       return this.#partialEvalJaxpr(name, jaxpr, numConsts, tracers);
+    }
+    if (primitive === Primitive.Scan) {
+      // Special case for JVP'd scan: primal outputs depend only on primal inputs
+      return this.#partialEvalScan(
+        params as PrimitiveParams<Primitive.Scan>,
+        tracers,
+      );
     }
     const tracersIn = tracers.map((t) => this.instantiateConst(t));
     const avalsIn = tracersIn.map((t) => t.pval.aval);
@@ -348,7 +500,6 @@ class PartialEvalTrace extends Trace {
     numConsts: number,
     tracers: PartialEvalTracer[],
   ): Tracer[] {
-    void numConsts; // Unused
     jaxpr = jaxpr.flatten(); // Otherwise, we don't partially evaluate nested Jaxprs well.
 
     const inUnknowns = tracers.map((t) => !t.pval.isKnown);
@@ -361,7 +512,24 @@ class PartialEvalTrace extends Trace {
 
     const outs1Res = bind(
       Primitive.Jit,
-      knownTracers.map((t) => t.ref.fullLower()),
+      knownTracers.map((t) => {
+        const rc = t.refCount;
+        const val = t.fullLower();
+        // fullLower() ref's the value and disposes the PET wrapper.
+        //
+        // When PET.#rc == 1: dispose reaches 0, val IS disposed, so
+        //   val.ref(+1) and val.dispose(-1) cancel → val at original rc.
+        //   bind will consume the arg. For borrowed PETs (externally-owned
+        //   user inputs like hasAux primals), add .ref so bind's consumption
+        //   doesn't free the external owner's value. For non-borrowed PETs
+        //   (intermediates), let bind consume the creation ref.
+        //
+        // When PET.#rc > 1: dispose does NOT reach 0, val is NOT disposed, so
+        //   val.ref(+1) is unbalanced → val at original+1.
+        //   bind consumes that extra ref, leaving val at original. Correct.
+        //   Adding .ref here would create an unbalanced ref → memory leak.
+        return rc === 1 && t.borrowed ? val.ref : val;
+      }),
       { name: `${name}_peval`, jaxpr: jaxpr1, numConsts: 0 },
     );
     const outs1 = outs1Res.slice(0, jaxpr1.outs.length - numRes);
@@ -388,10 +556,147 @@ class PartialEvalTrace extends Trace {
     });
     recipe.tracerRefsOut = outs2.map((t) => new WeakRef(t));
 
-    // Stitch the known and unknown output tracers together, both with Jit.
     let i = 0;
     let j = 0;
     return outUnknowns.map((unk) => (unk ? outs2[j++] : outs1[i++]));
+  }
+
+  /**
+   * Partial eval for Scan primitive.
+   *
+   * When scan is encountered during partial evaluation (e.g., inside JVP for VJP):
+   * - If all inputs are known, just run the scan
+   * - If this is a JVP'd scan (doubled carry/xs), we can split primal (known)
+   *   from tangent (unknown) outputs
+   * - Otherwise, mark all outputs as unknown
+   */
+  #partialEvalScan(
+    params: PrimitiveParams<Primitive.Scan>,
+    tracers: PartialEvalTracer[],
+  ): Tracer[] {
+    const { numConsts: _numConsts, numCarry } = params;
+
+    // Determine which tracers are known/unknown
+    const isKnown = tracers.map((t) => t.pval.isKnown);
+
+    // Check if any inputs are unknown
+    const hasUnknown = isKnown.some((k) => !k);
+
+    if (!hasUnknown) {
+      // All inputs known, just run the scan
+      const inputs = tracers.map((t) => t.fullLower());
+      return bind(Primitive.Scan, inputs, params);
+    }
+
+    // Get abstract values for all outputs
+    const avalsIn = tracers.map((t) => t.pval.aval);
+    const avalsOut = abstractEvalRules[Primitive.Scan](avalsIn, params);
+    const numY = avalsOut.length - numCarry;
+
+    // Check if this looks like a JVP'd scan (even numCarry and numY).
+    const isJvpScan = numCarry % 2 === 0 && numY % 2 === 0;
+
+    if (!isJvpScan) {
+      // Not a JVP scan, mark all outputs as unknown
+      const tracersIn = tracers.map((t) => this.instantiateConst(t));
+      const recipe: JaxprRecipe = {
+        type: "JaxprEqn",
+        prim: Primitive.Scan,
+        tracersIn,
+        params,
+        avalsOut,
+        tracerRefsOut: [],
+      };
+      const tracersOut = avalsOut.map((aval, i) => {
+        if (i > 0) tracersIn.forEach((t) => t.ref);
+        return new PartialEvalTracer(this, PartialVal.unknown(aval), recipe);
+      });
+      recipe.tracerRefsOut = tracersOut.map((t) => new WeakRef(t));
+      return tracersOut;
+    }
+
+    // This is a JVP'd scan. We need to:
+    // 1. Run primal-only computation to get known outputs
+    // 2. Create a residual jaxpr for tangent computation
+
+    const numPrimalCarry = numCarry / 2;
+    const numPrimalY = numY / 2;
+
+    // Run primal-only computation using known inputs + zeros for tangent
+    const fullInputs = tracers.map((t) => {
+      if (t.pval.isKnown) {
+        return (t.pval.val as Tracer).ref;
+      } else {
+        return zeros(t.pval.aval.shape, { dtype: t.pval.aval.dtype });
+      }
+    });
+
+    const fullOuts = bind(Primitive.Scan, fullInputs, params);
+
+    // Create tracersIn for the residual jaxpr
+    const tracersIn = tracers.map((t) => this.instantiateConst(t));
+
+    // Build recipe for the full scan
+    const recipe: JaxprRecipe = {
+      type: "JaxprEqn",
+      prim: Primitive.Scan,
+      tracersIn,
+      params,
+      avalsOut,
+      tracerRefsOut: [],
+    };
+
+    // Build output tracers
+    const tracersOut: PartialEvalTracer[] = [];
+
+    // Primal carry outputs (first numPrimalCarry) are known
+    for (let i = 0; i < numPrimalCarry; i++) {
+      tracersOut.push(
+        new PartialEvalTracer(this, PartialVal.known(fullOuts[i]), null),
+      );
+    }
+
+    // Tangent carry outputs are unknown
+    let isFirstUnknown = true;
+    for (let i = numPrimalCarry; i < numCarry; i++) {
+      fullOuts[i].dispose();
+      if (!isFirstUnknown) tracersIn.forEach((t) => t.ref);
+      isFirstUnknown = false;
+      tracersOut.push(
+        new PartialEvalTracer(this, PartialVal.unknown(avalsOut[i]), recipe),
+      );
+    }
+
+    // Primal Y outputs are known
+    for (let i = 0; i < numPrimalY; i++) {
+      tracersOut.push(
+        new PartialEvalTracer(
+          this,
+          PartialVal.known(fullOuts[numCarry + i]),
+          null,
+        ),
+      );
+    }
+
+    // Tangent Y outputs are unknown
+    for (let i = numPrimalY; i < numY; i++) {
+      fullOuts[numCarry + i].dispose();
+      tracersIn.forEach((t) => t.ref);
+      tracersOut.push(
+        new PartialEvalTracer(
+          this,
+          PartialVal.unknown(avalsOut[numCarry + i]),
+          recipe,
+        ),
+      );
+    }
+
+    // tracerRefsOut: known positions get null ref
+    recipe.tracerRefsOut = tracersOut.map((t) =>
+      t.pval.isKnown ? (null as any) : new WeakRef(t),
+    );
+
+    return tracersOut;
   }
 }
 
@@ -494,7 +799,9 @@ function partialEvalGraphToJaxpr(
         const tracersIn = t.recipe.tracersIn.map((t) => tracerToVar.get(t)!);
         const outBinders = t.recipe.avalsOut.map((aval) => new Var(aval));
         for (let i = 0; i < outBinders.length; i++) {
-          const tracerOut = t.recipe.tracerRefsOut[i].deref();
+          const ref = t.recipe.tracerRefsOut[i];
+          // ref can be null for known outputs in partial-eval of JVP'd scan
+          const tracerOut = ref?.deref?.();
           if (tracerOut) {
             tracerToVar.set(tracerOut, outBinders[i]);
           }
@@ -540,6 +847,53 @@ class UndefPrimal {
 }
 
 /**
+ * Helper to get or compute a primal (known) variable's value during transpose.
+ * For intermediate variables that are known (computed from only known inputs),
+ * we need to evaluate the equations that produce them.
+ */
+function getOrComputePrimal(
+  jaxpr: Jaxpr,
+  knownVars: Set<Var>,
+  knownPrimals: Map<Var, Tracer>,
+  v: Var,
+): Tracer {
+  // If we already have the value, return a ref
+  if (knownPrimals.has(v)) {
+    return knownPrimals.get(v)!.ref;
+  }
+
+  // Find the equation that produces this variable
+  const eqn = jaxpr.eqns.find((eq) => eq.outBinders.some((out) => out === v));
+  if (!eqn) {
+    throw new Error(
+      `Internal error: could not find equation producing variable`,
+    );
+  }
+
+  // Recursively get values for inputs
+  const inputVals = eqn.inputs.map((inp) =>
+    inp instanceof Lit
+      ? array(inp.value, { dtype: inp.dtype })
+      : getOrComputePrimal(jaxpr, knownVars, knownPrimals, inp),
+  );
+
+  // Evaluate this equation
+  const results = bind(eqn.primitive, inputVals, eqn.params as any);
+
+  // Store all output values
+  for (let i = 0; i < eqn.outBinders.length; i++) {
+    knownPrimals.set(eqn.outBinders[i], results[i]);
+  }
+
+  // Return the requested value
+  const result = knownPrimals.get(v);
+  if (!result) {
+    throw new Error(`Internal error: variable not produced by equation`);
+  }
+  return result.ref;
+}
+
+/**
  * Evaluate the backward pass over a linearized Jaxpr (pullback of cotangents).
  *
  * Will raise a TypeError if the provided Jaxpr is not a linear function of its,
@@ -550,6 +904,30 @@ function evalJaxprTransposed(
   args: (Tracer | UndefPrimal)[],
   cotangents: Tracer[],
 ): Tracer[] {
+  // Track which variables are known (primal) vs unknown (tangent).
+  // A variable is known if ALL its inputs are known (primal values propagate).
+  // A variable is unknown if ANY of its inputs are unknown (tangent dependency).
+  const knownVars = new Set<Var>();
+  for (let i = 0; i < jaxpr.inBinders.length; i++) {
+    if (!(args[i] instanceof UndefPrimal)) {
+      knownVars.add(jaxpr.inBinders[i]);
+    }
+  }
+
+  // Forward pass: propagate "known" status through equations
+  for (const eqn of jaxpr.eqns) {
+    const allInputsKnown = eqn.inputs.every(
+      (v) => v instanceof Lit || knownVars.has(v),
+    );
+    if (allInputsKnown) {
+      // All inputs are known → all outputs are known (primal computation)
+      for (const outVar of eqn.outBinders) {
+        knownVars.add(outVar);
+      }
+    }
+  }
+
+  // Now collect actual Tracer values for known input variables
   const knownPrimals = new Map<Var, Tracer>();
   for (let i = 0; i < jaxpr.inBinders.length; i++) {
     if (!(args[i] instanceof UndefPrimal)) {
@@ -589,22 +967,38 @@ function evalJaxprTransposed(
     // Inputs are primalsIn and cotangentsOut, outputs are cotangentsIn. We're
     // using the known primal values to _pull back_ cotangents for unknown
     // values. Tricky!
+
+    // Check if all inputs are known (using our forward-propagated knownVars)
+    const allInputsKnown = eqn.inputs.every(
+      (v) => v instanceof Lit || knownVars.has(v),
+    );
+
+    if (allInputsKnown) {
+      // Skip equations where all inputs are known (residual equations).
+      // These don't depend on unknowns and don't contribute to the linear function.
+      continue;
+    }
+
+    // For equations with mixed inputs, we need to get residual values for known inputs
+    // and mark unknown inputs as UndefPrimal
     const primalsIn = eqn.inputs.map((v) =>
       v instanceof Lit
         ? array(v.value, { dtype: v.dtype })
-        : knownPrimals.has(v)
-          ? knownPrimals.get(v)!.ref
+        : knownVars.has(v)
+          ? getOrComputePrimal(jaxpr, knownVars, knownPrimals, v)
           : new UndefPrimal(v.aval),
     );
+
     const cotangentsOut = eqn.outBinders.map(readCotangent);
     const rule = transposeRules[eqn.primitive];
     if (!rule) {
       throw new TypeError(`Backward pass not implemented for ${eqn.primitive}`);
     }
+
     const cotangentsIn = rule(cotangentsOut, primalsIn, eqn.params as any);
     for (let j = 0; j < eqn.inputs.length; j++) {
       const v = eqn.inputs[j];
-      if (v instanceof Var && !knownPrimals.has(v)) {
+      if (v instanceof Var && !knownVars.has(v)) {
         writeCotangent(v, cotangentsIn[j]);
       } else if (cotangentsIn[j] !== null) {
         throw new Error("internal: cotangent should be null");
@@ -909,9 +1303,506 @@ const transposeRules: Partial<{ [P in Primitive]: TransposeRule<P> }> = {
     let i = 0;
     return undefPrimals.map((isUndef) => (isUndef ? outs[i++] : null));
   },
+  [Primitive.DynamicUpdateSlice]() {
+    throw new Error("DynamicUpdateSlice transpose: not yet implemented");
+  },
+  [Primitive.Scan](
+    cts,
+    args,
+    { jaxpr, numCarry, numConsts, length, reverse, checkpoint },
+  ) {
+    // Scan transpose rule for backward pass through scan.
+    //
+    // Supports two strategies controlled by the `checkpoint` option:
+    // - Default: Store only √N checkpoints, recompute intermediate carries
+    //   from the nearest checkpoint during the backward pass — O(√N) memory, ~2× compute.
+    // - checkpoint=false: Store all N intermediate carries — O(N) memory.
+    //   See: Griewank & Walther, "Algorithm 799: Revolve"
+    //
+    // Forward scan: (consts, init_carry, xs) -> (final_carry, ys)
+    // body: (consts, carry, x) -> (new_carry, y)
+    //
+    // For a JVP-transformed scan, the layout is:
+    // args: [jvpConsts..., constsP..., constsT..., carryP..., carryT..., xsP..., xsT...]
+    // cts:  [ct_carryP..., ct_carryT..., ct_ysP..., ct_ysT...]
+
+    const numX = args.length - numConsts - numCarry;
+    const numY = cts.length - numCarry;
+
+    // Detect JVP structure: even numCarry, numX, and numY.
+    const isJvpScan = numCarry % 2 === 0 && numY % 2 === 0 && numX % 2 === 0;
+
+    const numPrimalCarry = isJvpScan ? numCarry / 2 : 0;
+    const numPrimalX = isJvpScan ? numX / 2 : 0;
+    const numPrimalY = isJvpScan ? numY / 2 : 0;
+
+    // Identify which args are effectively UndefPrimal (need cotangents)
+    const undefMask = args.map((x, i) => {
+      if (x instanceof UndefPrimal) return true;
+      if (!isJvpScan) return false;
+
+      // JVP structure: second half of each group is tangent
+      if (i < numConsts) {
+        return false;
+      } else if (i < numConsts + numCarry) {
+        const carryIdx = i - numConsts;
+        return carryIdx >= numPrimalCarry;
+      } else {
+        const xIdx = i - numConsts - numCarry;
+        return xIdx >= numPrimalX;
+      }
+    });
+
+    const bodyNumConsts = numConsts;
+    const bodyNumCarry = numCarry;
+
+    // Build transposed body jaxpr
+    // Body input layout: [consts..., carry..., x...]
+    const bodyUndefPrimals: boolean[] = [];
+    for (let i = 0; i < jaxpr.inBinders.length; i++) {
+      if (i < bodyNumConsts) {
+        bodyUndefPrimals.push(undefMask[i]);
+      } else if (i < bodyNumConsts + bodyNumCarry) {
+        bodyUndefPrimals.push(undefMask[numConsts + (i - bodyNumConsts)]);
+      } else {
+        bodyUndefPrimals.push(
+          undefMask[numConsts + numCarry + (i - bodyNumConsts - bodyNumCarry)],
+        );
+      }
+    }
+
+    // Get residual (primal) values from scan args
+    const constArgs = args.slice(0, numConsts);
+    const carryArgs = args.slice(numConsts, numConsts + numCarry);
+    const xsArgs = args.slice(numConsts + numCarry);
+
+    // Split into primal and tangent parts
+    const constResiduals = constArgs.filter(
+      (_, i) => !undefMask[i],
+    ) as Tracer[];
+    const carryResiduals = carryArgs.filter(
+      (_, i) => !undefMask[numConsts + i],
+    ) as Tracer[];
+    const xsResiduals = xsArgs.filter(
+      (_, i) => !undefMask[numConsts + numCarry + i],
+    ) as Tracer[];
+
+    const actualNumPrimalCarry = isJvpScan
+      ? numPrimalCarry
+      : carryArgs.map((_, i) => !undefMask[numConsts + i]).filter((x) => x)
+          .length;
+
+    if (actualNumPrimalCarry === 0 || carryResiduals.length === 0) {
+      throw new Error(
+        "Scan transpose: no carry residuals available. grad() through scan " +
+          "requires primal carry values to be available as residuals.",
+      );
+    }
+
+    // Step 1: Re-run forward pass to get all intermediate primal carries
+
+    // Create forward body that only computes primals
+    const forwardInTypes = jaxpr.inBinders
+      .filter((_, i) => !bodyUndefPrimals[i])
+      .map((v) => v.aval);
+
+    const { jaxpr: primalForwardJaxpr } = makeJaxpr(
+      (...primalInputs: Tracer[]): Tracer[] => {
+        // Build full inputs with zeros for tangent slots
+        const fullInputs: Tracer[] = [];
+        let primalIdx = 0;
+        for (let i = 0; i < jaxpr.inBinders.length; i++) {
+          if (bodyUndefPrimals[i]) {
+            const aval = jaxpr.inBinders[i].aval;
+            fullInputs.push(zeros(aval.shape, { dtype: aval.dtype }));
+          } else {
+            fullInputs.push(primalInputs[primalIdx++].ref);
+          }
+        }
+        const outs = evalJaxpr(jaxpr, fullInputs);
+        const primalCarryOuts = outs.slice(0, numPrimalCarry);
+        const primalYOuts = outs.slice(
+          numCarry,
+          numCarry + Math.floor(numY / 2),
+        );
+        // Dispose tangent outputs
+        for (let i = numPrimalCarry; i < numCarry; i++) outs[i].dispose();
+        for (let i = numCarry + Math.floor(numY / 2); i < outs.length; i++)
+          outs[i].dispose();
+        return [...primalCarryOuts, ...primalYOuts];
+      },
+    )(...forwardInTypes);
+
+    // Helper: run one forward step
+    const runOneForwardStep = (iter: number, carry: Tracer[]): Tracer[] => {
+      const dataIdx = reverse ? length - 1 - iter : iter;
+      const xSlices: Tracer[] = [];
+      for (const xs of xsResiduals) {
+        const slice = shrink(xs.ref, [
+          [dataIdx, dataIdx + 1],
+          ...xs.shape
+            .slice(1)
+            .map((_, i) => [0, xs.shape[i + 1]] as [number, number]),
+        ]);
+        xSlices.push(reshape(slice, xs.shape.slice(1)));
+      }
+      const forwardInputs = [
+        ...constResiduals.map((c) => c.ref),
+        ...carry.map((c) => c.ref),
+        ...xSlices,
+      ];
+      const forwardOuts = evalJaxpr(primalForwardJaxpr.jaxpr, [
+        ...primalForwardJaxpr.consts.map((c) => c.ref),
+        ...forwardInputs,
+      ]);
+      const newCarry = forwardOuts.slice(0, numPrimalCarry);
+      for (let i = numPrimalCarry; i < forwardOuts.length; i++) {
+        forwardOuts[i].dispose();
+      }
+      return newCarry;
+    };
+
+    // Forward pass: collect carries for backward pass
+    const useCheckpointing = checkpoint !== false;
+    const segmentSize = useCheckpointing
+      ? typeof checkpoint === "number"
+        ? checkpoint
+        : Math.max(1, Math.ceil(Math.sqrt(length)))
+      : length;
+
+    const allCarries: Tracer[][] | null = useCheckpointing ? null : [];
+    const checkpointCarries: Map<number, Tracer[]> | null = useCheckpointing
+      ? new Map()
+      : null;
+
+    {
+      let currentCarry = carryResiduals.map((c) => c.ref);
+      if (allCarries) {
+        allCarries.push(currentCarry.map((c) => c.ref));
+      } else {
+        checkpointCarries!.set(
+          0,
+          currentCarry.map((c) => c.ref),
+        );
+      }
+
+      for (let iter = 0; iter < length; iter++) {
+        const newCarry = runOneForwardStep(iter, currentCarry);
+        for (const c of currentCarry) c.dispose();
+        currentCarry = newCarry;
+
+        if (allCarries) {
+          allCarries.push(currentCarry.map((c) => c.ref));
+        } else if ((iter + 1) % segmentSize === 0) {
+          checkpointCarries!.set(
+            iter + 1,
+            currentCarry.map((c) => c.ref),
+          );
+        }
+      }
+      for (const c of currentCarry) c.dispose();
+    }
+
+    // Step 2: Create a tangent-only body for transposition
+    const numTangentConsts = numConsts - constResiduals.length;
+    const numTangentCarry = numCarry - numPrimalCarry;
+    const numTangentX = numX - numPrimalX;
+
+    const tangentBodyInAvals = [
+      ...jaxpr.inBinders
+        .filter((_, i) => !bodyUndefPrimals[i])
+        .map((v) => v.aval), // primal inputs (residuals)
+      ...jaxpr.inBinders
+        .filter((_, i) => bodyUndefPrimals[i])
+        .map((v) => v.aval), // tangent inputs
+    ];
+
+    const { jaxpr: tangentBody } = makeJaxpr(
+      (...tangentBodyArgs: Tracer[]): Tracer[] => {
+        const numPrimalInputs = jaxpr.inBinders.filter(
+          (_, i) => !bodyUndefPrimals[i],
+        ).length;
+        const primalResiduals = tangentBodyArgs.slice(0, numPrimalInputs);
+        const tangentInputs = tangentBodyArgs.slice(numPrimalInputs);
+
+        // Build full body inputs in original order
+        const fullInputs: Tracer[] = [];
+        let primalIdx = 0;
+        let tangentIdx = 0;
+        for (let i = 0; i < jaxpr.inBinders.length; i++) {
+          if (bodyUndefPrimals[i]) {
+            fullInputs.push(tangentInputs[tangentIdx++].ref);
+          } else {
+            fullInputs.push(primalResiduals[primalIdx++].ref);
+          }
+        }
+
+        // Evaluate full body
+        const fullOuts = evalJaxpr(jaxpr, fullInputs);
+
+        // Return only tangent outputs
+        const tangentOuts: Tracer[] = [];
+        for (let i = numPrimalCarry; i < numCarry; i++) {
+          tangentOuts.push(fullOuts[i]);
+        }
+        for (let i = numCarry + numPrimalY; i < fullOuts.length; i++) {
+          tangentOuts.push(fullOuts[i]);
+        }
+
+        // Dispose primal outputs
+        for (let i = 0; i < numPrimalCarry; i++) fullOuts[i].dispose();
+        for (let i = numCarry; i < numCarry + numPrimalY; i++)
+          fullOuts[i].dispose();
+
+        return tangentOuts;
+      },
+    )(...tangentBodyInAvals);
+
+    // Transpose the tangent-only body
+    const tangentBodyUndefPrimals = [
+      ...Array(
+        tangentBody.jaxpr.inBinders.length -
+          (numTangentConsts + numTangentCarry + numTangentX),
+      ).fill(false), // primal residuals
+      ...Array(numTangentConsts + numTangentCarry + numTangentX).fill(true), // tangent inputs
+    ];
+
+    const transposedBody = transposeJaxpr(
+      tangentBody.jaxpr,
+      tangentBodyUndefPrimals,
+    );
+
+    // Step 3: Run backward pass in reverse
+    const ctCarryAll = cts.slice(0, numCarry);
+    const ctYsAll = cts.slice(numCarry);
+
+    // Initialize running cotangent for carry (tangent carry cotangents only)
+    let ctCarryRunning = ctCarryAll.slice(numPrimalCarry).map((c) => c.ref);
+    // Consume all incoming carry cotangent handles. Tangent entries are retained
+    // via ctCarryRunning refs above; primal entries are not needed.
+    for (const ct of ctCarryAll) ct.dispose();
+
+    // Accumulate cotangents for xs and consts
+    const ctXsAccum: Tracer[][] = [];
+    for (let i = 0; i < numTangentX; i++) {
+      ctXsAccum.push([]);
+    }
+
+    let ctConstsAccum: Tracer[] | null = null;
+
+    // Helper: run one backward step
+    const runOneBackwardStep = (iter: number, primalCarry: Tracer[]) => {
+      const dataIdx = reverse ? length - 1 - iter : iter;
+
+      // Slice primal xs for this iteration
+      const xSlices: Tracer[] = [];
+      for (const xs of xsResiduals) {
+        const slice = shrink(xs.ref, [
+          [dataIdx, dataIdx + 1],
+          ...xs.shape
+            .slice(1)
+            .map((_, i) => [0, xs.shape[i + 1]] as [number, number]),
+        ]);
+        xSlices.push(reshape(slice, xs.shape.slice(1)));
+      }
+
+      // Slice cotangent of y for this iteration
+      const ctYSlices: Tracer[] = [];
+      for (let i = Math.floor(numY / 2); i < ctYsAll.length; i++) {
+        const ctY = ctYsAll[i];
+        const slice = shrink(ctY.ref, [
+          [dataIdx, dataIdx + 1],
+          ...ctY.shape
+            .slice(1)
+            .map((_, j) => [0, ctY.shape[j + 1]] as [number, number]),
+        ]);
+        ctYSlices.push(reshape(slice, ctY.shape.slice(1)));
+      }
+
+      // Build cotangents for tangentBody outputs
+      const bodyOutCotangents: Tracer[] = [];
+      bodyOutCotangents.push(...ctCarryRunning.map((c) => c.ref));
+      bodyOutCotangents.push(...ctYSlices);
+
+      // Run transposed body
+      const transposedInputs = [
+        ...transposedBody.consts.map((c) => c.ref),
+        ...constResiduals.map((c) => c.ref),
+        ...primalCarry.map((c) => c.ref),
+        ...xSlices,
+        ...bodyOutCotangents,
+      ];
+
+      const transposedOuts = evalJaxpr(transposedBody.jaxpr, transposedInputs);
+
+      // Extract cotangents
+      let outIdx = 0;
+      const ctConstsIter: Tracer[] = [];
+      for (let i = 0; i < numTangentConsts; i++) {
+        ctConstsIter.push(transposedOuts[outIdx++]);
+      }
+
+      const ctCarryNew: Tracer[] = [];
+      const numTangentCarryLocal = numCarry - numPrimalCarry;
+      for (let i = 0; i < numTangentCarryLocal; i++) {
+        ctCarryNew.push(transposedOuts[outIdx++]);
+      }
+
+      const ctXIter: Tracer[] = [];
+      for (let i = 0; i < numTangentX; i++) {
+        ctXIter.push(transposedOuts[outIdx++]);
+      }
+
+      // Accumulate const cotangents
+      if (ctConstsAccum === null) {
+        ctConstsAccum = ctConstsIter;
+      } else {
+        ctConstsAccum = ctConstsAccum.map((ct, i) => add(ct, ctConstsIter[i]));
+      }
+
+      // Store x cotangents (will stack later)
+      for (let i = 0; i < numTangentX; i++) {
+        ctXsAccum[i].push(ctXIter[i]);
+      }
+
+      // Update running carry cotangent
+      for (const c of ctCarryRunning) c.dispose();
+      ctCarryRunning = ctCarryNew;
+    };
+
+    // Execute backward pass
+    if (useCheckpointing) {
+      const numSegments = Math.ceil(length / segmentSize);
+
+      for (let seg = numSegments - 1; seg >= 0; seg--) {
+        const segStart = seg * segmentSize;
+        const segEnd = Math.min(segStart + segmentSize, length);
+
+        // Recompute carries for this segment from checkpoint
+        const segCarries: Tracer[][] = [];
+        let carry = checkpointCarries!.get(segStart)!.map((c) => c.ref);
+        segCarries.push(carry.map((c) => c.ref));
+
+        for (let iter = segStart; iter < segEnd - 1; iter++) {
+          const newCarry = runOneForwardStep(iter, carry);
+          for (const c of carry) c.dispose();
+          carry = newCarry;
+          segCarries.push(carry.map((c) => c.ref));
+        }
+        for (const c of carry) c.dispose();
+
+        // Process segment backward
+        for (let iter = segEnd - 1; iter >= segStart; iter--) {
+          const localIdx = iter - segStart;
+          runOneBackwardStep(iter, segCarries[localIdx]);
+          for (const c of segCarries[localIdx]) c.dispose();
+        }
+
+        // Dispose checkpoint
+        for (const c of checkpointCarries!.get(segStart)!) c.dispose();
+        checkpointCarries!.delete(segStart);
+      }
+
+      // Dispose any remaining checkpoints
+      for (const [, carries] of checkpointCarries!) {
+        for (const c of carries) c.dispose();
+      }
+    } else {
+      for (let iter = length - 1; iter >= 0; iter--) {
+        runOneBackwardStep(iter, allCarries![iter]);
+        for (const c of allCarries![iter]) c.dispose();
+      }
+      // Dispose the last allCarries entry
+      for (const c of allCarries![length]) c.dispose();
+    }
+
+    // Dispose remaining cotangents
+    for (let i = Math.floor(numY / 2); i < ctYsAll.length; i++)
+      ctYsAll[i].dispose();
+    for (let i = 0; i < Math.floor(numY / 2); i++) ctYsAll[i].dispose();
+
+    // Stack x cotangents
+    const ctXsStacked: Tracer[] = [];
+    for (let i = 0; i < numTangentX; i++) {
+      const reversed = ctXsAccum[i].reverse();
+      if (reverse) reversed.reverse();
+      const expanded = reversed.map((ct) =>
+        broadcast(ct, [1, ...ct.shape], [0]),
+      );
+      const stacked = concatenate(expanded, 0);
+      ctXsStacked.push(stacked);
+    }
+
+    // Build output cotangents
+    const actualUndefMask = args.map((x) => x instanceof UndefPrimal);
+
+    const result: (Tracer | null)[] = [];
+    let ctConstIdx = 0;
+    let ctCarryIdx = 0;
+    let ctXIdx = 0;
+
+    for (let i = 0; i < args.length; i++) {
+      const isJvpTangent = undefMask[i];
+
+      if (!actualUndefMask[i]) {
+        // This arg is a known primal (Tracer), return null
+        if (isJvpTangent) {
+          if (i < numConsts) {
+            ctConstsAccum![ctConstIdx++].dispose();
+          } else if (i < numConsts + numCarry) {
+            ctCarryRunning[ctCarryIdx++].dispose();
+          } else {
+            ctXsStacked[ctXIdx++].dispose();
+          }
+        }
+        result.push(null);
+      } else if (i < numConsts) {
+        result.push(ctConstsAccum![ctConstIdx++]);
+      } else if (i < numConsts + numCarry) {
+        result.push(ctCarryRunning[ctCarryIdx++]);
+      } else {
+        result.push(ctXsStacked[ctXIdx++]);
+      }
+    }
+
+    // Cleanup
+    primalForwardJaxpr.dispose();
+    // Disposing tangentBody triggers transpose cache cleanup for its jaxpr,
+    // including transposedBody.
+    tangentBody.dispose();
+    for (const c of constResiduals) c.dispose();
+    for (const c of carryResiduals) c.dispose();
+    for (const c of xsResiduals) c.dispose();
+
+    return result;
+  },
 };
 
 const transposeJaxprCache = new Map<Jaxpr, Map<string, ClosedJaxpr>>();
+
+/** Dispose all entries in the transposeJaxpr cache. Called by _disposeAllJitCaches. */
+export function _disposeTransposeJaxprCache(): void {
+  for (const map of transposeJaxprCache.values()) {
+    for (const entry of map.values()) {
+      try {
+        entry.dispose();
+      } catch {
+        /* already freed */
+      }
+    }
+  }
+  transposeJaxprCache.clear();
+}
+_derivedCacheCleanups.push(_disposeTransposeJaxprCache);
+
+// Clean up transposeJaxprCache entries when a jaxpr's ClosedJaxpr is disposed.
+ClosedJaxpr._disposeHooks.push((jaxpr: Jaxpr) => {
+  const cached = transposeJaxprCache.get(jaxpr);
+  if (cached) {
+    for (const entry of cached.values()) entry.dispose();
+    transposeJaxprCache.delete(jaxpr);
+  }
+});
 
 function transposeJaxpr(jaxpr: Jaxpr, undefPrimals: boolean[]): ClosedJaxpr {
   const cacheKey = JSON.stringify(undefPrimals); // deterministic
@@ -948,19 +1839,34 @@ function transposeJaxpr(jaxpr: Jaxpr, undefPrimals: boolean[]): ClosedJaxpr {
 function vjpFlat(
   f: (...x: Tracer[]) => Tracer[],
   primalsIn: Tracer[],
-): [Tracer[], (...cotangents: Tracer[]) => Tracer[], () => void] {
-  const { primalsOut, jaxpr } = linearizeFlatUtil(f, primalsIn);
-  // Pullback cotangents to the UndefPrimal transpose inputs.
+): [Tracer[], (...cotangents: Tracer[]) => Tracer[], () => void, () => void] {
+  const { primalsOut, jaxpr, tangentKnown, sweepOrphans } = linearizeFlatUtil(
+    f,
+    primalsIn,
+  );
+  // Save avals before consuming inputs — only .aval is needed for the backward
+  // pass (UndefPrimal just carries shape/dtype metadata).
+  const inAvals = primalsIn.map((t) => ShapedArray.fromAval(t.aval));
   const fVjp = (...cotangents: Tracer[]) => {
+    // Dispose cotangents for tangent outputs that were known at trace time
+    // (e.g. zero tangents from non-differentiable ops). Only forward the
+    // cotangents for unknown tangent outputs to the transposed jaxpr.
+    const unknownCts: Tracer[] = [];
+    for (let i = 0; i < cotangents.length; i++) {
+      if (tangentKnown[i]) {
+        cotangents[i].dispose();
+      } else {
+        unknownCts.push(cotangents[i]);
+      }
+    }
     const transposeInputs = [
       ...jaxpr.consts.map((c) => c.ref),
-      // Explcitly list which arguments should be transposed.
-      ...primalsIn.map((t) => new UndefPrimal(t.aval)),
+      ...inAvals.map((aval) => new UndefPrimal(aval)),
     ];
-    return evalJaxprTransposed(jaxpr.jaxpr, transposeInputs, cotangents);
+    return evalJaxprTransposed(jaxpr.jaxpr, transposeInputs, unknownCts);
   };
   const dispose = () => jaxpr.dispose();
-  return [primalsOut, fVjp, dispose];
+  return [primalsOut, fVjp, dispose, sweepOrphans];
 }
 
 export function vjp(
@@ -975,9 +1881,14 @@ export function vjp(
   } else {
     [fFlat, outTree] = flattenFun(f, inTree);
   }
-  const [primalsOutFlat, fVjpFlat, dispose] = vjpFlat(
+  const pureArgs = primalsInFlat.map(pureArray);
+  // Capture refcounts before PE tracing. The PE trace's all-known path
+  // (non-jit) consumes args via PET disposal, while the jit path borrows
+  // them. We compare after tracing to know which args need manual cleanup.
+  const rcBeforeTrace = pureArgs.map((a) => a.refCount);
+  const [primalsOutFlat, fVjpFlat, disposeJaxpr, sweepOrphans] = vjpFlat(
     fFlat,
-    primalsInFlat.map(pureArray),
+    pureArgs,
   );
   if (outTree.value === undefined) {
     throw new Error("outTree was not set in vjp");
@@ -993,11 +1904,28 @@ export function vjp(
     const cotangentsInFlat = fVjpFlat(...cotangentsOutFlat.map(pureArray));
     return treeUnflatten(inTree, cotangentsInFlat);
   }) as OwnedFunction<(...cotangents: any) => any>;
-  fVjp.dispose = dispose;
+  fVjp.dispose = () => {
+    disposeJaxpr();
+    // After jaxpr disposal (which frees captured constants), check if
+    // each primal arg was fully consumed. In the non-jit case, PE tracing
+    // consumes via PET disposal (-1) and adds as jaxpr const (+1); after
+    // disposeJaxpr frees the const (-1), rc is < rcBefore → consumed.
+    // In the jit case, PE borrows the PET (no consumption) and adds as
+    // const (+1); disposeJaxpr frees the const (-1), rc stays == rcBefore
+    // → NOT consumed. We must dispose to match calling convention.
+    for (let i = 0; i < pureArgs.length; i++) {
+      if (pureArgs[i].refCount >= rcBeforeTrace[i]) {
+        pureArgs[i].dispose();
+      }
+    }
+  };
 
   if (hasAux) {
-    return [primalsOut, fVjp, lowerAux(aux!.value)];
+    const auxOut = lowerAux(aux!.value);
+    sweepOrphans(); // Safe now: lowerAux has extracted all aux PET values
+    return [primalsOut, fVjp, auxOut];
   }
+  sweepOrphans(); // No aux — safe to sweep immediately
   return [primalsOut, fVjp];
 }
 
@@ -1009,7 +1937,7 @@ export type GradOpts = {
    *
    * Defaults to `0` (the first argument).
    */
-  argnums?: number | number[];
+  argnums?: IndexSpec;
 
   /**
    * The input function returns a pair of `[out, aux]` including an auxiliary
@@ -1035,10 +1963,11 @@ export function grad(f: (...primals: any) => Tracer, opts?: GradOpts) {
 }
 
 export function valueAndGrad(f: (...primals: any) => Tracer, opts?: GradOpts) {
-  const argnums = opts?.argnums ?? 0; // By default, differentiate w.r.t. first arg.
+  const argnumsSpec = opts?.argnums ?? 0; // By default, differentiate w.r.t. first arg.
   const hasAux = opts?.hasAux ?? false;
-  checkInts(argnums);
-  const argnumsSet = new Set(typeof argnums === "number" ? [argnums] : argnums);
+  const argnums = normalizeIndexSpec(argnumsSpec, "argnums");
+  const argnumsSet = new Set(argnums);
+  const returnSingleGrad = typeof argnumsSpec === "number";
   return (...x: any) => {
     if (x.length === 0) {
       throw new Error("grad requires at least one argument to differentiate");
@@ -1049,9 +1978,15 @@ export function valueAndGrad(f: (...primals: any) => Tracer, opts?: GradOpts) {
     }
     const [y, fVjp, aux] = vjp(f, x, { hasAux });
     if (!(y instanceof Tracer) || ndim(y) !== 0) {
+      treeDispose(y);
+      fVjp.dispose();
+      if (hasAux) treeDispose(aux);
       throw new TypeError("grad requires a scalar output");
     }
     if (!isFloatDtype(y.dtype)) {
+      treeDispose(y);
+      fVjp.dispose();
+      if (hasAux) treeDispose(aux);
       throw new TypeError("grad only supports floating-point dtypes");
     }
     const cts = fVjp(onesLike(y.ref)); // backprop from scalar 1
@@ -1059,8 +1994,9 @@ export function valueAndGrad(f: (...primals: any) => Tracer, opts?: GradOpts) {
     for (let i = 0; i < cts.length; i++) {
       if (!argnumsSet.has(i)) treeDispose(cts[i]);
     }
-    const grads =
-      typeof argnums === "number" ? cts[argnums] : argnums.map((i) => cts[i]);
+    const grads = returnSingleGrad
+      ? cts[argnums[0]]
+      : argnums.map((i) => cts[i]);
     return hasAux ? [[y, aux], grads] : [y, grads];
   };
 }
@@ -1071,15 +2007,33 @@ export function jacrev(f: any) {
     if (x.shape.length !== 1) {
       throw new TypeError("jacrev only supports 1D inputs");
     }
-    const [size] = x.shape;
-    const pullback = (ct: Tracer) => {
-      const [y, fVjp] = vjp(f, [x]);
+    const [y, fVjp] = vjp(f, [x]);
+    if (!(y instanceof Tracer)) {
+      fVjp.dispose();
+      throw new TypeError("jacrev requires array output");
+    }
+    if (y.shape.length === 0) {
+      const [ret] = fVjp(onesLike(y.ref));
       y.dispose();
-      const [ret] = fVjp(ct);
       fVjp.dispose();
       return ret;
+    }
+    if (y.shape.length !== 1) {
+      y.dispose();
+      fVjp.dispose();
+      throw new TypeError("jacrev only supports scalar or 1D outputs");
+    }
+    const [outSize] = y.shape;
+    const pullback = (ct: Tracer) => {
+      const [ret] = fVjp(ct);
+      return ret;
     };
-    return vmap(pullback, [1])(eye(size, undefined, { dtype: x.dtype }));
+    const basis = eye(outSize, undefined, { dtype: y.dtype });
+    const j = vmap(pullback, [1])(basis.ref);
+    basis.dispose();
+    y.dispose();
+    fVjp.dispose();
+    return j;
   };
 }
 

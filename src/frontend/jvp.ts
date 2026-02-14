@@ -30,6 +30,7 @@ import {
   fullRaise,
   gather,
   idiv,
+  isTopLevel,
   less,
   log,
   lu,
@@ -53,7 +54,13 @@ import {
   triangularSolve,
   where,
 } from "./core";
-import { ClosedJaxpr, Jaxpr, jaxprAsFun, makeJaxpr } from "./jaxpr";
+import {
+  _derivedCacheCleanups,
+  ClosedJaxpr,
+  Jaxpr,
+  jaxprAsFun,
+  makeJaxpr,
+} from "./jaxpr";
 import { moveaxis } from "./vmap";
 
 class JVPTracer extends Tracer {
@@ -195,7 +202,7 @@ const jvpRules: { [P in Primitive]: JvpRule<P> } = {
   [Primitive.Neg]: linearTangentsJvp(Primitive.Neg),
   [Primitive.Reciprocal]([x], [dx]) {
     // d(1/x) = -x^-2 * dx
-    const xRecip = reciprocal(x.ref);
+    const xRecip = reciprocal(x);
     return [[xRecip.ref], [neg(xRecip.ref.mul(xRecip)).mul(dx)]];
   },
   [Primitive.Floor]: zeroTangentsJvp(Primitive.Floor),
@@ -314,7 +321,7 @@ const jvpRules: { [P in Primitive]: JvpRule<P> } = {
   [Primitive.Sort]([x], [dx]) {
     // Propagate both primals and derivatives along the sorted order.
     const [y, idx] = argsort(x);
-    return [[y], [gather(dx, [idx], [-1], -1)]];
+    return [[y], [gather(dx, [idx], [-1], -1)]]; // idx consumed by gather
   },
   [Primitive.Argsort]([x], [dx]) {
     const [y, idx] = argsort(x);
@@ -337,7 +344,7 @@ const jvpRules: { [P in Primitive]: JvpRule<P> } = {
     // If L = cholesky(A), so that A = L @ L^T, then
     // dL = L @ tril(S - 0.5 * diag(S)),
     //   where S = L^{-1} @ dA @ L^{-T}
-    const L = cholesky(a.ref);
+    const L = cholesky(a);
     da = da.ref.add(mT(da)).mul(0.5); // Symmetrize dA for grad
     const W = triangularSolve(L.ref, da, { lower: true }); // (L^-1 @ dA.T).T = dA @ L^-T
     const ST = triangularSolve(L.ref, mT(W), { lower: true });
@@ -392,28 +399,242 @@ const jvpRules: { [P in Primitive]: JvpRule<P> } = {
     ];
   },
   [Primitive.Jit](primals, tangents, { name, jaxpr }) {
-    const newJaxpr = jvpJaxpr(jaxpr);
-    const outs = bind(
-      Primitive.Jit,
-      [...newJaxpr.consts.map((c) => c.ref), ...primals, ...tangents],
-      {
-        name: `${name}_jvp`,
-        jaxpr: newJaxpr.jaxpr,
-        numConsts: newJaxpr.consts.length,
-      },
-    );
+    const newJaxpr = jvpJaxpr(jaxpr, { cache: false });
+    const outs = (() => {
+      try {
+        return bind(
+          Primitive.Jit,
+          [...newJaxpr.consts.map((c) => c.ref), ...primals, ...tangents],
+          {
+            name: `${name}_jvp`,
+            jaxpr: newJaxpr.jaxpr,
+            numConsts: newJaxpr.consts.length,
+          },
+        );
+      } finally {
+        newJaxpr.dispose();
+      }
+    })();
     const n = outs.length / 2;
     if (!Number.isInteger(n))
       throw new Error("internal: JVP Jaxpr output length is not even");
     const [primalsOut, tangentsOut] = [outs.slice(0, n), outs.slice(n)];
     return [primalsOut, tangentsOut];
   },
+  [Primitive.DynamicUpdateSlice](
+    [_dst, _src],
+    [_ddst, _dsrc],
+    { offset: _offset, axis: _axis },
+  ) {
+    // JVP for dynamic update slice is not implemented. Throw to avoid silent errors.
+    throw new Error("JVP: dynamic_update_slice is not implemented");
+  },
+  [Primitive.Scan](
+    primals,
+    tangents,
+    { jaxpr, numCarry, numConsts, length, reverse, checkpoint },
+  ) {
+    // JVP of scan: run a combined scan that processes both primals and tangents.
+    //
+    // Original scan:
+    //   body: (consts, carry, x) -> (new_carry, y)
+    //   scan: (consts, init_carry, xs) -> (final_carry, ys)
+    //
+    // JVP body from jvpJaxpr expects inputs as: [all primals..., all tangents...]
+    //   i.e., [consts, carry, x, consts_dot, carry_dot, x_dot]
+    // And outputs: [primal_outs..., tangent_outs...]
+    //   i.e., [new_carry, y, new_carry_dot, y_dot]
+    //
+    // But scan feeds body as: [consts..., carry..., x...]
+    // So for JVP scan with doubled carry/xs, body receives:
+    //   [constsP, constsT, carryP, carryT, xP, xT]  (scan order)
+    //
+    // We need to reorder to match jvpJaxpr expectations:
+    //   [constsP, carryP, xP, constsT, carryT, xT]  (jvp order)
+    //
+    // Similarly for outputs, jvpJaxpr produces:
+    //   [new_carryP, yP, new_carryT, yT]  (jvp order)
+    // But scan expects:
+    //   [new_carryP, new_carryT, yP, yT]  (scan order, carry then ys)
+
+    const numX = primals.length - numConsts - numCarry;
+    const numY = jaxpr.outs.length - numCarry;
+
+    // Transform the body jaxpr to compute JVP
+    const inJaxprTrace =
+      primals.length > 0 &&
+      primals[0]._trace.main.traceType.name === "JaxprTrace";
+    const jvpBody = jvpJaxpr(jaxpr, { cache: !inJaxprTrace });
+
+    // jvpBody.jaxpr.inBinders = [jvpConsts..., primals..., tangents...]
+    //   where primals = [constsP, carryP, xP] and tangents = [constsT, carryT, xT]
+    // jvpBody.consts = the actual values for jvpConsts
+    const numJvpConsts = jvpBody.consts.length;
+    const numBodyInputs = numConsts + numCarry + numX;
+
+    // Get the body input avals in JVP order (primals then tangents)
+    const jvpOrderAvals = jvpBody.jaxpr.inBinders
+      .slice(numJvpConsts)
+      .map((v) => v.aval);
+
+    // Reorder to scan order: [constsP, constsT, carryP, carryT, xP, xT]
+    const constsP_avals = jvpOrderAvals.slice(0, numConsts);
+    const carryP_avals = jvpOrderAvals.slice(numConsts, numConsts + numCarry);
+    const xP_avals = jvpOrderAvals.slice(numConsts + numCarry, numBodyInputs);
+    const constsT_avals = jvpOrderAvals.slice(
+      numBodyInputs,
+      numBodyInputs + numConsts,
+    );
+    const carryT_avals = jvpOrderAvals.slice(
+      numBodyInputs + numConsts,
+      numBodyInputs + numConsts + numCarry,
+    );
+    const xT_avals = jvpOrderAvals.slice(numBodyInputs + numConsts + numCarry);
+
+    const wrapperInAvals = [
+      ...constsP_avals,
+      ...constsT_avals,
+      ...carryP_avals,
+      ...carryT_avals,
+      ...xP_avals,
+      ...xT_avals,
+    ];
+
+    const { jaxpr: wrapperJaxpr } = makeJaxpr(
+      (...scanOrderArgs: Tracer[]): Tracer[] => {
+        // scanOrderArgs layout: [constsP, constsT, carryP, carryT, xP, xT]
+        const constsP_in = scanOrderArgs.slice(0, numConsts);
+        const constsT_in = scanOrderArgs.slice(numConsts, numConsts * 2);
+        const carryP_in = scanOrderArgs.slice(
+          numConsts * 2,
+          numConsts * 2 + numCarry,
+        );
+        const carryT_in = scanOrderArgs.slice(
+          numConsts * 2 + numCarry,
+          numConsts * 2 + numCarry * 2,
+        );
+        const xP_in = scanOrderArgs.slice(
+          numConsts * 2 + numCarry * 2,
+          numConsts * 2 + numCarry * 2 + numX,
+        );
+        const xT_in = scanOrderArgs.slice(numConsts * 2 + numCarry * 2 + numX);
+
+        // Reorder to jvp order: [constsP, carryP, xP, constsT, carryT, xT]
+        const jvpOrderArgs = [
+          ...constsP_in.map((x) => x.ref),
+          ...carryP_in.map((x) => x.ref),
+          ...xP_in.map((x) => x.ref),
+          ...constsT_in.map((x) => x.ref),
+          ...carryT_in.map((x) => x.ref),
+          ...xT_in.map((x) => x.ref),
+        ];
+
+        // Call the jvpBody jaxpr with jvpConsts (captured) first, then reordered body args
+        const jvpOutputs = bind(
+          Primitive.Jit,
+          [...jvpBody.consts.map((c) => c.ref), ...jvpOrderArgs],
+          {
+            jaxpr: jvpBody.jaxpr,
+            numConsts: numJvpConsts,
+            name: "jvp_body",
+          },
+        );
+
+        // jvpOutputs layout: [carryP..., yP..., carryT..., yT...]
+        // Reorder to scan output order: [carryP..., carryT..., yP..., yT...]
+        const carryP_out = jvpOutputs.slice(0, numCarry);
+        const yP_out = jvpOutputs.slice(numCarry, numCarry + numY);
+        const carryT_out = jvpOutputs.slice(
+          numCarry + numY,
+          numCarry * 2 + numY,
+        );
+        const yT_out = jvpOutputs.slice(numCarry * 2 + numY);
+
+        return [...carryP_out, ...carryT_out, ...yP_out, ...yT_out];
+      },
+    )(...wrapperInAvals);
+
+    // Original args: consts (numConsts), carry (numCarry), xs (numX)
+    const constsP = primals.slice(0, numConsts);
+    const carryP = primals.slice(numConsts, numConsts + numCarry);
+    const xsP = primals.slice(numConsts + numCarry);
+
+    const constsT = tangents.slice(0, numConsts);
+    const carryT = tangents.slice(numConsts, numConsts + numCarry);
+    const xsT = tangents.slice(numConsts + numCarry);
+
+    // Build scan args in scan order:
+    // [wrapperConsts..., constsP, constsT, carryP, carryT, xsP, xsT]
+    const scanArgsJvp = [
+      ...wrapperJaxpr.consts.map((c) => c.ref),
+      ...constsP,
+      ...constsT,
+      ...carryP,
+      ...carryT,
+      ...xsP,
+      ...xsT,
+    ];
+
+    const results = (() => {
+      try {
+        return bind(Primitive.Scan, scanArgsJvp, {
+          jaxpr: wrapperJaxpr.jaxpr,
+          numCarry: numCarry * 2,
+          numConsts: wrapperJaxpr.consts.length + numConsts * 2,
+          length,
+          reverse,
+          checkpoint,
+        });
+      } finally {
+        // Dispose the wrapper jaxpr (not cached)
+        // Note: jvpBody is cached via jvpJaxprCache, so we don't dispose it
+        wrapperJaxpr.dispose();
+        if (inJaxprTrace) jvpBody.dispose();
+      }
+    })();
+
+    // Results layout from wrapper: [carryP..., carryT..., yP..., yT...]
+    const carryOutP = results.slice(0, numCarry);
+    const carryOutT = results.slice(numCarry, numCarry * 2);
+    const ysP = results.slice(numCarry * 2, numCarry * 2 + numY);
+    const ysT = results.slice(numCarry * 2 + numY);
+
+    const primalsOut = [...carryOutP, ...ysP];
+    const tangentsOut = [...carryOutT, ...ysT];
+
+    return [primalsOut, tangentsOut];
+  },
 };
 
 const jvpJaxprCache = new Map<Jaxpr, ClosedJaxpr>();
 
-function jvpJaxpr(jaxpr: Jaxpr): ClosedJaxpr {
-  if (jvpJaxprCache.has(jaxpr)) {
+/** Dispose all entries in the jvpJaxpr cache. Called by _disposeAllJitCaches. */
+export function _disposeJvpJaxprCache(): void {
+  for (const cached of jvpJaxprCache.values()) {
+    try {
+      cached.dispose();
+    } catch {
+      /* already freed */
+    }
+  }
+  jvpJaxprCache.clear();
+}
+_derivedCacheCleanups.push(_disposeJvpJaxprCache);
+
+// Clean up jvpJaxprCache entries when a jaxpr's ClosedJaxpr is disposed.
+ClosedJaxpr._disposeHooks.push((jaxpr: Jaxpr) => {
+  const cached = jvpJaxprCache.get(jaxpr);
+  if (cached) {
+    cached.dispose();
+    jvpJaxprCache.delete(jaxpr);
+  }
+});
+
+function jvpJaxpr(
+  jaxpr: Jaxpr,
+  { cache = true }: { cache?: boolean } = {},
+): ClosedJaxpr {
+  if (cache && jvpJaxprCache.has(jaxpr)) {
     return jvpJaxprCache.get(jaxpr)!;
   }
 
@@ -430,7 +651,7 @@ function jvpJaxpr(jaxpr: Jaxpr): ClosedJaxpr {
       jvpFlat(jaxprAsFun(jaxpr), primals, tangents),
   )(inAvals, inAvals);
 
-  jvpJaxprCache.set(jaxpr, newJaxpr);
+  if (cache) jvpJaxprCache.set(jaxpr, newJaxpr);
   return newJaxpr;
 }
 
@@ -468,11 +689,54 @@ export function jvp<F extends (...x: any[]) => any>(
     [flatFun, outTree] = flattenFun(f, inTree);
   }
 
-  const [primalsOutFlat, tangentsOutFlat] = jvpFlat(
-    flatFun,
-    primalsFlat,
-    tangentsFlat,
-  );
+  // At top level, pre-wrap non-Tracer values with pureArray to track
+  // ownership.  Inside tracing (e.g. makeJaxpr) the created Arrays become
+  // jaxpr consts and must NOT be disposed here.
+  const topLevel = isTopLevel();
+  let pFlat: TracerValue[] = primalsFlat;
+  let tFlat: TracerValue[] = tangentsFlat;
+  const ownedP: boolean[] = [];
+  const ownedT: boolean[] = [];
+  if (topLevel) {
+    pFlat = primalsFlat.map((x) => {
+      if (x instanceof Tracer) {
+        ownedP.push(false);
+        return x;
+      }
+      ownedP.push(true);
+      return pureArray(x);
+    });
+    tFlat = tangentsFlat.map((x) => {
+      if (x instanceof Tracer) {
+        ownedT.push(false);
+        return x;
+      }
+      ownedT.push(true);
+      return pureArray(x);
+    });
+  }
+
+  const [primalsOutFlat, tangentsOutFlat] = jvpFlat(flatFun, pFlat, tFlat);
+
+  // Dispose pre-wrapped arrays that jvpFlat didn't consume.
+  if (topLevel) {
+    for (let i = 0; i < pFlat.length; i++) {
+      if (ownedP[i])
+        try {
+          (pFlat[i] as Tracer).dispose();
+        } catch {
+          /* already consumed */
+        }
+    }
+    for (let i = 0; i < tFlat.length; i++) {
+      if (ownedT[i])
+        try {
+          (tFlat[i] as Tracer).dispose();
+        } catch {
+          /* already consumed */
+        }
+    }
+  }
   if (outTree.value === undefined) {
     throw new Error("outTree was not set in jvp");
   }

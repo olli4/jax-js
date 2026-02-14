@@ -8,6 +8,10 @@ docs-json/
 .vscode/
 .claude/
 
+# Local scratch and lockfiles
+tmp/
+deno.lock
+
 # Test files from vitest
 __screenshots__/
 coverage/

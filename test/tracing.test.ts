@@ -24,12 +24,14 @@ suite("jax.makeJaxpr()", () => {
   });
 
   test("tracks a unary function", () => {
+    const arg = np.array([
+      [2, 4, 10],
+      [1, 1, 1],
+    ]);
     const { jaxpr } = makeJaxpr((x: np.Array) => np.multiply(x.ref.add(2), x))(
-      np.array([
-        [2, 4, 10],
-        [1, 1, 1],
-      ]),
+      arg,
     );
+    arg.dispose();
     expect(jaxpr.toString()).toMatchInlineSnapshot(`
       "{ lambda a:float32[2,3] .
         let b:float32[2,3] = add a 2
@@ -117,13 +119,12 @@ suite("jax.linearize()", () => {
   });
 
   test("works for simple arrays", () => {
-    const [y, lin] = linearize(
-      (x: np.Array) => x.ref.mul(x),
-      [np.array([2, 3])],
-    );
+    const arg = np.array([2, 3]);
+    const [y, lin] = linearize((x: np.Array) => x.ref.mul(x), [arg]);
     expect(y).toBeAllclose(np.array([4, 9]));
     expect(lin(np.array([1, 0]))).toBeAllclose(np.array([4, 0]));
     expect(lin(np.array([0, 1]))).toBeAllclose(np.array([0, 6]));
+    arg.dispose();
   });
 
   test("can take and return jstrees", () => {
@@ -199,7 +200,7 @@ suite("jax.vjp()", () => {
     };
 
     const x = np.array([1, 2, 3]);
-    const [main, vjpFn, _aux] = vjp(f, [x], { hasAux: true });
+    const [main, vjpFn, aux] = vjp(f, [x], { hasAux: true });
 
     expect(main.a).toBeAllclose(6);
     expect(main.b).toBeAllclose(6);
@@ -208,6 +209,7 @@ suite("jax.vjp()", () => {
     expect(grad).toBeAllclose([7, 4, 3]);
 
     vjpFn.dispose();
+    aux.dispose();
   });
 
   test("hasAux throws if function does not return tuple", () => {
@@ -225,8 +227,11 @@ suite("jax.vjp()", () => {
 
     const x = np.array([1, 2, 3]);
 
-    const [, vjpFn1] = vjp(fWithAux, [x.ref], { hasAux: true });
-    const [, vjpFn2] = vjp(fWithoutAux, [x]);
+    const [main1, vjpFn1, aux1] = vjp(fWithAux, [x.ref], { hasAux: true });
+    main1.dispose();
+    aux1.dispose();
+    const [main2, vjpFn2] = vjp(fWithoutAux, [x]);
+    main2.dispose();
 
     const [grad1] = vjpFn1(np.ones([]));
     const [grad2] = vjpFn2(np.ones([]));
@@ -234,6 +239,7 @@ suite("jax.vjp()", () => {
     expect(grad1).toBeAllclose(grad2);
 
     vjpFn1.dispose();
+    vjpFn2.dispose();
   });
 
   test("hasAux works with jit wrapper", () => {
@@ -243,6 +249,7 @@ suite("jax.vjp()", () => {
     ]);
 
     const x = np.array([1, 2, 3]);
+    // vjp consumes primals — ownership of x is transferred.
     const [loss, vjpFn, aux] = vjp(f, [x], { hasAux: true });
 
     expect(loss).toBeAllclose(6);
@@ -251,6 +258,7 @@ suite("jax.vjp()", () => {
     expect(grad).toBeAllclose([1, 1, 1]);
 
     vjpFn.dispose();
+    f.dispose();
   });
 
   test("hasAux works inside jit", () => {
@@ -301,7 +309,7 @@ suite("jax.grad()", () => {
 
   test("passing const argnums", () => {
     const f = (x: np.Array, y: [np.Array, np.Array]) =>
-      x.ref.mul(y[0]).add(y[1]).sum();
+      x.mul(y[0]).add(y[1]).sum();
     const df_dx = grad(f, { argnums: 0 });
     const df_dy = grad(f, { argnums: 1 });
     const x = np.array([2, 3]);
@@ -318,6 +326,14 @@ suite("jax.grad()", () => {
     expect(dx.js()).toEqual([4, 5]);
     expect(dy0.js()).toEqual([2, 3]);
     expect(dy1.js()).toEqual([1, 1]);
+  });
+
+  test("supports object-style argnums spec", () => {
+    const f = (x: np.Array, y: np.Array) => x.ref.mul(y).sum();
+    const dfdBoth = grad(f, { argnums: { 1: true, 0: true } });
+    const [dx, dy] = dfdBoth(np.array([2, 3]), np.array([4, 5]));
+    expect(dx.js()).toEqual([4, 5]);
+    expect(dy.js()).toEqual([2, 3]);
   });
 
   test("backprops through auto-broadcast", () => {
@@ -426,7 +442,8 @@ suite("jax.grad()", () => {
 
     const x = np.array([1, 2, 3]);
 
-    const [grad1] = grad(fWithAux, { hasAux: true })(x.ref);
+    const [grad1, aux] = grad(fWithAux, { hasAux: true })(x.ref);
+    tree.dispose(aux);
     const grad2 = grad(fWithoutAux)(x);
 
     expect(grad1).toBeAllclose(grad2);
@@ -439,22 +456,26 @@ suite("jax.grad()", () => {
     ]);
 
     const x = np.array([1, 2, 3]);
+    // grad consumes x — ownership transferred.
     const [gradient, aux] = grad(f, { hasAux: true })(x);
 
     expect(gradient).toBeAllclose([1, 1, 1]);
     expect(aux).toBeAllclose([2, 4, 6]);
+    f.dispose();
   });
 
   test("hasAux throws on non-scalar output", () => {
     const f = (x: np.Array): [np.Array, np.Array] => [x.ref, x.mul(2)];
     const x = np.array([1, 2, 3]);
-    expect(() => grad(f, { hasAux: true })(x)).toThrow("scalar");
+    expect(() => grad(f, { hasAux: true })(x.ref)).toThrow("scalar");
+    x.dispose();
   });
 
   test("hasAux throws on non-float dtype", () => {
     const f = (x: np.Array): [np.Array, np.Array] => [x.ref.sum(), x.mul(2)];
     const x = np.array([1, 2, 3], { dtype: np.int32 });
-    expect(() => grad(f, { hasAux: true })(x)).toThrow("floating-point");
+    expect(() => grad(f, { hasAux: true })(x.ref)).toThrow("floating-point");
+    x.dispose();
   });
 
   test("grad is not stopped in aux values", () => {
@@ -537,11 +558,11 @@ suite("jax.jit()", () => {
   });
 
   test("processes gather ops", () => {
-    const f = jit((x: np.Array) =>
-      x.slice(np.array([1, 3, 2, 0], { dtype: np.int32 })),
-    );
+    const idx = np.array([1, 3, 2, 0], { dtype: np.int32 });
+    const f = jit((x: np.Array) => x.slice(idx));
     const a = f(np.array([10, 20, 30, 40]));
     expect(a.js()).toEqual([20, 40, 30, 10]);
+    idx.dispose();
   });
 
   test("supports staticArgnums", () => {
@@ -551,6 +572,14 @@ suite("jax.jit()", () => {
     expect(f(np.arange(20), 0).js()).toEqual(0);
     expect(f(np.arange(20), 3).js()).toEqual(3);
     expect(f(np.array([30, 1, 20, 11]), 3).js()).toEqual(11);
+  });
+
+  test("supports object-style staticArgnums", () => {
+    const f = jit((x: np.Array, idx: number) => x.slice(idx), {
+      staticArgnums: { 1: true },
+    });
+    expect(f(np.arange(10), 4).js()).toEqual(4);
+    expect(f(np.array([9, 8, 7, 6, 5]), 2).js()).toEqual(7);
   });
 
   test("jit-of-jit", () => {
@@ -567,12 +596,16 @@ suite("jax.jit()", () => {
 
   test("grad-of-jit", () => {
     const f = jit((x: np.Array) => x.ref.mul(x));
-
     expect(grad(f)(3)).toBeAllclose(6);
     expect(grad(f)(10)).toBeAllclose(20);
     expect(jvp(grad(f), [10], [1])).toBeAllclose([20, 2]);
+
     expect(grad(grad(f))(10)).toBeAllclose(2);
-    expect(grad(jit(grad(f)))(10)).toBeAllclose(2);
+
+    const f2 = jit(grad(f));
+    expect(grad(f2)(10)).toBeAllclose(2);
+    f2.dispose();
+    f.dispose();
   });
 
   test("vmap-of-jit", () => {

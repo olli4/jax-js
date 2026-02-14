@@ -32,6 +32,10 @@ import {
   ShapedArray,
 } from "./core";
 import { Jaxpr, Lit, Var } from "./jaxpr";
+import { executeScan } from "./scan-executor";
+import type { ScanPlan } from "./scan-plan";
+import { planScan } from "./scan-plan";
+import type { ScanPath } from "../utils";
 
 export type JitId = number;
 
@@ -54,6 +58,23 @@ export type JitStep =
   | {
       type: "free";
       input: JitId;
+    }
+  | {
+      type: "scan";
+      plan: ScanPlan;
+      bodyProgram: JitProgram;
+      bodyJaxpr: Jaxpr;
+      length: number;
+      numCarry: number;
+      numConsts: number;
+      numX: number;
+      numY: number;
+      reverse: boolean;
+      consts: JitId[];
+      initCarry: JitId[];
+      xs: JitId[];
+      xsAvals: ShapedArray[];
+      outputs: JitId[];
     };
 
 /** Result of compiling a Jaxpr. Can be evaluated on a series of inputs. */
@@ -91,6 +112,12 @@ export class JitProgram {
           return PPrint.pp(`incref ${step.input}`);
         case "free":
           return PPrint.pp(`free ${step.input}`);
+        case "scan":
+          return PPrint.pp(
+            `scan [${step.plan.path}] length=${step.length} numCarry=${step.numCarry} ` +
+              `numConsts=${step.numConsts} numX=${step.numX} numY=${step.numY}` +
+              (step.reverse ? " reverse" : ""),
+          );
       }
     });
     const display = PPrint.prototype.concat(
@@ -149,6 +176,55 @@ export class JitProgram {
           const slot = scope.get(step.input)!;
           this.backend.decRef(slot);
           scope.delete(step.input);
+          break;
+        }
+        case "scan": {
+          // Flush pending ops before scan — scan needs materialized inputs
+          for (const p of pending) {
+            p.prepareSync();
+            p.submit();
+          }
+          pending.length = 0;
+
+          // Resolve slots from scope
+          const constSlots = step.consts.map((id) => scope.get(id)!);
+          const initCarrySlots = step.initCarry.map((id) => scope.get(id)!);
+          const xsSlots = step.xs.map((id) => scope.get(id)!);
+          const outputSlots = step.outputs.map((id) => scope.get(id)!);
+
+          // IncRef consts and xs — executeScan borrows them
+          for (const s of constSlots) this.backend.incRef(s);
+          for (const s of xsSlots) this.backend.incRef(s);
+
+          const result = executeScan({
+            backend: this.backend,
+            plan: step.plan,
+            bodyProgram: step.bodyProgram,
+            bodyJaxpr: step.bodyJaxpr,
+            length: step.length,
+            numCarry: step.numCarry,
+            numConsts: step.numConsts,
+            numX: step.numX,
+            numY: step.numY,
+            reverse: step.reverse,
+            constSlots,
+            initCarrySlots,
+            xsSlots,
+            xsAvals: step.xsAvals,
+            outputSlots,
+          });
+
+          // DecRef borrowed consts and xs
+          for (const s of constSlots) this.backend.decRef(s);
+          for (const s of xsSlots) this.backend.decRef(s);
+
+          // Propagate scan pending ops
+          pending.push(...result.pending);
+
+          // Update scope with output slots
+          for (let oi = 0; oi < step.outputs.length; oi++) {
+            scope.set(step.outputs[oi], result.outputs[oi]);
+          }
           break;
         }
         default:
@@ -235,7 +311,12 @@ class JitProgramBuilder {
         (s) =>
           (s.type === "execute" &&
             (s.outputs.includes(id) || s.inputs.includes(id))) ||
-          (s.type === "malloc" && s.output === id),
+          (s.type === "malloc" && s.output === id) ||
+          (s.type === "scan" &&
+            (s.outputs.includes(id) ||
+              s.consts.includes(id) ||
+              s.initCarry.includes(id) ||
+              s.xs.includes(id))),
       )!;
       this.steps.splice(lastUsage + 1, 0, {
         type: "free",
@@ -286,6 +367,108 @@ export function jitCompile(backend: Backend, jaxpr: Jaxpr): JitProgram {
   // Now run each primitive through a set of rules, mirroring implRules.
   for (let i = 0; i < jaxpr.eqns.length; i++) {
     const eqn = jaxpr.eqns[i];
+
+    // Handle Primitive.Scan specially — it compiles the body jaxpr and
+    // emits a single "scan" JitStep with a ScanPlan.
+    if (eqn.primitive === Primitive.Scan) {
+      const params = eqn.params as PrimitiveParams<typeof Primitive.Scan>;
+      const {
+        jaxpr: bodyJaxpr,
+        numCarry,
+        numConsts,
+        length,
+        reverse,
+        acceptPath,
+      } = params;
+      const numX = bodyJaxpr.inBinders.length - numConsts - numCarry;
+      const numY = bodyJaxpr.outs.length - numCarry;
+
+      // Resolve input JitIds (all must be "imm" — black nodes)
+      const allInputIds: JitId[] = [];
+      for (const input of eqn.inputs) {
+        if (input instanceof Var) {
+          const jv = ctx.get(input)!;
+          if (jv.type !== "imm") {
+            throw new Error("jit: scan primitive input is not imm");
+          }
+          allInputIds.push(jv.arg);
+        } else if (input instanceof Lit) {
+          allInputIds.push(builder.pushLit(input));
+        }
+      }
+
+      const constsIds = allInputIds.slice(0, numConsts);
+      const initCarryIds = allInputIds.slice(numConsts, numConsts + numCarry);
+      const xsIds = allInputIds.slice(numConsts + numCarry);
+
+      // xs avals (actual shapes from the jaxpr, include leading length dim)
+      const xsAvals: ShapedArray[] = [];
+      const xsInputs = eqn.inputs.slice(numConsts + numCarry);
+      for (const input of xsInputs) {
+        xsAvals.push(input.aval);
+      }
+
+      // Allocate output buffers: [carry_out..., stacked_ys...]
+      const outputIds: JitId[] = [];
+      for (const outVar of eqn.outBinders) {
+        const outId = builder.pushBuffer(
+          outVar.aval.size * byteWidth(outVar.aval.dtype),
+        );
+        outputIds.push(outId);
+        ctx.set(outVar, { type: "imm", arg: outId });
+      }
+
+      // Compile body jaxpr
+      const bodyProgram = jitCompile(backend, bodyJaxpr);
+
+      // Determine scan plan
+      const scanPlan = planScan(
+        backend,
+        bodyProgram,
+        bodyJaxpr,
+        length,
+        numCarry,
+        numConsts,
+        numX,
+        numY,
+        reverse,
+        acceptPath as ScanPath | ScanPath[] | undefined,
+      );
+
+      // Compute per-slice xsAvals (without leading length dimension)
+      const xsSliceAvals = xsAvals.map(
+        (a) => new ShapedArray(a.shape.slice(1), a.dtype, a.weakType),
+      );
+
+      builder.steps.push({
+        type: "scan",
+        plan: scanPlan,
+        bodyProgram,
+        bodyJaxpr,
+        length,
+        numCarry,
+        numConsts,
+        numX,
+        numY,
+        reverse,
+        consts: constsIds,
+        initCarry: initCarryIds,
+        xs: xsIds,
+        xsAvals: xsSliceAvals,
+        outputs: outputIds,
+      });
+      continue;
+    }
+
+    // DynamicUpdateSlice is used by the scan executor directly (copySliceToBuffer).
+    // Standalone JIT compilation is not supported — DUS should only appear
+    // inside scan bodies.
+    if (eqn.primitive === Primitive.DynamicUpdateSlice) {
+      throw new Error(
+        "DynamicUpdateSlice JIT compilation is not supported. " +
+          "DUS should only appear inside scan bodies, which handle it directly.",
+      );
+    }
 
     // If this is a routine, construct and dispatch the routine.
     if (routinePrimitives.has(eqn.primitive)) {
@@ -777,6 +960,16 @@ const jitRules: { [P in Primitive]: JitRule<P> } = {
       "internal: Jit should have been flattened before JIT compilation",
     );
   },
+  [Primitive.DynamicUpdateSlice]() {
+    throw new Error(
+      "internal: DynamicUpdateSlice is handled specially in jitCompile",
+    );
+  },
+  [Primitive.Scan]() {
+    throw new Error(
+      "internal: Scan is handled specially in jitCompile, not via jitRules",
+    );
+  },
 };
 
 /** Determines how to split the Jaxpr into kernels via dataflow analysis. */
@@ -915,12 +1108,19 @@ function splitGraphDataflow(backend: Backend, jaxpr: Jaxpr): Set<Var> {
     // effect is to pad the intermediate with 1s instead of 0s!
     Primitive.Pad,
   ];
+  const specialBlackPrimitives = [
+    // These primitives are handled specially in jitCompile and must always
+    // be black nodes with materialized inputs.
+    Primitive.Scan,
+    Primitive.DynamicUpdateSlice,
+  ];
   for (let i = jaxpr.eqns.length - 1; i >= 0; i--) {
     const eqn = jaxpr.eqns[i];
     if (
       reductionEndpointEqns.has(i) ||
       heterogeneousViewPrimitives.includes(eqn.primitive) ||
       routinePrimitives.has(eqn.primitive) ||
+      specialBlackPrimitives.includes(eqn.primitive) ||
       eqn.outBinders.some((v) => blackNodes.has(v))
     ) {
       for (const v of eqn.outBinders) {
@@ -935,7 +1135,8 @@ function splitGraphDataflow(backend: Backend, jaxpr: Jaxpr): Set<Var> {
       for (const j of varToUsages.get(v) ?? []) {
         if (
           needsCleanShapePrimitives.includes(jaxpr.eqns[j].primitive) ||
-          routinePrimitives.has(jaxpr.eqns[j].primitive)
+          routinePrimitives.has(jaxpr.eqns[j].primitive) ||
+          specialBlackPrimitives.includes(jaxpr.eqns[j].primitive)
         ) {
           needsCleanOutput = true;
           break outer;

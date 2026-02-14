@@ -12,6 +12,8 @@ import {
   FpHash,
   FpHashable,
   generalBroadcast,
+  IndexSpec,
+  normalizeIndexSpec,
   runWithCache,
   unzip2,
   zip,
@@ -539,10 +541,30 @@ export function jaxprAsFun(jaxpr: Jaxpr): (...args: Tracer[]) => Tracer[] {
 
 /** Jaxpr with a collection of associated, traced constants. */
 export class ClosedJaxpr {
+  /** Callbacks invoked when dispose() is called, for cleaning up derived caches. */
+  static _disposeHooks: ((jaxpr: Jaxpr) => void)[] = [];
+
+  /** Debug-only: callbacks invoked when a ClosedJaxpr is constructed. */
+  static _createHooks: ((closed: ClosedJaxpr, createdAt: Error) => void)[] = [];
+
+  /** Debug-only: callbacks invoked when a ClosedJaxpr is disposed. */
+  static _disposeClosedHooks: ((closed: ClosedJaxpr) => void)[] = [];
+
   constructor(
     readonly jaxpr: Jaxpr,
     readonly consts: Tracer[],
-  ) {}
+  ) {
+    if (ClosedJaxpr._createHooks.length > 0) {
+      const createdAt = new Error();
+      for (const hook of ClosedJaxpr._createHooks) {
+        try {
+          hook(this, createdAt);
+        } catch {
+          /* debug hook */
+        }
+      }
+    }
+  }
 
   /** String representation of this Jaxpr. */
   toString(): string {
@@ -557,6 +579,14 @@ export class ClosedJaxpr {
   /** Dispose of the constants in this Jaxpr. */
   dispose() {
     for (const c of this.consts) c.dispose();
+    for (const hook of ClosedJaxpr._disposeHooks) hook(this.jaxpr);
+    for (const hook of ClosedJaxpr._disposeClosedHooks) {
+      try {
+        hook(this);
+      } catch {
+        /* debug hook */
+      }
+    }
   }
 }
 
@@ -706,12 +736,11 @@ class JaxprBuilder {
 
     // Inline any scalar constants as Lit and remove from the input list.
     typecheckJaxpr(jaxpr);
-    const cjaxpr = new ClosedJaxpr(jaxpr, consts);
-    return _inlineLiterals(cjaxpr);
+    return _inlineLiterals(jaxpr, consts);
   }
 }
 
-function _inlineLiterals({ jaxpr, consts }: ClosedJaxpr): ClosedJaxpr {
+function _inlineLiterals(jaxpr: Jaxpr, consts: Tracer[]): ClosedJaxpr {
   const literals = new Map<Atom, Lit>();
   const constBinders: Var[] = [];
   const newConsts: Tracer[] = [];
@@ -943,6 +972,32 @@ export const abstractEvalRules: { [P in Primitive]: AbstractEvalRule<P> } = {
     const newShape = x.shape.map((dim, i) => dim + width[i][0] + width[i][1]);
     return [new ShapedArray(newShape, x.dtype, x.weakType)];
   },
+  [Primitive.DynamicUpdateSlice]([dst, src], { offset, axis }) {
+    if (!(dst instanceof ShapedArray) || !(src instanceof ShapedArray)) {
+      throw new TypeError("dynamicUpdateSlice expects shaped array inputs");
+    }
+    const dstShape = dst.shape;
+    const srcShape = src.shape;
+    if (dstShape.length === srcShape.length) {
+      for (let i = 0; i < dstShape.length; i++) {
+        if (i === axis) continue;
+        if (dstShape[i] !== srcShape[i])
+          throw new TypeError("dynamicUpdateSlice: shape mismatch");
+      }
+      if (offset + srcShape[axis] > dstShape[axis])
+        throw new TypeError("dynamicUpdateSlice: out of bounds");
+    } else if (axis === 0 && dstShape.length === srcShape.length + 1) {
+      for (let i = 0; i < srcShape.length; i++) {
+        if (dstShape[i + 1] !== srcShape[i])
+          throw new TypeError("dynamicUpdateSlice: stacked shape mismatch");
+      }
+      if (offset + 1 > dstShape[0])
+        throw new TypeError("dynamicUpdateSlice: stacked out of bounds");
+    } else {
+      throw new TypeError("dynamicUpdateSlice: unsupported shapes");
+    }
+    return [new ShapedArray(dst.shape, dst.dtype, dst.weakType)];
+  },
   [Primitive.Sort]([x]) {
     if (x.ndim === 0) throw new TypeError("sort: requires at least 1D input");
     return [ShapedArray.fromAval(x)];
@@ -1007,6 +1062,33 @@ export const abstractEvalRules: { [P in Primitive]: AbstractEvalRule<P> } = {
     }
     return outTypes;
   },
+  [Primitive.Scan](args, { jaxpr, numCarry, numConsts, length, reverse: _ }) {
+    // Args: [...consts, ...initCarry, ...xs]
+    // jaxpr inputs: [...consts, ...carry, ...x_slice]
+    // jaxpr outputs: [...newCarry, ...y_slice]
+    // Note: reverse doesn't affect output shapes
+    const numX = args.length - numConsts - numCarry;
+    const { outTypes } = typecheckJaxpr(jaxpr);
+
+    // Validate input types match jaxpr expectations
+    if (jaxpr.inBinders.length !== numConsts + numCarry + numX) {
+      throw new TypeError(
+        `Scan jaxpr expects ${jaxpr.inBinders.length} inputs, got ${numConsts + numCarry + numX}`,
+      );
+    }
+
+    // Return types: [...carryOut, ...ys]
+    // carryOut shapes match initCarry shapes
+    // ys shapes are [length, ...y_slice_shape]
+    const carryOutTypes = outTypes.slice(0, numCarry);
+    const ySliceTypes = outTypes.slice(numCarry);
+
+    const yTypes = ySliceTypes.map((t) => {
+      return new ShapedArray([length, ...t.shape], t.dtype, t.weakType);
+    });
+
+    return [...carryOutTypes, ...yTypes];
+  },
 };
 
 function splitIdx(values: any[], argnums: Set<number>): [any[], any[]] {
@@ -1032,7 +1114,7 @@ function joinIdx(n: number, a: any[], b: any[], argnums: Set<number>): any[] {
 
 /** @inline */
 export type JitOpts = {
-  staticArgnums?: number[];
+  staticArgnums?: IndexSpec;
 };
 
 export function makeJaxpr(
@@ -1040,7 +1122,9 @@ export function makeJaxpr(
   opts?: JitOpts,
 ): (...argsIn: any) => { jaxpr: ClosedJaxpr; treedef: JsTreeDef } {
   return (...argsIn) => {
-    const staticArgnums = new Set(opts?.staticArgnums ?? []);
+    const staticArgnums = new Set(
+      normalizeIndexSpec(opts?.staticArgnums ?? [], "staticArgnums"),
+    );
     const [staticArgs, shapedArgs] = splitIdx(argsIn, staticArgnums);
 
     const [avalsIn, inTree] = treeFlatten(shapedArgs);
@@ -1074,6 +1158,34 @@ export function makeJaxpr(
   };
 }
 
+/** Global registry of all jit caches, for test-time cleanup. */
+const _jitCaches = new Set<Map<string, { jaxpr: ClosedJaxpr; treedef: any }>>();
+
+/** Callbacks for clearing derived caches (jvpJaxpr, transposeJaxpr, vmapJaxpr). */
+export const _derivedCacheCleanups: (() => void)[] = [];
+
+/** Dispose all jit caches and free their constants. Used by checkLeaks. */
+export function _disposeAllJitCaches(): void {
+  for (const cache of _jitCaches) {
+    for (const { jaxpr } of cache.values()) {
+      // Fire hooks for derived cache cleanup (jvp/transpose/vmap caches).
+      for (const hook of ClosedJaxpr._disposeHooks) hook(jaxpr.jaxpr);
+      // Dispose consts, skipping any already freed by user code.
+      for (const c of jaxpr.consts) {
+        try {
+          c.dispose();
+        } catch {
+          /* const was already disposed externally */
+        }
+      }
+    }
+    cache.clear();
+  }
+  // Also clear all derived caches — PE-derived sub-jaxprs may hold entries
+  // not reachable through the dispose-hook cascade above.
+  for (const cleanup of _derivedCacheCleanups) cleanup();
+}
+
 export function jit<F extends (...args: any[]) => any>(
   f: F,
   opts?: JitOpts,
@@ -1081,7 +1193,10 @@ export function jit<F extends (...args: any[]) => any>(
   (...args: MapJsTree<Parameters<F>, Array, ArrayLike>) => ReturnType<F>
 > {
   const cache = new Map<string, ReturnType<ReturnType<typeof makeJaxpr>>>();
-  const staticArgnums = new Set(opts?.staticArgnums ?? []);
+  _jitCaches.add(cache);
+  const staticArgnums = new Set(
+    normalizeIndexSpec(opts?.staticArgnums ?? [], "staticArgnums"),
+  );
 
   const result = ((...args) => {
     const [staticArgs, dynamicArgs] = splitIdx(args, staticArgnums);
@@ -1095,15 +1210,11 @@ export function jit<F extends (...args: any[]) => any>(
       makeJaxpr(f, opts)(...jaxprArgs),
     );
 
-    const outs = bind(
-      Primitive.Jit,
-      [...jaxpr.consts.map((c) => c.ref), ...argsFlat],
-      {
-        name: f.name || "closure",
-        jaxpr: jaxpr.jaxpr,
-        numConsts: jaxpr.consts.length,
-      },
-    );
+    const outs = bind(Primitive.Jit, [...jaxpr.consts, ...argsFlat], {
+      name: f.name || "closure",
+      jaxpr: jaxpr.jaxpr,
+      numConsts: jaxpr.consts.length,
+    });
     return treeUnflatten(outTree, outs);
   }) as OwnedFunction<F>;
 
@@ -1111,6 +1222,8 @@ export function jit<F extends (...args: any[]) => any>(
     for (const { jaxpr } of cache.values()) {
       jaxpr.dispose();
     }
+    cache.clear();
+    _jitCaches.delete(cache);
   };
 
   return result;

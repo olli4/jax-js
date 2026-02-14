@@ -1,4 +1,12 @@
-import { AluExp, AluGroup, AluOp, DType, isFloatDtype, Kernel } from "../alu";
+import {
+  AluExp,
+  AluGroup,
+  AluOp,
+  byteWidth,
+  DType,
+  isFloatDtype,
+  Kernel,
+} from "../alu";
 import {
   Backend,
   Device,
@@ -8,7 +16,7 @@ import {
   UnsupportedOpError,
 } from "../backend";
 import { Routine } from "../routine";
-import { tuneWebgpu } from "../tuner";
+import { tuneNullopt, tuneWebgpu } from "../tuner";
 import {
   DEBUG,
   findPow2,
@@ -23,15 +31,154 @@ import {
   calculateGrid,
   constToWgsl,
   dtypeToWgsl,
+  gridOffsetY,
   headerWgsl,
   ShaderInfo,
 } from "./webgpu/codegen";
 import { SyncReader } from "./webgpu/reader";
 import { createRoutineShader } from "./webgpu/routines";
+import {
+  createAllIterationsOffsetsBuffer,
+  type ScanBindingInfo,
+  wrapRoutineForScan,
+} from "./webgpu/scan-wrapper";
 
 interface ShaderDispatch extends ShaderInfo {
   pipeline: GPUComputePipeline; // Compiled pipeline for the shader.
 }
+
+// ---------------------------------------------------------------------------
+// Types for WebGPU native scan (multi-kernel shader)
+// ---------------------------------------------------------------------------
+
+export interface NativeScanMultiStep {
+  /** The kernel to execute. */
+  kernel: Kernel;
+  /** Input mapping: indices into [consts, carry, xs] flattened. */
+  inputs: number[];
+  /** Which carry slot this kernel writes to (0..numCarry-1). */
+  outputCarryIdx: number;
+  /** Size of output in elements (not bytes). */
+  outputSize: number;
+}
+
+/** Parameters for multi-kernel native scan execution on WebGPU. */
+export interface NativeScanMultiParams {
+  length: number;
+  numConsts: number;
+  constSizes: number[];
+  numCarry: number;
+  carrySizes: number[];
+  numX: number;
+  xsStrides: number[];
+  numY: number;
+  ysStrides: number[];
+  steps: NativeScanMultiStep[];
+  reverse?: boolean;
+}
+
+// ---------------------------------------------------------------------------
+// Types for WebGPU preencoded-routine scan (P4)
+// ---------------------------------------------------------------------------
+
+/** Parameters for preencoded scan execution on WebGPU (routine body like matmul). */
+export interface PreencodedScanParams {
+  /** Number of scan iterations. */
+  length: number;
+  /** Sizes of each carry buffer in bytes. */
+  carrySizes: number[];
+  /** Strides (in ELEMENTS) along axis 0 for each xs input. */
+  xsElemStrides: number[];
+  /** Strides (in ELEMENTS) along axis 0 for each stacked y output. */
+  ysElemStrides: number[];
+  /** The prepared routine executable for the body. */
+  bodyRoutine: Executable<ShaderDispatch[]>;
+  /** Number of carry arrays. */
+  numCarry: number;
+  /** Number of xs inputs. */
+  numX: number;
+  /** Number of ys outputs. */
+  numY: number;
+  /** Number of const inputs (bound before carry). */
+  numConsts: number;
+  /** Whether to scan in reverse order. */
+  reverse?: boolean;
+  /** For each routine input binding i, the body jaxpr JitId, used to classify as const/carry/xs. */
+  routineInputJitIds: number[];
+  /** For each routine output binding i, the body output index. */
+  routineOutputJitIds: number[];
+}
+
+/** Prepared preencoded scan with wrapped shaders and offset buffer. */
+export interface PreparedPreencodedScan {
+  params: PreencodedScanParams;
+  /** Shaders with uniform offset support. */
+  wrappedShaders: ShaderDispatch[];
+  /** GPU buffer containing all iteration offsets. */
+  offsetBuffer: GPUBuffer;
+  /** Alignment of each iteration's offset data in the buffer. */
+  offsetAlignment: number;
+  /** Per-carry copy strategy for ys stacking (true = use shader copy). */
+  copyUsesShader: boolean[];
+}
+
+const COPY_WORKGROUP_SIZE = 64;
+
+const COPY_SHADER_CODE = String.raw`
+${headerWgsl}
+
+struct CopyParams {
+  srcOffset: u32,
+  dstOffset: u32,
+  size: u32,
+  _pad: u32,
+}
+
+@group(0) @binding(0) var<storage, read> src: array<u32>;
+@group(0) @binding(1) var<storage, read_write> dst: array<u32>;
+@group(1) @binding(0) var<uniform> params: CopyParams;
+
+fn byte_mask(n: u32) -> u32 {
+  if (n >= 4u) { return 0xffffffffu; }
+  return (1u << (n * 8u)) - 1u;
+}
+
+fn load_unaligned(offset: u32) -> u32 {
+  let word = offset >> 2u;
+  let shift = (offset & 3u) * 8u;
+  if (shift == 0u) {
+    return src[word];
+  }
+  let low = src[word];
+  let high = src[word + 1u];
+  return (low >> shift) | (high << (32u - shift));
+}
+
+@compute @workgroup_size(${COPY_WORKGROUP_SIZE})
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+  let gid = id.x + id.y * ${gridOffsetY}u;
+  let firstDstWord = params.dstOffset >> 2u;
+  let wordIdx = firstDstWord + gid;
+  let lastDstWord = (params.dstOffset + params.size + 3u) >> 2u;
+  if (wordIdx >= lastDstWord) { return; }
+
+  let wordByteStart = wordIdx * 4u;
+  let copyStart = max(params.dstOffset, wordByteStart);
+  let copyEnd = min(params.dstOffset + params.size, wordByteStart + 4u);
+  let nbytes = copyEnd - copyStart;
+  let srcByteOff = params.srcOffset + (copyStart - params.dstOffset);
+  let value = load_unaligned(srcByteOff);
+
+  if (nbytes == 4u) {
+    dst[wordIdx] = value;
+  } else {
+    let shift = (copyStart & 3u) * 8u;
+    let mask = byte_mask(nbytes) << shift;
+    let cur = dst[wordIdx];
+    dst[wordIdx] = (cur & ~mask) | ((value << shift) & mask);
+  }
+}
+`.trim();
 
 /** Implementation of `Backend` that uses WebGPU in browsers. */
 export class WebGPUBackend implements Backend {
@@ -52,6 +199,7 @@ export class WebGPUBackend implements Backend {
 
   #cachedShaderMap = new Map<bigint, ShaderInfo>();
   #reusableZsb: GPUBuffer;
+  #copyPipeline: GPUComputePipeline | null = null;
 
   constructor(readonly device: GPUDevice) {
     if (DEBUG >= 3 && device.adapterInfo) {
@@ -139,6 +287,10 @@ export class WebGPUBackend implements Backend {
     }
   }
 
+  slotCount(): number {
+    return this.buffers.size;
+  }
+
   async read(
     slot: Slot,
     start?: number,
@@ -175,6 +327,35 @@ export class WebGPUBackend implements Backend {
     if (start === undefined) start = 0;
     if (count === undefined) count = size - start;
     return this.syncReader.read(buffer, start, count);
+  }
+
+  copyBufferToBuffer(
+    src: Slot,
+    srcOffset: number,
+    dst: Slot,
+    dstOffset: number,
+    size: number,
+  ): void {
+    if (size === 0) return;
+    const srcBuf = this.#getBuffer(src);
+    const dstBuf = this.#getBuffer(dst);
+    // WebGPU copyBufferToBuffer requires 4-byte alignment on offsets and size.
+    // If alignment is satisfied, use the fast GPU copy path.
+    if (srcOffset % 4 === 0 && dstOffset % 4 === 0 && size % 4 === 0) {
+      const encoder = this.device.createCommandEncoder();
+      encoder.copyBufferToBuffer(
+        srcBuf.buffer,
+        srcOffset,
+        dstBuf.buffer,
+        dstOffset,
+        size,
+      );
+      this.device.queue.submit([encoder.finish()]);
+    } else {
+      // Unaligned fallback: read + write via CPU
+      const data = this.syncReader.read(srcBuf.buffer, srcOffset, size);
+      this.device.queue.writeBuffer(dstBuf.buffer, dstOffset, data);
+    }
   }
 
   #cachedShader(kernel: Kernel): ShaderInfo {
@@ -229,6 +410,483 @@ export class WebGPUBackend implements Backend {
     const inputBuffers = inputs.map((slot) => this.#getBuffer(slot).buffer);
     const outputBuffers = outputs.map((slot) => this.#getBuffer(slot).buffer);
     pipelineSubmit(this.device, exe.data, inputBuffers, outputBuffers);
+  }
+
+  // ---------------------------------------------------------------------------
+  // Native scan methods (P3: WebGPU multi-kernel scan)
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Prepare a multi-kernel native scan shader.
+   * Returns null if codegen fails.
+   */
+  prepareNativeScanMulti(
+    params: NativeScanMultiParams,
+  ): Executable<ShaderDispatch[]> | null {
+    const { steps } = params;
+    if (!steps || steps.length === 0) return null;
+
+    try {
+      const shader = nativeScanMultiShaderSource(this.device, params);
+      const pipeline = this.pipelines.prepareSync(shader);
+      const firstKernel = steps[0].kernel;
+      return new Executable(firstKernel, [{ ...shader, pipeline }]);
+    } catch (e) {
+      if (DEBUG >= 2) {
+        console.warn("WebGPU native scan multi codegen failed:", e);
+      }
+      return null;
+    }
+  }
+
+  /**
+   * Dispatch a native scan shader.
+   *
+   * Buffer binding order: [consts, initCarry, xs, carryOut, ysStacked]
+   */
+  dispatchNativeScanGeneral(
+    exe: Executable<ShaderDispatch[]>,
+    _params: NativeScanMultiParams,
+    consts: Slot[],
+    initCarry: Slot[],
+    xs: Slot[],
+    carryOut: Slot[],
+    ysStacked: Slot[],
+  ): void {
+    const allBuffers = [
+      ...consts.map((slot) => this.#getBuffer(slot).buffer),
+      ...initCarry.map((slot) => this.#getBuffer(slot).buffer),
+      ...xs.map((slot) => this.#getBuffer(slot).buffer),
+      ...carryOut.map((slot) => this.#getBuffer(slot).buffer),
+      ...ysStacked.map((slot) => this.#getBuffer(slot).buffer),
+    ];
+
+    const commandEncoder = this.device.createCommandEncoder();
+    for (const { pipeline, ...shader } of exe.data) {
+      const bindGroup = this.device.createBindGroup({
+        layout: pipeline.getBindGroupLayout(0),
+        entries: allBuffers.map((buffer, i) => ({
+          binding: i,
+          resource: { buffer },
+        })),
+      });
+
+      for (const { grid } of shader.passes) {
+        if (prod(grid) === 0) continue;
+        const passEncoder = commandEncoder.beginComputePass();
+        passEncoder.setPipeline(pipeline);
+        passEncoder.setBindGroup(0, bindGroup);
+        passEncoder.dispatchWorkgroups(grid[0], grid[1]);
+        passEncoder.end();
+      }
+    }
+    this.device.queue.submit([commandEncoder.finish()]);
+  }
+
+  // ---------------------------------------------------------------------------
+  // Preencoded-routine scan methods (P4)
+  // ---------------------------------------------------------------------------
+
+  #getCopyPipeline(): GPUComputePipeline {
+    if (this.#copyPipeline) return this.#copyPipeline;
+    const shader: ShaderInfo = {
+      code: COPY_SHADER_CODE,
+      numInputs: 1,
+      numOutputs: 1,
+      hasUniform: true,
+      passes: [{ grid: [1, 1], uniform: new Uint8Array(16) }],
+    };
+    this.#copyPipeline = this.pipelines.prepareSync(shader);
+    return this.#copyPipeline;
+  }
+
+  #encodeCopyWithShader(
+    commandEncoder: GPUCommandEncoder,
+    srcBuf: GPUBuffer,
+    srcOffset: number,
+    dstBuf: GPUBuffer,
+    dstOffset: number,
+    size: number,
+  ): GPUBuffer | null {
+    if (size <= 0) return null;
+    const firstDstWord = dstOffset >>> 2;
+    const lastDstWord = (dstOffset + size + 3) >>> 2;
+    const words = lastDstWord - firstDstWord;
+    const workgroups = Math.ceil(words / COPY_WORKGROUP_SIZE);
+    if (workgroups === 0) return null;
+
+    const [gridX, gridY] = calculateGrid(workgroups);
+    const pipeline = this.#getCopyPipeline();
+
+    const storageBindGroup = this.device.createBindGroup({
+      layout: pipeline.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: { buffer: srcBuf } },
+        { binding: 1, resource: { buffer: dstBuf } },
+      ],
+    });
+
+    const uniformBuffer = this.device.createBuffer({
+      size: 16,
+      usage: GPUBufferUsage.UNIFORM,
+      mappedAtCreation: true,
+    });
+    new Uint32Array(uniformBuffer.getMappedRange()).set([
+      srcOffset,
+      dstOffset,
+      size,
+      0,
+    ]);
+    uniformBuffer.unmap();
+
+    const uniformBindGroup = this.device.createBindGroup({
+      layout: pipeline.getBindGroupLayout(1),
+      entries: [{ binding: 0, resource: { buffer: uniformBuffer } }],
+    });
+
+    const passEncoder = commandEncoder.beginComputePass();
+    passEncoder.setPipeline(pipeline);
+    passEncoder.setBindGroup(0, storageBindGroup);
+    passEncoder.setBindGroup(1, uniformBindGroup);
+    passEncoder.dispatchWorkgroups(gridX, gridY);
+    passEncoder.end();
+
+    return uniformBuffer;
+  }
+
+  /**
+   * Returns the minimum uniform buffer offset alignment for preencoded scan.
+   */
+  getPreencodedScanAlignment(): number {
+    return this.device.limits.minUniformBufferOffsetAlignment ?? 256;
+  }
+
+  /**
+   * Prepare a preencoded scan operation for routine bodies (matmul, etc.).
+   *
+   * Wraps routine shaders with uniform-based offset bindings for xs/ys,
+   * creates the combined offsets buffer, and compiles pipelines.
+   * Returns null if the routine can't be preencoded.
+   */
+  preparePreencodedScan(
+    params: PreencodedScanParams,
+  ): PreparedPreencodedScan | null {
+    const {
+      xsElemStrides,
+      ysElemStrides,
+      bodyRoutine,
+      numConsts,
+      numCarry,
+      numX,
+      numY,
+      length,
+      reverse,
+      carrySizes,
+      routineInputJitIds,
+      routineOutputJitIds,
+    } = params;
+
+    if (!bodyRoutine || bodyRoutine.data.length === 0) {
+      if (DEBUG >= 2) console.log("Preencoded scan: invalid routine");
+      return null;
+    }
+
+    // Skip if no xs/ys need offsets
+    if (numX === 0 && numY === 0) {
+      if (DEBUG >= 2) console.log("Preencoded scan: no xs/ys, skipping");
+      return null;
+    }
+
+    const scanInfo: ScanBindingInfo = {
+      numConsts,
+      numCarry,
+      routineInputJitIds,
+      routineOutputJitIds,
+    };
+
+    // Wrap each shader with scan offset support
+    const wrappedShaders: ShaderDispatch[] = [];
+    for (const shader of bodyRoutine.data) {
+      // Shaders that already use uniforms (like Sort) conflict with our offset uniform
+      if (shader.hasUniform) {
+        if (DEBUG >= 2)
+          console.log("Preencoded scan: shader already has uniform, skipping");
+        return null;
+      }
+
+      const wrapped = wrapRoutineForScan(shader, scanInfo);
+      if (!wrapped.hasUniform) {
+        if (DEBUG >= 2)
+          console.log("Preencoded scan: shader doesn't need offsets");
+        return null;
+      }
+
+      const module = this.device.createShaderModule({ code: wrapped.code });
+      const pipeline = this.device.createComputePipeline({
+        layout: "auto",
+        compute: { module, entryPoint: "main" },
+      });
+
+      wrappedShaders.push({
+        ...shader,
+        code: wrapped.code,
+        hasUniform: true,
+        pipeline,
+      });
+    }
+
+    // Create combined uniform buffer with offsets for all iterations
+    const alignment = this.getPreencodedScanAlignment();
+    const { buffer: offsetData, alignment: offsetAlignment } =
+      createAllIterationsOffsetsBuffer(
+        numX,
+        numY,
+        length,
+        xsElemStrides,
+        ysElemStrides,
+        alignment,
+        reverse,
+      );
+
+    const offsetBuffer = this.device.createBuffer({
+      size: offsetData.length,
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+      mappedAtCreation: true,
+    });
+    new Uint8Array(offsetBuffer.getMappedRange()).set(offsetData);
+    offsetBuffer.unmap();
+
+    if (DEBUG >= 1) {
+      console.log(
+        `Preencoded scan: prepared for ${length} iterations with uniform offsets`,
+      );
+    }
+
+    const copyUsesShader = carrySizes.map((size) => size % 4 !== 0);
+
+    return {
+      params,
+      wrappedShaders,
+      offsetBuffer,
+      offsetAlignment,
+      copyUsesShader,
+    };
+  }
+
+  /**
+   * Dispatch a preencoded scan with routine body.
+   *
+   * Uses ping-pong buffers for carry and uniform-based offsets for xs/ys.
+   * All iteration dispatches are encoded in a single command buffer.
+   */
+  dispatchPreencodedScan(
+    prepared: PreparedPreencodedScan,
+    constSlots: Slot[],
+    initCarrySlots: Slot[],
+    xsSlots: Slot[],
+    carryOutSlots: Slot[],
+    ysStackedSlots: Slot[],
+  ): void {
+    const {
+      params,
+      wrappedShaders,
+      offsetBuffer,
+      offsetAlignment,
+      copyUsesShader,
+    } = prepared;
+    const {
+      length,
+      carrySizes,
+      numCarry,
+      numConsts,
+      routineInputJitIds,
+      routineOutputJitIds,
+    } = params;
+
+    const constBuffers = constSlots.map((slot) => this.#getBuffer(slot).buffer);
+    const initCarryBuffers = initCarrySlots.map(
+      (slot) => this.#getBuffer(slot).buffer,
+    );
+    const xsBuffers = xsSlots.map((slot) => this.#getBuffer(slot).buffer);
+    const carryOutBuffers = carryOutSlots.map(
+      (slot) => this.#getBuffer(slot).buffer,
+    );
+    const ysStackedBuffers = ysStackedSlots.map(
+      (slot) => this.#getBuffer(slot).buffer,
+    );
+
+    // Create ping-pong buffers for carry state
+    const carryPing = carrySizes.map((size) =>
+      this.#createBuffer(Math.max(size, 4)),
+    );
+    const carryPong = carrySizes.map((size) =>
+      this.#createBuffer(Math.max(size, 4)),
+    );
+
+    const commandEncoder = this.device.createCommandEncoder();
+    const copyUniformBuffers: GPUBuffer[] = [];
+
+    // Copy initCarry to carryPing
+    for (let i = 0; i < numCarry; i++) {
+      if (carrySizes[i] > 0) {
+        commandEncoder.copyBufferToBuffer(
+          initCarryBuffers[i],
+          0,
+          carryPing[i],
+          0,
+          carrySizes[i],
+        );
+      }
+    }
+
+    const xsStart = numConsts + numCarry;
+
+    for (const shader of wrappedShaders) {
+      const { pipeline, passes } = shader;
+
+      // Helper to create storage bind group for a ping-pong configuration
+      const createStorageBindGroup = (
+        readCarry: GPUBuffer[],
+        writeCarry: GPUBuffer[],
+      ): GPUBindGroup => {
+        const entries: GPUBindGroupEntry[] = [];
+        let binding = 0;
+
+        // Input bindings: classify by scan buffer role
+        for (let i = 0; i < routineInputJitIds.length; i++) {
+          const jitId = routineInputJitIds[i];
+          let buffer: GPUBuffer;
+
+          if (jitId < numConsts) {
+            buffer = constBuffers[jitId];
+          } else if (jitId < xsStart) {
+            const carryIdx = jitId - numConsts;
+            buffer = readCarry[carryIdx];
+          } else {
+            const xIdx = jitId - xsStart;
+            buffer = xsBuffers[xIdx];
+          }
+
+          entries.push({ binding: binding++, resource: { buffer } });
+        }
+
+        // Output bindings: in passthrough pattern, all go to carry (write)
+        for (let i = 0; i < routineOutputJitIds.length; i++) {
+          const buffer = writeCarry[i];
+          if (!buffer) {
+            throw new Error(
+              `Preencoded scan: routine output ${i} has no carry buffer ` +
+                `(writeCarry.length=${writeCarry.length})`,
+            );
+          }
+          entries.push({ binding: binding++, resource: { buffer } });
+        }
+
+        return this.device.createBindGroup({
+          layout: pipeline.getBindGroupLayout(0),
+          entries,
+        });
+      };
+
+      const pingBindGroup = createStorageBindGroup(carryPing, carryPong);
+      const pongBindGroup = createStorageBindGroup(carryPong, carryPing);
+
+      // Create per-iteration uniform bind groups for offset data
+      const uniformBindGroups: GPUBindGroup[] = [];
+      for (let iter = 0; iter < length; iter++) {
+        const iterOffset = iter * offsetAlignment;
+        uniformBindGroups.push(
+          this.device.createBindGroup({
+            layout: pipeline.getBindGroupLayout(1),
+            entries: [
+              {
+                binding: 0,
+                resource: {
+                  buffer: offsetBuffer,
+                  offset: iterOffset,
+                  size: offsetAlignment,
+                },
+              },
+            ],
+          }),
+        );
+      }
+
+      const filteredPasses = passes.filter(({ grid }) => prod(grid) > 0);
+
+      for (let iter = 0; iter < length; iter++) {
+        const storageBindGroup = iter % 2 === 0 ? pingBindGroup : pongBindGroup;
+
+        for (const { grid } of filteredPasses) {
+          const passEncoder = commandEncoder.beginComputePass();
+          passEncoder.setPipeline(pipeline);
+          passEncoder.setBindGroup(0, storageBindGroup);
+          passEncoder.setBindGroup(1, uniformBindGroups[iter]);
+          passEncoder.dispatchWorkgroups(grid[0], grid[1]);
+          passEncoder.end();
+        }
+
+        // Copy carry → ys for this iteration (passthrough pattern)
+        const currentCarryBuffers = iter % 2 === 0 ? carryPong : carryPing;
+        for (let c = 0; c < numCarry; c++) {
+          const copySize = carrySizes[c];
+          if (copySize <= 0) continue;
+          const yOffset = iter * copySize;
+          if (!copyUsesShader[c]) {
+            commandEncoder.copyBufferToBuffer(
+              currentCarryBuffers[c],
+              0,
+              ysStackedBuffers[c],
+              yOffset,
+              copySize,
+            );
+          } else {
+            const uniformBuf = this.#encodeCopyWithShader(
+              commandEncoder,
+              currentCarryBuffers[c],
+              0,
+              ysStackedBuffers[c],
+              yOffset,
+              copySize,
+            );
+            if (uniformBuf) copyUniformBuffers.push(uniformBuf);
+          }
+        }
+      }
+    }
+
+    // Copy final carry to carryOut
+    const finalCarry = length % 2 === 0 ? carryPing : carryPong;
+    for (let i = 0; i < numCarry; i++) {
+      const copySize = carrySizes[i];
+      if (copySize <= 0) continue;
+      if (!copyUsesShader[i]) {
+        commandEncoder.copyBufferToBuffer(
+          finalCarry[i],
+          0,
+          carryOutBuffers[i],
+          0,
+          copySize,
+        );
+      } else {
+        const uniformBuf = this.#encodeCopyWithShader(
+          commandEncoder,
+          finalCarry[i],
+          0,
+          carryOutBuffers[i],
+          0,
+          copySize,
+        );
+        if (uniformBuf) copyUniformBuffers.push(uniformBuf);
+      }
+    }
+
+    this.device.queue.submit([commandEncoder.finish()]);
+
+    // Clean up temporary buffers
+    for (const buf of copyUniformBuffers) buf.destroy();
+    for (const buf of [...carryPing, ...carryPong]) buf.destroy();
+    // offsetBuffer is NOT destroyed — owned by PreparedPreencodedScan for reuse
   }
 
   #getBuffer(slot: Slot): { buffer: GPUBuffer; size: number } {
@@ -610,6 +1268,385 @@ function pipelineSource(device: GPUDevice, kernel: Kernel): ShaderInfo {
   };
 }
 
+// ---------------------------------------------------------------------------
+// Scan shader codegen (P3: WebGPU multi-kernel scan)
+// ---------------------------------------------------------------------------
+
+type EmitFn = (...lines: (string | symbol)[]) => void;
+const PUSH_INDENT = Symbol("pushIndent");
+const POP_INDENT = Symbol("popIndent");
+
+function createShaderEmitter(): {
+  emit: EmitFn;
+  pushIndent: symbol;
+  popIndent: symbol;
+  getCode: () => string;
+} {
+  const shader: string[] = [];
+  let indent = "";
+  const emit: EmitFn = (...lines) => {
+    for (const line of lines) {
+      if (line === PUSH_INDENT) indent += "  ";
+      else if (line === POP_INDENT) indent = indent.slice(0, -2);
+      else shader.push(line ? indent + (line as string) : line);
+    }
+  };
+  return {
+    emit,
+    pushIndent: PUSH_INDENT,
+    popIndent: POP_INDENT,
+    getCode: () => shader.join("\n"),
+  };
+}
+
+/**
+ * Generate a WGSL expression for a scan body kernel.
+ *
+ * Maps GlobalIndex gids to scan-specific buffer names (const0, carry0, xs0).
+ * xs inputs use `dataIdx` for iteration-aware addressing.
+ */
+function genScanExpressionWithRidx(
+  exp: AluExp,
+  _dtype: DType,
+  numConsts: number,
+  numCarry: number,
+  xsElemStrides: number[],
+): string {
+  const gen = (e: AluExp): string => {
+    const { op, src, dtype: eDtype, arg } = e;
+
+    // Handle scan-specific GlobalIndex classification
+    if (op === AluOp.GlobalIndex) {
+      const gid = arg[0] as number;
+      const idxCode = gen(src[0]);
+
+      if (gid < numConsts) {
+        const access = `const${gid}[${idxCode}]`;
+        return eDtype === DType.Bool ? `(${access} != 0)` : access;
+      } else if (gid < numConsts + numCarry) {
+        const carryIdx = gid - numConsts;
+        const access = `carry${carryIdx}[${idxCode}]`;
+        return eDtype === DType.Bool ? `(${access} != 0)` : access;
+      } else {
+        const xIdx = gid - numConsts - numCarry;
+        const stride = xsElemStrides[xIdx];
+        const access = `xs${xIdx}[i32(dataIdx) * ${stride} + ${idxCode}]`;
+        return eDtype === DType.Bool ? `(${access} != 0)` : access;
+      }
+    }
+
+    if (op === AluOp.Const) return constToWgsl(eDtype, arg);
+
+    if (op === AluOp.Special) {
+      const name = Array.isArray(arg) ? arg[0] : arg;
+      if (name === "gidx") return "gidx";
+      if (name === "ridx") return "ridx";
+      return name as string;
+    }
+
+    if (op === AluOp.Variable) {
+      if (arg === "acc") return "acc";
+      if (arg === "gidx") return "gidx";
+      if (arg === "ridx") return "ridx";
+      return arg as string;
+    }
+
+    // Erf/Erfc with f32 precision wrapper
+    if (op === AluOp.Erf || op === AluOp.Erfc) {
+      const funcName = op === AluOp.Erf ? "erf" : "erfc";
+      const a = strip1(gen(src[0]));
+      if (eDtype !== DType.Float32) {
+        return `${dtypeToWgsl(eDtype)}(${funcName}(f32(${a})))`;
+      }
+      return `${funcName}(${a})`;
+    }
+
+    // Binary ops
+    if (AluGroup.Binary.has(op) || AluGroup.Compare.has(op)) {
+      const a = gen(src[0]);
+      const b = gen(src[1]);
+      if (op === AluOp.Add) {
+        return eDtype === DType.Bool ? `(${a} || ${b})` : `(${a} + ${b})`;
+      }
+      if (op === AluOp.Sub) return `(${a} - ${b})`;
+      if (op === AluOp.Mul) {
+        return eDtype === DType.Bool ? `(${a} && ${b})` : `(${a} * ${b})`;
+      }
+      if (op === AluOp.Idiv) {
+        return isFloatDtype(eDtype) ? `trunc(${a} / ${b})` : `(${a} / ${b})`;
+      }
+      if (op === AluOp.Mod) return `(${a} % ${b})`;
+      if (op === AluOp.Min) {
+        return eDtype === DType.Bool
+          ? `(${a} && ${b})`
+          : `min(${strip1(a)}, ${strip1(b)})`;
+      }
+      if (op === AluOp.Max) {
+        return eDtype === DType.Bool
+          ? `(${a} || ${b})`
+          : `max(${strip1(a)}, ${strip1(b)})`;
+      }
+      if (op === AluOp.Cmplt) return `(${a} < ${b})`;
+      if (op === AluOp.Cmpne) return `(${a} != ${b})`;
+    }
+
+    // Unary ops
+    if (AluGroup.Unary.has(op)) {
+      const a = gen(src[0]);
+      if (op === AluOp.Sin) return `sin(${strip1(a)})`;
+      if (op === AluOp.Cos) return `cos(${strip1(a)})`;
+      if (op === AluOp.Asin) return `asin(${strip1(a)})`;
+      if (op === AluOp.Atan) return `atan(${strip1(a)})`;
+      if (op === AluOp.Exp) return `exp(${strip1(a)})`;
+      if (op === AluOp.Log) return `log(${strip1(a)})`;
+      if (op === AluOp.Sqrt) return `sqrt(${strip1(a)})`;
+      if (op === AluOp.Reciprocal) return `(1.0 / ${a})`;
+      if (op === AluOp.Floor) return `floor(${strip1(a)})`;
+      if (op === AluOp.Ceil) return `ceil(${strip1(a)})`;
+      if (op === AluOp.Cast) return `${dtypeToWgsl(eDtype)}(${strip1(a)})`;
+      if (op === AluOp.Bitcast) {
+        return `bitcast<${dtypeToWgsl(eDtype)}>(${strip1(a)})`;
+      }
+    }
+
+    // Ternary
+    if (op === AluOp.Where) {
+      return `select(${strip1(gen(src[2]))}, ${strip1(gen(src[1]))}, ${strip1(gen(src[0]))})`;
+    }
+
+    throw new Error(`genScanExpressionWithRidx: unsupported op ${AluOp[op]}`);
+  };
+
+  return strip1(gen(exp));
+}
+
+/**
+ * Generate a WGSL shader for native scan with multiple kernel steps.
+ *
+ * Each step writes to a carry buffer and optionally to a stacked Y output.
+ * The scan loop runs `length` iterations, executing all kernel steps per
+ * iteration. Kernels may have reductions (inner loops).
+ *
+ * Buffer layout:
+ *   - binding 0..numConsts-1: constants (read)
+ *   - binding numConsts..numConsts+numCarry-1: initCarry (read)
+ *   - binding numConsts+numCarry..+numX: xs (read)
+ *   - binding +numX..+numCarry: carryOut (read_write)
+ *   - binding +numCarry..+numY: ysStacked (read_write)
+ */
+function nativeScanMultiShaderSource(
+  device: GPUDevice,
+  params: NativeScanMultiParams,
+): ShaderInfo {
+  const {
+    length,
+    numConsts,
+    carrySizes,
+    xsStrides,
+    ysStrides,
+    steps,
+    numCarry,
+    numX,
+    numY,
+    reverse,
+  } = params;
+
+  // Determine dtype from first kernel step
+  const dtype = steps[0]?.kernel.dtype ?? DType.Float32;
+  const resultTy = dtypeToWgsl(dtype, true);
+  const elemSize = byteWidth(dtype);
+
+  // Compute element-level strides (byte strides / element size)
+  const xsElemStrides = xsStrides.map((s) => s / elemSize);
+
+  // Find the maximum kernel size across all steps
+  const maxKernelSize = Math.max(...steps.map((s) => s.kernel.size), 1);
+
+  const { emit, pushIndent, popIndent, getCode } = createShaderEmitter();
+
+  // Check for f16 requirement
+  if (dtype === DType.Float16) {
+    if (!device.features.has("shader-f16")) {
+      throw new Error("WebGPU device does not support shader-f16 feature");
+    }
+    emit("enable f16;");
+  }
+
+  emit(headerWgsl);
+
+  // Global function definitions needed by all kernels
+  const allDistinctOps = new Set<AluOp>();
+  for (const step of steps) {
+    const tune = tuneNullopt(step.kernel);
+    for (const [op] of tune.exp.distinctOps()) allDistinctOps.add(op);
+    if (tune.epilogue) {
+      for (const [op] of tune.epilogue.distinctOps()) allDistinctOps.add(op);
+    }
+  }
+  if (allDistinctOps.has(AluOp.Threefry2x32)) emit(threefrySrc);
+  if (allDistinctOps.has(AluOp.Erf) || allDistinctOps.has(AluOp.Erfc)) {
+    emit(erfSrc);
+  }
+
+  emit("");
+
+  // Buffer declarations
+  let bindingIdx = 0;
+
+  for (let i = 0; i < numConsts; i++) {
+    emit(
+      `@group(0) @binding(${bindingIdx++}) var<storage, read> const${i}: array<${resultTy}>;`,
+    );
+  }
+  for (let i = 0; i < numCarry; i++) {
+    emit(
+      `@group(0) @binding(${bindingIdx++}) var<storage, read> initCarry${i}: array<${resultTy}>;`,
+    );
+  }
+  for (let i = 0; i < numX; i++) {
+    emit(
+      `@group(0) @binding(${bindingIdx++}) var<storage, read> xs${i}: array<${resultTy}>;`,
+    );
+  }
+  for (let i = 0; i < numCarry; i++) {
+    emit(
+      `@group(0) @binding(${bindingIdx++}) var<storage, read_write> carry${i}: array<${resultTy}>;`,
+    );
+  }
+  for (let i = 0; i < numY; i++) {
+    emit(
+      `@group(0) @binding(${bindingIdx++}) var<storage, read_write> ys${i}: array<${resultTy}>;`,
+    );
+  }
+
+  // Compute shader entry point
+  const workgroupSize = Math.min(Math.max(maxKernelSize, 1), 256);
+  const [gridX, gridY] = calculateGrid(
+    Math.ceil(Math.max(maxKernelSize, 1) / workgroupSize),
+  );
+
+  emit(
+    "",
+    `@compute @workgroup_size(${workgroupSize})`,
+    "fn main(@builtin(global_invocation_id) id: vec3<u32>) {",
+    pushIndent,
+  );
+
+  emit(`let gidx = i32(id.x);`);
+  emit("");
+
+  // Step 1: Copy initCarry to carryOut (working buffer)
+  emit("// Initialize carry from initCarry");
+  for (let i = 0; i < numCarry; i++) {
+    const carrySize = carrySizes[i] / elemSize;
+    emit(`if (gidx < ${carrySize}) {`);
+    emit(pushIndent);
+    emit(`carry${i}[gidx] = initCarry${i}[gidx];`);
+    emit(popIndent, "}");
+  }
+  emit("");
+
+  // Step 2: Main scan loop
+  emit(`// Main scan loop over ${length} iterations`);
+  emit(`for (var iter: u32 = 0u; iter < ${length}u; iter++) {`, pushIndent);
+
+  if (reverse) {
+    emit(`let dataIdx = ${length - 1}u - iter;`);
+  } else {
+    emit(`let dataIdx = iter;`);
+  }
+
+  // Execute each kernel step
+  for (let stepIdx = 0; stepIdx < steps.length; stepIdx++) {
+    const step = steps[stepIdx];
+    const kernel = step.kernel;
+    const tune = tuneNullopt(kernel);
+    const carryIdx = step.outputCarryIdx;
+    const kernelSize = kernel.size;
+    const ysElemStride = ysStrides[carryIdx] / elemSize;
+
+    emit("");
+    emit(`// Step ${stepIdx}: kernel writes to carry${carryIdx}`);
+    emit(`if (gidx < ${kernelSize}) {`);
+    emit(pushIndent);
+
+    const re = kernel.reduction;
+    if (re) {
+      // Reduction kernel: inner ridx loop + epilogue
+      const accTy = dtypeToWgsl(re.dtype, true);
+      emit(`var acc: ${accTy} = ${constToWgsl(re.dtype, re.identity)};`);
+      emit(
+        `for (var ridx: i32 = 0; ridx < ${tune.size.reduce}; ridx++) {`,
+        pushIndent,
+      );
+
+      const expCode = genScanExpressionWithRidx(
+        tune.exp,
+        dtype,
+        numConsts,
+        numCarry,
+        xsElemStrides,
+      );
+      emit(`let val = ${expCode};`);
+
+      // Accumulate
+      if (re.op === AluOp.Add) emit(`acc = acc + val;`);
+      else if (re.op === AluOp.Mul) emit(`acc = acc * val;`);
+      else if (re.op === AluOp.Min) emit(`acc = min(acc, val);`);
+      else if (re.op === AluOp.Max) emit(`acc = max(acc, val);`);
+      else throw new Error(`Unsupported reduction op: ${re.op}`);
+
+      emit(popIndent, "}");
+
+      // Apply epilogue
+      const epilogueCode = genScanExpressionWithRidx(
+        tune.epilogue!,
+        dtype,
+        numConsts,
+        numCarry,
+        xsElemStrides,
+      );
+      emit(`let result_val_${stepIdx}: ${resultTy} = ${epilogueCode};`);
+    } else {
+      // Elementwise kernel
+      const expCode = genScanExpressionWithRidx(
+        tune.exp,
+        dtype,
+        numConsts,
+        numCarry,
+        xsElemStrides,
+      );
+      emit(`let result_val_${stepIdx}: ${resultTy} = ${expCode};`);
+    }
+
+    // Write to ysStacked at dataIdx * stride + gidx
+    if (numY > 0 && carryIdx < numY) {
+      emit(
+        `ys${carryIdx}[i32(dataIdx) * ${ysElemStride} + gidx] = result_val_${stepIdx};`,
+      );
+    }
+
+    // Update carry for next iteration
+    emit(`carry${carryIdx}[gidx] = result_val_${stepIdx};`);
+
+    emit(popIndent, "}");
+  }
+
+  emit(popIndent, "}");
+  emit(popIndent, "}");
+
+  const numReadOnlyInputs = numConsts + numCarry + numX;
+  const numReadWriteOutputs = numCarry + numY;
+
+  return {
+    code: getCode(),
+    numInputs: numReadOnlyInputs,
+    numOutputs: numReadWriteOutputs,
+    hasUniform: false,
+    passes: [{ grid: [gridX, gridY] }],
+  };
+}
+
 function pipelineSubmit(
   device: GPUDevice,
   pipelines: ShaderDispatch[],
@@ -761,6 +1798,11 @@ class ShaderPipelineCache {
   }
 
   async prepare(shader: ShaderInfo): Promise<GPUComputePipeline> {
+    // Deno's WebGPU (wgpu-rs) doesn't support createComputePipelineAsync
+    // reliably. Fall back to synchronous pipeline creation.
+    // @ts-expect-error Deno global
+    if (typeof Deno !== "undefined") return this.prepareSync(shader);
+
     const existingPipeline = this.cache.get(shader.code);
     if (existingPipeline) return existingPipeline;
 
@@ -810,7 +1852,10 @@ class ShaderPipelineCache {
     }
 
     const shaderModule = this.device.createShaderModule({ code: shader.code });
-    this.device.pushErrorScope("validation");
+    // Deno's wgpu-rs doesn't support pushErrorScope/popErrorScope reliably.
+    // @ts-expect-error Deno global
+    const hasScopeApi = typeof Deno === "undefined";
+    if (hasScopeApi) this.device.pushErrorScope("validation");
     const pipeline = this.device.createComputePipeline({
       layout: this.#getLayout(shader),
       compute: {
@@ -818,15 +1863,17 @@ class ShaderPipelineCache {
         entryPoint: "main",
       },
     });
-    this.device.popErrorScope().then(async (scope) => {
-      // This happens asynchronously, so we can't throw here. But shader syntax
-      // validation errors should never occur in correct code. Any issues here
-      // reflect bugs in jax-js.
-      if (scope !== null) {
-        const emsg = await compileError(shaderModule, scope, shader.code);
-        console.error(emsg);
-      }
-    });
+    if (hasScopeApi) {
+      this.device.popErrorScope().then(async (scope) => {
+        // This happens asynchronously, so we can't throw here. But shader syntax
+        // validation errors should never occur in correct code. Any issues here
+        // reflect bugs in jax-js.
+        if (scope !== null) {
+          const emsg = await compileError(shaderModule, scope, shader.code);
+          console.error(emsg);
+        }
+      });
+    }
     this.cache.set(shader.code, pipeline);
     return pipeline;
   }

@@ -57,11 +57,13 @@ suite.each(devicesWithLinalg)("device:%s", (device) => {
         [4.0, 5.0, 6.0],
       ]);
       expect(() => lax.linalg.cholesky(x).js()).toThrow();
+      x.dispose();
     });
 
     test("throws on non-2D array", () => {
       const x = np.array([1.0, 2.0, 3.0]);
       expect(() => lax.linalg.cholesky(x).js()).toThrow();
+      x.dispose();
     });
 
     test("works with jvp", () => {
@@ -165,10 +167,43 @@ suite.each(devicesWithLinalg)("device:%s", (device) => {
       const [lu, dlu] = jvp(luFn, [A.ref], [dA.ref]);
 
       // Verify dlu by finite differences
-      const eps = 1e-4;
-      const lu2 = lax.linalg.lu(A.add(dA.mul(eps)))[0];
+      // Use larger eps (1e-3) and looser tolerance because f32 finite
+      // differences are inherently noisy (the WASM LU routine uses native
+      // f32 arithmetic, amplifying rounding in the FD quotient).      
+      const eps = 1e-3;
+      const [lu2, _pivots, _perm] = lax.linalg.lu(A.add(dA.mul(eps)));
+      _pivots.dispose();
+      _perm.dispose();
       const dlu_fd = lu2.sub(lu).div(eps);
-      expect(dlu).toBeAllclose(dlu_fd, { rtol: 1e-2, atol: 1e-3 });
+      expect(dlu).toBeAllclose(dlu_fd, { rtol: 2e-2, atol: 2e-3 });
+    });
+
+    test("works with jvp (f64)", () => {
+      if (device !== "wasm" && device !== "cpu") return;
+      const A = np.array([
+        [4.0, 3.0, 6.3],
+        [6.0, 3.0, -2.4],
+      ], { dtype: np.float64 });
+      const dA = np.array([
+        [0.1, 0.2, -0.2],
+        [0.3, 0.4, -0.1],
+      ], { dtype: np.float64 });
+
+      const luFn = (x: np.Array) => {
+        const [lu, pivots, permutation] = lax.linalg.lu(x);
+        pivots.dispose();
+        permutation.dispose();
+        return lu;
+      };
+      const [lu, dlu] = jvp(luFn, [A.ref], [dA.ref]);
+
+      // Verify dlu by finite differences
+      const eps = 1e-4;
+      const [lu2, _pivots, _perm] = lax.linalg.lu(A.add(dA.mul(eps)));
+      _pivots.dispose();
+      _perm.dispose();
+      const dlu_fd = lu2.sub(lu).div(eps);
+      expect(dlu).toBeAllclose(dlu_fd, { rtol: 1e-4, atol: 1e-5 });
     });
   });
 
@@ -245,6 +280,7 @@ suite.each(devicesWithLinalg)("device:%s", (device) => {
         expected[i][0] = (fp - fm) / (2 * eps);
       }
       expect(db).toBeAllclose(expected, { rtol: 1e-2, atol: 1e-3 });
+      L.dispose();
     });
 
     test("behavior with transposed A", () => {

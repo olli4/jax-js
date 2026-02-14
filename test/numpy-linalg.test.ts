@@ -39,7 +39,7 @@ suite.each(devicesWithLinalg)("device:%s", (device) => {
         [4.0, 7.0],
         [2.0, 6.0],
       ]);
-      const detA = np.linalg.det(a.ref);
+      const detA = np.linalg.det(a);
       expect(detA).toBeAllclose(10.0);
     });
 
@@ -87,8 +87,8 @@ suite.each(devicesWithLinalg)("device:%s", (device) => {
       // Verify solution minimizes ||Ax - b||
       // The normal equations: A^T A x = A^T b
       const atA = np.matmul(a.ref.transpose(), a.ref);
-      const atb = np.matmul(a.ref.transpose(), b.ref);
-      const lhs = np.matmul(atA.ref, x.ref);
+      const atb = np.matmul(a.transpose(), b);
+      const lhs = np.matmul(atA, x);
       expect(lhs).toBeAllclose(atb, { rtol: 1e-4, atol: 1e-4 });
     });
 
@@ -102,7 +102,7 @@ suite.each(devicesWithLinalg)("device:%s", (device) => {
       const x = np.linalg.lstsq(a.ref, b.ref);
 
       // Verify Ax = b (should be exact for underdetermined systems)
-      const ax = np.matmul(a.ref, x.ref);
+      const ax = np.matmul(a, x);
       expect(ax).toBeAllclose(b, { rtol: 1e-4, atol: 1e-4 });
     });
 
@@ -115,7 +115,7 @@ suite.each(devicesWithLinalg)("device:%s", (device) => {
       const x = np.linalg.lstsq(a.ref, b.ref);
 
       // Verify Ax = b
-      const ax = np.matmul(a.ref, x.ref);
+      const ax = np.matmul(a, x);
       expect(ax).toBeAllclose(b, { rtol: 1e-4, atol: 1e-4 });
     });
 
@@ -137,8 +137,8 @@ suite.each(devicesWithLinalg)("device:%s", (device) => {
 
       // Verify normal equations for each column
       const atA = np.matmul(a.ref.transpose(), a.ref);
-      const atb = np.matmul(a.ref.transpose(), b.ref);
-      const lhs = np.matmul(atA.ref, x.ref);
+      const atb = np.matmul(a.transpose(), b);
+      const lhs = np.matmul(atA, x);
       expect(lhs).toBeAllclose(atb, { rtol: 1e-4, atol: 1e-4 });
     });
 
@@ -157,14 +157,17 @@ suite.each(devicesWithLinalg)("device:%s", (device) => {
       expect(x.shape).toEqual([3, 2]);
 
       // Verify Ax = b
-      const ax = np.matmul(a.ref, x.ref);
+      const ax = np.matmul(a, x);
       expect(ax).toBeAllclose(b, { rtol: 1e-4, atol: 1e-4 });
     });
 
     test("throws on non-2D coefficient matrix", () => {
       const a = np.array([1.0, 2.0, 3.0]);
       const b = np.array([1.0, 2.0, 3.0]);
+      // lstsq throws before consuming a and b
       expect(() => np.linalg.lstsq(a, b).js()).toThrow();
+      a.dispose();
+      b.dispose();
     });
 
     test("throws on mismatched dimensions", () => {
@@ -173,7 +176,10 @@ suite.each(devicesWithLinalg)("device:%s", (device) => {
         [3.0, 4.0],
       ]);
       const b = np.array([1.0, 2.0, 3.0]); // Wrong size
+      // lstsq throws before consuming a and b
       expect(() => np.linalg.lstsq(a, b).js()).toThrow();
+      a.dispose();
+      b.dispose();
     });
 
     test("works with jvp on b (underdetermined)", () => {
@@ -217,6 +223,7 @@ suite.each(devicesWithLinalg)("device:%s", (device) => {
         const fm = f(np.array(bm)).js() as number;
         expected.push([(fp - fm) / (2 * eps)]);
       }
+      a.dispose();
       expect(db).toBeAllclose(expected, { rtol: 1e-2, atol: 1e-3 });
     });
   });
@@ -227,7 +234,7 @@ suite.each(devicesWithLinalg)("device:%s", (device) => {
         [4.0, 7.0],
         [2.0, 6.0],
       ]);
-      const [sign, logdet] = np.linalg.slogdet(a.ref);
+      const [sign, logdet] = np.linalg.slogdet(a);
       expect(sign).toBeAllclose(1);
       expect(logdet).toBeAllclose(Math.log(10));
     });

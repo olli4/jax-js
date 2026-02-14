@@ -18,6 +18,9 @@ export function setDebug(level: number) {
   DEBUG = level;
 }
 
+/** The execution strategy chosen for a scan loop. */
+export type ScanPath = "compiled-loop" | "preencoded-routine" | "fallback";
+
 export function assertNonNull<T>(value: T): asserts value is NonNullable<T> {}
 
 export function unzip2<T, U>(pairs: Iterable<[T, U]>): [T[], U[]] {
@@ -198,6 +201,40 @@ export function checkInts(indices: number | number[]) {
       seen.add(i);
     }
   }
+}
+
+/**
+ * Index spec accepted by argnums/staticArgnums-style options.
+ *
+ * Supports classic positional forms (`number`, `number[]`) and JS-style
+ * dictionary forms (`{ "0": true, "2": true }`).
+ */
+export type IndexSpec = number | number[] | Record<number | string, boolean>;
+
+/** Normalize index specs to a validated sorted list of unique integers. */
+export function normalizeIndexSpec(
+  spec: IndexSpec,
+  name: string = "indices",
+): number[] {
+  let indices: number[];
+  if (typeof spec === "number") {
+    indices = [spec];
+  } else if (Array.isArray(spec)) {
+    indices = [...spec];
+  } else {
+    indices = [];
+    for (const [key, enabled] of Object.entries(spec)) {
+      if (!enabled) continue;
+      if (!/^-?\d+$/.test(key)) {
+        throw new TypeError(
+          `${name} dictionary keys must be integer strings, got ${key}`,
+        );
+      }
+      indices.push(Number(key));
+    }
+  }
+  checkInts(indices);
+  return indices;
 }
 
 export function range(

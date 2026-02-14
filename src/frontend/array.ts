@@ -13,6 +13,12 @@ import {
   Reduction,
 } from "../alu";
 import { Backend, Device, Executable, getBackend, Slot } from "../backend";
+import {
+  _lastRefMap,
+  _leakTrackingEnabled,
+  _leakTrackingMap,
+  _trackRefsEnabled,
+} from "./check-leaks";
 import { Routine } from "../routine";
 import { Pair, ShapeTracker, unravelAlu } from "../shape";
 import {
@@ -24,6 +30,7 @@ import {
   RecursiveArray,
   recursiveFlatten,
   rep,
+  type ScanPath,
 } from "../utils";
 import {
   checkConvShape,
@@ -52,6 +59,8 @@ import {
 } from "./core";
 import { abstractEvalRules } from "./jaxpr";
 import { jitCompile } from "./jit";
+import { executeScan } from "./scan-executor";
+import { planScan } from "./scan-plan";
 
 const JsArray = globalThis.Array;
 
@@ -198,6 +207,12 @@ export class Array extends Tracer {
     } else if (this.#source instanceof AluExp) {
       throw new Error("internal: AluExp source cannot have pending executes");
     }
+
+    // Leak tracking: record this Array and capture stack frames (V8 defers
+    // the expensive .stack string formatting until first access — cold path).
+    if (_leakTrackingEnabled) {
+      _leakTrackingMap.set(this, new Error());
+    }
   }
 
   /** @ignore */
@@ -234,7 +249,27 @@ export class Array extends Tracer {
   get ref() {
     this.#check();
     this.#rc++;
+    if (_trackRefsEnabled) _lastRefMap.set(this, new Error());
     return this;
+  }
+
+  /**
+   * Create a distinct Array handle that aliases the same underlying data.
+   *
+   * Unlike `.ref`, this does NOT mutate and return the same JS object.
+   * It returns a new Array wrapper and increments the backend slot and
+   * pending-execute reference counts accordingly.
+   *
+   * This is primarily for internal use in transformations (e.g. transpose/VJP)
+   * where a temporary "borrow" must be disposed without affecting the original
+   * owner's object identity.
+   */
+  borrow(): Array {
+    this.#check();
+    const pending = this.#pending;
+    for (const exe of pending) exe.updateRc(+1);
+    if (typeof this.#source === "number") this.#backend.incRef(this.#source);
+    return this.#newArrayFrom({ pending });
   }
 
   /** Get the current reference count (for debugging memory management). */
@@ -245,6 +280,9 @@ export class Array extends Tracer {
   dispose() {
     this.#check();
     if (--this.#rc === 0) {
+      // Leak tracking: remove from map (no-op when map is empty / tracking off).
+      if (_leakTrackingMap.size > 0) _leakTrackingMap.delete(this);
+
       // Free any pending executables that haven't been submitted yet.
       for (const exe of this.#pending) exe.updateRc(-1);
       // If this has an array source, free it from the backend.
@@ -1088,7 +1126,7 @@ export class Array extends Tracer {
       [Primitive.TriangularSolve]: Array.#routine(Primitive.TriangularSolve),
       [Primitive.Cholesky]: Array.#routine(Primitive.Cholesky),
       [Primitive.LU]: Array.#routine(Primitive.LU),
-      [Primitive.Jit](args, { jaxpr }) {
+      [Primitive.Jit](args, { jaxpr, numConsts }) {
         if (jaxpr.inBinders.length !== args.length) {
           throw new Error(
             `jit expects ${jaxpr.inBinders.length} args, got ${args.length}`,
@@ -1096,17 +1134,29 @@ export class Array extends Tracer {
         }
 
         const { backend, committed } = Array.#computeBackend("jit", args);
+        // Protect ClosedJaxpr-owned consts from _putSync disposal.
+        // Call-sites pass consts without .ref; we bump rc here so
+        // _putSync on a different backend won't free the original.
+        for (let i = 0; i < numConsts; i++) args[i].ref;
         args = args.map((ar) => ar._putSync(backend));
 
+        // Realize all input slots upfront.
+        const slots = args.map((x) => x._realizeSource());
+
+        // Flush all input pending ops to ensure data is materialized
+        // before JIT execution. This is critical for scan's fallback loop
+        // which reads slots synchronously within the JIT program.
+        for (const ar of args) {
+          for (const exe of ar.#pending) {
+            exe.prepareSync();
+            exe.submit();
+          }
+        }
+
         const jp = jitCompile(backend, jaxpr);
-        const { outputs, pending } = jp.execute(
-          args.map((x) => x._realizeSource()),
-        );
+        const { outputs, pending } = jp.execute(slots);
         for (const exe of pending) exe.updateRc(+outputs.length - 1);
 
-        const prevPending = [...new Set(args.flatMap((x) => x.#pending))];
-        for (const exe of prevPending) exe.updateRc(+outputs.length);
-        pending.splice(0, 0, ...prevPending); // Dispatch order of pending kernels is important.
         args.forEach((x) => x.dispose()); // Dispose of args after dispatch.
 
         return outputs.map((source, i) => {
@@ -1120,6 +1170,295 @@ export class Array extends Tracer {
             pending,
           });
         });
+      },
+      [Primitive.DynamicUpdateSlice]([dst, src], { offset, axis }) {
+        const dstShape = dst.shape;
+        const srcShape = src.shape;
+
+        // Mode 1: same rank, axis in range
+        if (dstShape.length === srcShape.length) {
+          for (let i = 0; i < dstShape.length; i++) {
+            if (i === axis) continue;
+            if (dstShape[i] !== srcShape[i]) {
+              throw new Error(
+                "dynamicUpdateSlice: dst and src must match on non-updated axes",
+              );
+            }
+          }
+          if (offset + srcShape[axis] > dstShape[axis]) {
+            throw new Error(
+              "dynamicUpdateSlice: offset + src.shape[axis] out of bounds",
+            );
+          }
+          const innerBefore = prod(dstShape.slice(axis + 1));
+          const outerBefore = prod(dstShape.slice(0, axis));
+          const dstData = dst.dataSync();
+          const srcData = src.dataSync();
+          for (let out = 0; out < outerBefore; out++) {
+            for (let i = 0; i < srcShape[axis]; i++) {
+              const srcStart = (out * srcShape[axis] + i) * innerBefore;
+              const dstStart =
+                (out * dstShape[axis] + offset + i) * innerBefore;
+              dstData.set(
+                srcData.subarray(srcStart, srcStart + innerBefore),
+                dstStart,
+              );
+            }
+          }
+          return [
+            array(dstData, {
+              shape: dstShape,
+              dtype: dst.dtype,
+              device: dst.device,
+            }),
+          ];
+        }
+
+        // Mode 2: stacked dst at axis=0 — dst has one extra leading dim
+        if (axis === 0 && dstShape.length === srcShape.length + 1) {
+          for (let i = 0; i < srcShape.length; i++) {
+            if (dstShape[i + 1] !== srcShape[i]) {
+              throw new Error(
+                "dynamicUpdateSlice: dst and src must match on non-updated axes (stacked mode)",
+              );
+            }
+          }
+          if (offset + 1 > dstShape[0]) {
+            throw new Error(
+              "dynamicUpdateSlice: offset out of bounds for stacked dst",
+            );
+          }
+
+          // Fast path: backend buffer copy
+          const { backend } = Array.#computeBackend("dynamicUpdateSlice", [
+            dst,
+            src,
+          ]);
+          if (backend.copyBufferToBuffer) {
+            const dstSlot = dst._realizeSource();
+            const srcSlot = src._realizeSource();
+            const innerSizeBytes = prod(srcShape) * byteWidth(dst.dtype);
+            const dstOffsetBytes = offset * innerSizeBytes;
+            const canBufferCopy =
+              dstOffsetBytes % 4 === 0 && innerSizeBytes % 4 === 0;
+            if (canBufferCopy) {
+              // Flush pending ops on both
+              for (const p of dst.#pending) {
+                p.prepareSync();
+                p.submit();
+              }
+              for (const p of src.#pending) {
+                p.prepareSync();
+                p.submit();
+              }
+              backend.copyBufferToBuffer(
+                srcSlot,
+                0,
+                dstSlot,
+                dstOffsetBytes,
+                innerSizeBytes,
+              );
+              backend.incRef(dstSlot);
+              return [
+                new Array({
+                  source: dstSlot,
+                  st: ShapeTracker.fromShape(dstShape),
+                  dtype: dst.dtype,
+                  weakType: dst.weakType,
+                  backend,
+                  committed: true,
+                  pending: [],
+                }),
+              ];
+            }
+          }
+
+          // CPU fallback: read, patch, create new array
+          const dstData = dst.dataSync();
+          const srcData = src.dataSync();
+          const innerSize = prod(srcShape);
+          const dstStart = offset * innerSize;
+          (dstData as any).set(srcData as any, dstStart);
+          return [
+            array(dstData, {
+              shape: dstShape,
+              dtype: dst.dtype,
+              device: dst.device,
+            }),
+          ];
+        }
+
+        throw new Error(
+          "dynamicUpdateSlice: unsupported dst/src shapes for update",
+        );
+      },
+      [Primitive.Scan](
+        args,
+        { jaxpr, numCarry, numConsts, length, reverse, acceptPath },
+      ) {
+        // Scan primitive: executes jaxpr in a loop, threading carry state
+        // Args layout: [...consts, ...initCarry, ...xs]
+        // jaxpr inputs: [...consts, ...carry, ...x_slice]
+        // jaxpr outputs: [...newCarry, ...y_slice]
+
+        const _consts = args.slice(0, numConsts);
+        const _initCarry = args.slice(numConsts, numConsts + numCarry);
+        const xs = args.slice(numConsts + numCarry);
+
+        const numX = xs.length;
+        const numY = jaxpr.outs.length - numCarry;
+
+        if (jaxpr.inBinders.length !== numConsts + numCarry + numX) {
+          throw new Error(
+            `scan jaxpr expects ${jaxpr.inBinders.length} inputs, got ${numConsts + numCarry + numX}`,
+          );
+        }
+
+        const { backend, committed } = Array.#computeBackend("scan", args);
+        // Move all args to the same backend
+        const allArgs = args.map((ar) => ar._putSync(backend));
+        const constArgs = allArgs.slice(0, numConsts);
+        const initCarryArgs = allArgs.slice(numConsts, numConsts + numCarry);
+        const xsArgs = allArgs.slice(numConsts + numCarry);
+
+        // JIT-compile body for fused per-iteration execution
+        const bodyProgram = jitCompile(backend, jaxpr);
+
+        // Determine scan plan (P0: always fallback)
+        const plan = planScan(
+          backend,
+          bodyProgram,
+          jaxpr,
+          length,
+          numCarry,
+          numConsts,
+          numX,
+          numY,
+          reverse,
+          acceptPath as ScanPath | ScanPath[] | undefined,
+        );
+
+        // Realize all input slots and flush pending ops
+        const constSlots = constArgs.map((c) => {
+          const slot = c._realizeSource();
+          for (const p of c.#pending) {
+            p.prepareSync();
+            p.submit();
+          }
+          return slot;
+        });
+        const initCarrySlots = initCarryArgs.map((c) => {
+          const slot = c._realizeSource();
+          for (const p of c.#pending) {
+            p.prepareSync();
+            p.submit();
+          }
+          return slot;
+        });
+        const xsSlots = xsArgs.map((x) => {
+          const slot = x._realizeSource();
+          for (const p of x.#pending) {
+            p.prepareSync();
+            p.submit();
+          }
+          return slot;
+        });
+
+        // Compute xs avals (per-slice shape, without leading length dim)
+        const xsAvals = xsArgs.map(
+          (x) => new ShapedArray(x.shape.slice(1), x.dtype, x.aval.weakType),
+        );
+
+        // Preallocate output slots: [carry_out..., stacked_ys...]
+        const outputSlots: Slot[] = [];
+        const bodyOutAvals = jaxpr.outs.map((v) => v.aval);
+
+        // Carry output slots
+        for (let ci = 0; ci < numCarry; ci++) {
+          const aval = bodyOutAvals[ci];
+          const sizeBytes = prod(aval.shape) * byteWidth(aval.dtype);
+          outputSlots.push(backend.malloc(sizeBytes > 0 ? sizeBytes : 1));
+        }
+
+        // Stacked Y output slots
+        for (let yi = 0; yi < numY; yi++) {
+          const aval = bodyOutAvals[numCarry + yi];
+          const totalSizeBytes =
+            length * prod(aval.shape) * byteWidth(aval.dtype);
+          outputSlots.push(
+            backend.malloc(totalSizeBytes > 0 ? totalSizeBytes : 1),
+          );
+        }
+
+        // IncRef slots that executeScan borrows (consts and xs)
+        for (const s of constSlots) backend.incRef(s);
+        for (const s of xsSlots) backend.incRef(s);
+
+        const result = executeScan({
+          backend,
+          plan,
+          bodyProgram,
+          bodyJaxpr: jaxpr,
+          length,
+          numCarry,
+          numConsts,
+          numX,
+          numY,
+          reverse,
+          constSlots,
+          initCarrySlots,
+          xsSlots,
+          xsAvals,
+          outputSlots,
+        });
+
+        // Flush any remaining pending ops
+        for (const p of result.pending) {
+          p.prepareSync();
+          p.submit();
+        }
+
+        // Dispose original args (consts, xs refs consumed above)
+        for (const s of constSlots) backend.decRef(s);
+        for (const s of xsSlots) backend.decRef(s);
+        allArgs.forEach((a) => a.dispose());
+
+        // Wrap output slots as Arrays
+        const outputs: Array[] = [];
+
+        // Carry outputs
+        for (let ci = 0; ci < numCarry; ci++) {
+          const aval = bodyOutAvals[ci];
+          outputs.push(
+            new Array({
+              source: result.outputs[ci],
+              st: ShapeTracker.fromShape(aval.shape),
+              dtype: aval.dtype,
+              weakType: aval.weakType,
+              backend,
+              committed,
+              pending: [],
+            }),
+          );
+        }
+
+        // Stacked Y outputs
+        for (let yi = 0; yi < numY; yi++) {
+          const aval = bodyOutAvals[numCarry + yi];
+          outputs.push(
+            new Array({
+              source: result.outputs[numCarry + yi],
+              st: ShapeTracker.fromShape([length, ...aval.shape]),
+              dtype: aval.dtype,
+              weakType: aval.weakType,
+              backend,
+              committed,
+              pending: [],
+            }),
+          );
+        }
+
+        return outputs;
       },
     };
   }

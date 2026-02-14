@@ -46,8 +46,8 @@ suite.each(devices)("device:%s", (device) => {
     );
     expect(y.dtype).toBe(np.float64);
     expect(dy.dtype).toBe(np.float64);
-    expect(y.ref.dataSync()).toEqual(new Float64Array([2.25, 6.25]));
-    expect(dy.ref.dataSync()).toEqual(new Float64Array([3.0, 5.0]));
+    expect(y.dataSync()).toEqual(new Float64Array([2.25, 6.25]));
+    expect(dy.dataSync()).toEqual(new Float64Array([3.0, 5.0]));
   });
 
   test("gradient of f64 calculation", () => {
@@ -57,7 +57,7 @@ suite.each(devices)("device:%s", (device) => {
     const x = np.array([1.5, 2.5], { dtype: np.float64 });
     const y = g(x);
     expect(y.dtype).toBe(np.float64);
-    expect(y.ref.dataSync()).toEqual(new Float64Array([3.0, 5.0]));
+    expect(y.dataSync()).toEqual(new Float64Array([3.0, 5.0]));
   });
 
   test("erfc() works for f64", () => {
