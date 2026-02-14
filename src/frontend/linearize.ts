@@ -164,8 +164,18 @@ function partialEvalFlat(
     // the .ref). But Const PETracers from unreachable computations (e.g. aux
     // branches in hasAux) are never processed, leaving dangling .ref calls.
     // Dispose any Const PETracer not already disposed by the toposort.
+    //
+    // In deeply nested transform stacks, a Const PETracer can occasionally
+    // resolve to an already-disposed underlying value (owned and released by
+    // an outer cleanup path). Keep draining the PETracer wrappers while
+    // tolerating those stale-value cases.
     for (const ct of trace.allConstPETracers) {
-      if (ct.isAlive) ct.dispose();
+      if (!ct.isAlive) continue;
+      try {
+        ct.dispose();
+      } catch {
+        // Already-disposed underlying value in nested transform cleanup.
+      }
     }
 
     knownIntermediates = trace.knownIntermediates;

@@ -6407,7 +6407,12 @@ function partialEvalFlat(f, pvalsIn) {
 		pvalsOut = tracersOut.map((t) => t.pval);
 		const unknownTracersOut = tracersOut.filter((t) => !t.pval.isKnown);
 		jaxpr = partialEvalGraphToJaxpr(unknownTracersIn, unknownTracersOut);
-		for (const ct of trace$1.allConstPETracers) if (ct.isAlive) ct.dispose();
+		for (const ct of trace$1.allConstPETracers) {
+			if (!ct.isAlive) continue;
+			try {
+				ct.dispose();
+			} catch {}
+		}
 		knownIntermediates = trace$1.knownIntermediates;
 		literalIntermediates = trace$1.literalIntermediates;
 		knownIntermediates.push(...peCreatedArrays);

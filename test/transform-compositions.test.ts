@@ -987,27 +987,20 @@ suite("depth-5 stress tests", () => {
 });
 
 // ============================================================
-// KNOWN_BUG tests — actual broken patterns
+// Previously KNOWN_BUG tests — regression coverage for fixed patterns
 //
-// These tests exercise patterns that are known to fail (leak or UAF) in the
-// non-consuming ownership model. They are regular test() calls so failures show
-// in the fail count. When a framework fix lands, the test will start passing
-// automatically — no clerical changes needed.
+// This suite still contains active KNOWN_BUG-tagged tests plus nearby
+// regression coverage for patterns that were fixed.
 //
-// Each test is tagged with KNOWN_BUG(<id>): <description> for grepability.
-// Corresponding workaround tests exist above (jit-wrapping, jvp, depth caps).
+// Active KNOWN_BUG tests use KNOWN_BUG(<id>) in their names for grepability.
 // ============================================================
 suite("KNOWN_BUG: framework issues under active development", () => {
-  // KNOWN_BUG(depth4-grad-leak): grad⁴(f) leaks intermediates
-  // Workaround: use jvp(grad³(f)) for 4th derivative
-  test("KNOWN_BUG(depth4-grad-leak): grad(grad(grad(grad(f)))) should not leak", () => {
+  test("grad(grad(grad(grad(f)))) should not leak", () => {
     using r = grad(grad(grad(grad(fn))))(X);
     expect(r).toBeAllclose(F4);
   });
 
-  // KNOWN_BUG(depth4-vjp-uaf): vjp at depth 4 causes UseAfterFreeError
-  // Workaround: cap vjp at depth 3
-  test("KNOWN_BUG(depth4-vjp-uaf): vjp(grad(grad(grad(f)))) should not crash", () => {
+  test("vjp(grad(grad(grad(f)))) should not crash", () => {
     const [y, backward] = vjp(grad(grad(grad(fn))), [X]);
     using _y = y;
     const cts = backward(1);

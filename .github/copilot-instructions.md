@@ -934,11 +934,9 @@ grep -rn 'KNOWN_BUG(' test/
 
 **Current inventory:**
 
-| Tag                 | File                           | Issue                                   | Workaround in tests     |
-| ------------------- | ------------------------------ | --------------------------------------- | ----------------------- |
-| `depth4-grad-leak`  | transform-compositions.test.ts | `grad⁴(f)` leaks intermediates          | `jvp(grad³(f))` for f⁴  |
-| `depth4-vjp-uaf`    | transform-compositions.test.ts | `vjp(grad³(f))` UAF at depth 4          | Cap vjp at depth 3      |
-| `sort-grad`         | numpy.test.ts                  | `sort` grad needs scatter (not impl)    | None                    |
+| Tag         | File          | Issue                                | Workaround in tests |
+| ----------- | ------------- | ------------------------------------ | ------------------- |
+| `sort-grad` | numpy.test.ts | `sort` grad needs scatter (not impl) | None                |
 
 **Test status:** See `pnpm vitest run` output. Known failures are expected and tracked above. The LU
 JVP finite-difference test was previously failing because the WASM LU routine uses native f32
