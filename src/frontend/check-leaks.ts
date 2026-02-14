@@ -368,13 +368,16 @@ export const checkLeaks = {
     // Flush all jit caches so their const arrays are freed before counting.
     _disposeAllJitCaches();
 
-    // Sum slot deltas across ALL backends.
+    // Sum slot deltas across ALL currently-initialized backends.
+    // Backends initialized between start() and stop() (e.g. WebGPU init
+    // inside a test body) use baseline 0 — any surviving slots are leaks.
     let leaked = 0;
-    for (const [d, baseline] of _startSlots) {
+    for (const d of devices) {
       try {
+        const baseline = _startSlots.get(d) ?? 0;
         leaked += (getBackend(d) as any).slotCount() - baseline;
       } catch {
-        /* backend gone */
+        /* backend not initialized or gone */
       }
     }
     _startSlots.clear();

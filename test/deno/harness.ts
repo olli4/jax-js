@@ -44,8 +44,7 @@ export async function initWebGPU(): Promise<boolean> {
 /**
  * Check if WebGPU is available in this environment.
  */
-export const hasWebGPU =
-  typeof navigator !== "undefined" && "gpu" in navigator;
+export const hasWebGPU = typeof navigator !== "undefined" && "gpu" in navigator;
 
 /**
  * Assert that two arrays (or ArrayLike values) are element-wise close.
@@ -176,21 +175,18 @@ export function withLeakCheck(
   const allowedLeaks = options?.allowedLeaks ?? 0;
 
   return async () => {
-    const before = getSlotCount();
     checkLeaks.start();
     try {
       await fn();
     } finally {
       const report = checkLeaks.stop();
-      const after = getSlotCount();
-      const leaked = after - before;
-      if (leaked > allowedLeaks) {
+      if (report.leaked > allowedLeaks) {
         const details =
-          report.leaked > 0
+          report.details.length > 0
             ? `\n${report.details.map((d: string) => `  - ${d}`).join("\n")}`
             : "";
         throw new Error(
-          `Memory leak: ${leaked} slot(s) leaked (before=${before}, after=${after}, allowed=${allowedLeaks})${details}`,
+          `Memory leak: ${report.leaked} slot(s) leaked (allowed=${allowedLeaks})${details}`,
         );
       }
     }

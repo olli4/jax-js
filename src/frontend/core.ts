@@ -333,7 +333,7 @@ export function where(cond: TracerValue, x: TracerValue, y: TracerValue) {
   return bind1(Primitive.Where, [cond, x, y]);
 }
 
-export function concatenate(xs: TracerValue[], axis: number) {
+export function concatenate(xs: TracerValue[], axis: number): Tracer {
   if (xs.length === 0)
     throw new Error("concatenate requires at least one input");
   const avals = xs.map((x) => ShapedArray.fromAval(getAval(x)));
@@ -346,6 +346,39 @@ export function concatenate(xs: TracerValue[], axis: number) {
       throw new Error(
         `Concatenate: inputs ${avals[0]} and ${x} must match shapes except on axis ${axis}`,
       );
+  }
+  // The eager Concatenate impl creates a single kernel with all inputs.
+  // On WebGPU, this exceeds maxStorageBuffersPerShaderStage when xs.length > ~7.
+  // Tree-reduce in groups of 7 to keep each kernel within buffer limits.
+  // (In JIT, splitGraphDataflow handles splitting, so the extra equations
+  //  from tree-reduction are harmless — they'll be fused or kept as-is.)
+  const MAX_CONCAT_CHUNK = 7;
+  if (xs.length > MAX_CONCAT_CHUNK) {
+    const chunks: TracerValue[] = [];
+    for (let i = 0; i < xs.length; i += MAX_CONCAT_CHUNK) {
+      const group = xs.slice(i, Math.min(i + MAX_CONCAT_CHUNK, xs.length));
+      chunks.push(
+        group.length === 1
+          ? group[0]
+          : bind1(Primitive.Concatenate, group, { axis }),
+      );
+    }
+    const result = concatenate(chunks, axis);
+    // In eager mode, dispose intermediate chunk arrays (but not original inputs
+    // or the result). During tracing, intermediates are graph nodes — don't touch.
+    if (!insideAbstractTrace()) {
+      const xsSet = new Set(xs);
+      for (const c of chunks) {
+        if (
+          c !== result &&
+          !xsSet.has(c) &&
+          typeof (c as any).dispose === "function"
+        ) {
+          (c as any).dispose();
+        }
+      }
+    }
+    return result;
   }
   return bind1(Primitive.Concatenate, xs, { axis });
 }
