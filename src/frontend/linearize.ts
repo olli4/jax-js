@@ -32,6 +32,7 @@ import {
   _setPACT,
   AbstractValue,
   add,
+  argsort,
   bind,
   broadcast,
   concatenate,
@@ -41,6 +42,7 @@ import {
   flattenFunWithAux,
   flip,
   fullRaise,
+  gather,
   insideAbstractTrace,
   mul,
   ndim,
@@ -1509,9 +1511,27 @@ const transposeRules: Partial<{ [P in Primitive]: TransposeRule<P> }> = {
     if (!(x instanceof UndefPrimal)) throw new NonlinearError(Primitive.Gather);
     if (indices.some((i) => i instanceof UndefPrimal))
       throw new NonlinearError(Primitive.Gather);
-    void [ct, axis, outDim];
+    // Permutation-case transpose: when a single 1-D index gathers along one
+    // axis and the output has the same size as the input, the index is a
+    // permutation.  Its transpose is gather(ct, inverse_perm). This covers
+    // the sort/argsort JVP path.  The general case (duplicate indices,
+    // multi-axis) requires a scatter_add primitive — see future work.
+    if (
+      indices.length === 1 &&
+      axis.length === 1 &&
+      ct.shape[axis[0]] === x.aval.shape[axis[0]]
+    ) {
+      const idx = indices[0] as Tracer;
+      // argsort of the permutation gives the inverse permutation.
+      const [sortedVals, invIdx] = argsort(idx);
+      const result = gather(ct, [invIdx], axis, outDim);
+      sortedVals.dispose();
+      invIdx.dispose();
+      return [result, null];
+    }
     throw new Error(
-      "Gather transpose rule is not yet implemented, requires complex Scatter sum operation",
+      "Gather transpose rule is only implemented for permutation gathers. " +
+        "General case (duplicate indices) requires a scatter_add primitive.",
     );
   },
   [Primitive.Transpose]([ct], [x], { perm }) {

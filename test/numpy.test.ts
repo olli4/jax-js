@@ -2440,8 +2440,7 @@ suite.each(devices)("device:%s", (device) => {
         expect(dy.js()).toEqual([20, 30, 10]);
       });
 
-      // KNOWN_BUG(sort-grad): Won't work until scatter is implemented.
-      test("KNOWN_BUG(sort-grad): works with grad", () => {
+      test("works with grad", () => {
         using x = np.array([3, 1, 4, 2]);
         const f = (x: np.Array) => np.sort(x).slice([0, 2]).sum();
         using dx = grad(f)(x);

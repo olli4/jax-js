@@ -934,9 +934,7 @@ grep -rn 'KNOWN_BUG(' test/
 
 **Current inventory:**
 
-| Tag         | File          | Issue                                | Workaround in tests |
-| ----------- | ------------- | ------------------------------------ | ------------------- |
-| `sort-grad` | numpy.test.ts | `sort` grad needs scatter (not impl) | None                |
+All KNOWN_BUGs have been resolved. No remaining inventory.
 
 **Test status:** See `pnpm vitest run` output. Known failures are expected and tracked above. The LU
 JVP finite-difference test was previously failing because the WASM LU routine uses native f32
@@ -2947,9 +2945,10 @@ rather than providing a weaker alternative. Keeps the API surface JAX-compatible
 
 ## Future Work
 
-| Priority | Feature                             | Notes                                                     |
-| -------- | ----------------------------------- | --------------------------------------------------------- |
-| ~~High~~ | ~~`checkLeaks` diagnostic~~         | ✅ Implemented in `src/frontend/check-leaks.ts`           |
-| ~~High~~ | ~~unreachable Const PETracer leak~~ | ✅ Fixed via `allConstPETracers` tracking in PE trace     |
-| Medium   | Anonymous constant leak fix         | Distinguish user-held vs anonymous consts in scan tracing |
-| ~~Low~~  | ~~`using` declaration examples~~    | ✅ Documented in copilot-instructions + README            |
+| Priority | Feature                             | Notes                                                                                                                                                                                         |
+| -------- | ----------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| ~~High~~ | ~~`checkLeaks` diagnostic~~         | ✅ Implemented in `src/frontend/check-leaks.ts`                                                                                                                                               |
+| ~~High~~ | ~~unreachable Const PETracer leak~~ | ✅ Fixed via `allConstPETracers` tracking in PE trace                                                                                                                                         |
+| Medium   | Anonymous constant leak fix         | Distinguish user-held vs anonymous consts in scan tracing                                                                                                                                     |
+| Medium   | `scatter_add` primitive             | Needed for general Gather transpose (duplicate indices, multi-axis). Currently only permutation gathers (sort/argsort path) are supported. Would enable `np.take` grad with repeated indices. |
+| ~~Low~~  | ~~`using` declaration examples~~    | ✅ Documented in copilot-instructions + README                                                                                                                                                |

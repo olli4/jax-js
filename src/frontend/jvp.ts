@@ -111,7 +111,10 @@ class JVPTracer extends Tracer {
    * primals/tangents that have already been captured as Jaxpr consts.
    */
   [Symbol.dispose]() {
-    if (!_peArrayCreationTracker && !hasAbstractTraceBelow(this._trace.main.level)) {
+    if (
+      !_peArrayCreationTracker &&
+      !hasAbstractTraceBelow(this._trace.main.level)
+    ) {
       this.dispose();
     }
   }
@@ -388,7 +391,10 @@ const jvpRules: { [P in Primitive]: JvpRule<P> } = {
     // Propagate both primals and derivatives along the sorted order.
     const [y, idx] = argsort(x);
     const gatherResult = gather(dx, [idx], [-1], -1);
-    idx.dispose();
+    // During PE tracing (grad path), idx becomes a ClosedJaxpr const whose
+    // lifecycle is managed by disposePeIntermediates. Eagerly disposing here
+    // would free it before the VJP pullback can use it.
+    if (!_peArrayCreationTracker) idx.dispose();
     return [[y], [gatherResult]];
   },
   [Primitive.Argsort]([x], [dx]) {

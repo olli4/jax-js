@@ -25,9 +25,9 @@ This file tracks items that must be resolved before merging this branch to main.
 
 ## Current KNOWN_BUG inventory
 
-| Tag         | File          | Description                          |
-| ----------- | ------------- | ------------------------------------ |
-| `sort-grad` | numpy.test.ts | `sort` grad needs scatter (not impl) |
+| Tag | File | Description     |
+| --- | ---- | --------------- |
+| —   | —    | All resolved ✅ |
 
 ### Resolved KNOWN_BUGs
 
