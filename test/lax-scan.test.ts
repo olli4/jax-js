@@ -1465,6 +1465,32 @@ describe("scan autodiff", () => {
       expect(await dxs.data()).toEqual(new Float32Array([1, 1, 1]));
       dxs.dispose();
     });
+
+    it("grad works when function disposes initVal inside body", async () => {
+      // Regression: user-disposed constants inside a grad body caused
+      // UseAfterFreeError in getOrComputePrimal because disposePeIntermediates
+      // would free the ClosedJaxpr's last reference to the constant.
+      const step = (carry: np.Array, x: np.Array): [np.Array, np.Array] => {
+        const newCarry = np.add(carry, x);
+        return [newCarry, newCarry];
+      };
+
+      const f = (xs: np.Array) => {
+        const initVal = np.array([0.0]);
+        const [finalCarry, ys] = lax.scan(step, initVal, xs);
+        initVal.dispose();
+        ys.dispose();
+        const result = finalCarry.sum();
+        finalCarry.dispose();
+        return result;
+      };
+
+      using xs = np.array([[1.0], [2.0], [3.0]]);
+      const dxs = grad(f)(xs);
+      expect(dxs.shape).toEqual([3, 1]);
+      expect(await dxs.data()).toEqual(new Float32Array([1, 1, 1]));
+      dxs.dispose();
+    });
   });
 
   describe("gradient checkpointing", () => {

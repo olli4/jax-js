@@ -320,6 +320,14 @@ function linearizeFlat(
     linearizeFlatUtil(f, primalsIn);
   // Protect primalsOut + concrete arrays underlying aux captures
   const protectedVals = new Set<Tracer>(primalsOut);
+  // Protect jaxpr consts whose creation ref was already consumed by user disposal.
+  // Normal consts have rc>=2 (creation + instantiateConst); disposePeIntermediates
+  // safely takes the creation ref. But if user code inside the traced function
+  // disposed a const (e.g. initVal.dispose() in a grad body), rc=1 and disposal
+  // would kill ClosedJaxpr's ownership.
+  for (const c of jaxpr.consts) {
+    if (c.refCount <= 1) protectedVals.add(c);
+  }
   if (auxStore?.value != null) {
     for (const arr of collectConcreteArrays(auxStore.value)) {
       protectedVals.add(arr);
@@ -2171,6 +2179,11 @@ function vjpFlat(
     linearizeFlatUtil(f, primalsIn);
   // Protect primalsOut + concrete arrays underlying aux captures
   const protectedVals = new Set<Tracer>(primalsOut);
+  // Protect jaxpr consts whose creation ref was already consumed by user disposal.
+  // (See same comment in linearizeFlat above.)
+  for (const c of jaxpr.consts) {
+    if (c.refCount <= 1) protectedVals.add(c);
+  }
   if (auxStore?.value != null) {
     for (const arr of collectConcreteArrays(auxStore.value)) {
       protectedVals.add(arr);
