@@ -136,7 +136,7 @@ Deno.test({
     using _out = outputs;
 
     await assertAllcloseAsync(finalCarry.a, [6.0]);
-    await assertAllcloseAsync(finalCarry.b, [3.0]);
+    await assertAllcloseAsync(finalCarry.b, [4.0]);
   }),
 });
 

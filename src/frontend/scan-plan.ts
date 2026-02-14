@@ -2,7 +2,7 @@
  * @file Scan plan construction — determines the execution strategy for a scan.
  */
 
-import { byteWidth, Kernel, Reduction } from "../alu";
+import { AluOp, byteWidth, Kernel, Reduction } from "../alu";
 import type { Backend, Executable } from "../backend";
 import {
   getScanRoutineInfo,
@@ -560,6 +560,51 @@ function tryPrepareWebGPUNativeScan(
     orderedSteps.push({ carryIdx, step });
   }
   orderedSteps.sort((a, b) => a.carryIdx - b.carryIdx);
+
+  // Check for cross-step carry read-after-write hazards.
+  // If step i writes to carry[ci], no later step j may read carry[ci],
+  // because the WGSL shader writes carry[ci] immediately after step i
+  // (before step j runs), so step j would see NEW values instead of OLD.
+  // This catches JVP'd bilinear bodies where the tangent step reads the
+  // primal carry. WASM handles this via shadow buffers; WebGPU falls back.
+  for (let i = 0; i < orderedSteps.length; i++) {
+    const writtenCarryGid = numConsts + orderedSteps[i].carryIdx;
+    for (let j = i + 1; j < orderedSteps.length; j++) {
+      const laterStep = orderedSteps[j].step;
+      const laterSource = laterStep.source as Kernel;
+      const laterReindexMap = laterStep.inputs;
+      const laterExp = laterSource.exp.reindexGids(laterReindexMap);
+      const readsWrittenCarry = laterExp.some(
+        (e) =>
+          (e.op === AluOp.GlobalIndex || e.op === AluOp.GlobalView) &&
+          e.arg[0] === writtenCarryGid,
+      );
+      if (readsWrittenCarry) {
+        if (DEBUG >= 1)
+          console.log(
+            `[webgpu-scan] skipped, step ${j} reads carry[${orderedSteps[i].carryIdx}] written by step ${i}`,
+          );
+        return null;
+      }
+      // Also check reduction epilogue if present
+      if (laterSource.reduction) {
+        const laterReductionExp =
+          laterSource.reduction.epilogue.reindexGids(laterReindexMap);
+        const readsInReduction = laterReductionExp.some(
+          (e) =>
+            (e.op === AluOp.GlobalIndex || e.op === AluOp.GlobalView) &&
+            e.arg[0] === writtenCarryGid,
+        );
+        if (readsInReduction) {
+          if (DEBUG >= 1)
+            console.log(
+              `[webgpu-scan] skipped, step ${j} reduction reads carry[${orderedSteps[i].carryIdx}] written by step ${i}`,
+            );
+          return null;
+        }
+      }
+    }
+  }
 
   const multiSteps: NativeScanMultiStep[] = orderedSteps.map(
     ({ carryIdx, step }) => {

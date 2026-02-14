@@ -308,12 +308,19 @@ function sliceXsAtIteration(
     const srcOffset = iterIdx * xsStrides[j];
     const sliceSize = xsAvals[j].size * byteWidth(xsAvals[j].dtype);
 
-    // Read the slice and create a new slot with a copy of the data.
-    // This is the simple approach for the fallback path. Native paths
-    // (P2-P4) use buffer offsets or views instead.
-    const data = backend.readSync(xsSlots[j], srcOffset, sliceSize);
-    const slot = backend.malloc(sliceSize, data);
-    slices.push(slot);
+    // Copy the xs slice into a new buffer. Prefer copyBufferToBuffer
+    // (keeps data on-device, avoids readSync which needs OffscreenCanvas
+    // on WebGPU and is unavailable in Deno). Fall back to readSync + malloc
+    // for backends that don't implement copyBufferToBuffer (CPU).
+    if (backend.copyBufferToBuffer) {
+      const slot = backend.malloc(sliceSize);
+      backend.copyBufferToBuffer(xsSlots[j], srcOffset, slot, 0, sliceSize);
+      slices.push(slot);
+    } else {
+      const data = backend.readSync(xsSlots[j], srcOffset, sliceSize);
+      const slot = backend.malloc(sliceSize, data);
+      slices.push(slot);
+    }
   }
   return slices;
 }
