@@ -11,6 +11,8 @@ import {
   flattenFun,
   flip,
   fullRaise,
+  insideAbstractTrace,
+  hasAbstractTraceBelow,
   gather,
   ndim,
   newMain,
@@ -114,7 +116,14 @@ class BatchTracer extends Tracer {
 
 class BatchTrace extends Trace {
   pure(val: TracerValue) {
-    return this.lift(pureArray(val));
+    const arr = pureArray(val);
+    // Track arrays created from raw (non-Tracer) values while batching.
+    // These are anonymous temporaries (e.g., scalar literals) and should be
+    // released after vmapFlat completes unless they escape via outputs.
+    if (!(val instanceof Tracer)) {
+      this.pureIntermediates.push(arr);
+    }
+    return this.lift(arr);
   }
 
   lift(val: Tracer): Tracer {
@@ -136,7 +145,9 @@ class BatchTrace extends Trace {
       // BatchTracer before getting here. However, I'm not sure about this in
       // edge cases, so it's better to just be safe.
       const valOuts = bind(primitive, valsIn, params);
-      return valOuts.map((x) => new BatchTracer(this, x, null));
+      const outs = valOuts.map((x) => new BatchTracer(this, x, null));
+      this.intermediates.push(...outs);
+      return outs;
     }
     const [valOuts, bdimOuts] = vmapRule(
       this.axisSize,
@@ -150,13 +161,23 @@ class BatchTrace extends Trace {
           `${valOuts.length} vs ${bdimOuts.length}`,
       );
     }
-    return zip(valOuts, bdimOuts).map(
+    const outs = zip(valOuts, bdimOuts).map(
       ([x, bd]) => new BatchTracer(this, x, bd),
     );
+    this.intermediates.push(...outs);
+    return outs;
   }
 
   get axisSize(): number {
-    return this.main.globalData;
+    return this.main.globalData.axisSize;
+  }
+
+  get pureIntermediates(): Tracer[] {
+    return this.main.globalData.pureIntermediates;
+  }
+
+  get intermediates(): BatchTracer[] {
+    return this.main.globalData.intermediates;
   }
 }
 
@@ -647,8 +668,13 @@ function vmapFlat(
   }
 
   let valsOut: Tracer[], bdimsOut: (number | null)[];
+  let shouldDisposeValOut = false;
   {
-    using main = newMain(BatchTrace, axisSize);
+    using main = newMain(BatchTrace, {
+      axisSize,
+      pureIntermediates: [] as Tracer[],
+      intermediates: [] as BatchTracer[],
+    });
     const trace = new BatchTrace(main);
     const tracersIn = args.map((x, i) =>
       inAxes[i] === null
@@ -658,10 +684,47 @@ function vmapFlat(
     const outs = f(...tracersIn);
     const tracersOut = outs.map((out) => fullRaise(trace, out) as BatchTracer);
     [valsOut, bdimsOut] = unzip2(tracersOut.map((t) => [t.val, t.batchDim]));
+
+    // Dispose anonymous arrays created via BatchTrace.pure() that do not
+    // escape through outputs. Skip cleanup when a lower abstract trace exists:
+    // in that case ownership belongs to the lower trace machinery.
+    shouldDisposeValOut = !hasAbstractTraceBelow(main.level);
+
+    if (shouldDisposeValOut) {
+      const outputTracers = new Set<BatchTracer>(tracersOut);
+      const outputVals = new Set<Tracer>(valsOut);
+      for (const t of trace.intermediates) {
+        if (outputTracers.has(t)) continue;
+        if (outputVals.has(t.val)) continue;
+        try {
+          t.dispose();
+        } catch {
+          // Already disposed.
+        }
+      }
+
+      const outputSet = new Set(valsOut);
+      const disposed = new Set<Tracer>();
+      for (const arr of trace.pureIntermediates) {
+        if (outputSet.has(arr) || disposed.has(arr)) continue;
+        disposed.add(arr);
+        if (arr.refCount > 0) arr[Symbol.dispose]?.();
+      }
+    }
   }
   return zip(valsOut, bdimsOut).map(([valOut, bdim]) => {
     const result = moveBatchAxis(axisSize, bdim, 0, valOut);
-    if (result !== valOut) valOut[Symbol.dispose]();
+    if (result !== valOut) {
+      if (shouldDisposeValOut) {
+        try {
+          valOut.dispose();
+        } catch {
+          // Already disposed.
+        }
+      } else {
+        valOut[Symbol.dispose]();
+      }
+    }
     return result;
   }); // outs_transposed
 }
@@ -718,7 +781,28 @@ export function jacfwd(f: any) {
     const [size] = x.shape;
     const pushfwd = (v: Tracer) => {
       const [primals, tangents] = jvp(f, [x], [v]);
-      for (const p of primals) p[Symbol.dispose]();
+      // In eager vmap contexts, primals can be BatchTracers whose
+      // [Symbol.dispose] is a no-op (Tracer base). Dispose explicitly to
+      // release their underlying concrete arrays.
+      // In abstract tracing contexts (e.g., jit(jacfwd(...))), keep the
+      // previous no-op behavior to avoid mutating tracer bookkeeping.
+      if (!insideAbstractTrace()) {
+        const [primalsFlat] = treeFlatten(primals);
+        for (const p of primalsFlat) {
+          if (p instanceof Tracer) {
+            try {
+              p.dispose();
+            } catch {
+              // Already disposed.
+            }
+          }
+        }
+      } else {
+        const [primalsFlat] = treeFlatten(primals);
+        for (const p of primalsFlat) {
+          if (p instanceof Tracer) p[Symbol.dispose]();
+        }
+      }
       return tangents;
     };
     const eyeMatrix = eye(size, undefined, { dtype: x.dtype });

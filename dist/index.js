@@ -1034,16 +1034,30 @@ function currentTraceLevel() {
 	return traceStack[traceStack.length - 1].level;
 }
 /**
-* Returns true if code is currently executing inside a trace context (e.g.
-* makeJaxpr, jit, vmap). Disposal of ClosedJaxpr constants is unsafe inside
-* traces because the consts may be JaxprTracers or BatchTracers from an outer
-* trace that must remain alive.
+* Returns true if any abstract (graph-building) trace is on the stack.
 *
-* Note: traceStack always has at least 1 entry (the base EvalTrace at level 0),
-* so we check for length > 1 to detect non-eval traces.
+* Unlike `insideTrace()`, this returns false when only concrete-value traces
+* like BatchTrace are active. Cleanup of intermediate arrays is safe when
+* no abstract traces are present — BatchTrace wraps concrete arrays that are
+* independently owned, so disposing them doesn't affect outer trace state.
+*
+* Use this instead of `insideTrace()` at cleanup sites where the values being
+* disposed are concrete arrays (not abstract tracers from a graph-building trace).
 */
-function insideTrace() {
-	return traceStack.length > 1;
+function insideAbstractTrace() {
+	for (let i = 1; i < traceStack.length; i++) if (traceStack[i].isAbstract) return true;
+	return false;
+}
+/**
+* Returns true if any abstract trace exists below the given level on the stack.
+*
+* Used by jvpFlat to decide whether its own intermediate cleanup is safe.
+* When only BatchTraces are below, cleanup is safe. When PE or JaxprTrace
+* is below, the intermediates are managed by that outer trace.
+*/
+function hasAbstractTraceBelow(level) {
+	for (let i = 1; i < level && i < traceStack.length; i++) if (traceStack[i].isAbstract) return true;
+	return false;
 }
 var Trace = class {
 	constructor(main) {
@@ -2246,6 +2260,7 @@ function makeJaxpr$1(f, opts) {
 			}, inTree);
 			const builder = new JaxprBuilder();
 			const main = _usingCtx$1.u(newMain(JaxprTrace, builder));
+			main.isAbstract = true;
 			_usingCtx$1.u(newDynamic(main));
 			const trace$1 = new JaxprTrace(main);
 			const tracersIn = avalsIn.map((aval) => trace$1.newArg(typeof aval === "object" ? aval : pureArray(aval)));
@@ -5178,7 +5193,9 @@ var BatchTracer = class extends Tracer {
 };
 var BatchTrace = class extends Trace {
 	pure(val) {
-		return this.lift(pureArray(val));
+		const arr = pureArray(val);
+		if (!(val instanceof Tracer)) this.pureIntermediates.push(arr);
+		return this.lift(arr);
 	}
 	lift(val) {
 		return new BatchTracer(this, val, null);
@@ -5189,14 +5206,24 @@ var BatchTrace = class extends Trace {
 		if (vmapRule === void 0) throw new Error(`No vmap rule for: ${primitive}`);
 		if (bdimsIn.every((d) => d === null)) {
 			const valOuts$1 = bind(primitive, valsIn, params);
-			return valOuts$1.map((x) => new BatchTracer(this, x, null));
+			const outs$1 = valOuts$1.map((x) => new BatchTracer(this, x, null));
+			this.intermediates.push(...outs$1);
+			return outs$1;
 		}
 		const [valOuts, bdimOuts] = vmapRule(this.axisSize, valsIn, bdimsIn, params);
 		if (valOuts.length !== bdimOuts.length) throw new Error(`vmap rule for ${primitive} returned mismatched lengths: ${valOuts.length} vs ${bdimOuts.length}`);
-		return zip(valOuts, bdimOuts).map(([x, bd]) => new BatchTracer(this, x, bd));
+		const outs = zip(valOuts, bdimOuts).map(([x, bd]) => new BatchTracer(this, x, bd));
+		this.intermediates.push(...outs);
+		return outs;
 	}
 	get axisSize() {
-		return this.main.globalData;
+		return this.main.globalData.axisSize;
+	}
+	get pureIntermediates() {
+		return this.main.globalData.pureIntermediates;
+	}
+	get intermediates() {
+		return this.main.globalData.intermediates;
 	}
 };
 /**
@@ -5539,14 +5566,38 @@ function vmapFlat(f, inAxes, args) {
 	}
 	if (axisSize === void 0) throw new TypeError("vmap requires at least one mapped axis");
 	let valsOut, bdimsOut;
+	let shouldDisposeValOut = false;
 	try {
 		var _usingCtx$1 = _usingCtx();
-		const main = _usingCtx$1.u(newMain(BatchTrace, axisSize));
+		const main = _usingCtx$1.u(newMain(BatchTrace, {
+			axisSize,
+			pureIntermediates: [],
+			intermediates: []
+		}));
 		const trace$1 = new BatchTrace(main);
 		const tracersIn = args.map((x, i) => inAxes[i] === null ? pureArray(x) : new BatchTracer(trace$1, pureArray(x), inAxes[i]));
 		const outs = f(...tracersIn);
 		const tracersOut = outs.map((out) => fullRaise(trace$1, out));
 		[valsOut, bdimsOut] = unzip2(tracersOut.map((t) => [t.val, t.batchDim]));
+		shouldDisposeValOut = !hasAbstractTraceBelow(main.level);
+		if (shouldDisposeValOut) {
+			const outputTracers = new Set(tracersOut);
+			const outputVals = new Set(valsOut);
+			for (const t of trace$1.intermediates) {
+				if (outputTracers.has(t)) continue;
+				if (outputVals.has(t.val)) continue;
+				try {
+					t.dispose();
+				} catch {}
+			}
+			const outputSet = new Set(valsOut);
+			const disposed = /* @__PURE__ */ new Set();
+			for (const arr of trace$1.pureIntermediates) {
+				if (outputSet.has(arr) || disposed.has(arr)) continue;
+				disposed.add(arr);
+				if (arr.refCount > 0) arr[Symbol.dispose]?.();
+			}
+		}
 	} catch (_) {
 		_usingCtx$1.e = _;
 	} finally {
@@ -5554,7 +5605,10 @@ function vmapFlat(f, inAxes, args) {
 	}
 	return zip(valsOut, bdimsOut).map(([valOut, bdim]) => {
 		const result = moveBatchAxis(axisSize, bdim, 0, valOut);
-		if (result !== valOut) valOut[Symbol.dispose]();
+		if (result !== valOut) if (shouldDisposeValOut) try {
+			valOut.dispose();
+		} catch {}
+		else valOut[Symbol.dispose]();
 		return result;
 	});
 }
@@ -5582,7 +5636,15 @@ function jacfwd$1(f) {
 		const [size$1] = x.shape;
 		const pushfwd = (v) => {
 			const [primals, tangents] = jvp$1(f, [x], [v]);
-			for (const p of primals) p[Symbol.dispose]();
+			if (!insideAbstractTrace()) {
+				const [primalsFlat] = flatten(primals);
+				for (const p of primalsFlat) if (p instanceof Tracer) try {
+					p.dispose();
+				} catch {}
+			} else {
+				const [primalsFlat] = flatten(primals);
+				for (const p of primalsFlat) if (p instanceof Tracer) p[Symbol.dispose]();
+			}
 			return tangents;
 		};
 		const eyeMatrix = eye(size$1, void 0, { dtype: x.dtype });
@@ -6186,6 +6248,7 @@ function jvpFlat(f, primals, tangents) {
 			liftedTangents: []
 		};
 		const main = _usingCtx22.u(newMain(JVPTrace, jvpData));
+		main.isAbstract = true;
 		const trace$1 = new JVPTrace(main);
 		const newlyCreatedInputs = [];
 		const tracersIn = zip(primals, tangents).map(([x, t]) => {
@@ -6198,7 +6261,7 @@ function jvpFlat(f, primals, tangents) {
 		const outs = f(...tracersIn);
 		const tracersOut = outs.map((out) => fullRaise(trace$1, out));
 		const result = unzip2(tracersOut.map((t) => [t.primal, t.tangent]));
-		if (main.level <= 1) {
+		if (!hasAbstractTraceBelow(main.level)) {
 			const outputSet = new Set(tracersOut);
 			for (const t of jvpData.intermediates) if (!outputSet.has(t)) {
 				if (t.primal.refCount > 0) t.primal[Symbol.dispose]();
@@ -6277,7 +6340,7 @@ function partialEvalFlat(f, pvalsIn) {
 	try {
 		var _usingCtx$1 = _usingCtx();
 		const main = _usingCtx$1.u(newMain(PartialEvalTrace));
-		main.isTransform = true;
+		main.isAbstract = true;
 		const trace$1 = new PartialEvalTrace(main);
 		const tracersIn = pvalsIn.map((pval) => trace$1.newArg(pval));
 		const unknownTracersIn = tracersIn.filter((t) => !t.pval.isKnown).map((t) => t.ref);
@@ -6316,6 +6379,20 @@ function partialEvalFlat(f, pvalsIn) {
 	};
 }
 /**
+* Unwrap tracer wrappers (BatchTracer, etc.) to find the underlying concrete
+* Array. Chases the `.val` chain until it reaches a non-wrapper value.
+* Returns the input unchanged if it's already a concrete Array.
+*/
+function unwrapToConcreteArray(t) {
+	let current = t;
+	while (current && typeof current === "object" && "val" in current) {
+		const inner$1 = current.val;
+		if (inner$1 === current || !(inner$1 instanceof Tracer)) break;
+		current = inner$1;
+	}
+	return current;
+}
+/**
 * Dispose PE intermediates that aren't outputs or externally captured.
 * During PE, all-known evaluations create concrete arrays. Output values
 * (in protectedVals) are returned to the caller. ClosedJaxpr consts have
@@ -6324,13 +6401,21 @@ function partialEvalFlat(f, pvalsIn) {
 * to balance the rc=1 from creation.
 */
 function disposePeIntermediates(peIntermediates, _literalIntermediates, protectedVals) {
-	if (insideTrace()) return;
+	if (insideAbstractTrace()) return;
+	const allProtected = new Set(protectedVals);
+	for (const v of protectedVals) {
+		const concrete = unwrapToConcreteArray(v);
+		if (concrete !== v) allProtected.add(concrete);
+	}
 	const targets = peIntermediates;
 	const disposed = /* @__PURE__ */ new Set();
 	for (const t of targets) {
-		if (protectedVals.has(t)) continue;
+		if (allProtected.has(t)) continue;
 		if (disposed.has(t)) continue;
+		const concrete = unwrapToConcreteArray(t);
+		if (concrete !== t && allProtected.has(concrete)) continue;
 		disposed.add(t);
+		if (concrete !== t) disposed.add(concrete);
 		try {
 			t.dispose();
 		} catch {}
@@ -6395,7 +6480,7 @@ function linearize$1(f, primalsIn, { hasAux = false } = {}) {
 	else [fFlat, outTree] = flattenFun(f, inTree);
 	const wrappedPrimals = primalsInFlat.map(pureArray);
 	const [primalsOutFlat, fLinFlat, dispose$1] = linearizeFlat(fFlat, wrappedPrimals, hasAux ? aux : void 0);
-	if (!insideTrace()) {
+	if (!insideAbstractTrace()) {
 		const primalsOutSet = new Set(primalsOutFlat);
 		for (let i = 0; i < wrappedPrimals.length; i++) if (wrappedPrimals[i] !== primalsInFlat[i] && !primalsOutSet.has(wrappedPrimals[i])) wrappedPrimals[i].dispose();
 	}
@@ -6793,9 +6878,11 @@ function evalJaxprTransposed(jaxpr, args, cotangents) {
 	const argPrimals = /* @__PURE__ */ new Set();
 	const argPrimalInitRc = /* @__PURE__ */ new Map();
 	for (let i = 0; i < jaxpr.inBinders.length; i++) if (!(args[i] instanceof UndefPrimal)) {
-		knownPrimals.set(jaxpr.inBinders[i], args[i]);
+		const arg = args[i];
+		knownPrimals.set(jaxpr.inBinders[i], arg);
 		argPrimals.add(jaxpr.inBinders[i]);
-		argPrimalInitRc.set(jaxpr.inBinders[i], args[i].refCount);
+		const concrete = unwrapToConcreteArray(arg);
+		argPrimalInitRc.set(jaxpr.inBinders[i], concrete instanceof Array$1 ? concrete.refCount : arg.refCount);
 	}
 	const ctStore = /* @__PURE__ */ new Map();
 	const internalArrays = /* @__PURE__ */ new Set();
@@ -6851,25 +6938,24 @@ function evalJaxprTransposed(jaxpr, args, cotangents) {
 	}
 	const results = [];
 	for (let i = 0; i < jaxpr.inBinders.length; i++) if (args[i] instanceof UndefPrimal) results.push(readCotangent(jaxpr.inBinders[i]));
-	if (!insideTrace()) {
+	if (!insideAbstractTrace()) {
 		for (const r of results) if (r instanceof Array$1) r._flushPendingSync();
 	}
 	for (const v of argPrimals) {
 		const val = knownPrimals.get(v);
 		const initialRc = argPrimalInitRc.get(v);
 		if (val && initialRc !== void 0) {
-			const excess = val.refCount - initialRc;
-			for (let i = 0; i < excess; i++) {
-				if (val.refCount <= 0) break;
-				try {
-					val.dispose();
-				} catch {
-					break;
-				}
+			const concrete = unwrapToConcreteArray(val);
+			const currentRc = concrete instanceof Array$1 ? concrete.refCount : val.refCount;
+			const excess = currentRc - initialRc;
+			for (let i = 0; i < excess; i++) try {
+				val.dispose();
+			} catch {
+				break;
 			}
 		}
 	}
-	if (!insideTrace()) {
+	if (!insideAbstractTrace()) {
 		const returnedSet = new Set(results);
 		for (const [v, t] of knownPrimals.entries()) if (!argPrimals.has(v) && !returnedSet.has(t)) try {
 			while (t.refCount > 0) t.dispose();
@@ -7410,7 +7496,7 @@ function vjpFlat(f, primalsIn, auxStore) {
 	const protectedVals = new Set(primalsOut);
 	if (auxStore?.value != null) for (const arr of collectConcreteArrays(auxStore.value)) protectedVals.add(arr);
 	disposePeIntermediates(peIntermediates, literalIntermediates, protectedVals);
-	if (!insideTrace()) {
+	if (!insideAbstractTrace()) {
 		for (const p of primalsOut) if (p instanceof Array$1) p._flushPendingSync();
 	}
 	const fVjp = (...cotangents) => {
@@ -7431,7 +7517,7 @@ function vjp$1(f, primalsIn, { hasAux = false } = {}) {
 	else [fFlat, outTree] = flattenFun(f, inTree);
 	const wrappedPrimals = primalsInFlat.map(pureArray);
 	const [primalsOutFlat, fVjpFlat, innerDispose] = vjpFlat(fFlat, wrappedPrimals, hasAux ? aux : void 0);
-	if (!insideTrace()) {
+	if (!insideAbstractTrace()) {
 		const primalsOutSet = new Set(primalsOutFlat);
 		for (let i = 0; i < wrappedPrimals.length; i++) if (wrappedPrimals[i] !== primalsInFlat[i] && !primalsOutSet.has(wrappedPrimals[i])) wrappedPrimals[i].dispose();
 	}
@@ -7442,7 +7528,7 @@ function vjp$1(f, primalsIn, { hasAux = false } = {}) {
 		if (!outTree.value.equals(outTree2)) throw new TreeMismatchError("vjp", outTree.value, outTree2);
 		const wrappedCots = cotangentsOutFlat.map(pureArray);
 		const cotangentsInFlat = fVjpFlat(...wrappedCots);
-		if (!insideTrace()) {
+		if (!insideAbstractTrace()) {
 			for (let i = 0; i < wrappedCots.length; i++) if (wrappedCots[i] !== cotangentsOutFlat[i]) wrappedCots[i].dispose();
 		}
 		return unflatten(inTree, cotangentsInFlat);
@@ -7461,11 +7547,11 @@ function grad$1(f, opts) {
 	return (...x) => {
 		if (opts?.hasAux) {
 			const [[y, aux], dx] = valueAndGradFn(...x);
-			if (!insideTrace()) y.dispose();
+			if (!insideAbstractTrace()) y.dispose();
 			return [dx, aux];
 		} else {
 			const [y, dx] = valueAndGradFn(...x);
-			if (!insideTrace()) y.dispose();
+			if (!insideAbstractTrace()) y.dispose();
 			return dx;
 		}
 	};
@@ -7489,7 +7575,7 @@ function valueAndGrad$1(f, opts) {
 		}, x[i]);
 		const [y, fVjp, aux] = vjp$1(f, x, { hasAux });
 		if (!(y instanceof Tracer) || ndim$1(y) !== 0) {
-			if (!insideTrace()) {
+			if (!insideAbstractTrace()) {
 				fVjp.dispose();
 				dispose(y);
 				if (hasAux) dispose(aux);
@@ -7498,7 +7584,7 @@ function valueAndGrad$1(f, opts) {
 			throw new TypeError("grad requires a scalar output");
 		}
 		if (!isFloatDtype(y.dtype)) {
-			if (!insideTrace()) {
+			if (!insideAbstractTrace()) {
 				fVjp.dispose();
 				dispose(y);
 				if (hasAux) dispose(aux);
@@ -7521,12 +7607,12 @@ function valueAndGrad$1(f, opts) {
 			if (seedEscapes) break;
 		}
 		const shouldDisposeSeed = !seedEscapes;
-		if (!insideTrace()) {
+		if (!insideAbstractTrace()) {
 			for (const a of sgArrays) if (!sgOriginals.has(a)) a.dispose();
 		}
 		fVjp.dispose();
 		if (shouldDisposeSeed) {
-			if (!insideTrace()) seed.dispose();
+			if (!insideAbstractTrace()) seed.dispose();
 			else if (currentTraceLevel() === 1 && seed instanceof Array$1 && seed.refCount > 0) seed.dispose();
 		}
 		for (let i = 0; i < cts.length; i++) if (!argnumsSet.has(i)) dispose(cts[i]);
@@ -9508,7 +9594,9 @@ function sign(x) {
 		const neq = _usingCtx19.u(notEqual(x, 0));
 		const lt = _usingCtx19.u(less(x, 0));
 		const inner$1 = _usingCtx19.u(where(lt, -1, 1));
-		return where(neq, inner$1, 0);
+		const result = _usingCtx19.u(where(neq, inner$1, 0));
+		const isnan$1 = _usingCtx19.u(notEqual(x, x));
+		return where(isnan$1, x, result);
 	} catch (_) {
 		_usingCtx19.e = _;
 	} finally {

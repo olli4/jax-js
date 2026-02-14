@@ -888,7 +888,15 @@ type MainTrace = {
   level: number;
   traceType: new (main: MainTrace) => Trace;
   globalData: any | null;
-  isTransform?: boolean;
+  /**
+   * True for graph-building traces where values are abstract or shared with
+   * the outer trace (JaxprTrace, PartialEvalTrace, JVPTrace). These traces
+   * hold values that must not be disposed by inner cleanup code.
+   *
+   * False/unset for concrete-value traces (EvalTrace, BatchTrace) where
+   * operations produce fresh arrays that can be safely disposed.
+   */
+  isAbstract?: boolean;
 };
 /**
  * Push an interpreter onto the trace stack. Use this like:

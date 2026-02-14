@@ -1017,18 +1017,16 @@ suite("KNOWN_BUG: framework issues under active development", () => {
     expect(cts[0]).toBeAllclose(F4);
   });
 
-  // KNOWN_BUG(bare-vmap-leak): vmap(grad(f)) without jit leaks
-  // Workaround: wrap in jit() — jit(vmap(grad(f)))
-  test("KNOWN_BUG(bare-vmap-leak): vmap(grad(f)) should not leak without jit", () => {
-    using r = vmap(grad(fn))(np.array([1, 2, 3]));
+  test("vmap(grad(f)) does not leak without jit", () => {
+    using x = np.array([1, 2, 3]);
+    using r = vmap(grad(fn))(x);
     expect(r).toBeAllclose([3, 12, 27]);
   });
 
-  // KNOWN_BUG(bare-jacfwd-leak): jacfwd without jit leaks
-  // Workaround: wrap in jit() — jit(jacfwd(f))
-  test("KNOWN_BUG(bare-jacfwd-leak): jacfwd(f) should not leak without jit", () => {
+  test("jacfwd(f) does not leak without jit", () => {
     const vecFn = (x: np.Array) => x.mul(x);
-    using J = jacfwd(vecFn)(np.array([1, 2, 3]));
+    using x = np.array([1, 2, 3]);
+    using J = jacfwd(vecFn)(x);
     expect(J).toBeAllclose([
       [2, 0, 0],
       [0, 4, 0],
@@ -1036,11 +1034,10 @@ suite("KNOWN_BUG: framework issues under active development", () => {
     ]);
   });
 
-  // KNOWN_BUG(bare-jacrev-leak): jacrev without jit leaks
-  // Workaround: wrap in jit() — jit(jacrev(f))
-  test("KNOWN_BUG(bare-jacrev-leak): jacrev(f) should not leak without jit", () => {
+  test("jacrev(f) does not leak without jit", () => {
     const vecFn = (x: np.Array) => x.mul(x);
-    using J = jacrev(vecFn)(np.array([1, 2, 3]));
+    using x = np.array([1, 2, 3]);
+    using J = jacrev(vecFn)(x);
     expect(J).toBeAllclose([
       [2, 0, 0],
       [0, 4, 0],
@@ -1048,11 +1045,10 @@ suite("KNOWN_BUG: framework issues under active development", () => {
     ]);
   });
 
-  // KNOWN_BUG(bare-hessian-leak): hessian without jit leaks
-  // Workaround: wrap in jit() — jit(hessian(f))
-  test("KNOWN_BUG(bare-hessian-leak): hessian(f) should not leak without jit", () => {
+  test("hessian(f) does not leak without jit", () => {
     const scalarFn = (x: np.Array) => np.sum(x.mul(x));
-    using H = hessian(scalarFn)(np.array([1, 2, 3]));
+    using x = np.array([1, 2, 3]);
+    using H = hessian(scalarFn)(x);
     expect(H).toBeAllclose([
       [2, 0, 0],
       [0, 2, 0],

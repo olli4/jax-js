@@ -938,10 +938,6 @@ grep -rn 'KNOWN_BUG(' test/
 | ------------------- | ------------------------------ | --------------------------------------- | ----------------------- |
 | `depth4-grad-leak`  | transform-compositions.test.ts | `grad⁴(f)` leaks intermediates          | `jvp(grad³(f))` for f⁴  |
 | `depth4-vjp-uaf`    | transform-compositions.test.ts | `vjp(grad³(f))` UAF at depth 4          | Cap vjp at depth 3      |
-| `bare-vmap-leak`    | transform-compositions.test.ts | `vmap(grad(f))` leaks without jit       | `jit(vmap(grad(f)))`    |
-| `bare-jacfwd-leak`  | transform-compositions.test.ts | `jacfwd(f)` leaks without jit           | `jit(jacfwd(f))`        |
-| `bare-jacrev-leak`  | transform-compositions.test.ts | `jacrev(f)` leaks without jit           | `jit(jacrev(f))`        |
-| `bare-hessian-leak` | transform-compositions.test.ts | `hessian(f)` leaks without jit          | `jit(hessian(f))`       |
 | `makejaxpr-jvp`     | tracing.test.ts                | `makeJaxpr` does not compose with `jvp` | None (test.skip → test) |
 | `sort-grad`         | numpy.test.ts                  | `sort` grad needs scatter (not impl)    | None                    |
 

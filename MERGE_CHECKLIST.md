@@ -29,10 +29,6 @@ This file tracks items that must be resolved before merging this branch to main.
 | ------------------- | ------------------------------ | ----------------------------------------- |
 | `depth4-grad-leak`  | transform-compositions.test.ts | `grad⁴(f)` leaks intermediates            |
 | `depth4-vjp-uaf`    | transform-compositions.test.ts | `vjp(grad³(f))` UAF at depth 4            |
-| `bare-vmap-leak`    | transform-compositions.test.ts | `vmap(grad(f))` leaks without jit wrapper |
-| `bare-jacfwd-leak`  | transform-compositions.test.ts | `jacfwd(f)` leaks without jit wrapper     |
-| `bare-jacrev-leak`  | transform-compositions.test.ts | `jacrev(f)` leaks without jit wrapper     |
-| `bare-hessian-leak` | transform-compositions.test.ts | `hessian(f)` leaks without jit wrapper    |
 | `makejaxpr-jvp`     | tracing.test.ts                | `makeJaxpr` does not compose with `jvp`   |
 | `sort-grad`         | numpy.test.ts                  | `sort` grad needs scatter (not impl)      |
 
@@ -41,3 +37,7 @@ This file tracks items that must be resolved before merging this branch to main.
 | Tag        | Resolution                                                                 |
 | ---------- | -------------------------------------------------------------------------- |
 | `sign-nan` | Fixed: NaN propagation via `notEqual(x, x)` + `where` in `numpy.ts sign()` |
+| `bare-vmap-leak` | Fixed: wrapper-aware primal borrow balancing in transpose + explicit input ownership in test |
+| `bare-jacfwd-leak` | Fixed: BatchTrace intermediate disposal + jacfwd primal-tree disposal in eager vmap contexts |
+| `bare-jacrev-leak` | Fixed: wrapper-aware primal borrow balancing; test now owns input explicitly |
+| `bare-hessian-leak` | Fixed via jacfwd/vmap ownership cleanup + input ownership in test |

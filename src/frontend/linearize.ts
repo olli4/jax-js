@@ -1066,9 +1066,14 @@ function evalJaxprTransposed(
   const argPrimalInitRc = new Map<Var, number>();
   for (let i = 0; i < jaxpr.inBinders.length; i++) {
     if (!(args[i] instanceof UndefPrimal)) {
-      knownPrimals.set(jaxpr.inBinders[i], args[i] as Tracer);
+      const arg = args[i] as Tracer;
+      knownPrimals.set(jaxpr.inBinders[i], arg);
       argPrimals.add(jaxpr.inBinders[i]);
-      argPrimalInitRc.set(jaxpr.inBinders[i], (args[i] as Tracer).refCount);
+      const concrete = unwrapToConcreteArray(arg);
+      argPrimalInitRc.set(
+        jaxpr.inBinders[i],
+        concrete instanceof JaxArray ? concrete.refCount : arg.refCount,
+      );
     }
   }
 
@@ -1192,9 +1197,11 @@ function evalJaxprTransposed(
     const val = knownPrimals.get(v);
     const initialRc = argPrimalInitRc.get(v);
     if (val && initialRc !== undefined) {
-      const excess = val.refCount - initialRc;
+      const concrete = unwrapToConcreteArray(val);
+      const currentRc =
+        concrete instanceof JaxArray ? concrete.refCount : val.refCount;
+      const excess = currentRc - initialRc;
       for (let i = 0; i < excess; i++) {
-        if (val.refCount <= 0) break;
         try {
           val.dispose();
         } catch {
