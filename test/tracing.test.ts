@@ -38,8 +38,7 @@ suite("jax.makeJaxpr()", () => {
     expect(jaxpr.consts).toEqual([]);
   });
 
-  // KNOWN_BUG(makejaxpr-jvp): makeJaxpr does not compose with jvp
-  test("KNOWN_BUG(makejaxpr-jvp): composes with jvp", () => {
+  test("composes with jvp", () => {
     const f = (x: np.Array) => np.multiply(x.add(2), x);
     const fdot = (x: np.Array) => {
       const [, dy] = jvp(f, [x], [1]);

@@ -5685,9 +5685,14 @@ var JVPTracer = class extends Tracer {
 	* During PE tracing, JVPTracers may wrap concrete Arrays tracked in
 	* PE's knownIntermediates. Disposing via `using` would conflict with
 	* PE's lifecycle management, so we skip when inside PE scope.
+	*
+	* Also skip when a lower abstract trace exists. In nested abstract
+	* compositions (e.g., makeJaxpr(jvp(...))), core.bind may call
+	* Symbol.dispose on raised raw-literal arguments. Cascading here would free
+	* primals/tangents that have already been captured as Jaxpr consts.
 	*/
 	[Symbol.dispose]() {
-		if (!_peArrayCreationTracker) this.dispose();
+		if (!_peArrayCreationTracker && !hasAbstractTraceBelow(this._trace.main.level)) this.dispose();
 	}
 };
 var JVPTrace = class extends Trace {

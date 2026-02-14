@@ -938,7 +938,6 @@ grep -rn 'KNOWN_BUG(' test/
 | ------------------- | ------------------------------ | --------------------------------------- | ----------------------- |
 | `depth4-grad-leak`  | transform-compositions.test.ts | `grad⁴(f)` leaks intermediates          | `jvp(grad³(f))` for f⁴  |
 | `depth4-vjp-uaf`    | transform-compositions.test.ts | `vjp(grad³(f))` UAF at depth 4          | Cap vjp at depth 3      |
-| `makejaxpr-jvp`     | tracing.test.ts                | `makeJaxpr` does not compose with `jvp` | None (test.skip → test) |
 | `sort-grad`         | numpy.test.ts                  | `sort` grad needs scatter (not impl)    | None                    |
 
 **Test status:** See `pnpm vitest run` output. Known failures are expected and tracked above. The LU
